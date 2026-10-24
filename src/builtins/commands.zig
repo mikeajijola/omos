@@ -272,7 +272,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
         .summary = "Manage runtime updates",
-        .notes = &.{"Managed omos workspaces require a verified bundle installer; the upstream fx updater is disabled."},
+        .details = &.{"Managed omos workspaces require a verified bundle installer; the upstream fx updater is disabled."},
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,

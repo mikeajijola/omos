@@ -680,6 +680,11 @@ fn writeForegroundSessionReplaceFailure(
 }
 
 fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
+    // The target waiter has joined. Reap the Linux subreaper's adopted dead
+    // children here, before exit hands them to the host's init process.
+    if (comptime builtin.target.os.tag == .linux) {
+        while (std.c.waitpid(-1, null, std.c.W.NOHANG) > 0) {}
+    }
     switch (term) {
         .exited => |code| std.process.exit(code),
         .signal => |signal| {
@@ -3846,6 +3851,19 @@ test "foreground session bootstrap waits for release before executing target" {
 test "foreground session owner loss kills the target and descendant before delayed effects" {
     if (comptime !supports_foreground_session) return;
 
+    // Retain any orphaned zombie ourselves so the assertion cannot depend
+    // on how quickly the host's init process reaps it.
+    var previous_subreaper: c_int = 0;
+    if (comptime builtin.target.os.tag == .linux) {
+        _ = try std.posix.prctl(.GET_CHILD_SUBREAPER, .{@intFromPtr(&previous_subreaper)});
+        _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
+    }
+    defer {
+        if (comptime builtin.target.os.tag == .linux) {
+            _ = std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, @intCast(previous_subreaper))}) catch 0;
+        }
+    }
+
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3896,6 +3914,11 @@ test "foreground session owner loss kills the target and descendant before delay
     const target_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pids.next() orelse return error.TestUnexpectedResult, 10);
     try std.testing.expect(pids.next() == null);
+    defer {
+        if (comptime builtin.target.os.tag == .linux) {
+            _ = std.c.waitpid(descendant_pid, null, 0);
+        }
+    }
     defer signalProcess(target_pid, std.posix.SIG.KILL) catch {};
     defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
 
