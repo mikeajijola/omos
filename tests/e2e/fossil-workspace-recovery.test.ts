@@ -1318,6 +1318,77 @@ sys.exit(result.returncode)
     } finally { service.child.kill(); await service.child.exited; }
   }, 240000);
 
+  test("reuses bounded host checkouts across personal publications while retaining isolated task views", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const shared = "Unchanged portable document.\n".repeat(2400);
+    let phase = -1, wrote = false;
+    const views = new Map<number, string>();
+    model(f, body => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      views.set(phase, root);
+      if (!wrote) {
+        wrote = true;
+        return phase < 0 ? { tool_calls: [{ index: 0, id: "shared-document", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/shared.txt", content: shared }) } }] } : writeMemory(`Personal value ${phase}`);
+      }
+      return { content: phase < 0 ? "The shared document is saved." : `Personal value ${phase} is saved.` };
+    });
+    const seed = await f.run(["ask", "Save the unchanged shared document", "--json"]);
+    expect(seed.code, seed.stderr).toBe(0);
+    const repository = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).repository;
+    const checkouts = join(f.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"), "checkouts");
+    const copies = () => readdirSync(checkouts, { withFileTypes: true }).filter(entry => entry.isDirectory() && existsSync(join(checkouts, entry.name, "documents/shared.txt"))).length;
+    const before = copies();
+    const retained = [];
+    for (phase = 0; phase < 4; phase++) {
+      wrote = false;
+      const result = await f.run(["ask", `Save personal value ${phase}`, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      const session = createHash("sha256").update(JSON.parse(result.stdout).session_id).digest("hex");
+      const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((task: any) => task.session === session);
+      expect(task.state).toBe("accepted");
+      retained.push({ branch: task.branch, phase });
+      expect(copies()).toBeLessThanOrEqual(before);
+    }
+    expect(new Set([...views.values()]).size).toBe(5);
+    for (const task of retained) {
+      expect(f.fossil("cat", "memory/preference.md", "-r", task.branch)).toBe(`Personal value ${task.phase}`);
+      expect(readFileSync(join(views.get(task.phase)!, "memory/preference.md"), "utf8")).toBe(`Personal value ${task.phase}`);
+      expect(readFileSync(join(views.get(task.phase)!, "documents/shared.txt"), "utf8")).toBe(shared);
+    }
+  }, 240000);
+
+  test("preserves dirty same-revision host scratch before rebuilding it without replaying actor work", async () => {
+    const f = fixture();
+    let permit = false;
+    const inference = model(f, (_body, count) => count === 1 ? writeMemory("Canonical retained information") : { content: "The canonical information is saved." }, packet => permit ? "met" : {
+      name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Retain this candidate" }] },
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const initial = await f.run(["ask", "Save the canonical information", "--json"]);
+    expect(initial.code).toBe(1);
+    const session = JSON.parse(initial.stdout).session_id;
+    const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const checkouts = join(f.home, ".fx/fossil", createHash("sha256").update(snapshot.repository).digest("hex"), "checkouts");
+    const key = createHash("sha256").update("task-content").digest("hex");
+    const tree = join(checkouts, key);
+    mkdirSync(join(tree, "documents"), { recursive: true });
+    writeFileSync(join(tree, "documents/uncommitted.txt"), "Retain these interrupted bytes");
+    writeFileSync(join(tree, "memory/preference.md"), "An uncommitted host scratch change");
+    const calls = inference.counts().actors;
+    permit = true;
+    const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
+    expect(resumed.code, resumed.stderr).toBe(0);
+    expect(inference.counts().actors).toBe(calls);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Canonical retained information");
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/uncommitted.txt");
+    const recoveries = readdirSync(checkouts).filter(name => name.startsWith(`${key}.recovery-`));
+    expect(recoveries).toHaveLength(1);
+    expect(readFileSync(join(checkouts, recoveries[0], "documents/uncommitted.txt"), "utf8")).toBe("Retain these interrupted bytes");
+    expect(readFileSync(join(checkouts, recoveries[0], "memory/preference.md"), "utf8")).toBe("An uncommitted host scratch change");
+  }, 120000);
+
   test("keeps company drafts isolated without copying the company files for every view", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

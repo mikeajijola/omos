@@ -669,9 +669,13 @@ changes until independent review and authorized publication succeed.
 Each company view retains its own task branch, base revision, contract, and
 private changes. Unchanged files reuse Fossil content objects. Scoped actors
 retrieve content through the service; they receive no access to the host's
-scratch directories. The host serializes mutations through one reusable company
-checkout and uses one integration checkout for publication. Creating more views
-does not create another complete filesystem copy for each actor. These host
+scratch directories. The host serializes task mutations through one reusable task checkout and uses
+one integration checkout for publication. Personal and company tasks share this
+rule; definition proposals also reuse one checkout. Creating more tasks or views
+does not create another host checkout for each actor. Agent filesystem views
+remain separate. Dirty host scratch is retained in a private recovery directory
+before rebuilding, including when its revision has not changed. Recovery copies
+and earlier cache layouts are retained; they are not silently evicted. These host
 checkouts can still materialize a complete revision. Sparse client files and
 caching for task projections require further implementation. Scoped exports
 use the bounded profile object cache described above.

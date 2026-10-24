@@ -1223,12 +1223,10 @@ pub const Manager = struct {
     }
 
     fn checkout(self: Manager, branch: []const u8) ![]const u8 {
-        // Company actors use the scoped content API, never this host scratch
-        // directory. The enclosing writer lease serializes branch switches.
-        if (std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) {
-            const task = self.loadTask(branch[5..]) catch null;
-            if (task != null and task.?.authority != null) return self.checkoutAt("company-content", branch);
-        }
+        // Actors use separate filesystem projections or the scoped service.
+        // One writer lease serializes these replaceable host working trees.
+        if (std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) return self.checkoutAt("task-content", branch);
+        if (std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..])) return self.checkoutAt("definition-content", branch);
         return self.checkoutAt(branch, branch);
     }
 
@@ -1254,12 +1252,12 @@ pub const Manager = struct {
             }
         }
         const target = try self.revision(revision_id);
-        if (repository_matches and checkout_revision != null and std.mem.eql(u8, try self.fullRevision(tree, "current"), target)) return tree;
         const clean = if (repository_matches)
             (try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0
         else
             false;
         if (clean) {
+            if (checkout_revision != null and std.mem.eql(u8, try self.fullRevision(tree, "current"), target)) return tree;
             _ = try self.run(tree, &.{ "update", "--nosync", revision_id });
             return tree;
         }
@@ -1503,7 +1501,7 @@ pub const Manager = struct {
                 .obligations = &.{.{ .id = "request_complete", .description = "Fulfil every requested outcome and acceptance criterion, using successful host evidence for actions." }},
             },
         };
-        const tree = if (authority != null) try self.checkoutAt("company-content", branch) else try self.checkout(branch);
+        const tree = try self.checkout(branch);
         if (request_artifact) |path| try atomicWrite(self.alloc, try join(self.alloc, tree, path), request_text);
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(id)), try json(self.alloc, task));
         _ = try self.commit(tree, "Record task contract");
@@ -3038,10 +3036,7 @@ pub const Manager = struct {
                 if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
             }
             if (!try self.sameRevision(try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
-            var nonce: [16]u8 = undefined;
-            io_mod.getIo().random(&nonce);
-            const key = if (publication.task.authority != null) "company-integration" else try self.alloc.print("publication/{s}/{s}", .{ publication.operation, std.fmt.bytesToHex(&nonce, .lower) });
-            const tree = try self.checkoutAt(key, try self.revision(publication.target));
+            const tree = try self.checkoutAt("workspace-integration", try self.revision(publication.target));
             // The lease protects this manager's writers; Fossil's no-fork commit
             // also fences external processes that advance the target branch.
             _ = try self.run(tree, &.{ "update", "--nosync", publication.target });
