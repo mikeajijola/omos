@@ -45,6 +45,30 @@ async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = f
   }
 }
 
+function commitFixtureAmendment(f: ReturnType<typeof fixture>, taskId: string, clarification: string) {
+  const branch = `task/${taskId}`;
+  const current = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", branch));
+  const prior = structuredClone(current.definition);
+  current.definition.version++;
+  current.amendments.push(clarification);
+  current.revision_pending = true;
+  current.review_job = null;
+  const tree = join(f.home, "committed-amendment"); mkdirSync(tree);
+  const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+  const command = (...args: string[]) => {
+    const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  command("open", "--nosync", join(f.cwd, "omos.fossil"), branch);
+  writeFileSync(join(tree, `tasks/${taskId}.json`), JSON.stringify(current));
+  const amendment = JSON.stringify({ kind: "contract_amendment", task: taskId, contract_version: current.definition.version, value: { origin: "user", text: clarification, previous_contract: prior, revision_pending: true } });
+  const history = join(tree, "history", taskId); mkdirSync(history, { recursive: true });
+  writeFileSync(join(history, `${createHash("sha256").update(amendment).digest("hex")}.json`), amendment);
+  command("addremove");
+  command("commit", "--nosign", "--nosync", "-m", "Retain an authenticated amendment before its cache update");
+  command("close");
+}
+
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
   test("reports executable flag changes from immutable manifests when Fossil's brief diff is empty", async () => {
@@ -2853,6 +2877,71 @@ sys.exit(result.returncode)
     }
   }, 90000);
 
+  test("retains completed command evidence under its original contract when an amendment commits during execution", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const target = join(f.cwd, "completed-effect.txt");
+    const clarification = "Retain the completed effect and wait for the additional requested outcome.";
+    let taskId = "";
+    let amendments = 0;
+    const updates = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+      amendments++;
+      commitFixtureAmendment(f, taskId, clarification);
+      return new Response("Amendment saved");
+    } });
+    const inference = model(f, (_body, count) => {
+      if (count !== 1) return { content: "The existing effect is retained while the amended work remains pending." };
+      const binding = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8"));
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(binding.repository).digest("hex"), "tasks");
+      taskId = readdirSync(cache).find((name: string) => name.endsWith(".json"))!.slice(0, -5);
+      return { tool_calls: [{ index: 0, id: "completed-shell", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `printf x >> '${target}' && curl --fail --silent http://127.0.0.1:${updates.port}/amend`, timeout_ms: 15000 } }) } }] };
+    }, () => "blocked");
+    try {
+      const result = await f.run(["ask", "Record the local command outcome and keep the task open", "--json"]);
+      expect(result.code, result.stderr).toBe(1);
+      expect(amendments).toBe(1);
+      expect(readFileSync(target, "utf8")).toBe("x");
+      const retained = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", `task/${taskId}`));
+      expect(retained.definition.version).toBe(2);
+      expect(retained.amendments).toContain(clarification);
+      const history = f.fossil("ls", "-r", `task/${taskId}`).split("\n").filter((path: string) => path.startsWith(`history/${taskId}/`));
+      const records = history.map((path: string) => JSON.parse(f.fossil("cat", path.trim(), "-r", `task/${taskId}`)));
+      const executed = records.filter((row: any) => row.kind === "tool_evidence");
+      expect(executed.some((row: any) => row.contract_version === 1 && row.value.some((item: any) => item.tool === "shell" && item.status === "success"))).toBe(true);
+      expect(records.some((row: any) => row.kind === "command_receipt" && row.contract_version === 1)).toBe(true);
+      expect(executed.filter((row: any) => row.contract_version === 2)).toHaveLength(0);
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain(`tasks/${taskId}.json`);
+      expect(inference.counts().actors).toBeLessThanOrEqual(2);
+    } finally { updates.stop(true); }
+  }, 90000);
+
+  test("rejects an outgoing actor action after a user amendment commits before its cache update", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const target = join(f.cwd, "must-not-execute.txt");
+    const clarification = "Pause this task until the amended request is planned.";
+    let taskId = "";
+    model(f, () => {
+      const binding = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8"));
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(binding.repository).digest("hex"), "tasks");
+      taskId = readdirSync(cache).find((name: string) => name.endsWith(".json"))!.slice(0, -5);
+      commitFixtureAmendment(f, taskId, clarification);
+      return { tool_calls: [{ index: 0, id: "stale-shell", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `printf 'unexpected effect' > '${target}'`, timeout_ms: 1000 } }) } }] };
+    });
+    const result = await f.run(["ask", "Wait for my next instruction", "--json"]);
+    expect(result.code, result.stderr).toBe(1);
+    expect(result.stderr + result.stdout).toContain("StaleWorkContract");
+    expect(existsSync(target)).toBe(false);
+    const retained = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", `task/${taskId}`));
+    expect(retained.definition.version).toBe(2);
+    expect(retained.amendments).toContain(clarification);
+    const history = f.fossil("ls", "-r", `task/${taskId}`).split("\n").filter((path: string) => path.startsWith(`history/${taskId}/`));
+    for (const path of history) {
+      const row = JSON.parse(f.fossil("cat", path.trim(), "-r", `task/${taskId}`));
+      expect(row.kind).not.toBe("action_intent");
+    }
+  }, 90000);
+
   test("retains a committed user amendment when assessment finishes against an older cached contract", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -2863,27 +2952,7 @@ sys.exit(result.returncode)
       if (amended) return "blocked";
       amended = true;
       taskId = packet.contract.id;
-      const branch = `task/${taskId}`;
-      const current = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", branch));
-      const prior = structuredClone(current.definition);
-      current.definition.version++;
-      current.amendments.push(clarification);
-      current.revision_pending = true;
-      current.review_job = null;
-      const tree = join(f.home, "committed-amendment"); mkdirSync(tree);
-      const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
-      const command = (...args: string[]) => {
-        const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
-        expect(result.status, result.stderr).toBe(0);
-      };
-      command("open", "--nosync", join(f.cwd, "omos.fossil"), branch);
-      writeFileSync(join(tree, `tasks/${taskId}.json`), JSON.stringify(current));
-      const amendment = JSON.stringify({ kind: "contract_amendment", task: taskId, contract_version: current.definition.version, value: { origin: "user", text: clarification, previous_contract: prior, revision_pending: true } });
-      const history = join(tree, "history", taskId); mkdirSync(history, { recursive: true });
-      writeFileSync(join(history, `${createHash("sha256").update(amendment).digest("hex")}.json`), amendment);
-      command("addremove");
-      command("commit", "--nosign", "--nosync", "-m", "Retain an authenticated amendment before its cache update");
-      command("close");
+      commitFixtureAmendment(f, taskId, clarification);
       // Return the assessment for the older packet while leaving its cache
       // untouched, as if the other runtime died after committing the amendment.
       return "met";

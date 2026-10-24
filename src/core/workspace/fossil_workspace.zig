@@ -1760,8 +1760,17 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
-        const current = try self.loadTask(task.id);
-        if (current.definition.version != task.definition.version) return error.StaleWorkContract;
+        var inspection_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer inspection_arena.deinit();
+        var inspection = self;
+        inspection.alloc = inspection_arena.allocator();
+        const current = try inspection.refreshTaskContextLocked(try inspection.loadTask(task.id));
+        const historical_outcome = current.definition.version != task.definition.version;
+        if (historical_outcome and (task.definition.version > current.definition.version or
+            (!std.mem.eql(u8, kind, "tool_evidence") and !std.mem.eql(u8, kind, "command_receipt") and !std.mem.eql(u8, kind, "source_validation")))) return error.StaleWorkContract;
+        // Completed effects remain facts of their original contract. They do
+        // not authorize a new action or satisfy the amended contract by default.
+        const provenance = if (historical_outcome) task else current;
         if (current.revision_pending and std.mem.eql(u8, kind, "action_intent")) return error.TaskContractRevisionPending;
         try self.checkReviewFence(current);
         if (std.mem.eql(u8, kind, "action_intent")) if (current.review_job) |id| {
@@ -1770,10 +1779,10 @@ pub const Manager = struct {
         };
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
         var value = (try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{})).value;
-        if (current.model_basis) |basis| {
+        if (provenance.model_basis) |basis| {
             const operation = if (std.mem.eql(u8, kind, "action_intent")) "omos_record_action" else if (std.mem.eql(u8, kind, "tool_evidence")) "omos_record_evidence" else if (std.mem.eql(u8, kind, "review_assessment")) "omos_record_assessment" else "";
             if (operation.len > 0) {
-                const declaration_value = try self.loadDeclaration(basis.revision);
+                const declaration_value = try inspection.loadDeclaration(basis.revision);
                 if (model.hasOperation(declaration_value, operation)) {
                     // Optional metadata serialized as null is absent, not a typed value.
                     const payload = if (std.mem.eql(u8, kind, "review_assessment")) (try std.json.parseFromSlice(std.json.Value, self.alloc, model.text(value, "data"), .{})).value else value;
@@ -1793,7 +1802,7 @@ pub const Manager = struct {
             try envelope.put(self.alloc, "review_job", .{ .string = fence.job });
             try envelope.put(self.alloc, "review_generation", .{ .integer = @intCast(fence.generation) });
         }
-        if (current.model_basis) |basis| {
+        if (provenance.model_basis) |basis| {
             try envelope.put(self.alloc, "definition_hash", .{ .string = basis.definition_hash });
             try envelope.put(self.alloc, "definition_revision", .{ .string = basis.revision });
         }

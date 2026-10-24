@@ -318,7 +318,11 @@ does not restore private provider checkpoints or repeat actor actions.
 Task mutation and publication boundaries, including review queuing, claims,
 attempts, and checkpoints, refresh canonical task context under their writer
 boundary. A cache entry cannot replace a committed contract
-or company authority. A private recovery marker spans the canonical job commit
+or company authority. New action intents are fenced before execution when a
+committed amendment advances the contract. Evidence and command receipts for
+already completed effects retain their original contract version and model
+provenance; they do not authorize another action or automatically satisfy the
+amended contract. A private recovery marker spans the canonical job commit
 and its local index update. After interruption, the scheduler repairs at most
 16 marked task pointers per pass under execution ownership. It does not recreate
 jobs or repeat actor actions. Copies of the repository rebuild job pointers
