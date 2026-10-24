@@ -646,7 +646,7 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     defer arena.deinit();
     const declaration = try parse(arena.allocator(), seed);
     try std.testing.expectEqual(@as(usize, 2), items(spec(declaration.value), "capabilities").len);
-    try std.testing.expectEqual(@as(usize, 23), declaration.semantic.entityTypes.len);
+    try std.testing.expectEqual(@as(usize, 24), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }
 
@@ -796,12 +796,14 @@ test "workspace declaration explicit transport upgrades preserve company constra
     try properties.object.put(alloc, "version", (try std.json.parseFromSlice(Value, alloc, "{\"const\":\"omos.company/v1\"}", .{})).value);
     _ = properties.object.swapRemove("executable");
     _ = properties.object.swapRemove("previous_executable");
+    _ = properties.object.swapRemove("upload");
     try properties.object.put(alloc, "company_note", (try std.json.parseFromSlice(Value, alloc, "{\"type\":\"string\",\"maxLength\":7}", .{})).value);
     const old = try parse(alloc, try canonical(alloc, value));
     const next = try upgrade(alloc, old);
     const operation = named(items(spec(next.value), "operations"), "omos_company_operation").?;
     const upgraded = field(field(operation, "input").?, "properties").?;
     try std.testing.expect(field(upgraded, "executable") != null);
+    try std.testing.expect(field(upgraded, "upload") != null);
     try std.testing.expect(contains(items(field(upgraded, "version").?, "enum"), "omos.company/v2"));
     try std.testing.expectEqualStrings(try canonical(alloc, field(properties.*, "company_note").?), try canonical(alloc, field(upgraded, "company_note").?));
     try std.testing.expect(!try compatible(alloc, old, next));

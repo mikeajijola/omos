@@ -32,6 +32,7 @@ pub const State = struct {
 };
 pub const Binding = struct { actor: []const u8, grant: []const u8 };
 pub const Envelope = struct { payload: []const u8, signature: []const u8 };
+pub const Upload = struct { sha256: []const u8, bytes: usize };
 pub const Request = struct {
     version: []const u8,
     workspace: []const u8,
@@ -51,6 +52,7 @@ pub const Request = struct {
     previous_hash: ?[]const u8 = null,
     executable: ?bool = null,
     previous_executable: ?bool = null,
+    upload: ?Upload = null,
     objective: ?[]const u8 = null,
     candidate: ?[]const u8 = null,
     outcome: ?[]const u8 = null,

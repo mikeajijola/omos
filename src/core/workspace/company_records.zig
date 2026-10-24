@@ -13,7 +13,7 @@ pub fn path(alloc: std.mem.Allocator, entity: []const u8, id: []const u8) ![]con
 
 pub fn validationFailure(err: anyerror) bool {
     return switch (err) {
-        error.InvalidCompanyFileAttributes, error.InvalidCompanyIdentity, error.HostOwnedEntity, error.UnknownEntityType, error.InvalidEntityRecord, error.MissingEntityField, error.UnknownEntityField, error.InvalidEntityFieldType, error.InvalidCompanyRecordJson, error.CompanyRecordNotPortable, error.UnsupportedCompanyRecordEncoding, error.MissingContent, error.MissingPath, error.WorkspacePathDenied, error.WorkspaceRecordTooLarge, error.InvalidArtifactIdentity, error.InvalidPadding, error.InvalidCharacter => true,
+        error.TaskIsReadOnly, error.TaskReviewInProgress, error.StaleWorkContract, error.InvalidCompanyUpload, error.CompanyUploadIncomplete, error.CompanyUploadHashMismatch, error.CompanyUploadConflict, error.InvalidCompanyFileAttributes, error.InvalidCompanyIdentity, error.HostOwnedEntity, error.UnknownEntityType, error.InvalidEntityRecord, error.MissingEntityField, error.UnknownEntityField, error.InvalidEntityFieldType, error.InvalidCompanyRecordJson, error.CompanyRecordNotPortable, error.UnsupportedCompanyRecordEncoding, error.MissingContent, error.MissingPath, error.WorkspacePathDenied, error.WorkspaceRecordTooLarge, error.InvalidArtifactIdentity, error.InvalidPadding, error.InvalidCharacter => true,
         else => false,
     };
 }

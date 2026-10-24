@@ -890,8 +890,9 @@ sys.exit(result.returncode)
       await waitJob(view.view, "blocked", "CompanyApprovalDenied");
       expect(inference.counts().assessments).toBe(0);
       await stop();
-      const expiry = Date.now() + 2500;
-      await decide("approve", view.view, inspected.candidate_hash, expiry);
+      const expiryRevision = (await admin({ action: "status" })).revision;
+      const expiry = Date.now() + 10000;
+      await admin({ action: "approve", revision: expiryRevision, view: view.view, candidate_hash: inspected.candidate_hash, expires_ms: expiry });
       if (Date.now() <= expiry) await Bun.sleep(expiry - Date.now() + 1);
       service = await startWorkspaceService(f, true);
       await waitJob(view.view, "blocked", "CompanyApprovalExpired");
@@ -1093,12 +1094,13 @@ sys.exit(result.returncode)
     // Reconstruct the earlier persisted declaration, including its view shape,
     // to exercise an upgrade rather than only initializing the newest seed.
     const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
-    legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission"].includes(entity.id));
+    legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission", "omos_company_upload"].includes(entity.id));
     delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
     const legacyInput = legacy.spec.operations.find((operation: any) => operation.id === "omos_company_operation").input.properties;
     legacyInput.version = { const: "omos.company/v1" };
     delete legacyInput.executable;
     delete legacyInput.previous_executable;
+    delete legacyInput.upload;
     const tree = join(f.home, "legacy-declaration");
     mkdirSync(tree);
     const fossil = (...args: string[]) => {
@@ -1136,6 +1138,7 @@ sys.exit(result.returncode)
       expect(boot.features.read_dependencies).toBe(false);
       expect(boot.features.file_attributes).toBeNull();
       expect(boot.features.checkpoint_attributes).toBe(false);
+      expect(boot.features.chunked_upload).toBe(false);
       const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report while upgrading its input model" });
       const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained legacy report" });
       expect(JSON.parse(f.fossil("cat", `company/views/${view.view}.json`, "-r", "omos-company")).reads).toBeUndefined();
@@ -1155,6 +1158,7 @@ sys.exit(result.returncode)
       const upgraded = await (await fetch(service.url + "/v1/company")).json() as any;
       expect(upgraded.features.file_attributes).toBe("omos.company/v2");
       expect(upgraded.features.checkpoint_attributes).toBe(true);
+      expect(upgraded.features.chunked_upload).toBe(true);
       const read = await send("read", { view: view.view, path: "documents/team/report.md" });
       expect(read.read_tracking).toBe("recorded");
       expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");
@@ -2932,6 +2936,119 @@ sys.exit(result.returncode)
       expect(existsSync(marker)).toBe(false);
     } finally { service.child.kill(); await service.child.exited; }
   }, 90000);
+
+  test("resumes signed bounded uploads from Fossil and checkpoints only a complete verified file", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Upload verification cannot replay actor work"); });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "upload-operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "upload-team", actor: "uploader", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status", "read"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    expect(boot.features).toMatchObject({ chunked_upload: true, max_upload_chunk_bytes: 131072, max_request_bytes: 1048576, max_object_bytes: 8388608 });
+    const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+    let useNativeClient = false;
+    const send = async (action: string, params: object = {}, status = 200, operation = crypto.randomUUID()) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "uploader", grant: "upload-team", operation, expires_ms: Date.now() + 120000, action, ...params });
+      const raw = JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") });
+      expect(Buffer.byteLength(raw)).toBeLessThan(1048576);
+      let envelope: any;
+      if (useNativeClient) {
+        useNativeClient = false;
+        const file = join(f.home, "signed-upload-part.json"); writeFileSync(file, raw);
+        const result = await f.run(["fossil", "remote", service.url, file, "--json"]);
+        expect(result.code, result.stderr).toBe(0);
+        envelope = JSON.parse(result.stdout).model_data;
+      } else {
+        const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: raw });
+        envelope = await response.json();
+        expect(response.status, JSON.stringify(envelope)).toBe(status);
+      }
+      if (status !== 200) return envelope;
+      expect(verify(null, Buffer.from(envelope.payload), issuer, Buffer.from(envelope.signature, "hex"))).toBe(true);
+      const claims = JSON.parse(envelope.payload);
+      expect(claims).toMatchObject({ actor: "uploader", grant: "upload-team", operation, action, request_hash: createHash("sha256").update(payload).digest("hex") });
+      return claims.result;
+    };
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Save the complete portable binary document" });
+      const bytes = Buffer.alloc(1048576 + 57);
+      for (let index = 0; index < bytes.length; index++) bytes[index] = index % 251;
+      const upload = { sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length };
+      const basis = { view: view.view, revision: view.revision, path: "documents/team/portable.bin", encoding: "base64", upload, executable: false };
+      const chunk = (offset: number) => ({ ...basis, offset, content: bytes.subarray(offset, offset + 131072).toString("base64") });
+      expect(await send("checkpoint", basis, 400)).toMatchObject({ error: "CompanyUploadIncomplete" });
+      useNativeClient = true;
+      const first = await send("checkpoint", chunk(0));
+      expect(first).toMatchObject({ state: "uploading", revision: view.revision, offset: 0, bytes: 131072 });
+      expect(await send("checkpoint", chunk(0))).toEqual(first);
+      await send("checkpoint", chunk(131072));
+      const pendingTask = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+      expect(f.fossil("ls", "-r", pendingTask.branch)).not.toContain(basis.path);
+      // Discard the host's replaceable task indexes and scratch checkouts.
+      // The signed pieces, identity and journals remain in Fossil.
+      service.child.kill(); await service.child.exited;
+      const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(snapshot.repository).digest("hex"));
+      rmSync(join(cache, "tasks"), { recursive: true });
+      rmSync(join(cache, "checkouts"), { recursive: true });
+      service = await startWorkspaceService(f, true);
+      expect(await send("checkpoint", chunk(0))).toEqual(first);
+      const corrupt = Buffer.from(bytes.subarray(0, 131072)); corrupt[0] ^= 255;
+      expect(await send("checkpoint", { ...chunk(0), content: corrupt.toString("base64") }, 400)).toMatchObject({ error: "CompanyUploadConflict" });
+      expect(await send("checkpoint", { ...chunk(0), path: "documents/private/escape.bin" }, 403)).toMatchObject({ error: "CompanyAccessDenied" });
+      expect(await send("checkpoint", { ...chunk(0), offset: 1 }, 400)).toMatchObject({ error: "InvalidCompanyUpload" });
+      expect(await send("checkpoint", { ...basis, upload: { ...upload, bytes: 8388609 } }, 400)).toHaveProperty("error");
+      for (let offset = 262144; offset < bytes.length; offset += 131072) await send("checkpoint", chunk(offset));
+      const retainedTask = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+      expect(f.fossil("ls", "-r", retainedTask.branch)).not.toContain(basis.path);
+      // Parts cannot be reused by another view, even with the same grant.
+      const other = await send("create_view", { revision: boot.revision, objective: "Keep a separate isolated view" });
+      expect(await send("checkpoint", { ...basis, view: other.view, revision: other.revision }, 400)).toMatchObject({ error: "CompanyUploadIncomplete" });
+      const finished = await send("checkpoint", basis);
+      expect(finished).toMatchObject({ state: "checkpointed", view: view.view });
+      expect(finished.revision).not.toBe(view.revision);
+      const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+      const original = spawnSync(existsSync(helper) ? helper : "fossil", ["cat", basis.path, "-r", finished.revision, "-R", join(f.cwd, "omos.fossil")], { encoding: "buffer" });
+      expect(original.status).toBe(0);
+      expect(original.stdout.equals(bytes)).toBe(true);
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain(basis.path);
+      const submitted = await send("submit", { view: view.view, revision: finished.revision, candidate: "Saved the complete hash-verified portable binary document." });
+      let result: any;
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        const response = await send("status", { view: view.view });
+        result = response;
+        if (["published", "failed", "changes_required", "blocked", "pending"].includes(response.job?.state)) break;
+        await Bun.sleep(100);
+      }
+      expect(result.job, JSON.stringify(result)).toMatchObject({ id: submitted.job, state: "published" });
+      expect(f.fossil("ls", "-r", "trunk")).toContain(basis.path);
+      expect(inference.counts().actors).toBe(0);
+      const readonlyOperation = crypto.randomUUID();
+      expect(await send("checkpoint", { ...chunk(0), revision: result.revision }, 400, readonlyOperation)).toMatchObject({ error: "TaskIsReadOnly" });
+      expect(await send("status", { outcome: readonlyOperation })).toMatchObject({ state: "failed", failure: "TaskIsReadOnly" });
+      const small = Buffer.from("A separately pinned file");
+      const wrong = { view: other.view, revision: other.revision, path: "documents/team/wrong.bin", encoding: "base64", upload: { sha256: "0".repeat(64), bytes: small.length } };
+      await send("checkpoint", { ...wrong, content: small.toString("base64") });
+      expect(await send("checkpoint", wrong, 400)).toMatchObject({ error: "CompanyUploadHashMismatch" });
+      const stale = { ...wrong, path: "documents/team/stale.bin", upload: { sha256: createHash("sha256").update(small).digest("hex"), bytes: small.length } };
+      await send("checkpoint", { ...stale, content: small.toString("base64") });
+      await send("checkpoint", { view: other.view, revision: other.revision, path: "documents/team/advanced.md", content: "A later checkpoint advances this candidate" });
+      expect(await send("checkpoint", stale, 409)).toMatchObject({ error: "WorkspaceRevisionChanged" });
+      const authority = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: authority.revision, id: "upload-team" });
+      expect(await send("checkpoint", chunk(0), 403)).toMatchObject({ error: "CompanyAccessRevoked" });
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
 
   test("restores canonical company authority before claiming review after cache corruption and revocation", async () => {
     const f = fixture();

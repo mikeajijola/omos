@@ -992,6 +992,29 @@
                 "boolean",
                 "null"
               ]
+            },
+            "upload": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "sha256": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8388608
+                }
+              },
+              "required": [
+                "sha256",
+                "bytes"
+              ],
+              "additionalProperties": false
             }
           },
           "required": [
@@ -1847,6 +1870,23 @@
             "contract_hash",
             "candidate_hash",
             "reads"
+          ]
+        },
+        {
+          "id": "omos_company_upload",
+          "fields": {
+            "version": "string",
+            "binding": "string",
+            "offset": "number",
+            "sha256": "string",
+            "content": "string"
+          },
+          "required": [
+            "version",
+            "binding",
+            "offset",
+            "sha256",
+            "content"
           ]
         }
       ],

@@ -9,6 +9,7 @@ const keys = @import("company_keys.zig");
 const model = @import("definition.zig");
 const fossil_manifest = @import("fossil_manifest.zig");
 const read_dependencies = @import("company_reads.zig");
+const uploads = @import("company_upload.zig");
 
 const Journal = struct {
     version: []const u8 = "omos.company-operation/v1",
@@ -101,7 +102,7 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
         if (view.pending != null) return error.CompanyOperationRecoveryRequired;
         const execution = (try manager.tryTaskExecutionLease(view.task)) orelse return error.WorkspaceExecutionBusy;
         defer execution.release();
-        const task = try manager.loadTask(view.task);
+        const task = try manager.refreshTaskContext(try manager.loadTask(view.task));
         const current = try state(manager);
         const grant = try authority.liveGrant(current, view.grant, io.milliTimestamp());
         if (!std.mem.eql(u8, grant.actor, view.actor) or task.authority == null or !std.mem.eql(u8, task.authority.?.actor, view.actor) or !std.mem.eql(u8, task.authority.?.grant, view.grant)) return error.CompanyAccessDenied;
@@ -217,7 +218,10 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     _ = try keys.current(manager, current.epoch, current.issuer);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     const properties = operationProperties(declaration);
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    const upload_entity = for (declaration.semantic.entityTypes) |entity| {
+        if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
+    } else false;
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -231,6 +235,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
+    if (request.upload != null and request.action != .checkpoint) return error.InvalidCompanyUpload;
     const mutation = authority.isMutation(request.action);
     if (mutation and !writable) return error.ServiceReadOnly;
     if (mutation and request.action != .reconcile) if (request.view) |id| {
@@ -275,7 +280,7 @@ fn loadView(manager: workspace.Manager, grant: authority.Grant, id: []const u8) 
     if (!authority.safeIdentity(id)) return error.InvalidCompanyIdentity;
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{id})), .{});
     if (!std.mem.eql(u8, view.actor, grant.actor) or !std.mem.eql(u8, view.grant, grant.id)) return error.CompanyAccessDenied;
-    return .{ .view = view, .task = try manager.loadTask(view.task) };
+    return .{ .view = view, .task = try manager.refreshTaskContext(try manager.loadTask(view.task)) };
 }
 
 fn requestPage(manager: workspace.Manager, bytes: []const u8, offset: usize, limit: usize) !std.json.Value {
@@ -441,7 +446,15 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const path = request.path orelse return error.MissingPath;
         if ((request.remove and request.executable != null) or (request.previous_executable != null and request.previous_hash == null) or (request.executable != null and request.previous_hash != null and request.previous_executable == null)) return error.InvalidCompanyFileAttributes;
         if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
-        const bytes: ?[]const u8 = if (request.remove) null else if (request.encoding == .utf8) request.content orelse return error.MissingContent else blk: {
+        if (view.task.state == .accepted or view.task.state == .publication_pending or view.task.state == .conflict) return error.TaskIsReadOnly;
+        if (view.task.review_job) |id| {
+            const job = try manager.loadReviewJob(view.task, id);
+            if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
+        }
+        const bytes: ?[]const u8 = if (request.upload != null) switch (try uploads.accept(manager, request)) {
+            .part => |response| return response,
+            .complete => |content| content,
+        } else if (request.remove) null else if (request.encoding == .utf8) request.content orelse return error.MissingContent else blk: {
             const encoded = request.content orelse return error.MissingContent;
             const result = try alloc.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(encoded));
             try std.base64.standard.Decoder.decode(result, encoded);

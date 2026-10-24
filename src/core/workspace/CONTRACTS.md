@@ -491,8 +491,36 @@ are verified in the same checkpoint receipt as content and deletions. Conflictin
 flags fail without changing the source branch, and retries retain the original
 operation outcome.
 
-Public discovery derives `file_attributes` and `checkpoint_attributes` from the
-accepted operation declaration. An older declaration does not advertise these
+When `features.chunked_upload` is true, `checkpoint` also accepts
+`upload: { "sha256": "FULL_LOWERCASE_SHA256", "bytes": 1234567 }`.
+Every part repeats the same actor, grant, view, target path, expected revision,
+previous file hash and flags. Send base64 `content` at byte offsets that are
+multiples of 131,072. Each part must contain exactly 131,072 bytes, except the
+last part, which contains the remainder. The complete file is bounded to 8 MiB;
+the HTTP envelope retains its separate 1 MiB limit.
+
+A successful part returns `state: "uploading"`, the unchanged view revision,
+upload binding, offset, byte count and part hash. Parts are immutable protected
+`omos_company_upload` records on the company control branch. They survive a
+service restart and replacement of local task indexes and scratch checkouts.
+An identical part under a fresh operation ID returns the existing result;
+a different part at the same bound offset fails with `CompanyUploadConflict`.
+Normal operation IDs still identify uncertain requests and their recorded
+outcomes.
+
+To finish, send another signed `checkpoint` with the identical upload binding,
+`offset: 0`, and omitted or null `content`. The host requires every part, checks
+each part hash, assembles at most 8 MiB and verifies the full file size and hash.
+Only then does the normal task checkpoint compare the expected revision and
+previous file state. Missing or mismatched parts leave the task content
+unchanged. Parts cannot be moved to another actor, grant, view, path, revision or
+file state. Every request checks live authority, so revocation stops subsequent
+parts and finishing. An upload does not publish or assess its file; those remain
+the normal proposal and independent-review operations. Uploaded parts remain in
+versioned control history after finishing or abandonment.
+
+Public discovery derives `file_attributes`, `checkpoint_attributes` and
+`chunked_upload` from the accepted operation declaration. An older declaration does not advertise these
 features. Read clients fail with `CompanyDefinitionUpdateRequired` when the
 signed attribute representation is unavailable; they do not silently discard it.
 
