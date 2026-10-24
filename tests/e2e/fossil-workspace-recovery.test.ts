@@ -2849,6 +2849,168 @@ sys.exit(result.returncode)
     }
   }, 90000);
 
+  test("retains a committed user amendment when assessment finishes against an older cached contract", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let amended = false;
+    let taskId = "";
+    const clarification = "Also include the additional requested outcome.";
+    model(f, () => ({ content: "The initial informational answer is retained." }), packet => {
+      if (amended) return "blocked";
+      amended = true;
+      taskId = packet.contract.id;
+      const branch = `task/${taskId}`;
+      const current = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", branch));
+      const prior = structuredClone(current.definition);
+      current.definition.version++;
+      current.amendments.push(clarification);
+      current.revision_pending = true;
+      current.review_job = null;
+      const tree = join(f.home, "committed-amendment"); mkdirSync(tree);
+      const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+      const command = (...args: string[]) => {
+        const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+        expect(result.status, result.stderr).toBe(0);
+      };
+      command("open", "--nosync", join(f.cwd, "omos.fossil"), branch);
+      writeFileSync(join(tree, `tasks/${taskId}.json`), JSON.stringify(current));
+      const amendment = JSON.stringify({ kind: "contract_amendment", task: taskId, contract_version: current.definition.version, value: { origin: "user", text: clarification, previous_contract: prior, revision_pending: true } });
+      const history = join(tree, "history", taskId); mkdirSync(history, { recursive: true });
+      writeFileSync(join(history, `${createHash("sha256").update(amendment).digest("hex")}.json`), amendment);
+      command("addremove");
+      command("commit", "--nosign", "--nosync", "-m", "Retain an authenticated amendment before its cache update");
+      command("close");
+      // Return the assessment for the older packet while leaving its cache
+      // untouched, as if the other runtime died after committing the amendment.
+      return "met";
+    });
+    const result = await f.run(["ask", "Give the initial informational answer", "--json"]);
+    expect(result.code, result.stderr).toBe(1);
+    expect(amended).toBe(true);
+    const retained = JSON.parse(f.fossil("cat", `tasks/${taskId}.json`, "-r", `task/${taskId}`));
+    expect(retained.definition.version).toBe(2);
+    expect(retained.amendments).toContain(clarification);
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain(`tasks/${taskId}.json`);
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((task: any) => task.id === taskId).state).not.toBe("accepted");
+  }, 120000);
+
+  test("discovers a durably queued review after its local index update is interrupted", async () => {
+    const f = fixture();
+    let permit = false;
+    const inference = model(f, () => ({ content: "The retained answer is available for server verification." }), packet => permit ? "met" : {
+      name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["unseen-fixture"], note: "Retain this informational candidate" }] },
+    });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    expect((await f.run(["ask", "Give the informational answer", "--json"])).code).toBe(1);
+    const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const task = snapshot.tasks[0];
+    const actors = inference.counts().actors;
+    permit = true;
+    const service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "review-job-committed" });
+    try {
+      const bootstrap = await (await fetch(service.url + "/v1/definition", { headers: service.headers })).json() as any;
+      const basis = { version: "omos.workspace-api/v1", workspace: service.ready.workspace, definition_hash: bootstrap.definition.basis.definition_hash, revision: bootstrap.revision };
+      const directory = (await (await service.post({ ...basis, action: "query", entity: "omos_task" })).json() as any).data;
+      const queued = await service.post({ ...basis, action: "queue_review", task: task.id, revision: directory.records.find((row: any) => row.id === task.id).revision });
+      expect(queued.status).toBe(400);
+      expect(await queued.text()).toContain("WorkspaceInjectedFailure");
+      const canonical = JSON.parse(f.fossil("cat", `tasks/${task.id}.json`, "-r", task.branch));
+      expect(canonical.review_job).toHaveLength(64);
+      let result: any;
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        const response = await service.post({ ...basis, action: "job", task: task.id, job: canonical.review_job });
+        if (response.status === 409) { await Bun.sleep(25); continue; }
+        expect(response.status, await response.clone().text()).toBe(200);
+        result = (await response.json() as any).data;
+        if (["published", "failed", "changes_required", "blocked", "pending"].includes(result.state)) break;
+        await Bun.sleep(50);
+      }
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "published", generation: 1 });
+      expect(inference.counts().actors).toBe(actors);
+      const marker = join(f.home, ".fx/fossil", createHash("sha256").update(snapshot.repository).digest("hex"), "review-selections", `${task.id}.json`);
+      expect(existsSync(marker)).toBe(false);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 90000);
+
+  test("restores canonical company authority before claiming review after cache corruption and revocation", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Company verification cannot replay an actor"); });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "approval", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "submit", "status"], human_approval: true, expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const send = async (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "approval", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") }) });
+      const body = await response.json() as any;
+      expect(response.status, JSON.stringify(body)).toBe(200);
+      return JSON.parse(body.payload).result;
+    };
+    try {
+      const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report pending an authorized decision" });
+      const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained report" });
+      const submitted = await send("submit", { view: view.view, revision: saved.revision, candidate: "Saved the retained company report." });
+      let status: any;
+      const blockedDeadline = Date.now() + 30000;
+      while (Date.now() < blockedDeadline) {
+        status = await send("status", { view: view.view });
+        if (status.job?.state === "blocked") break;
+        await Bun.sleep(50);
+      }
+      expect(status.job?.state).toBe("blocked");
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+      service.child.kill(); await service.child.exited;
+      const repository = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).repository;
+      const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks.find((task: any) => task.id === view.contract.id);
+      // A trusted fixture emulates a durable queued retry left by an old worker.
+      // The task's canonical binding remains intact throughout this setup.
+      const tree = join(f.home, "review-retry"); mkdirSync(tree);
+      const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+      const command = (...args: string[]) => {
+        const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+        expect(result.status, result.stderr).toBe(0);
+      };
+      command("open", "--nosync", repository, task.branch);
+      const jobPath = join(tree, "jobs", `${submitted.job}.json`);
+      const retry = JSON.parse(readFileSync(jobPath, "utf8"));
+      retry.state = "queued"; retry.lease_expires_ms = 0;
+      writeFileSync(jobPath, JSON.stringify(retry));
+      command("commit", "--nosign", "--nosync", "-m", "Retain a queued review retry in the fixture");
+      command("close");
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"), "tasks", `${task.id}.json`);
+      writeFileSync(cache, JSON.stringify({ ...task, authority: null }));
+      const authority = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: authority.revision, id: "approval" });
+      service = await startWorkspaceService(f, true);
+      const definition = await (await fetch(service.url + "/v1/definition", { headers: service.headers })).json() as any;
+      const basis = { version: "omos.workspace-api/v1", workspace: service.ready.workspace, definition_hash: definition.definition.basis.definition_hash, revision: definition.revision };
+      let result: any;
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        const response = await service.post({ ...basis, action: "job", task: task.id, job: submitted.job });
+        if (response.status === 409) { await Bun.sleep(25); continue; }
+        expect(response.status, await response.clone().text()).toBe(200);
+        result = (await response.json() as any).data;
+        if (["failed", "published", "blocked", "changes_required"].includes(result.state)) break;
+        await Bun.sleep(50);
+      }
+      expect(result, JSON.stringify(result)).toMatchObject({ state: "failed", reason: "CompanyAccessRevoked" });
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+      expect(JSON.parse(f.fossil("cat", `tasks/${task.id}.json`, "-r", task.branch)).authority).toEqual(task.authority);
+      expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/report.md");
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 120000);
+
   test("upgrades future contracts with a verified backup while preserving active task bases", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -2894,6 +3056,13 @@ sys.exit(result.returncode)
     expect(first.code).toBe(1);
     const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     const actorCount = m.counts().actors;
+    const repository = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).repository;
+    const cachedTask = join(f.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"), "tasks", `${task.id}.json`);
+    const stale = structuredClone(task);
+    stale.definition.objective = "A cached objective must not replace the canonical request";
+    stale.model_basis.capability = "unavailable-cache-capability";
+    stale.authority = { actor: "cache-only", grant: "cache-only" };
+    writeFileSync(cachedTask, JSON.stringify(stale));
     permit = true;
     const service = await startWorkspaceService(f, true);
     try {
@@ -2919,7 +3088,11 @@ sys.exit(result.returncode)
       }
       expect(completed, existsSync(f.env.FX_TRACE_LOG) ? readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-4000) : "").toMatchObject({ state: "published", generation: 1 });
       expect(m.counts().actors).toBe(actorCount);
-      expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+      expect(m.packets.at(-1).contract.objective).toBe(task.definition.objective);
+      const repaired = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+      expect(repaired.state).toBe("accepted");
+      expect(repaired.authority).toBeNull();
+      expect(repaired.definition).toEqual(task.definition);
       expect(f.fossil("ls", "-r", "trunk")).toContain(`jobs/${queued.data.id}.json`);
       permit = false;
       expect((await f.run(["ask", "Give another short informational answer", "--json"])).code).toBe(1);

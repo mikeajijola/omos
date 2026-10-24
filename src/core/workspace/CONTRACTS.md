@@ -315,6 +315,15 @@ before those indexes are used. A legacy export registry remains compatible;
 newer canonical task records and selection events take precedence. This rebuild
 does not restore private provider checkpoints or repeat actor actions.
 
+Task mutation and publication boundaries, including review queuing, claims,
+attempts, and checkpoints, refresh canonical task context under their writer
+boundary. A cache entry cannot replace a committed contract
+or company authority. A private recovery marker spans the canonical job commit
+and its local index update. After interruption, the scheduler repairs at most
+16 marked task pointers per pass under execution ownership. It does not recreate
+jobs or repeat actor actions. Copies of the repository rebuild job pointers
+from canonical task records without those private markers.
+
 Repository verification uses Fossil's public check-in manifests and its full
 object integrity check. The host checks the complete integrity report, including
 error counts, missing content, and the database result; a zero process exit code

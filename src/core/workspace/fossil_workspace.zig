@@ -622,7 +622,7 @@ pub const Manager = struct {
     pub fn bindCompanyTask(self: Manager, previous: Task, authority: @import("company_authority.zig").Binding) !Task {
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (task.authority) |existing| {
             if (!std.mem.eql(u8, existing.actor, authority.actor) or !std.mem.eql(u8, existing.grant, authority.grant)) return error.CompanyAccessDenied;
             return task;
@@ -640,7 +640,7 @@ pub const Manager = struct {
         if (references.len > 100) return error.CompanyReadSetTooLarge;
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (task.authority == null) return error.CompanyAccessDenied;
         if (task.state == .accepted or task.state == .publication_pending) return error.TaskIsReadOnly;
         const frozen = try self.alloc.dupe(@import("company_reads.zig").Reference, references);
@@ -922,10 +922,40 @@ pub const Manager = struct {
         _ = try self.commit(tree, "Retain durable review job state");
     }
 
+    fn reviewSelectionPath(self: Manager, id: []const u8) ![]const u8 {
+        if (!safeId(id)) return error.InvalidTaskId;
+        return join(self.alloc, try join(self.alloc, self.root, "review-selections"), try self.alloc.print("{s}.json", .{id}));
+    }
+
+    fn clearReviewSelection(self: Manager, id: []const u8) !void {
+        const path = try self.reviewSelectionPath(id);
+        std.Io.Dir.cwd().deleteFile(io_mod.getIo(), path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        try syncDirectory(std.Io.Dir.path.dirname(path).?);
+    }
+
+    // The canonical task and job commit together. This private marker repairs
+    // only their cache pointer after a crash, never recreates or replays a job.
+    fn recoverReviewSelections(self: Manager) !void {
+        const names = try self.entries(try join(self.alloc, self.root, "review-selections"));
+        for (names[0..@min(names.len, 16)]) |name| {
+            try self.checkOperation();
+            if (name.len != 69 or !std.mem.endsWith(u8, name, ".json") or !safeId(name[0..64])) return error.InvalidReviewSelection;
+            const id = name[0..64];
+            if (!std.mem.eql(u8, id, try read(self.alloc, try self.reviewSelectionPath(id)))) return error.InvalidReviewSelection;
+            const execution = (try self.tryTaskExecutionLease(id)) orelse continue;
+            defer execution.release();
+            _ = try self.refreshTaskContextLocked(try self.loadTask(id));
+            try self.clearReviewSelection(id);
+        }
+    }
+
     pub fn queueReview(self: Manager, previous: Task) !@import("review_job.zig").Job {
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         try self.checkExpectedRevision(task.branch);
         if (task.revision_pending) return error.TaskContractRevisionPending;
         if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
@@ -936,13 +966,19 @@ pub const Manager = struct {
         const id = try hash(self.alloc, try json(self.alloc, .{ task.id, task.definition.version, definition_hash, candidate_hash, workspace_basis.definition_hash }));
         var generation: u64 = 0;
         if (self.loadReviewJob(task, id)) |existing| {
-            if (existing.state == .queued or existing.state == .running or existing.state == .published) return existing;
+            if (existing.state == .queued or existing.state == .running or existing.state == .published) {
+                try self.clearReviewSelection(task.id);
+                return existing;
+            }
             generation = existing.generation;
         } else |err| if (err != error.FossilCommandFailed) return err;
         const job: @import("review_job.zig").Job = .{ .id = id, .task = task.id, .contract_version = task.definition.version, .definition_hash = definition_hash, .candidate_hash = candidate_hash, .generation = generation, .workspace_definition_hash = workspace_basis.definition_hash, .workspace_definition_revision = workspace_basis.revision, .budget_epoch = std.math.add(u64, generation, 1) catch return error.InvalidReviewJob };
         task.review_job = id;
+        try atomicWrite(self.alloc, try self.reviewSelectionPath(task.id), task.id);
         try self.saveReviewJob(task, job);
+        try fault("review-job-committed");
         try self.saveTask(task);
+        try self.clearReviewSelection(task.id);
         if (task.authority != null) try fault("company-review-queued");
         return job;
     }
@@ -952,18 +988,25 @@ pub const Manager = struct {
         defer if (authority_lease) |held| held.release();
         const lease = try self.writerLease();
         defer lease.release();
+        try self.recoverReviewSelections();
         const now = io_mod.milliTimestamp();
         for (try self.tasks()) |loaded| {
             var task = loaded;
             if (task.state == .accepted or task.state == .conflict) continue;
-            const job_id = task.review_job orelse continue;
+            var job_id = task.review_job orelse continue;
             var job = try self.loadReviewJob(task, job_id);
-            const eligible = job.state == .queued or (job.state == .running and job.lease_expires_ms <= now);
+            var eligible = job.state == .queued or (job.state == .running and job.lease_expires_ms <= now);
             // Do not momentarily acquire an active review's execution lock
             // between another worker's durable claim and executor startup.
             if (!eligible and task.state != .publication_pending) continue;
             const task_lease = (try self.tryTaskExecutionLease(task.id)) orelse continue;
             defer task_lease.release();
+            task = try self.refreshTaskContextLocked(task);
+            if (task.state == .accepted or task.state == .conflict) continue;
+            job_id = task.review_job orelse continue;
+            job = try self.loadReviewJob(task, job_id);
+            eligible = job.state == .queued or (job.state == .running and job.lease_expires_ms <= now);
+            if (!eligible and task.state != .publication_pending) continue;
             try self.drain(task);
             if (task.state == .publication_pending and try self.publicationCommitted(task)) {
                 _ = try self.finishPublication(try parse(self.alloc, Publication, try read(self.alloc, try self.publicationPath(task.id))));
@@ -1015,7 +1058,7 @@ pub const Manager = struct {
     pub fn finishReviewJob(self: Manager, previous: @import("review_job.zig").Job, state: @FieldType(@import("review_job.zig").Job, "state"), reason: []const u8) !void {
         const lease = try self.writerLease();
         defer lease.release();
-        const task = try self.loadTask(previous.task);
+        const task = try self.refreshTaskContextLocked(try self.loadTask(previous.task));
         var job = try self.loadReviewJob(task, previous.id);
         const fence: @import("review_job.zig").Fence = .{ .task = previous.task, .job = previous.id, .owner = previous.owner, .generation = previous.generation };
         if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
@@ -1030,7 +1073,7 @@ pub const Manager = struct {
         if (self.review_fence == null) return error.StaleReviewLease;
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.task);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.task));
         var job = try self.loadReviewJob(task, previous.id);
         try self.checkReviewFence(task);
         const policy = if (task.model_basis) |basis| basis.execution.review else model.ReviewPolicy.legacy;
@@ -1613,7 +1656,7 @@ pub const Manager = struct {
             if (job.state == .queued or job.state == .running) return;
         }
         try self.drain(previous);
-        previous = try self.loadTask(previous.id);
+        previous = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         previous.state = .paused;
         try self.saveTask(previous);
         try self.retainTaskState(previous);
@@ -1640,7 +1683,7 @@ pub const Manager = struct {
         if (state == .accepted or state == .publication_pending or state == .conflict) return error.ProtectedTaskTransition;
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(id));
         if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return task;
         task.state = state;
         try self.saveTask(task);
@@ -1652,7 +1695,7 @@ pub const Manager = struct {
         if (text.len == 0 or std.ascii.eqlIgnoreCase(std.mem.trim(u8, text, " \t\r\n"), "continue")) return previous;
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (std.mem.eql(u8, text, task.definition.objective)) return task;
         if (task.request_artifact) |path| if (std.mem.eql(u8, path[10..], try hash(self.alloc, text))) return task;
         for (task.amendments) |existing| if (std.mem.eql(u8, existing, text)) return task;
@@ -1826,7 +1869,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         try self.drain(task);
-        const latest = try self.loadTask(task.id);
+        const latest = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         try self.checkReviewFence(latest);
         if (self.review_fence == null) if (latest.review_job) |id| {
             const job = try self.loadReviewJob(latest, id);
@@ -1937,7 +1980,7 @@ pub const Manager = struct {
         if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) return bytes;
         const lease = try self.writerLease();
         defer lease.release();
-        var current = try self.loadTask(task.id);
+        var current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.state == .accepted or current.state == .publication_pending) return bytes;
         const base = self.run(null, &.{ "cat", path, "-r", current.base_revision, "-R", self.repository }) catch null;
         const dependency: ReadDependency = .{ .path = path, .base_hash = if (base) |value| try hash(self.alloc, value) else null, .observed_hash = try hash(self.alloc, bytes) };
@@ -1953,7 +1996,7 @@ pub const Manager = struct {
     pub fn refresh(self: Manager, previous: Task) !Task {
         const lease = try self.writerLease();
         defer lease.release();
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (task.state == .publication_pending or task.state == .accepted) return error.TaskIsReadOnly;
         const parent_revision = try self.revision(task.parent);
         try @import("company_reads.zig").validate(self, task, task.company_reads, parent_revision);
@@ -2105,7 +2148,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
-        const current = try self.loadTask(task.id);
+        const current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.state == .accepted or current.state == .publication_pending) return error.TaskIsReadOnly;
         if (current.definition.version != task.definition.version) return error.StaleWorkContract;
         const tree = try self.checkout(task.branch);
@@ -2236,7 +2279,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
-        const current = try self.loadTask(task.id);
+        const current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.authority != null) if (current.review_job) |id| {
             const job = try self.loadReviewJob(current, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
@@ -2263,7 +2306,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
-        const current = try self.loadTask(task.id);
+        const current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.authority != null) if (current.review_job) |id| {
             const job = try self.loadReviewJob(current, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
@@ -2362,7 +2405,7 @@ pub const Manager = struct {
         defer lease.release();
         if (operation) |id| if (try self.companyCheckpointRevision(task, id)) |revision_id| return revision_id;
         try self.checkExpectedRevision(task.branch);
-        const current = try self.loadTask(task.id);
+        const current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.authority != null) if (current.review_job) |id| {
             const job = try self.loadReviewJob(current, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
@@ -2901,7 +2944,7 @@ pub const Manager = struct {
         defer if (authority_lease) |held| held.release();
         const lease = try self.writerLease();
         defer lease.release();
-        const latest = try self.loadTask(task.id);
+        const latest = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         try @import("company_authority.zig").authorizeTask(self, latest);
         if (latest.authority != null and !try self.sameRevision(latest.base_revision, try self.revision(latest.parent))) return error.CompanyReconciliationRequired;
         if (latest.revision_pending) return error.TaskContractRevisionPending;
@@ -3087,7 +3130,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         if (try self.publicationCommitted(previous)) return error.TaskAlreadyAccepted;
-        var task = try self.loadTask(previous.id);
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         const bytes = try json(self.alloc, .{ .kind = "review_invalidated", .task = task.id, .contract_version = task.definition.version, .value = "Authenticated user steering requires a new assessment before publication." });
         try atomicWrite(self.alloc, try join(self.alloc, try self.journalDir(task), try hash(self.alloc, bytes)), bytes);
         task.state = .active;
@@ -3461,7 +3504,7 @@ pub const Manager = struct {
     fn applyPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: ?[]const []const u8) !Task {
         const lease = try self.writerLease();
         defer lease.release();
-        var current = try self.loadTask(previous.id);
+        var current = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (current.definition.version != previous.definition.version or current.state != .active) return error.StaleWorkContract;
         if (current.model_basis == null) return error.WorkspaceMigrationRequired;
         const previous_definition = current.definition;

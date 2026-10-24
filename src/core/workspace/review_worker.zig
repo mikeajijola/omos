@@ -24,7 +24,7 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     manager.review_fence = .{ .task = job.task, .job = job.id, .generation = job.generation, .owner = job.owner };
     const execution_lease = (try manager.tryTaskExecutionLease(job.task)) orelse return error.WorkspaceExecutionBusy;
     defer execution_lease.release();
-    var task = try manager.loadTask(job.task);
+    var task = try manager.refreshTaskContext(try manager.loadTask(job.task));
     try manager.validateTaskBasis(task);
     try @import("company_reads.zig").validate(manager, task, task.company_reads, try manager.revision(task.parent));
     try @import("company_authority.zig").authorizeTask(manager, task);
