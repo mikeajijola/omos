@@ -479,6 +479,12 @@ After sending a mutation, a missing or rejected HTTP response reports
 failed: inspect or reconcile the original operation before retrying it. The
 client never silently sends another mutation to repair a response.
 
+An optional MCP stdio companion forwards the same native signed operations.
+Its fixed client configuration supplies the actor, grant, workspace, issuer,
+and epoch. It verifies original receipts and retains no separate product state.
+See [the company deployment guide](../../../deployment/company/README.md#connect-an-external-mcp-client)
+for enrollment, protocol versions, request bounds, and uncertain outcomes.
+
 Supported actions are `discover`, `read`, `create_view`, `checkpoint`, `submit`,
 `status`, `export_scope`, `delegate`, `reconcile`, `query`, and `record`. Reads
 and inventories enforce the live grant and restrict historical revisions to
@@ -697,6 +703,12 @@ and deletions also supply the previous record hash; `remove: true` deletes a
 record. Different records can reconcile independently. Concurrent changes to
 the same record remain subject to the file conflict boundary and independent
 assessment. Existing content-addressed records retain their identities.
+
+Decoded record content, including fields declared as `json`, uses the same
+64-level and 20,000-value boundary as declaration validation. This check runs
+before privacy filtering and serialization. A bounded outer transport string
+does not exempt its decoded contents. Excessive trees and prohibited object
+keys fail without changing the view; the operation remains inspectable as failed.
 
 Company actors cannot write `omos_` entities or bypass validation by sending a
 raw checkpoint into `records/`. Structural validation failures retain a failed

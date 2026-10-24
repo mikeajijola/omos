@@ -68,6 +68,71 @@ a server bridge that signs or forwards each authenticated user's scoped
 requests. The gateway rejects browser-origin requests directly. Keep the service
 on loopback; this configuration does not authorize exposing its other routes.
 
+## Connect an external MCP client
+
+The optional `deployment/company/mcp.mjs` companion exposes the same signed
+operations over MCP stdio. It requires Node.js 22 or newer and the source tree
+containing the pinned `src/core/workspace/standard/omos.json` contract. The native
+installation and company server do not require Node.js. The companion negotiates
+MCP `2025-11-25` or `2025-06-18`; newer clients receive an explicit supported-version
+response and must negotiate a supported version.
+
+Run `omos fossil company-key HANDLE --json` in the client account. Enroll its
+returned public key through the server's local operator with the required paths,
+actions, and expiry. The client keeps the private key in its own profile; do not
+copy the server issuer key or local owner token to it.
+
+Create a mode `0600` configuration file outside the agent's mutable workspace:
+
+```json
+{
+  "version": "omos.company-mcp/v1",
+  "endpoint": "https://company.example",
+  "workspace": "COMPLETE_WORKSPACE_ID",
+  "issuer": "COMPLETE_ISSUER_PUBLIC_KEY",
+  "epoch": 1,
+  "actor": "external-worker",
+  "grant": "team-editor",
+  "key_handle": "company-worker",
+  "actions": ["discover", "read", "create_view", "checkpoint", "query", "record", "submit", "status", "reconcile"]
+}
+```
+
+Replace the workspace and issuer with complete lowercase hexadecimal identities
+verified through your operator. Pin the current issuer epoch explicitly. Match
+`key_handle` to the locally created handle. The configured action list narrows
+the advertised interface; the native service checks the live grant on every
+operation. After issuer recovery, update these pins only after verifying the new
+identity and enrolling the client again.
+
+Configure your MCP client to launch:
+
+```sh
+node "$OMOS_SOURCE/deployment/company/mcp.mjs" "$HOME/.config/omos/company-mcp.json"
+```
+
+`OMOS_SOURCE` is the absolute path to the verified source checkout. For an omos
+client, register that command with `omos mcp add company -- node SCRIPT CONFIG`,
+using those absolute script and configuration paths. `omos mcp show company
+--json` verifies connection and lists the tools.
+
+`company_context` returns the public instance discovery, configured actor and
+grant, current time, and configured actions. It does not certify live access.
+`company_workspace` accepts the native operation fields, with workspace, actor,
+and grant supplied by the fixed configuration. Supply an operation ID and an
+`expires_ms` within five minutes. Use the returned pinned revision for edits and
+retain the operation ID when an outcome is uncertain. Successful calls return
+the original signed receipt in `structuredContent.receipt` for later inspection.
+Submission queues native independent review; it is not an acceptance receipt.
+
+The companion verifies response signatures, request hashes, issuer epoch, and
+identity fields. It forwards no owner bearer token or cookies and follows no
+redirects. It never automatically retries mutations. Cancellation or a missing
+response after sending a mutation leaves its outcome uncertain; inspect `status`
+or reconcile the original operation. Inputs and HTTP responses are bounded to
+1 MiB, with 16 active requests and a 30-second deadline shared by discovery and
+the operation. The companion stores no task, grant, or operation database.
+
 ## Backup and restore
 
 Create a verified portable export with `omos fossil export PATH`. Preserve all

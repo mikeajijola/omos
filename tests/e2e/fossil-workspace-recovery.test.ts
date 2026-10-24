@@ -69,8 +69,212 @@ function commitFixtureAmendment(f: ReturnType<typeof fixture>, taskId: string, c
   command("close");
 }
 
+async function companyMcp(config: string, home: string) {
+  const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), config], {
+    env: { ...process.env, HOME: home, OMOS_WORKSPACE_TOKEN: "owner-token-must-never-be-forwarded" }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  let next = 0;
+  const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  const stderr = new Response(child.stderr).text();
+  const pump = (async () => {
+    const reader = child.stdout.getReader();
+    let buffered = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffered += new TextDecoder().decode(value);
+        while (buffered.includes("\n")) {
+          const end = buffered.indexOf("\n"), line = JSON.parse(buffered.slice(0, end));
+          buffered = buffered.slice(end + 1);
+          const waiter = pending.get(line.id);
+          pending.delete(line.id);
+          waiter?.resolve(line);
+        }
+      }
+    } finally {
+      reader.releaseLock();
+      for (const waiter of pending.values()) waiter.reject(new Error("Company MCP process closed"));
+      pending.clear();
+    }
+  })();
+  const rpc = async (method: string, params: object = {}) => {
+    const id = ++next;
+    let timer: ReturnType<typeof setTimeout>;
+    const response = new Promise<any>((resolve, reject) => {
+      timer = setTimeout(() => { pending.delete(id); reject(new Error(`Company MCP ${method} timed out`)); }, 45000);
+      pending.set(id, { resolve, reject });
+    });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    await child.stdin.flush();
+    try { return await response; } finally { clearTimeout(timer!); }
+  };
+  return { child, rpc, stderr, lastId: () => next, notify: async (method: string, params: object) => { child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n"); await child.stdin.flush(); }, close: async () => { child.kill(); await child.exited; await pump; } };
+}
+
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("connects native MCP clients to signed company operations without owner credentials or unsafe retries", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const filename = join(f.home, "operator.json");
+      writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", filename, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initial = await admin({ action: "initialize" });
+    const keyResult = await f.run(["fossil", "company-key", "mcp-worker", "--json"]);
+    expect(keyResult.code, keyResult.stderr).toBe(0);
+    const identity = JSON.parse(keyResult.stdout);
+    const key = identity.model_data ?? identity;
+    await admin({ action: "grant", revision: initial.revision, grant: { id: "mcp-editor", actor: "worker", public_key: key.public_key, paths: ["documents/team/"], actions: ["discover", "read", "create_view", "checkpoint", "status", "reconcile"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, true);
+    let mode = "normal", posts = 0, redirects = 0;
+    let committed: (() => void) | undefined, releaseResponse: (() => void) | undefined;
+    let heldResponse: Promise<void> | undefined;
+    const authorityHeaders: string[] = [];
+    const redirect = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { redirects++; return Response.json({}); } });
+    const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      authorityHeaders.push(request.headers.get("authorization") ?? "", request.headers.get("cookie") ?? "");
+      if (mode === "redirect") return Response.redirect(`http://127.0.0.1:${redirect.port}/v1/company`, 307);
+      if (mode === "oversized") return new Response("x".repeat(1024 * 1024 + 1));
+      if (request.method === "POST") posts++;
+      const response = await fetch(service.url + "/v1/company", { method: request.method, headers: { "content-type": "application/json" }, body: request.method === "POST" ? await request.text() : undefined });
+      if (mode === "identity" && request.method === "GET") {
+        const value = await response.json() as any;
+        value.epoch++;
+        return Response.json(value);
+      }
+      if (mode === "hold" && request.method === "POST") { committed?.(); await heldResponse; }
+      if (mode === "tamper" && request.method === "POST" && response.status === 200) {
+        const value = await response.json() as any;
+        value.payload += " ";
+        return Response.json(value);
+      }
+      return response;
+    } });
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const filename = join(f.home, "company-mcp.json");
+    const config = { version: "omos.company-mcp/v1", endpoint: `http://127.0.0.1:${proxy.port}`, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "mcp-editor", key_handle: "mcp-worker", actions: ["discover", "read", "create_view", "checkpoint", "status", "reconcile"] };
+    writeFileSync(filename, JSON.stringify(config), { mode: 0o600 });
+    const client = await companyMcp(filename, f.home);
+    const call = async (name: string, args: object = {}) => {
+      const response = await client.rpc("tools/call", { name, arguments: args });
+      expect(response.error).toBeUndefined();
+      return { ...response.result, value: JSON.parse(response.result.content[0].text) };
+    };
+    const args = (action: string, params: object = {}) => ({ version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...params });
+    try {
+      const modern = await client.rpc("initialize", { protocolVersion: "2026-07-28" });
+      expect(modern.error.code).toBe(-32022);
+      expect(modern.error.data.supported).toContain("2025-11-25");
+      expect((await client.rpc("initialize", { protocolVersion: "2025-11-25" })).result.protocolVersion).toBe("2025-11-25");
+      const tools = (await client.rpc("tools/list")).result.tools;
+      expect(tools.map((tool: any) => tool.name)).toEqual(["company_context", "company_workspace"]);
+      expect(tools[1].inputSchema.properties.actor).toBeUndefined();
+      expect(tools[1].inputSchema.properties.action.enum).not.toContain("delegate");
+      const context = await call("company_context");
+      expect(context.value.company.workspace).toBe(boot.workspace);
+      expect(context.value.public_key).toBe(key.public_key);
+      expect((await client.rpc("tools/list", null as any)).error.code).toBe(-32602);
+      const before = posts;
+      expect((await call("invented_alias")).value.error).toBe("UnknownTool");
+      expect((await call("company_workspace", args("read", { actor: "other" }))).value.error).toBe("InvalidArguments");
+      expect((await call("company_workspace", args("delegate"))).value.error).toBe("InvalidArguments");
+      expect(posts).toBe(before);
+      const createdRequest = args("create_view", { revision: boot.revision, objective: "Save a team document through MCP" });
+      const created = await call("company_workspace", createdRequest);
+      expect(created.isError).not.toBe(true);
+      const receipt = created.structuredContent.receipt;
+      const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+      expect(verify(null, Buffer.from(receipt.payload), publicKey, Buffer.from(receipt.signature, "hex"))).toBe(true);
+      const claim = JSON.parse(receipt.payload);
+      expect(claim.operation).toBe(createdRequest.operation);
+      const saved = await call("company_workspace", args("checkpoint", { view: created.value.view, revision: created.value.revision, path: "documents/team/mcp.txt", content: "A native Fossil checkpoint from MCP" }));
+      expect(saved.isError).not.toBe(true);
+      const read = await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/team/mcp.txt" }));
+      expect(Buffer.from(read.value.content, "base64").toString()).toBe("A native Fossil checkpoint from MCP");
+      expect((await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/private.txt" }))).isError).toBe(true);
+      mode = "tamper";
+      const uncertainRequest = args("create_view", { revision: boot.revision, objective: "Retain a view despite a corrupted response" });
+      const postCount = posts;
+      const uncertain = await call("company_workspace", uncertainRequest);
+      expect(uncertain.value.error).toBe("CompanyOutcomeUnverified");
+      expect(posts).toBe(postCount + 1);
+      mode = "normal";
+      const outcome = await call("company_workspace", args("status", { outcome: uncertainRequest.operation }));
+      expect(outcome.value.state).toBe("completed");
+      const committedResponse = new Promise<void>(resolve => { committed = resolve; });
+      heldResponse = new Promise<void>(resolve => { releaseResponse = resolve; });
+      mode = "hold";
+      const cancelledRequest = args("create_view", { revision: boot.revision, objective: "Retain the operation when its MCP caller cancels" });
+      const beforeCancel = posts;
+      const cancelled = call("company_workspace", cancelledRequest);
+      const cancelId = client.lastId();
+      await committedResponse;
+      await client.notify("notifications/cancelled", { requestId: cancelId, reason: "The caller cancelled after commit" });
+      expect((await cancelled).value.error).toBe("CompanyOutcomeUnknown");
+      releaseResponse?.();
+      mode = "normal";
+      expect(posts).toBe(beforeCancel + 1);
+      expect((await call("company_workspace", args("status", { outcome: cancelledRequest.operation }))).value.state).toBe("completed");
+      const noPost = posts;
+      for (mode of ["redirect", "oversized"]) expect((await call("company_context")).isError).toBe(true);
+      mode = "identity";
+      expect((await call("company_workspace", args("create_view", { revision: boot.revision, objective: "Reject a changed issuer epoch" }))).value.error).toBe("CompanyIdentityChanged");
+      expect(posts).toBe(noPost);
+      expect(redirects).toBe(0);
+      mode = "normal";
+      expect(authorityHeaders.every(value => value === "")).toBe(true);
+      const added = await f.run(["mcp", "add", "company", "--", process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), filename], { FX_MCP_ENGINE: "v2" });
+      expect(added.code, added.stderr).toBe(0);
+      const shown = await f.run(["mcp", "show", "company", "--json"], { FX_MCP_ENGINE: "v2" });
+      expect(shown.code, shown.stderr + shown.stdout).toBe(0);
+      expect(JSON.parse(shown.stdout)).toMatchObject({ status: "ready", version: "2025-11-25" });
+      expect(JSON.parse(shown.stdout).tools.map((tool: any) => tool.name)).toEqual(["company_context", "company_workspace"]);
+      const selectedName = `mcp_company_${JSON.parse(shown.stdout).tools.find((tool: any) => tool.name === "company_workspace").name}`;
+      const nativeRead = args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/team/mcp.txt" });
+      const inference = model(f, (body, count) => {
+        if (count === 1) return { tool_calls: [{ index: 0, id: "select-company", type: "function", function: { name: "mcp_select_tool", arguments: JSON.stringify({ name: selectedName }) } }] };
+        if (count === 2) {
+          expect(body.tools.some((tool: any) => tool.function.name === selectedName)).toBe(true);
+          return { tool_calls: [{ index: 0, id: "read-company", type: "function", function: { name: selectedName, arguments: JSON.stringify(nativeRead) } }] };
+        }
+        expect(JSON.stringify(body.messages)).toContain(Buffer.from("A native Fossil checkpoint from MCP").toString("base64"));
+        return { content: "The native agent inspected the exact company document through MCP." };
+      });
+      const native = await f.run(["ask", "--no-save", "--json", "Read the scoped company document using its advertised MCP tool"], { FX_MCP_ENGINE: "v2" });
+      expect(native.code, native.stderr + native.stdout).toBe(0);
+      expect(inference.counts().actors).toBe(3);
+      const current = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: current.revision, id: "mcp-editor" });
+      expect((await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/team/mcp.txt" }))).isError).toBe(true);
+      const rejectedConfiguration = async (configuration: string) => {
+        const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), configuration], { env: { HOME: f.home, PATH: process.env.PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+        const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
+        expect(await child.exited).toBe(1);
+        expect(await stdout).toBe("");
+        expect(await stderr).toBe("Company MCP configuration could not be loaded. Check its private path, permissions, identity pins, and key handle.\n");
+      };
+      const beforeConfigFailures = posts;
+      chmodSync(filename, 0o644);
+      await rejectedConfiguration(filename);
+      chmodSync(filename, 0o600);
+      const alias = join(f.home, "company-config-link.json");
+      symlinkSync(filename, alias);
+      await rejectedConfiguration(alias);
+      const keyFile = join(f.home, ".fx/company-keys/mcp-worker.seed");
+      chmodSync(keyFile, 0o644);
+      await rejectedConfiguration(filename);
+      chmodSync(keyFile, 0o600);
+      writeFileSync(filename, JSON.stringify({ ...config, endpoint: "http://company.example" }));
+      await rejectedConfiguration(filename);
+      expect(posts).toBe(beforeConfigFailures);
+    } finally { releaseResponse?.(); await client.close(); proxy.stop(true); redirect.stop(true); service.child.kill(); await service.child.exited; }
+    expect(await client.stderr).toBe("");
+  }, 150000);
   test("reports executable flag changes from immutable manifests when Fossil's brief diff is empty", async () => {
     const f = fixture();
     let phase = "seed", seeded = false;
@@ -669,7 +873,7 @@ sys.exit(result.returncode)
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
-    declaration.spec.semantic.entityTypes.push({ id: "company_note", fields: { text: "string", authorization: "string" }, required: ["text"] });
+    declaration.spec.semantic.entityTypes.push({ id: "company_note", fields: { text: "string", authorization: "string", detail: "json" }, required: ["text"] });
     const definitionFile = join(f.home, "company-definition.json");
     writeFileSync(definitionFile, JSON.stringify(declaration));
     const proposed = await f.run(["fossil", "definition", "propose", definitionFile, "--json"]);
@@ -726,6 +930,14 @@ sys.exit(result.returncode)
       expect(refused.status).toBe(400);
       expect((await refused.json() as any).error).toBe("CompanyRecordNotPortable");
       expect((await send("status", { outcome: JSON.parse(unportable.payload).operation })).state).toBe("failed");
+      for (const detail of ["[".repeat(512) + "0" + "]".repeat(512), JSON.stringify(Array(20001).fill(0)), '{"__proto__":{}}']) {
+        const excessive = envelope("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "beta", content: '{"text":"Bound decoded JSON fields","detail":' + detail + '}' });
+        const response = await post(excessive);
+        expect(response.status).toBe(400);
+        expect(["DeclarationTooComplex", "InvalidDeclarationKey"]).toContain((await response.json() as any).error);
+        expect((await send("status", { outcome: JSON.parse(excessive.payload).operation })).state).toBe("failed");
+        expect((await send("status", { view: view.view })).revision).toBe(first.revision);
+      }
       expect((await post(envelope("record", { view: view.view, revision: first.revision, entity: "omos_assessment", record_id: "forged", content: "{}" }))).status).toBe(403);
       expect((await post(envelope("checkpoint", { view: view.view, revision: first.revision, path: first.path, content: "{}" }))).status).toBe(403);
       expect((await post(envelope("record", { view: view.view, revision: first.revision, entity: "company_note", record_id: "ALPHA", content: JSON.stringify({ text: "Conflicting filename case" }) }))).status).toBe(409);

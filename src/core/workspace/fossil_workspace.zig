@@ -2482,6 +2482,10 @@ pub const Manager = struct {
                 error.OutOfMemory => return err,
                 else => return error.InvalidCompanyRecordJson,
             };
+            // The transport schema sees content as a string. Bound its decoded
+            // tree before privacy filtering or serialization walks JSON fields.
+            var count: usize = 0;
+            try @import("declaration_schema.zig").boundary(value, 0, &count);
             try model.validateRecord(declaration.semantic, entity, value, true);
             const encoded = try json(self.alloc, .{ .entity = entity, .id = id, .task = task.id, .data = value });
             const portable = try parse(self.alloc, std.json.Value, encoded);
