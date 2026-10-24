@@ -59,6 +59,7 @@ pub const Request = struct {
     delegated_grant: ?Grant = null,
     entity: ?[]const u8 = null,
     record_id: ?[]const u8 = null,
+    progress_cursor: ?[]const u8 = null,
 };
 
 /// Version 2 adds authenticated file attributes to read-only file operations.

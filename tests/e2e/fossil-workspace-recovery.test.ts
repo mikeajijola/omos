@@ -114,6 +114,127 @@ async function companyMcp(config: string, home: string) {
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("resumes signed company progress pages without losing concurrent revisions or crossing view authority", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
+    const repository = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8")).repository;
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json");
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    let authority = await admin({ action: "initialize" });
+    const keys = { alice: generateKeyPairSync("ed25519"), bob: generateKeyPairSync("ed25519") };
+    for (const actor of ["alice", "bob"] as const) authority = await admin({ action: "grant", revision: authority.revision, grant: { id: actor + "-grant", actor, public_key: keys[actor].publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "status"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const envelope = (actor: keyof typeof keys, action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor, grant: actor + "-grant", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), keys[actor].privateKey).toString("hex") };
+    };
+    const post = (actor: keyof typeof keys, action: string, params: object = {}) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(envelope(actor, action, params)) });
+    const send = async (actor: keyof typeof keys, action: string, params: object = {}) => {
+      const response = await post(actor, action, params), receipt = await response.json() as any;
+      expect(response.status, JSON.stringify(receipt)).toBe(200);
+      return JSON.parse(receipt.payload).result;
+    };
+    const revisions = (head: string, after: string) => {
+      const result: { revision: string; parent: string; committed_at: string; kind: string }[] = [];
+      while (head !== after) {
+        const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+        const inspected = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", "artifact", head, "-R", repository], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, LC_ALL: "C" } });
+        expect(inspected.status, inspected.stderr).toBe(0);
+        const raw = inspected.stdout;
+        expect(createHash("sha3-256").update(raw).digest("hex")).toBe(head);
+        const parent = raw.match(/^P ([a-f0-9]+)/m)?.[1];
+        expect(parent).toBeDefined();
+        result.push({ revision: head, parent: parent!, committed_at: raw.match(/^D (.+)$/m)![1], kind: "view_revision" });
+        head = parent!;
+        expect(result.length).toBeLessThan(100);
+      }
+      return result;
+    };
+    try {
+      expect(boot.features.progress_history).toBe(true);
+      const alice = await send("alice", "create_view", { revision: boot.revision, objective: "Retain team documents and their complete progress" });
+      const bob = await send("bob", "create_view", { revision: boot.revision, objective: "Retain a separate private progress stream" });
+      let head = alice.revision;
+      for (let index = 0; index < 3; index++) head = (await send("alice", "checkpoint", { view: alice.view, revision: head, path: "documents/team/" + index + ".txt", content: "Versioned content" })).revision;
+      const first = (await send("alice", "status", { view: alice.view, progress_cursor: "", limit: 1 })).progress;
+      expect(first.version).toBe("omos.company-progress/v1");
+      expect(first.revision).toBe(head);
+      expect(first.events).toHaveLength(1);
+      expect(typeof first.next_cursor).toBe("string");
+      const expected = revisions(head, boot.revision);
+      const advanced = await send("alice", "checkpoint", { view: alice.view, revision: head, path: "documents/team/later.txt", content: "Arrived while paging" });
+      const events = [...first.events];
+      let page = first;
+      while (page.next_cursor !== null) {
+        page = (await send("alice", "status", { view: alice.view, progress_cursor: page.next_cursor, limit: 2 })).progress;
+        expect(page.revision).toBe(head);
+        expect(page.events.length).toBeLessThanOrEqual(2);
+        events.push(...page.events);
+        expect(events.length).toBeLessThan(100);
+      }
+      expect(events).toEqual(expected);
+      expect(new Set(events.map(event => event.revision)).size).toBe(events.length);
+      const cursor = page.resume_cursor;
+      const tampered = JSON.parse(cursor), claims = JSON.parse(tampered.payload);
+      claims.after = boot.revision;
+      tampered.payload = JSON.stringify(claims);
+      expect((await post("alice", "status", { view: alice.view, progress_cursor: JSON.stringify(tampered) })).status).toBe(400);
+      expect((await post("bob", "status", { view: bob.view, progress_cursor: cursor })).status).toBe(400);
+      expect((await post("bob", "status", { view: alice.view, progress_cursor: cursor })).status).toBe(403);
+      const sibling = await send("alice", "create_view", { revision: boot.revision, objective: "A distinct view for the same actor" });
+      expect((await post("alice", "status", { view: sibling.view, progress_cursor: cursor })).status).toBe(400);
+      expect((await post("alice", "status", { view: alice.view, progress_cursor: "{}" })).status).toBe(400);
+      expect((await post("alice", "checkpoint", { view: alice.view, revision: advanced.revision, path: "documents/team/invalid.txt", content: "Must not be written", progress_cursor: "" })).status).toBe(400);
+      expect((await post("alice", "status", { view: alice.view, revision: advanced.revision, progress_cursor: cursor })).status).toBe(400);
+      service.child.kill(); await service.child.exited;
+      const cache = join(f.home, ".fx/fossil", createHash("sha256").update(repository).digest("hex"));
+      rmSync(join(cache, "tasks"), { recursive: true });
+      rmSync(join(cache, "checkouts"), { recursive: true });
+      service = await startWorkspaceService(f, false);
+      const resumed = (await send("alice", "status", { view: alice.view, progress_cursor: cursor })).progress;
+      expect(resumed.events).toEqual(revisions(advanced.revision, head));
+      expect(resumed.revision).toBe(advanced.revision);
+      expect(resumed.next_cursor).toBeNull();
+      const idle = (await send("alice", "status", { view: alice.view, progress_cursor: resumed.resume_cursor })).progress;
+      expect(idle.events).toEqual([]);
+      expect(idle.next_cursor).toBeNull();
+      const authorityRoot = join(f.home, ".fx/authority", boot.workspace);
+      const locks = Bun.spawn(["python3", "-u", "-c", "import fcntl, sys\nwith open(sys.argv[1], 'r+') as operation, open(sys.argv[2], 'r+') as issuer:\n fcntl.flock(operation, fcntl.LOCK_EX)\n fcntl.flock(issuer, fcntl.LOCK_EX)\n print('locked', flush=True)\n sys.stdin.readline()\n fcntl.flock(operation, fcntl.LOCK_UN)\n print('operation-released', flush=True)\n sys.stdin.read()\n", join(authorityRoot, "operation.lock"), join(authorityRoot, "issuer.lock")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const lockReader = locks.stdout.getReader();
+      const lockErrors = new Response(locks.stderr).text();
+      const lockLine = async () => {
+        let line = "";
+        while (!line.includes("\n")) { const chunk = await lockReader.read(); if (chunk.done) throw new Error("Progress lock fixture exited"); line += new TextDecoder().decode(chunk.value); }
+        return line.trim();
+      };
+      try {
+        expect(await lockLine()).toBe("locked");
+        const started = Date.now();
+        const pending = post("alice", "status", { view: alice.view, progress_cursor: idle.resume_cursor });
+        // Deliberately spend part of one request's allowance at admission,
+        // then hold the issuer lock to prove collection cannot renew it.
+        await Bun.sleep(10000);
+        locks.stdin.write("release\n"); await locks.stdin.flush();
+        expect(await lockLine()).toBe("operation-released");
+        const timedOut = await pending;
+        expect(timedOut.status).toBe(400);
+        expect((await timedOut.json() as any).error).toBe("Timeout");
+        expect(Date.now() - started).toBeGreaterThanOrEqual(29000);
+        expect(Date.now() - started).toBeLessThan(37000);
+      } finally { locks.stdin.end(); await locks.exited; lockReader.releaseLock(); }
+      expect(await lockErrors).toBe("");
+      expect((await send("alice", "status", { view: alice.view, progress_cursor: idle.resume_cursor })).progress.events).toEqual([]);
+      const current = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: current.revision, id: "alice-grant" });
+      expect((await post("alice", "status", { view: alice.view, progress_cursor: idle.resume_cursor })).status).toBe(403);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 150000);
   test("connects native MCP clients to signed company operations without owner credentials or unsafe retries", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
@@ -196,6 +317,10 @@ describe("portable Fossil workspace recovery", () => {
       expect(saved.isError).not.toBe(true);
       const read = await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/team/mcp.txt" }));
       expect(Buffer.from(read.value.content, "base64").toString()).toBe("A native Fossil checkpoint from MCP");
+      const progress = await call("company_workspace", args("status", { view: created.value.view, progress_cursor: "", limit: 1 }));
+      expect(progress.isError).not.toBe(true);
+      expect(progress.value.progress.version).toBe("omos.company-progress/v1");
+      expect(progress.value.progress.events).toHaveLength(1);
       expect((await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/private.txt" }))).isError).toBe(true);
       mode = "tamper";
       const uncertainRequest = args("create_view", { revision: boot.revision, objective: "Retain a view despite a corrupted response" });
@@ -1336,6 +1461,7 @@ sys.exit(result.returncode)
     legacyInput.version = { const: "omos.company/v1" };
     delete legacyInput.executable;
     delete legacyInput.previous_executable;
+    delete legacyInput.progress_cursor;
     delete legacyInput.upload;
     const tree = join(f.home, "legacy-declaration");
     mkdirSync(tree);
@@ -1375,6 +1501,7 @@ sys.exit(result.returncode)
       expect(boot.features.file_attributes).toBeNull();
       expect(boot.features.checkpoint_attributes).toBe(false);
       expect(boot.features.chunked_upload).toBe(false);
+      expect(boot.features.progress_history).toBe(false);
       const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report while upgrading its input model" });
       const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained legacy report" });
       expect(JSON.parse(f.fossil("cat", `company/views/${view.view}.json`, "-r", "omos-company")).reads).toBeUndefined();
@@ -1395,6 +1522,7 @@ sys.exit(result.returncode)
       expect(upgraded.features.file_attributes).toBe("omos.company/v2");
       expect(upgraded.features.checkpoint_attributes).toBe(true);
       expect(upgraded.features.chunked_upload).toBe(true);
+      expect(upgraded.features.progress_history).toBe(true);
       const read = await send("read", { view: view.view, path: "documents/team/report.md" });
       expect(read.read_tracking).toBe("recorded");
       expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");

@@ -45,7 +45,8 @@ fn descriptor(manager: workspace.Manager, dir: std.Io.Dir) !?Descriptor {
     return value;
 }
 
-fn issuerLock(dir: std.Io.Dir) !workspace.ExecutionLease {
+fn issuerLock(manager: workspace.Manager, dir: std.Io.Dir) !workspace.ExecutionLease {
+    if (manager.operation_control) |control| try control.check();
     const file = dir.openFile(io.getIo(), "issuer.lock", .{ .mode = .read_write, .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => dir.createFile(io.getIo(), "issuer.lock", .{ .exclusive = true, .truncate = false, .permissions = .fromMode(0o600) }) catch |created| switch (created) {
             error.PathAlreadyExists => try dir.openFile(io.getIo(), "issuer.lock", .{ .mode = .read_write, .follow_symlinks = false }),
@@ -56,9 +57,10 @@ fn issuerLock(dir: std.Io.Dir) !workspace.ExecutionLease {
     errdefer file.close(io.getIo());
     var attempts: usize = 0;
     while (!try file.tryLock(io.getIo(), .exclusive)) {
+        if (manager.operation_control) |control| try control.check();
         if (attempts >= 3000) return error.WorkspaceBusy;
         attempts += 1;
-        io.sleep(10 * std.time.ns_per_ms);
+        if (manager.operation_control != null) try io.getIo().sleep(.fromMilliseconds(10), .awake) else io.sleep(10 * std.time.ns_per_ms);
     }
     return .{ .file = file };
 }
@@ -78,7 +80,7 @@ fn readKey(manager: workspace.Manager, dir: std.Io.Dir, value: Descriptor) !Ed25
 pub fn current(manager: workspace.Manager, epoch: u64, public_key: []const u8) !Ed25519.KeyPair {
     var dir = try open(manager);
     defer dir.close();
-    const lease = try issuerLock(dir.dir);
+    const lease = try issuerLock(manager, dir.dir);
     defer lease.release();
     var value = (try descriptor(manager, dir.dir)) orelse return error.CompanyIssuerRecoveryRequired;
     if (!std.mem.eql(u8, value.repository, manager.repository)) return error.CompanyIssuerBoundElsewhere;
@@ -132,7 +134,7 @@ pub fn recoveryLease(manager: workspace.Manager) !?workspace.ExecutionLease {
 pub fn prepare(manager: workspace.Manager, epoch: u64, replace: bool) !Ed25519.KeyPair {
     var dir = try open(manager);
     defer dir.close();
-    const lease = try issuerLock(dir.dir);
+    const lease = try issuerLock(manager, dir.dir);
     defer lease.release();
     if (try descriptor(manager, dir.dir)) |previous| {
         if (previous.epoch == epoch and std.mem.eql(u8, previous.repository, manager.repository)) return readKey(manager, dir.dir, previous);

@@ -125,6 +125,14 @@ retain the operation ID when an outcome is uncertain. Successful calls return
 the original signed receipt in `structuredContent.receipt` for later inspection.
 Submission queues native independent review; it is not an acceptance receipt.
 
+For resumable view updates, call `status` with the view identity and
+`progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
+`progress.resume_cursor` for the next poll. Each signed request rechecks the
+grant. The feed remains pinned while paging and recovers its position after a
+service restart. It reports revision notifications; inspect the status snapshot
+and publication receipt to determine verification and acceptance. This version
+uses polling rather than an open HTTP subscription.
+
 The companion verifies response signatures, request hashes, issuer epoch, and
 identity fields. It forwards no owner bearer token or cookies and follows no
 redirects. It never automatically retries mutations. Cancellation or a missing

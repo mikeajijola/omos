@@ -981,6 +981,13 @@
                 "null"
               ]
             },
+            "progress_cursor": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 4096
+            },
             "executable": {
               "type": [
                 "boolean",

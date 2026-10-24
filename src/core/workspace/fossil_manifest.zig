@@ -11,6 +11,55 @@ pub const Manifest = struct { baseline: ?[]const u8 = null, files: []const File 
 pub const SizedFile = struct { path: []const u8, bytes: usize };
 pub const Change = struct { path: []const u8, before: ?File, after: ?File };
 
+pub const Checkin = struct { parent: ?[]const u8, timestamp: []const u8 };
+
+/// Callers verify the complete immutable artifact before using these metadata.
+/// Read first-parent ancestry without allocating its file inventory.
+pub fn checkin(raw: []const u8) !Checkin {
+    var parent: ?[]const u8 = null;
+    var timestamp: ?[]const u8 = null;
+    var parents = false;
+    var comment = false;
+    var checksum = false;
+    var lines = std.mem.splitScalar(u8, try cards(raw), '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (line.len < 2 or line[1] != ' ') return error.InvalidFossilManifest;
+        switch (line[0]) {
+            'C' => comment = true,
+            'Z' => checksum = true,
+            'D' => {
+                if (timestamp != null or line.len < 12 or line.len > 66) return error.InvalidFossilManifest;
+                timestamp = line[2..];
+            },
+            'P' => {
+                if (parents) return error.InvalidFossilManifest;
+                parents = true;
+                var words = std.mem.tokenizeScalar(u8, line[2..], ' ');
+                while (words.next()) |identity| {
+                    if (!validHash(identity)) return error.InvalidFossilManifest;
+                    if (parent == null) parent = identity;
+                }
+                if (parent == null) return error.InvalidFossilManifest;
+            },
+            else => {},
+        }
+    }
+    if (!comment or !checksum) return error.InvalidFossilManifest;
+    return .{ .parent = parent, .timestamp = timestamp orelse return error.InvalidFossilManifest };
+}
+
+test "Fossil progress follows first parents without trusting inventory or display identities" {
+    const root = try checkin("C Initial\\srevision\nD 2026-10-24T12:00:00.000\nZ checksum\n");
+    try std.testing.expect(root.parent == null);
+    try std.testing.expectEqualStrings("2026-10-24T12:00:00.000", root.timestamp);
+    const merged = try checkin("C Merge\nD 2026-10-24T12:00:01.000\nF documents/a.txt " ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "\nP " ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++ " " ++ "cccccccccccccccccccccccccccccccccccccccc" ++ "\nZ checksum\n");
+    try std.testing.expectEqualStrings("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", merged.parent.?);
+    try std.testing.expectError(error.InvalidFossilManifest, checkin("C Bad\nD 2026-10-24\nP abbreviated\nZ checksum\n"));
+    try std.testing.expectError(error.InvalidFossilManifest, checkin("C Bad\nD 2026-10-24\nP " ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "\nP " ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++ "\nZ checksum\n"));
+    try std.testing.expectError(error.InvalidFossilManifest, checkin("D 2026-10-24\nP " ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "\nZ checksum\n"));
+}
+
 /// Compare resolved inventories, including modes that Fossil's brief textual
 /// diff omits when the content object remains unchanged.
 pub fn compare(alloc: std.mem.Allocator, before: []const File, after: []const File) ![]const Change {

@@ -221,11 +221,23 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .progress_history = model.field(properties, "progress_cursor") != null, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
     var manager = original;
+    if (raw.len > 1024 * 1024) return error.ServiceRequestTooLarge;
+    const incoming = try records.decode(authority.Envelope, manager.alloc, raw, .{});
+    // This hint only installs a deadline. Authentication and declaration
+    // validation below remain mandatory before inspecting workspace state.
+    const hint = try records.decode(struct { progress_cursor: ?[]const u8 = null }, manager.alloc, incoming.payload, .{ .ignore_unknown_fields = true });
+    var cancelled = std.atomic.Value(bool).init(false);
+    if (hint.progress_cursor != null) {
+        const deadline: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = std.Io.Clock.Timestamp.now(io.getIo(), .awake).raw.addDuration(.fromSeconds(30)) };
+        if (manager.operation_control) |*control| {
+            if (std.Io.Clock.Timestamp.compare(deadline, .lt, control.deadline)) control.deadline = deadline;
+        } else manager.operation_control = .{ .cancel = &cancelled, .deadline = deadline };
+    }
     const lease = try manager.companyOperationLease();
     defer lease.release();
     manager.company_operation_held = true;
@@ -233,9 +245,10 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, raw), .input);
     const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
-    try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload), .input);
+    try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, incoming.payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
     if (request.upload != null and request.action != .checkpoint) return error.InvalidCompanyUpload;
+    if (request.progress_cursor != null and (request.action != .status or request.outcome != null or request.offset != 0 or request.revision != null)) return error.InvalidCompanyProgressCursor;
     const mutation = authority.isMutation(request.action);
     if (mutation and !writable) return error.ServiceReadOnly;
     if (mutation and request.action != .reconcile) if (request.view) |id| {
@@ -245,7 +258,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     // Never perform an effect without the key needed to acknowledge it.
     _ = try keys.current(manager, current.epoch, current.issuer);
     const path = try operationPath(manager, request.actor, request.operation);
-    const request_hash = try workspace.hash(manager.alloc, (try records.decode(authority.Envelope, manager.alloc, raw, .{})).payload);
+    const request_hash = try workspace.hash(manager.alloc, incoming.payload);
     const retained = try loadJournal(manager, path);
     if (retained) |previous| {
         if (!std.mem.eql(u8, previous.request_hash, request_hash) or !std.mem.eql(u8, previous.grant, grant.id)) return error.CompanyOperationConflict;
@@ -424,7 +437,9 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         }
         const view = selected orelse return error.CompanyViewRequired;
         const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else null;
-        return encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .job = job, .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null });
+        var result = try parse(alloc, try encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .job = job, .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null }));
+        if (request.progress_cursor) |cursor| try result.object.put(alloc, "progress", try @import("company_progress.zig").page(manager, current, grant, view.task, view.view.id, view.view.base, revision_id, cursor, request.limit));
+        return encode(alloc, result);
     }
     if (request.action == .record) {
         const view = selected orelse return error.CompanyViewRequired;

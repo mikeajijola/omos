@@ -501,6 +501,40 @@ are verified in the same checkpoint receipt as content and deletions. Conflictin
 flags fail without changing the source branch, and retries retain the original
 operation outcome.
 
+When public discovery reports `features.progress_history: true`, signed
+`status` requests for the caller's own view can include `progress_cursor: ""`
+to start a revision feed. Each page contains at most 32 `view_revision` events,
+newest first, with complete revision and first-parent identities and the
+committed timestamp. `limit` can reduce the page size. No document bodies,
+filenames, host paths, commit comments, or other actors' private views are
+included. Revision notifications do not establish useful progress or contract
+completion; the status snapshot's job and publication receipt report those
+separate outcomes.
+
+The `progress` response uses `omos.company-progress/v1`. Drain `next_cursor`
+until it is null, then retain `resume_cursor` for the next poll. Later pages
+remain pinned to the first page's revision. Checkpoints arriving during paging
+appear after resuming, without changing pages already being inspected. An idle
+poll returns an empty event list. Each page shares a 30-second allowance across
+admission, operation and issuer locks, Fossil reads, and receipt signing. A
+timeout does not advance the caller's retained cursor. A shorter caller-owned
+deadline remains in force.
+
+Cursors are signed by the current issuer and bind the workspace, actor, grant,
+view, epoch, stop revision, and pinned position. They supply no access authority.
+Every request checks the live grant. Tampered, cross-view, cross-grant, or
+obsolete-issuer cursors are rejected. Requests with progress cursors cannot
+also select an operation outcome, revision, or byte offset. The cursor format
+uses immutable first-parent identities, so restart and rebuilt local indexes
+do not change its position. The feed stops before the view's original base.
+
+Clients poll this bounded feed and retain their last fully consumed position.
+This version does not hold an HTTP subscription open or push SSE events.
+The optional MCP companion accepts the same fields through
+`company_workspace`. Older declarations do not advertise the feed; an explicit
+`omos fossil migrate --contracts` adds its optional transport field while
+preserving existing constraints and task contracts.
+
 When `features.chunked_upload` is true, `checkpoint` also accepts
 `upload: { "sha256": "FULL_LOWERCASE_SHA256", "bytes": 1234567 }`.
 Every part repeats the same actor, grant, view, target path, expected revision,

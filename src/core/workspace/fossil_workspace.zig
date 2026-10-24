@@ -2824,6 +2824,15 @@ pub const Manager = struct {
         return self.fileEntries(revision_id, true);
     }
 
+    pub fn checkinMetadata(self: Manager, identity: []const u8) !fossil_manifest.Checkin {
+        if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
+        const raw = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        // Progress positions require complete identities, including legacy
+        // SHA-1, rather than accepting abbreviated SHA-3 display prefixes.
+        try fossil_manifest.verifyObject(identity, raw);
+        return fossil_manifest.checkin(raw);
+    }
+
     pub fn history(self: Manager) ![]const u8 {
         return self.run(null, &.{ "timeline", "-n", "40", "--type", "ci", "-R", self.repository });
     }

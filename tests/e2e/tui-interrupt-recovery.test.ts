@@ -246,6 +246,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
 
       session.sendKeysImmediate(["C-c", "o", "k", "Enter"]);
       await waitForCondition(() => followUp.started, "follow-up request after tool completion");
+      await session.waitForText("Read probe.txt", TIMEOUT);
       await session.waitForText("Thinking", TIMEOUT);
       const activeGrid = await session.capturePaneGrid();
       expect(activeGrid.join("\n")).toContain("Read probe.txt");
@@ -941,6 +942,7 @@ while :; do sleep 1; done
       expect(cancelIndex).toBeGreaterThanOrEqual(0);
       expect(cancelIndex).toBeLessThan(completedToolIndex);
       await session.waitForText(`Searched ${pattern}`, TIMEOUT);
+      await session.waitForText("What can omniseedos do differently?", TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
       expect(countOccurrences(scrollback, "What can omniseedos do differently?")).toBe(1);
