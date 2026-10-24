@@ -1,0 +1,9 @@
+{$OMOS_COMPANY_DOMAIN} {
+    # Only the signed company capability endpoint crosses the public boundary.
+    handle /v1/company {
+        reverse_proxy 127.0.0.1:8765
+    }
+    handle {
+        respond "Not found" 404
+    }
+}

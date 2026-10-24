@@ -47,7 +47,7 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
       session = await TmuxSession.create();
       await session.waitForComposer(10_000);
       await session.sendText("/help");
-      const pane = await session.waitForText("Commands 37", 5_000);
+      const pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("[All]");
       expect(pane).toContain("tab category");
       expect(pane).toContain("enter open");
@@ -145,7 +145,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         expect(wideHelp).toBeDefined();
         const wideDescriptionColumn = wideHelp!.indexOf("show available slash commands");
-        expect(wideDescriptionColumn).toBe(18);
+        expect(wideDescriptionColumn).toBe(19);
 
         await session.resizeWindow(60, 40);
         const narrow = await session.waitForPane(

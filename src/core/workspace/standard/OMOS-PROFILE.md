@@ -26,7 +26,11 @@ response and attempt deadlines, automatic attempts, total time, serialized
 context, individual reads and reported token usage. New workspaces save these
 settings explicitly. Missing review settings retain the legacy eight-call,
 60-second, single-attempt policy. Automatic proposals may tighten allowances;
-increases remain inactive. See [contract authority](../CONTRACTS.md).
+increases remain inactive. The optional `server.review_workers` setting accepts
+1–4 independent review workers. New workspaces use 2; older policies retain 1.
+The server reads this capacity at startup. Increasing capacity requires an
+explicit contract migration rather than automatic proposal activation. Existing
+task policy hashes remain unchanged. See [contract authority](../CONTRACTS.md).
 
 `semantic.ts` is an unchanged reference copy of the SaaS extension from commit
 `e3d1d5f1ed7d5918f9d6997949a942c7fcdcb2f1`. Parity tests use it with the SaaS's

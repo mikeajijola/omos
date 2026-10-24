@@ -4,6 +4,53 @@ const std = @import("std");
 const io = @import("../shared/io.zig");
 const worker = @import("../agent/worker_runtime.zig");
 
+const ValidationFixture = struct {
+    host: *Host = undefined,
+    emitted: usize = 0,
+    respond: bool = false,
+
+    fn emit(raw: *anyopaque, _: []const u8) !void {
+        const self: *ValidationFixture = @ptrCast(@alignCast(raw));
+        self.emitted += 1;
+        if (self.respond) try self.host.validated(self.host.validation_id, "{\"status\":\"valid\"}");
+    }
+};
+
+test "workspace UI validation uses its caller deadline and rejects a late receipt" {
+    var fixture: ValidationFixture = .{};
+    var host: Host = .{ .context = &fixture, .emit_fn = ValidationFixture.emit };
+    fixture.host = &host;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(20) });
+    try std.testing.expectError(error.UiValidationPending, host.validateSource(std.testing.allocator, "source", deadline));
+    try std.testing.expectEqual(@as(usize, 1), fixture.emitted);
+    try std.testing.expectEqual(@as(usize, 0), host.validation_id);
+    try std.testing.expectError(error.StaleValidationRequest, host.validated(1, "{}"));
+}
+
+test "workspace UI validation retains an exact response and releases its request identity" {
+    var fixture: ValidationFixture = .{ .respond = true };
+    var host: Host = .{ .context = &fixture, .emit_fn = ValidationFixture.emit };
+    fixture.host = &host;
+    const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromSeconds(5) });
+    const response = try host.validateSource(std.testing.allocator, "source", deadline);
+    defer std.testing.allocator.free(response);
+    try std.testing.expectEqualStrings("{\"status\":\"valid\"}", response);
+    try std.testing.expectEqual(@as(usize, 0), host.validation_id);
+    try std.testing.expect(host.validation_response == null);
+}
+
+test "workspace UI validation does not dispatch an expired or cancelled request" {
+    var fixture: ValidationFixture = .{};
+    var host: Host = .{ .context = &fixture, .emit_fn = ValidationFixture.emit };
+    fixture.host = &host;
+    const expired = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(-1) });
+    try std.testing.expectError(error.UiValidationPending, host.validateSource(std.testing.allocator, "source", expired));
+    host.cancel.store(true, .release);
+    const future = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromSeconds(1) });
+    try std.testing.expectError(error.Cancelled, host.validateSource(std.testing.allocator, "source", future));
+    try std.testing.expectEqual(@as(usize, 0), fixture.emitted);
+}
+
 pub const Host = struct {
     context: *anyopaque,
     emit_fn: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -117,7 +164,9 @@ pub const Host = struct {
         return error.StaleInputRequest;
     }
 
-    pub fn validateSource(self: *Host, arena: std.mem.Allocator, revision: []const u8) ![]const u8 {
+    pub fn validateSource(self: *Host, arena: std.mem.Allocator, revision: []const u8, deadline: std.Io.Clock.Timestamp) ![]const u8 {
+        if (self.cancel.load(.acquire)) return error.Cancelled;
+        if (!std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline)) return error.UiValidationPending;
         self.mutex.lockUncancelable(io.getIo());
         const id = self.next_input;
         self.next_input += 1;
@@ -132,7 +181,6 @@ pub const Host = struct {
             self.mutex.unlock(io.getIo());
         }
         try self.emit(.{ .type = "validate_ui", .request_id = id, .revision = revision });
-        const deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60000) });
         while (!self.cancel.load(.acquire) and std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .lt, deadline)) {
             self.mutex.lockUncancelable(io.getIo());
             if (self.validation_response) |bytes| {
@@ -142,6 +190,7 @@ pub const Host = struct {
             self.mutex.unlock(io.getIo());
             io.sleep(10 * std.time.ns_per_ms);
         }
+        if (self.cancel.load(.acquire)) return error.Cancelled;
         return error.UiValidationPending;
     }
 

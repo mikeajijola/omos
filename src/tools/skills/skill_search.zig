@@ -39,10 +39,11 @@ pub fn searchRequest(
     request: capability_retrieval.Request,
     max_bytes: usize,
 ) !SearchResult {
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(
+    var discovery = try builtin_skills.loadManagedSkillsForTool(
         ctx.allocator,
         ctx.workspace_root,
         ctx.skills_dir,
+        ctx.fossil_session_id,
     );
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("capability_search", discovery.diagnostics);

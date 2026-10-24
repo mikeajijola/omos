@@ -50,7 +50,7 @@ pub fn inspect(manager: workspace.Manager, revision: []const u8) ![]const u8 {
 
 pub fn execute(manager: workspace.Manager, method: []const u8, raw: std.json.Value) ![]const u8 {
     const alloc = manager.alloc;
-    const Params = struct { revision: []const u8 = "", task: ?[]const u8 = null, session: ?[]const u8 = null, path: ?[]const u8 = null, offset: usize = 0, files: []const File = &.{}, content: ?[]const u8 = null };
+    const Params = struct { revision: []const u8 = "", task: ?[]const u8 = null, session: ?[]const u8 = null, path: ?[]const u8 = null, offset: usize = 0, files: []const File = &.{}, content: ?[]const u8 = null, rebind_project: bool = false };
     const request = try std.json.parseFromValueLeaky(Params, alloc, raw, .{});
     if (std.mem.eql(u8, method, "ui.import_legacy")) {
         const content = request.content orelse return error.MissingContent;
@@ -94,7 +94,7 @@ pub fn execute(manager: workspace.Manager, method: []const u8, raw: std.json.Val
     if (std.mem.eql(u8, method, "task.resume")) {
         var fenced = manager;
         fenced.expected_revision = request.revision;
-        const selected = try fenced.resumeTask(request.session orelse return error.SessionIdRequired, request.task orelse return error.TaskIdRequired, try @import("../shared/io.zig").realpathAlloc(alloc, "."));
+        const selected = try fenced.resumeTaskInProject(request.session orelse return error.SessionIdRequired, request.task orelse return error.TaskIdRequired, try @import("../shared/io.zig").realpathAlloc(alloc, "."), request.rebind_project);
         return std.json.Stringify.valueAlloc(alloc, selected, .{});
     }
     return error.UnsupportedUiMethod;

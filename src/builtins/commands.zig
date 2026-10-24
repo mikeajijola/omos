@@ -309,10 +309,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .fossil,
         .token = "fossil",
-        .usage = "fossil [init|use|status|tasks|diff|history|verify|recover|export|migrate|query|audit|serve|remote|definition show|validate|propose] [PATH] [--execution PATH] [--offset N] [--write] [--contracts] [--json]",
+        .usage = "fossil [ensure|init|company|company-key|use|status|tasks|diff|history|verify|recover|export|export-scope|verify-scope|migrate|query|audit|serve|remote|definition show|validate|propose] [PATH] [--execution PATH] [--offset N] [--write] [--contracts] [--json]",
         .summary = "Manage the portable agent workspace",
         .options = &.{json_option},
-        .details = &.{ "init defaults to omos.fossil and archives existing history.", "use remembers an absolute repository binding in your profile.", "export writes a verified clone and refuses to overwrite files.", "audit validates canonical records against their pinned contracts.", "serve [PORT] binds loopback and requires OMOS_WORKSPACE_TOKEN; --write permits typed records and definition proposals.", "remote URL [REQUEST.json] uses the workspace API without a local repository." },
+        .details = &.{ "ensure creates an empty personal instance when no workspace is bound; it never imports history.", "init defaults to omos.fossil and archives existing history.", "use remembers an absolute repository binding in your profile.", "company REQUEST.json manages signed company authority and exact proposal approvals as the local operator.", "company-key HANDLE creates or reuses a private actor key and prints its public identity.", "export writes a verified clone and refuses to overwrite files.", "export-scope CONFIG.json OUTPUT.tar downloads authorised files at one pinned company revision.", "verify-scope CONFIG.json ARCHIVE.tar verifies an exported package offline against its separate identity pins.", "audit validates canonical records against their pinned contracts.", "serve [PORT] binds loopback and requires OMOS_WORKSPACE_TOKEN; --write permits typed records and definition proposals.", "remote URL [REQUEST.json] uses the workspace API without a local repository." },
     },
     .{
         .kind = .schedule,
@@ -529,7 +529,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
-    .{ .kind = .task, .command = "/task", .help_entry = "/task new [goal] | resume <id>", .completion_description = "start or resume a Fossil task", .presentation_category = .agents, .has_args = true, .accepts_payload = true },
+    .{ .kind = .task, .command = "/task", .help_entry = "/task new [goal] | resume <id> [--rebind-project]", .completion_description = "start or resume a Fossil task", .presentation_category = .agents, .has_args = true, .accepts_payload = true },
     .{ .kind = .shell, .command = "/shell", .help_entry = "/shell reload", .completion_description = "reload shell startup files for commands", .presentation_category = .workspace, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the omniseedos version", .presentation_category = .general },
     .{ .kind = .quit, .command = "/quit", .aliases = &.{"/exit"}, .help_entry = "/quit", .completion_description = "exit the interactive shell", .presentation_category = .general, .show_in_welcome = true },

@@ -153,10 +153,14 @@ const Context = struct {
                 if (value != .string) return error.InvalidSchema;
                 try pattern.validate(self.alloc, try acceptancePattern(self.alloc, value.string), pattern_limits);
             } else if (std.mem.eql(u8, key, "type")) {
-                if (value != .string) return error.UnsupportedSchemaFeature;
-                var known = false;
-                for ([_][]const u8{ "object", "array", "string", "number", "integer", "boolean", "null" }) |name| known = known or std.mem.eql(u8, name, value.string);
-                if (!known) return error.InvalidSchema;
+                const kinds: []const Value = if (value == .string) &.{value} else if (value == .array and value.array.items.len > 0 and value.array.items.len <= 7) value.array.items else return error.InvalidSchema;
+                for (kinds, 0..) |kind, index| {
+                    if (kind != .string) return error.InvalidSchema;
+                    var known = false;
+                    for ([_][]const u8{ "object", "array", "string", "number", "integer", "boolean", "null" }) |name| known = known or std.mem.eql(u8, name, kind.string);
+                    if (!known) return error.InvalidSchema;
+                    for (kinds[0..index]) |previous| if (std.mem.eql(u8, previous.string, kind.string)) return error.InvalidSchema;
+                }
             } else if (std.mem.eql(u8, key, "enum")) {
                 if (value != .array or value.array.items.len == 0) return error.InvalidSchema;
             } else if (std.mem.eql(u8, key, "uniqueItems")) {
@@ -179,7 +183,13 @@ const Context = struct {
         if (schema != .object) return error.InvalidSchema;
         const fields = schema.object;
         if (fields.get("$ref")) |ref| try self.check(try self.resolve(ref.string), value, path, depth + 1);
-        if (fields.get("type")) |kind| if (!typeMatches(kind.string, value)) return self.fail(path, "Incorrect value type");
+        if (fields.get("type")) |kind| {
+            const accepted = if (kind == .string) typeMatches(kind.string, value) else accepted: {
+                for (kind.array.items) |option| if (typeMatches(option.string, value)) break :accepted true;
+                break :accepted false;
+            };
+            if (!accepted) return self.fail(path, "Incorrect value type");
+        }
         if (fields.get("const")) |expected| if (!equal(value, expected)) return self.fail(path, "Incorrect constant");
         if (fields.get("enum")) |options| {
             var found = false;
@@ -246,4 +256,19 @@ test "workspace declaration schema validates nested shapes and rejects unsupport
     try std.testing.expect(!(try validate(alloc, schema, bad)).valid);
     const unsupported = (try std.json.parseFromSlice(Value, alloc, "{\"format\":\"email\"}", .{})).value;
     try std.testing.expectError(error.UnsupportedSchemaFeature, supported(alloc, unsupported));
+}
+
+test "workspace declaration schema accepts nullable type unions without weakening other constraints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema = (try std.json.parseFromSlice(Value, alloc, "{\"type\":[\"string\",\"null\"],\"minLength\":2}", .{})).value;
+    try std.testing.expect((try validate(alloc, schema, .null)).valid);
+    try std.testing.expect((try validate(alloc, schema, .{ .string = "photo" })).valid);
+    try std.testing.expect(!(try validate(alloc, schema, .{ .string = "x" })).valid);
+    try std.testing.expect(!(try validate(alloc, schema, .{ .integer = 1 })).valid);
+    for ([_][]const u8{ "{\"type\":[]}", "{\"type\":[\"string\",\"string\"]}", "{\"type\":[\"string\",1]}", "{\"type\":[\"unknown\"]}" }) |raw| {
+        const invalid = (try std.json.parseFromSlice(Value, alloc, raw, .{})).value;
+        try std.testing.expectError(error.InvalidSchema, supported(alloc, invalid));
+    }
 }

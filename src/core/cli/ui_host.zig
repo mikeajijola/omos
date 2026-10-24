@@ -192,6 +192,11 @@ const Server = struct {
             }
             return value(arena, try manager.scheduleSnapshot(request));
         }
+        if (std.mem.eql(u8, method, "profile.read")) return parse(arena, try manager.profilePhoto(false, null));
+        if (std.mem.eql(u8, method, "profile.update")) {
+            const photo = try records.decode(struct { content: ?[]const u8 }, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{});
+            return parse(arena, try manager.profilePhoto(true, photo.content));
+        }
         if (std.mem.eql(u8, method, "workspace")) return parse(arena, try @import("../workspace/workspace_service.zig").execute(manager, try std.json.Stringify.valueAlloc(arena, params, .{}), false));
         if (std.mem.startsWith(u8, method, "ui.") or std.mem.eql(u8, method, "task.resume")) return parse(arena, try @import("../workspace/ui_artifact.zig").execute(manager, method, params));
         return error.UnsupportedUiMethod;
@@ -268,7 +273,7 @@ const Server = struct {
         const acknowledgement = try value(arena, .{ .turn = id, .already_accepted = false });
         const execution_lease: ?workspace.ExecutionLease = if (scheduled == null) blk: {
             const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
-            break :blk (try manager.tryExecutionLease()) orelse return error.WorkspaceExecutionBusy;
+            break :blk (try manager.trySessionExecutionLease(request.session orelse id)) orelse return error.WorkspaceExecutionBusy;
         } else null;
         errdefer if (execution_lease) |lease| lease.release();
         const job = try alloc.create(Job);
@@ -416,7 +421,7 @@ pub fn run(runner: Runner) !void {
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     var setup = std.heap.ArenaAllocator.init(alloc);
     defer setup.deinit();
-    const binding = (try workspace.Manager.bound(setup.allocator())) orelse return error.NoFossilWorkspace;
+    const binding = try workspace.Manager.ensureBound(setup.allocator());
     workspace.configureHostBinding(.{ .repository = binding.repository, .workspace_id = binding.manifest.id });
     defer workspace.configureHostBinding(null);
     const home = io.getenv("HOME") orelse return error.HomeUnavailable;

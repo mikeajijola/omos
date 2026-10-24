@@ -3819,6 +3819,20 @@ pub fn renderSchedules(alloc: std.mem.Allocator, snapshot: @import("../workspace
     return out.toOwnedSlice();
 }
 
+pub fn renderFossilCommand(alloc: std.mem.Allocator, reply: @import("../workspace/fossil_commands.zig").Reply, format: OutputFormat) ![]u8 {
+    switch (reply) {
+        .workspace => |snapshot| return renderFossilWorkspace(alloc, snapshot, format),
+        .scope => |snapshot| {
+            if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+            return alloc.print("Verified company file package: {s}\nWorkspace: {s}\nRevision: {s}\nFiles: {d}; bytes: {d}\nCapability dependency closure: not evaluated\n", .{ snapshot.path, snapshot.workspace, snapshot.revision, snapshot.files, snapshot.bytes });
+        },
+        .identity => |snapshot| {
+            if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+            return alloc.print("{s} local company actor key: {s}\nPublic key: {s}\n", .{ if (snapshot.created) "Created" else "Using existing", snapshot.key_handle, snapshot.public_key });
+        },
+    }
+}
+
 pub fn renderFossilWorkspace(alloc: std.mem.Allocator, snapshot: @import("../workspace/fossil_workspace.zig").Snapshot, format: OutputFormat) ![]u8 {
     if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
     var out: std.Io.Writer.Allocating = .init(alloc);

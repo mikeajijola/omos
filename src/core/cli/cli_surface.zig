@@ -1890,7 +1890,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
             const format: output_contracts.OutputFormat = if (options.json) .json else .text;
-            const output = try output_contracts.renderFossilWorkspace(alloc, snapshot, format);
+            const output = try output_contracts.renderFossilCommand(alloc, snapshot, format);
             defer alloc.free(output);
             try writeFormattedOutput(deps, output, format);
             return .handled_success;

@@ -234,6 +234,7 @@ pub const Input = struct {
     definition: ?work_contract.Definition = null,
     original_request: ?[]const u8 = null,
     prior_evidence: []const Evidence = &.{},
+    prior_payloads: []const retained_evidence.PayloadRef = &.{},
     prior_review_pages: []const []const u8 = &.{},
     prior_review_checkpoints: []const []const u8 = &.{},
     amendments: []const []const u8 = &.{},
@@ -475,7 +476,7 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         .obligations = &.{.{ .id = "request_complete", .description = "Fulfil every requested outcome and acceptance criterion in the original request, verified against the host's evidence records." }},
     };
     const evidence = try collectEvidence(alloc, input);
-    var view = try retained_evidence.View.init(alloc, evidence);
+    var view = try retained_evidence.View.initWithBacking(alloc, evidence, input.prior_payloads);
     view.max_read_bytes = input.policy.max_read_bytes;
     var ledger = try checkpoints.Ledger.init(alloc, definition, view);
     try ledger.restore(alloc, &view, input.prior_review_checkpoints);

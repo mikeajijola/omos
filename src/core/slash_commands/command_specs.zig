@@ -277,8 +277,8 @@ const HelpRole = enum {
 };
 
 pub fn matchesTopLevel(registry: TopLevelRegistry, token: []const u8, kind: TopLevelKind) bool {
-    const spec = topLevelSpec(registry, kind);
-    return matchesCommandToken(token, spec.token, spec.aliases);
+    for (registry.specs) |spec| if (spec.kind == kind) return matchesCommandToken(token, spec.token, spec.aliases);
+    return false;
 }
 
 pub fn matchesSlashExact(registry: SlashRegistry, cmd: []const u8, kind: SlashKind) bool {

@@ -801,6 +801,702 @@
           "api",
           "cli"
         ]
+      },
+      {
+        "id": "omos_company_request",
+        "capability": "general_task",
+        "description": "Authenticated company service envelope; runtime authority remains host owned.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "issuer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature",
+            "issuer"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_operation",
+        "capability": "general_task",
+        "description": "Scoped discovery, reads, isolated views, checkpoints, proposals and outcomes.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.company/v1",
+                "omos.company/v2"
+              ]
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "discover",
+                "read",
+                "create_view",
+                "checkpoint",
+                "submit",
+                "status",
+                "export_scope",
+                "delegate",
+                "reconcile",
+                "query",
+                "record"
+              ]
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "content": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "previous_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "objective": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "candidate": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "encoding": {
+              "type": "string",
+              "enum": [
+                "utf8",
+                "base64"
+              ]
+            },
+            "remove": {
+              "type": "boolean"
+            },
+            "delegated_grant": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "outcome": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "record_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "executable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "previous_executable": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "upload": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "sha256": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 8388608
+                }
+              },
+              "required": [
+                "sha256",
+                "bytes"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_admin",
+        "capability": "general_task",
+        "description": "Inspect retained company proposals and record local operator authority decisions.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "initialize",
+                "status",
+                "grant",
+                "revoke",
+                "rotate",
+                "inspect_proposal",
+                "approve",
+                "deny"
+              ]
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "grant": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "candidate_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "expires_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_create_company_key",
+        "capability": "general_task",
+        "description": "Create or reuse a local actor key handle and return its public identity.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "key_handle": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "key_handle"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-key/v1"
+            },
+            "key_handle": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "created": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "version",
+            "key_handle",
+            "public_key",
+            "created"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_export_scope",
+        "capability": "general_task",
+        "description": "Export a verified file snapshot within a live company grant, with explicit dependency closure status.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-export-request/v1"
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "actor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "grant": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_handle": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 3600000
+            }
+          },
+          "required": [
+            "version",
+            "endpoint",
+            "workspace",
+            "actor",
+            "grant",
+            "key_handle",
+            "issuer",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.scope-package/v1",
+                "omos.scope-package/v2"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scope": {
+              "const": "grant_file_snapshot"
+            },
+            "dependency_closure": {
+              "const": "not_evaluated"
+            },
+            "shared_cache": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "hits": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "misses": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "stored_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "evicted_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "evictions": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "hits",
+                "misses",
+                "stored_bytes",
+                "evicted_bytes",
+                "evictions"
+              ],
+              "additionalProperties": false
+            },
+            "file_attributes": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "path",
+            "workspace",
+            "revision",
+            "files",
+            "bytes",
+            "scope",
+            "dependency_closure"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_verify_scope",
+        "capability": "general_task",
+        "description": "Verify a scoped file package offline against separate issuer and scope pins.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.scope-export-request/v1"
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "actor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "grant": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_handle": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "view": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1099511627776
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 3600000
+            }
+          },
+          "required": [
+            "version",
+            "endpoint",
+            "workspace",
+            "actor",
+            "grant",
+            "key_handle",
+            "issuer",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.scope-package/v1",
+                "omos.scope-package/v2"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scope": {
+              "const": "grant_file_snapshot"
+            },
+            "dependency_closure": {
+              "const": "not_evaluated"
+            },
+            "shared_cache": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "hits": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "misses": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "stored_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "evicted_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "evictions": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "hits",
+                "misses",
+                "stored_bytes",
+                "evicted_bytes",
+                "evictions"
+              ],
+              "additionalProperties": false
+            },
+            "file_attributes": {
+              "enum": [
+                "verified",
+                "unavailable"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "path",
+            "workspace",
+            "revision",
+            "files",
+            "bytes",
+            "scope",
+            "dependency_closure"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
       }
     ],
     "semantic": {
@@ -1000,6 +1696,197 @@
             "hash",
             "state",
             "reason"
+          ]
+        },
+        {
+          "id": "omos_document",
+          "fields": {
+            "path": "string"
+          },
+          "required": [
+            "path"
+          ]
+        },
+        {
+          "id": "omos_profile",
+          "fields": {
+            "id": "string",
+            "photo_hash": "string",
+            "mime": "string"
+          },
+          "required": [
+            "id",
+            "photo_hash",
+            "mime"
+          ]
+        },
+        {
+          "id": "omos_company_authority",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "epoch": "number",
+            "issuer": "string",
+            "grants": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "epoch",
+            "issuer",
+            "grants"
+          ]
+        },
+        {
+          "id": "omos_workspace_view",
+          "fields": {
+            "id": "string",
+            "actor": "string",
+            "grant": "string",
+            "task": "string",
+            "base": "string",
+            "pending": "json",
+            "reads": "json"
+          },
+          "required": [
+            "id",
+            "actor",
+            "grant",
+            "task",
+            "base"
+          ]
+        },
+        {
+          "id": "omos_company_operation",
+          "fields": {
+            "version": "string",
+            "actor": "string",
+            "grant": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "state": "string",
+            "result": "json",
+            "failure": "json",
+            "view": "json",
+            "request": "json",
+            "receipt": "json",
+            "reconciled_by": "json"
+          },
+          "required": [
+            "version",
+            "actor",
+            "grant",
+            "operation",
+            "request_hash",
+            "state"
+          ]
+        },
+        {
+          "id": "omos_company_checkpoint",
+          "fields": {
+            "kind": "string",
+            "task": "string",
+            "operation": "string",
+            "base": "string",
+            "files": "json",
+            "outcome": "string",
+            "note": "string"
+          },
+          "required": [
+            "task",
+            "operation",
+            "base",
+            "files",
+            "outcome"
+          ]
+        },
+        {
+          "id": "omos_company_approval",
+          "fields": {
+            "version": "string",
+            "task": "string",
+            "payload": "string",
+            "signature": "string",
+            "issuer": "string"
+          },
+          "required": [
+            "version",
+            "task",
+            "payload",
+            "signature",
+            "issuer"
+          ]
+        },
+        {
+          "id": "omos_company_read",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "actor": "string",
+            "grant": "string",
+            "selector": "string",
+            "revision": "string",
+            "base_revision": "string",
+            "paths": "json",
+            "kind": "string",
+            "entity": "json",
+            "membership_hash": "json",
+            "base_membership_hash": "json",
+            "files": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "actor",
+            "grant",
+            "selector",
+            "revision",
+            "base_revision",
+            "paths",
+            "kind",
+            "files"
+          ]
+        },
+        {
+          "id": "omos_company_submission",
+          "fields": {
+            "version": "string",
+            "task": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "revision": "string",
+            "contract_hash": "string",
+            "candidate_hash": "string",
+            "reads": "json"
+          },
+          "required": [
+            "version",
+            "task",
+            "operation",
+            "request_hash",
+            "revision",
+            "contract_hash",
+            "candidate_hash",
+            "reads"
+          ]
+        },
+        {
+          "id": "omos_company_upload",
+          "fields": {
+            "version": "string",
+            "binding": "string",
+            "offset": "number",
+            "sha256": "string",
+            "content": "string"
+          },
+          "required": [
+            "version",
+            "binding",
+            "offset",
+            "sha256",
+            "content"
           ]
         }
       ],

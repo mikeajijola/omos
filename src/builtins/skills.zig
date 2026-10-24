@@ -55,6 +55,49 @@ pub fn loadVisibleSkillsForTool(
     );
 }
 
+/// A managed task's versioned skill packages take precedence over filesystem
+/// compatibility copies with the same name. Explicit locations remain distinct.
+pub fn loadManagedSkillsForTool(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    skills_dir: []const u8,
+    session: ?[]const u8,
+) !skill_runtime.SkillDiscovery {
+    const pinned = (try @import("../core/workspace/filesystem_projection.zig").skillsDirectory(alloc, session)) orelse return loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
+    var primary = try skill_runtime.loadVisibleSkills(alloc, null, null, pinned, .{ .managed_root_source = .workspace_fx });
+    errdefer primary.deinit(alloc);
+    var fallback = try loadVisibleSkillsForTool(alloc, workspace_root, skills_dir);
+    errdefer fallback.deinit(alloc);
+    var unique: usize = 0;
+    for (fallback.skills) |skill| {
+        const shadowed = for (primary.skills) |preferred| {
+            if (std.mem.eql(u8, skill.name, preferred.name)) break true;
+        } else false;
+        if (!shadowed) unique += 1;
+    }
+    const skills = try alloc.alloc(skill_runtime.Skill, primary.skills.len + unique);
+    errdefer alloc.free(skills);
+    const diagnostics = try alloc.alloc(skill_runtime.SkillDiagnostic, primary.diagnostics.len + fallback.diagnostics.len);
+    @memcpy(skills[0..primary.skills.len], primary.skills);
+    var index = primary.skills.len;
+    for (fallback.skills) |skill| {
+        const shadowed = for (primary.skills) |preferred| {
+            if (std.mem.eql(u8, skill.name, preferred.name)) break true;
+        } else false;
+        if (shadowed) skill_runtime.freeSkill(alloc, skill) else {
+            skills[index] = skill;
+            index += 1;
+        }
+    }
+    @memcpy(diagnostics[0..primary.diagnostics.len], primary.diagnostics);
+    @memcpy(diagnostics[primary.diagnostics.len..], fallback.diagnostics);
+    alloc.free(primary.skills);
+    alloc.free(primary.diagnostics);
+    alloc.free(fallback.skills);
+    alloc.free(fallback.diagnostics);
+    return .{ .skills = skills, .diagnostics = diagnostics };
+}
+
 fn homeFromSkillsDir(skills_dir: []const u8) ?[]const u8 {
     const suffix = "/.fx/skills";
     if (!std.mem.endsWith(u8, skills_dir, suffix)) return null;

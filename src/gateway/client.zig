@@ -2001,136 +2001,25 @@ fn runBoundedStreamOperation(
     );
 }
 
-pub fn runBoundedHttpOperation(
-    comptime Result: type,
-    alloc: std.mem.Allocator,
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
-    operation: anytype,
-) !Result {
-    if (cancel_flag.load(.seq_cst)) {
-        debug_trace.logf("stream", "bounded termination cause=cancellation phase=admission", .{});
-        return error.Cancelled;
-    }
-    std.debug.assert(deadline.clock == .awake);
-
-    const zio = io_mod.getIo();
-    const now = std.Io.Clock.Timestamp.now(zio, .awake);
-    if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) {
-        debug_trace.logf("stream", "bounded termination cause=deadline phase=admission", .{});
-        return error.Timeout;
-    }
-
-    const Event = union(enum) {
-        request: anyerror!Result,
-        watch: anyerror!BoundedRequestWatch.Outcome,
-    };
-    const Operation = @TypeOf(operation);
-    const Runner = struct {
-        fn run(value: Operation) anyerror!Result {
-            return value.run();
+pub fn runBoundedHttpOperation(comptime Result: type, alloc: std.mem.Allocator, cancel_flag: *std.atomic.Value(bool), deadline: std.Io.Clock.Timestamp, operation: anytype) !Result {
+    // Keep operations and results private to this module while the shared
+    // lifetime controller receives a public adapter.
+    const WrappedResult = struct {
+        result: Result,
+        pub fn deinit(self: *@This(), result_alloc: std.mem.Allocator) void {
+            self.result.deinit(result_alloc);
         }
     };
-    const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_result = request_result catch continue;
-                    late_result.deinit(result_alloc);
-                },
-                .watch => {},
-            };
+    const Operation = struct {
+        value: @TypeOf(operation),
+        pub fn run(self: @This()) anyerror!WrappedResult {
+            return .{ .result = try self.value.run() };
         }
     };
-
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(zio, &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| {
-        return err;
-    };
-    select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                debug_trace.logf("stream", "bounded termination cause=cancellation phase=request_result", .{});
-                var owned_result = request_result catch return error.Cancelled;
-                owned_result.deinit(alloc);
-                return error.Cancelled;
-            }
-            return request_result;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(alloc, &select, &watch);
-            const outcome = try watch_result;
-            if (outcome == .cancelled) {
-                debug_trace.logf("stream", "bounded termination cause=cancellation phase=control", .{});
-                return error.Cancelled;
-            }
-            if (cancel_flag.load(.seq_cst)) {
-                debug_trace.logf("stream", "bounded termination cause=cancellation phase=deadline_cleanup", .{});
-                return error.Cancelled;
-            }
-            debug_trace.logf("stream", "bounded termination cause=deadline phase=control", .{});
-            return error.Timeout;
-        },
-    }
+    const result = try @import("../core/shared/bounded_operation.zig").run(WrappedResult, alloc, cancel_flag, deadline, Operation{ .value = operation });
+    return result.result;
 }
-
-/// Watches one bounded request for cancellation and its deadline. The request
-/// owner stops it with `finish` instead of cancelling it: in Zig 0.17 a cancel
-/// can interrupt whatever task the watch's worker thread runs next, and an
-/// interrupted connect then fails with ISCONN.
-const BoundedRequestWatch = struct {
-    stopped: std.Io.Event = .unset,
-
-    const Outcome = enum { stopped, cancelled, deadline };
-
-    fn run(
-        watch: *BoundedRequestWatch,
-        cancel_flag: *std.atomic.Value(bool),
-        deadline: ?std.Io.Clock.Timestamp,
-    ) anyerror!Outcome {
-        const zio = io_mod.getIo();
-        while (true) {
-            if (cancel_flag.load(.seq_cst)) return .cancelled;
-            if (deadline) |limit| {
-                const now = std.Io.Clock.Timestamp.now(zio, .awake);
-                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) return .deadline;
-            }
-            watch.stopped.waitTimeout(zio, .{ .duration = .{
-                .raw = .fromMilliseconds(5),
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => |e| return e,
-            };
-            return .stopped;
-        }
-    }
-
-    /// Stops the watch and waits for its event, then releases the select.
-    /// Call only when the watch event is the one still outstanding.
-    fn finish(watch: *BoundedRequestWatch, select: anytype) void {
-        watch.stopped.set(select.io);
-        const event = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
-            // Only Select.cancel closes the queue, so nothing is outstanding.
-            error.Closed => return,
-        };
-        std.debug.assert(event == .watch);
-        std.debug.assert(select.cancel() == null);
-    }
-};
+const BoundedRequestWatch = @import("../core/shared/bounded_operation.zig").Watch;
 
 const GatewayCancelWatcher = struct {
     fn run(

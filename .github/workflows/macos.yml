@@ -164,6 +164,11 @@ jobs:
           fossil version
           zsh --version
 
+      - name: Stage the pinned installation helper
+        run: |
+          python3 scripts/stage-fossil-helper.py --platform macos-aarch64
+          python3 -m unittest scripts.tests.test_fossil_helper
+
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile
         working-directory: tests/e2e

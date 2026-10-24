@@ -142,7 +142,7 @@ fn prepareInput(ctx: tool_dispatch.DispatchContext, input: *const Input) !skill_
             return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = locations.skills, .diagnostics = locations.diagnostics }, input.name, path, ctx.max_tool_result_bytes);
         }
     }
-    var discovery = try builtin_skills.loadVisibleSkillsForTool(ctx.allocator, ctx.workspace_root, ctx.skills_dir);
+    var discovery = try builtin_skills.loadManagedSkillsForTool(ctx.allocator, ctx.workspace_root, ctx.skills_dir, ctx.fossil_session_id);
     defer discovery.deinit(ctx.allocator);
     skill_runtime.traceDiagnostics("skill_tool", discovery.diagnostics);
     return skill_invocation.prepareIdentity(ctx.allocator, .{ .skills = discovery.skills, .diagnostics = discovery.diagnostics }, input.name, location, ctx.max_tool_result_bytes);

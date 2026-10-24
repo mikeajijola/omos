@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "fossil_version": "2.28",
+  "source_revision": "52445a27f116603d784ad753c6acd494e0b02aeaf8502ee0fee0aa30030f4c4e",
+  "source_url": "https://fossil-scm.org/home/tarball/52445a27f116603d784ad753c6acd494e0b02aeaf8502ee0fee0aa30030f4c4e/fossil-src-2.28.tar.gz",
+  "platforms": {
+    "linux-x86_64": {
+      "url": "https://fossil-scm.org/home/uv/fossil-linux-x64-2.28.tar.gz",
+      "archive_sha256": "c9d2bf9d150dff1076eae1b0b822ed3cde892e1273f78b040c4f8ace1b59dd40",
+      "binary_sha256": "4f3ccbfec139e7b1ffc0b264aa36ecda3246cd9aa0fbc85dda107e9a41d70238",
+      "binary_bytes": 10326376
+    },
+    "linux-aarch64": {
+      "url": "https://fossil-scm.org/home/uv/fossil-pi-2.28.tar.gz",
+      "archive_sha256": "14f1a1e781caff9828fc740d7abf28f09f5ce191150408ae5450d4f786d0d846",
+      "binary_sha256": "263c7d1111b8fdef1d3dde88324d1f5c7caa51bdf9af766e3ffffbc645ed3157",
+      "binary_bytes": 8977808
+    },
+    "macos-x86_64": {
+      "url": "https://fossil-scm.org/home/uv/fossil-mac-x64-2.28.tar.gz",
+      "archive_sha256": "39475d5a763363e0bdccdfafa0c7f46f7946bb4ae7381b4346924400c5bd9fc1",
+      "binary_sha256": "5f56c11ac90003d83e410e411c8b13f0edd35c4c31bb7e95d58cf6776443a663",
+      "binary_bytes": 8675440
+    },
+    "macos-aarch64": {
+      "url": "https://fossil-scm.org/home/uv/fossil-mac-arm-2.28.tar.gz",
+      "archive_sha256": "f0956c7ab8b4eef63997d33d7f55a4b547447e7a9de7f8ab19222743a743fca3",
+      "binary_sha256": "d5e4608c4d7f85ce5482826206da1d4c8369eb99ec1f7bdc0bf51ffab2465a4e",
+      "binary_bytes": 8844656
+    }
+  }
+}

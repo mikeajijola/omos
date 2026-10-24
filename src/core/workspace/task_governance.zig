@@ -25,13 +25,16 @@ pub const State = struct {
     pause_reason: ?[]const u8 = null,
 
     pub noinline fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
+        return self.observeWithBacking(alloc, result, records, policy, &.{});
+    }
+    pub noinline fn observeWithBacking(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy, backing: []const evidence_mod.PayloadRef) !void {
         var novel = false;
         for (result.evidence) |id| for (records) |record| {
             if (!std.mem.eql(u8, id, record.id)) continue;
-            const identity = (try recordKey(alloc, record)) orelse continue;
+            const identity = (try recordKeyWithBacking(alloc, record, backing)) orelse continue;
             if (!self.seen.contains(identity)) novel = true;
         };
-        try self.seed(alloc, records);
+        try self.seedWithBacking(alloc, records, backing);
         self.stalls = if (result.meaningful and novel) 0 else self.stalls + 1;
         self.assessed_batches = self.batches;
         if (result.outcome == .pause) self.pause_reason = result.note;
@@ -39,17 +42,30 @@ pub const State = struct {
         self.finalizing = result.outcome == .finalize or self.pause_reason != null;
     }
     pub noinline fn seed(self: *State, alloc: std.mem.Allocator, records: []const review.Evidence) !void {
-        for (records) |record| if (try recordKey(alloc, record)) |identity| try self.seen.put(alloc, identity, {});
+        return self.seedWithBacking(alloc, records, &.{});
+    }
+    pub noinline fn seedWithBacking(self: *State, alloc: std.mem.Allocator, records: []const review.Evidence, backing: []const evidence_mod.PayloadRef) !void {
+        for (records) |record| if (try recordKeyWithBacking(alloc, record, backing)) |identity| try self.seen.put(alloc, identity, {});
+    }
+    fn eligible(record: review.Evidence) bool {
+        if (record.kind == .tool and record.status != .success) return false;
+        return record.kind == .tool or std.mem.startsWith(u8, record.id, "workspace-file:") or std.mem.startsWith(u8, record.id, "source-state:");
+    }
+    fn recordKeyWithBacking(alloc: std.mem.Allocator, record: review.Evidence, backing: []const evidence_mod.PayloadRef) !?[]const u8 {
+        if (!eligible(record)) return null;
+        for (backing) |reference| if (std.mem.eql(u8, reference.id, record.id)) {
+            const identity = reference.identity_sha256 orelse return error.InvalidContractEvidence;
+            return try alloc.dupe(u8, identity);
+        };
+        return recordKey(alloc, record);
     }
     noinline fn recordKey(alloc: std.mem.Allocator, record: review.Evidence) !?[]const u8 {
-        if (record.kind == .tool and record.status != .success) return null;
-        if (record.kind != .tool and !std.mem.startsWith(u8, record.id, "workspace-file:") and !std.mem.startsWith(u8, record.id, "source-state:")) return null;
-        // This fixed string/null object is already in canonical key order.
-        const bytes = try std.json.Stringify.valueAlloc(alloc, .{ .arguments = record.arguments, .content = record.content, .tool = record.tool }, .{});
-        defer alloc.free(bytes);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        return try alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+        if (!eligible(record)) return null;
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const payload = try std.json.Stringify.valueAlloc(a, .{ .arguments = record.arguments, .content = record.content }, .{});
+        return try alloc.dupe(u8, &try evidence_mod.progressIdentity(a, payload, record.tool));
     }
 };
 
@@ -102,18 +118,21 @@ const revision_instructions =
 
 pub const Reply = struct { raw: []const u8, usage: types.Usage };
 pub fn plan(alloc: std.mem.Allocator, provider: streams.Provider, request: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal) !Reply {
-    return invoke(alloc, provider, request, provider_id, packet, journal, plan_schema, plan_instructions, &.{});
+    return invoke(alloc, provider, request, provider_id, packet, journal, plan_schema, plan_instructions, &.{}, &.{});
 }
 pub fn revise(alloc: std.mem.Allocator, provider: streams.Provider, request: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal) !Reply {
-    return invoke(alloc, provider, request, provider_id, packet, journal, revision_schema, revision_instructions, &.{});
+    return invoke(alloc, provider, request, provider_id, packet, journal, revision_schema, revision_instructions, &.{}, &.{});
 }
 pub fn progress(alloc: std.mem.Allocator, provider: streams.Provider, request: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, records: []const review.Evidence) !Reply {
-    return invoke(alloc, provider, request, provider_id, packet, journal, progress_schema, progress_instructions, records);
+    return progressWithBacking(alloc, provider, request, provider_id, packet, journal, records, &.{});
+}
+pub fn progressWithBacking(alloc: std.mem.Allocator, provider: streams.Provider, request: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, records: []const review.Evidence, backing: []const evidence_mod.PayloadRef) !Reply {
+    return invoke(alloc, provider, request, provider_id, packet, journal, progress_schema, progress_instructions, records, backing);
 }
 fn discard(_: *anyopaque, _: streams.Event) void {}
-fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, function: schemas.FunctionSchema, instructions: []const u8, records: []const review.Evidence) !Reply {
+fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, function: schemas.FunctionSchema, instructions: []const u8, records: []const review.Evidence, backing: []const evidence_mod.PayloadRef) !Reply {
     if (packet.len > 128 * 1024) return error.TaskGovernancePending;
-    var view = try evidence_mod.View.init(alloc, records);
+    var view = try evidence_mod.View.initWithBacking(alloc, records, backing);
     const initial = try std.json.Stringify.valueAlloc(alloc, .{ .context = (try std.json.parseFromSlice(std.json.Value, alloc, packet, .{})).value, .evidence = try view.index(alloc, 0, 128), .evidenceCount = records.len, .nextEvidenceOffset = if (records.len > 128) @as(?usize, 128) else null }, .{});
     try journal.record(if (std.mem.eql(u8, function.name, plan_schema.name)) "planning_request" else if (std.mem.eql(u8, function.name, revision_schema.name)) "contract_revision_request" else "progress_request", initial);
     var messages: std.ArrayList(types.ChatMessage) = .empty;
@@ -197,4 +216,30 @@ test "workspace progress does not treat new call IDs or repeated results as prog
     for (0..3) |_| try state.observe(arena.allocator(), repeated, &records, .{});
     try std.testing.expect(state.pause_reason != null);
     try std.testing.expectEqual(@as(usize, 3), state.stalls);
+}
+
+test "workspace progress uses full host identities when payload previews are identical" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const first: review.Evidence = .{ .id = "first", .tool = "read_file", .status = .success, .content = "A shared preview followed by original bytes" };
+    var second = first;
+    second.id = "second";
+    second.content = "A shared preview followed by changed bytes";
+    const original_key = (try State.recordKey(alloc, first)).?;
+    const changed_key = (try State.recordKey(alloc, second)).?;
+    var preview = first;
+    preview.content = "A shared preview";
+    const original: evidence_mod.PayloadRef = .{ .id = "first", .path = "unused-host-cache-reference", .bytes = 4000, .sha256 = original_key, .identity_sha256 = original_key };
+    var repeated = original;
+    repeated.id = "second";
+    var state: State = .{};
+    try state.seedWithBacking(alloc, &.{preview}, &.{original});
+    preview.id = "second";
+    const decision: Progress = .{ .outcome = .continue_work, .meaningful = true, .evidence = &.{"second"}, .remaining = &.{"request_complete"}, .note = "The independent assessor inspected this evidence." };
+    try state.observeWithBacking(alloc, decision, &.{preview}, .{}, &.{repeated});
+    try std.testing.expectEqual(@as(usize, 1), state.stalls);
+    repeated.identity_sha256 = changed_key;
+    try state.observeWithBacking(alloc, decision, &.{preview}, .{}, &.{repeated});
+    try std.testing.expectEqual(@as(usize, 0), state.stalls);
 }

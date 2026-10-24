@@ -1209,7 +1209,7 @@ pub fn Commands(comptime App: type) type {
             const defs = configuredDefinitions(app);
             const current_provider = provider_runtime.provider(app);
             const inferred = completion_review.inferProviderSelection(query, current_provider, defs, provider_runtime.model(app));
-            const cross_provider = !inferred.provider.eql(current_provider) or std.mem.indexOfAny(u8, std.mem.trim(u8, query, " \t"), ": \t") != null;
+            const cross_provider = !inferred.provider.eql(current_provider) or !std.mem.eql(u8, inferred.model, std.mem.trim(u8, query, " \t\r\n"));
 
             if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
                 var ids = snapshot;

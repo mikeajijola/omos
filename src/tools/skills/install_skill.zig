@@ -68,7 +68,11 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
 
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
-    const output = executeFromSource(ctx.allocator, ctx.skills_dir, input.source, input.skill) catch |err| switch (err) {
+    const destination = @import("../../core/workspace/filesystem_projection.zig").skillsDirectory(ctx.allocator, ctx.fossil_session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try ctx.allocator.print("Workspace skill view unavailable: {s}", .{@errorName(err)}) },
+    };
+    const output = executeFromSource(ctx.allocator, destination orelse ctx.skills_dir, input.source, input.skill) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = try ctx.allocator.print("install_skill failed: {s}", .{@errorName(err)}) },
     };
@@ -83,7 +87,11 @@ pub fn executeRunCommand(
     ctx: tool_dispatch.DispatchContext,
     command: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    const output = executeFromSource(ctx.allocator, ctx.skills_dir, command, null) catch |err| switch (err) {
+    const destination = @import("../../core/workspace/filesystem_projection.zig").skillsDirectory(ctx.allocator, ctx.fossil_session_id) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .failure = try ctx.allocator.print("Workspace skill view unavailable: {s}", .{@errorName(err)}) },
+    };
+    const output = executeFromSource(ctx.allocator, destination orelse ctx.skills_dir, command, null) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return .{ .failure = try tool_result_errors.formatToolExecutionErrorJson(
             ctx.allocator,

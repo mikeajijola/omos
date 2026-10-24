@@ -875,7 +875,7 @@ describe("CLI work contracts", () => {
       expect(JSON.parse(result.stdout).output).toContain("host verified contents");
       expect(actorCalls).toBe(3);
       expect(reviews).toBe(2);
-      expect(f.requests).toHaveLength(5);
+      expect(f.requests).toHaveLength(6);
       expect(f.requests.every(request => request.authorization === "Bearer own-provider-token")).toBe(true);
     } finally { f.close(); }
   }, 30000);
@@ -922,7 +922,7 @@ describe("CLI work contracts", () => {
       });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(JSON.parse(result.stdout).output).toBe("Hello");
-      expect(f.requests).toHaveLength(2);
+      expect(f.requests).toHaveLength(3);
     } finally { f.close(); }
   }, 25000);
 
@@ -942,7 +942,7 @@ describe("CLI work contracts", () => {
         cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
       });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(f.requests).toHaveLength(2);
+      expect(f.requests).toHaveLength(3);
     } finally { f.close(); }
   }, 25000);
 

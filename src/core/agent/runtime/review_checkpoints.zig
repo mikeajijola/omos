@@ -47,10 +47,10 @@ pub const Ledger = struct {
 
     pub fn init(alloc: std.mem.Allocator, definition: contract.Definition, view: evidence.View) !Ledger {
         const records = try alloc.alloc(Record, view.records.len);
-        for (view.records, view.payloads, records) |record, payload, *out| {
+        for (view.records, records, 0..) |record, *out, i| {
             const counts = try alloc.alloc(Counts, definition.obligations.len);
             for (definition.obligations, counts) |obligation, *count| count.* = .{ .id = obligation.id };
-            out.* = .{ .id = record.id, .sha256 = try digest(alloc, payload), .bytes = payload.len, .obligations = counts };
+            out.* = .{ .id = record.id, .sha256 = view.payloadDigest(i), .bytes = view.payloadSize(i), .obligations = counts };
         }
         return .{ .definition = definition, .records = records };
     }
@@ -98,7 +98,10 @@ pub const Ledger = struct {
     pub fn submit(self: *Ledger, alloc: std.mem.Allocator, view: evidence.View, raw: []const u8) ![]const u8 {
         const segment = try record_json.decode(Submission, alloc, raw, .{});
         const i = try self.ordinal(segment.id);
-        try self.validate(segment, view.payloads[i], self.records[i].assessed_bytes);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const payload = try view.loadPayload(scratch.allocator(), i);
+        try self.validate(segment, payload, self.records[i].assessed_bytes);
         // Only raw bytes delivered in this attempt may establish a new decision.
         if (!view.rawInspected(i, segment.offset, segment.bytes)) return error.UninspectedContractEvidence;
         const receipt: Receipt = .{
@@ -106,7 +109,7 @@ pub const Ledger = struct {
             .version = self.definition.version,
             .segment = segment,
             .sha256 = self.records[i].sha256,
-            .segment_sha256 = try digest(alloc, view.payloads[i][segment.offset..][0..segment.bytes]),
+            .segment_sha256 = try digest(alloc, payload[segment.offset..][0..segment.bytes]),
         };
         self.apply(i, segment);
         return std.json.Stringify.valueAlloc(alloc, receipt, .{});
@@ -127,8 +130,10 @@ pub const Ledger = struct {
         for (receipts.items) |receipt| {
             if (!std.mem.eql(u8, receipt.contract_id, self.definition.id) or receipt.version != self.definition.version) continue;
             const i = self.ordinal(receipt.segment.id) catch continue;
-            const payload = view.payloads[i];
             if (!std.mem.eql(u8, receipt.sha256, self.records[i].sha256)) continue;
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const payload = try view.loadPayload(scratch.allocator(), i);
             self.validate(receipt.segment, payload, self.records[i].assessed_bytes) catch continue;
             if (!std.mem.eql(u8, receipt.segment_sha256, try digest(alloc, payload[receipt.segment.offset..][0..receipt.segment.bytes]))) continue;
             self.apply(i, receipt.segment);
@@ -169,7 +174,7 @@ pub const Ledger = struct {
     pub fn verify(self: Ledger, view: evidence.View, obligation: []const u8, id: []const u8) !void {
         const i = try self.ordinal(id);
         const record = self.records[i];
-        if (record.segments == 0 or view.rawInspected(i, 0, view.payloads[i].len)) return;
+        if (record.segments == 0 or view.rawInspected(i, 0, view.payloadSize(i))) return;
         for (record.obligations) |counts| if (std.mem.eql(u8, counts.id, obligation)) {
             if (counts.supports == 0 or counts.contradicts > 0) return error.InvalidContractEvidence;
             return;

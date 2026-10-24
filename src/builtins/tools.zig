@@ -843,10 +843,10 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
+    .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256 and bytes. Contracts, evidence, assessments and publication are host-owned.",
+        .description = "Inspect the pinned OmniForm definition, query typed workspace records, retain a plan refinement or custom record, and propose a compatible definition for future tasks. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
         .input_schema = .{
             .properties = &.{
                 .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui" } } },
@@ -981,7 +981,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "76aa3e15c145d262cd003a43ebb2e17b91c43c3fe7f0cfd5e13d8354f109eb5c",
+        "8ec3563058fd623637e5d6b6f8d44147f5a56abe4eb6e9df0a17cd00cf873bc7",
         &actual_hex,
     );
 }

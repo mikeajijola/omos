@@ -3,6 +3,23 @@ const std = @import("std");
 const sort_utils = @import("../../shared/sort_utils.zig");
 const types = @import("../../shared/types.zig");
 const record_json = @import("../../shared/record_json.zig");
+const io = @import("../../shared/io.zig");
+
+/// A rebuildable host cache entry, never a canonical evidence record or a
+/// model-supplied reference. Its bytes are checked before every retrieval.
+pub const PayloadRef = struct { id: []const u8, path: []const u8, bytes: usize, sha256: []const u8, identity_sha256: ?[]const u8 = null };
+
+/// Preserve the existing progress identity's canonical arguments/content/tool
+/// object while hashing the large serialized prefix without another copy.
+pub fn progressIdentity(alloc: std.mem.Allocator, payload: []const u8, tool: ?[]const u8) ![64]u8 {
+    if (payload.len == 0 or payload[payload.len - 1] != '}') return error.InvalidContractEvidence;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(payload[0 .. payload.len - 1]);
+    hash.update(",\"tool\":");
+    hash.update(try std.json.Stringify.valueAlloc(alloc, tool, .{}));
+    hash.update("}");
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
 
 pub const Evidence = struct {
     id: []const u8,
@@ -38,6 +55,9 @@ pub const View = struct {
     records: []const Evidence,
     inspected: []usize,
     payloads: []const []const u8,
+    payload_refs: []const ?PayloadRef,
+    payload_sizes: []const usize,
+    payload_digests: []const []const u8,
     raw_ranges: std.ArrayList(struct { ordinal: usize, start: usize, end: usize }) = .empty,
     max_read_bytes: usize = 16384,
 
@@ -55,11 +75,68 @@ pub const View = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, records: []const Evidence) !View {
+        return initWithBacking(alloc, records, &.{});
+    }
+
+    pub fn initWithBacking(alloc: std.mem.Allocator, records: []const Evidence, backing: []const PayloadRef) !View {
         const inspected = try alloc.alloc(usize, records.len);
         @memset(inspected, 0);
         const payloads = try alloc.alloc([]const u8, records.len);
-        for (records, payloads) |record, *payload| payload.* = try std.json.Stringify.valueAlloc(alloc, .{ .arguments = record.arguments, .content = record.content }, .{});
-        return .{ .records = records, .inspected = inspected, .payloads = payloads };
+        const refs = try alloc.alloc(?PayloadRef, records.len);
+        const sizes = try alloc.alloc(usize, records.len);
+        const digests = try alloc.alloc([]const u8, records.len);
+        var by_id: std.StringHashMapUnmanaged(PayloadRef) = .empty;
+        for (backing) |reference| {
+            if (reference.bytes <= 2048 or reference.bytes > 64 * 1024 * 1024 or reference.sha256.len != 64 or !std.mem.eql(u8, std.Io.Dir.path.basename(reference.path), reference.sha256)) return error.InvalidContractEvidence;
+            for (reference.sha256) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidContractEvidence;
+            if (reference.identity_sha256) |identity| {
+                if (identity.len != 64) return error.InvalidContractEvidence;
+                for (identity) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidContractEvidence;
+            }
+            const entry = try by_id.getOrPut(alloc, reference.id);
+            if (entry.found_existing) return error.InvalidContractEvidence;
+            entry.value_ptr.* = reference;
+        }
+        var matched: usize = 0;
+        for (records, payloads, refs, sizes, digests) |record, *payload, *reference, *size, *digest| {
+            reference.* = by_id.get(record.id);
+            if (reference.*) |value| {
+                matched += 1;
+                payload.* = "";
+                size.* = value.bytes;
+                digest.* = value.sha256;
+            } else {
+                payload.* = try std.json.Stringify.valueAlloc(alloc, .{ .arguments = record.arguments, .content = record.content }, .{});
+                size.* = payload.*.len;
+                digest.* = try payloadHash(alloc, payload.*);
+            }
+        }
+        if (matched != backing.len) return error.InvalidContractEvidence;
+        return .{ .records = records, .inspected = inspected, .payloads = payloads, .payload_refs = refs, .payload_sizes = sizes, .payload_digests = digests };
+    }
+
+    pub fn payloadSize(self: View, ordinal: usize) usize {
+        return self.payload_sizes[ordinal];
+    }
+
+    pub fn payloadDigest(self: View, ordinal: usize) []const u8 {
+        return self.payload_digests[ordinal];
+    }
+
+    /// Callers use an independent scratch allocator and release one payload
+    /// before loading another. The model still receives bounded byte ranges.
+    pub fn loadPayload(self: View, alloc: std.mem.Allocator, ordinal: usize) ![]const u8 {
+        const reference = self.payload_refs[ordinal] orelse return self.payloads[ordinal];
+        if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        var dir = try io.openDirAbsoluteNoFollow(std.Io.Dir.path.dirname(reference.path) orelse return error.InvalidContractEvidence, .{});
+        defer dir.close(io.getIo());
+        var file = try dir.openFile(io.getIo(), std.Io.Dir.path.basename(reference.path), .{ .allow_directory = false, .follow_symlinks = false });
+        defer file.close(io.getIo());
+        const stat = try file.stat(io.getIo());
+        if (stat.kind != .file or stat.size != reference.bytes) return error.InvalidContractEvidence;
+        const bytes = try io.readFileToEnd(alloc, &file, 64 * 1024 * 1024);
+        if (!std.mem.eql(u8, reference.sha256, try payloadHash(alloc, bytes))) return error.InvalidContractEvidence;
+        return bytes;
     }
 
     pub fn prefix(bytes: []const u8, limit: usize) []const u8 {
@@ -73,14 +150,12 @@ pub const View = struct {
         const end = start + @min(@min(limit, 128), self.records.len - start);
         const result = try alloc.alloc(IndexEntry, end - start);
         for (self.records[start..end], result, start..) |record, *entry, ordinal| {
-            const payload = self.payloads[ordinal];
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(payload, &digest, .{});
-            const complete = payload.len <= 2048;
+            const size = self.payloadSize(ordinal);
+            const complete = size <= 2048;
             const content = if (complete) record.content else prefix(record.content, 256);
             if (complete) {
-                self.inspected[ordinal] = payload.len;
-                try self.raw_ranges.append(alloc, .{ .ordinal = ordinal, .start = 0, .end = payload.len });
+                self.inspected[ordinal] = size;
+                try self.raw_ranges.append(alloc, .{ .ordinal = ordinal, .start = 0, .end = size });
             }
             entry.* = .{
                 .id = record.id,
@@ -88,8 +163,8 @@ pub const View = struct {
                 .tool = record.tool,
                 .arguments = if (record.arguments) |args| if (complete) args else prefix(args, 512) else null,
                 .status = record.status,
-                .bytes = payload.len,
-                .sha256 = try alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower)),
+                .bytes = size,
+                .sha256 = self.payloadDigest(ordinal),
                 .content = content,
                 .complete = complete,
                 .action_id = record.action_id,
@@ -116,7 +191,9 @@ pub const View = struct {
         const id = command.id orelse return error.InvalidContractEvidence;
         for (self.records, 0..) |record, ordinal| {
             if (!std.mem.eql(u8, record.id, id)) continue;
-            const payload = self.payloads[ordinal];
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const payload = try self.loadPayload(scratch.allocator(), ordinal);
             if (command.offset > payload.len or (command.offset < payload.len and (payload[command.offset] & 0xc0) == 0x80)) return error.InvalidEvidenceOffset;
             const chunk = prefix(payload[command.offset..], @min(command.limit, self.max_read_bytes));
             if (chunk.len == 0 and command.offset < payload.len) return error.InvalidEvidenceOffset;
@@ -127,7 +204,7 @@ pub const View = struct {
                 .offset = command.offset,
                 .content = chunk,
                 .bytes = payload.len,
-                .sha256 = try payloadHash(alloc, payload),
+                .sha256 = self.payloadDigest(ordinal),
                 .nextOffset = if (command.offset + chunk.len < payload.len) command.offset + chunk.len else @as(?usize, null),
                 .fullyInspected = self.inspected[ordinal] == payload.len,
             }, .{});
@@ -160,9 +237,9 @@ pub const View = struct {
                 const Gap = struct { offset: usize, bytes: usize };
                 var gaps: std.ArrayList(Gap) = .empty;
                 var cursor: usize = 0;
-                while (cursor < self.payloads[ordinal].len) {
+                while (cursor < self.payloadSize(ordinal)) {
                     var end = cursor;
-                    var next = self.payloads[ordinal].len;
+                    var next = self.payloadSize(ordinal);
                     for (self.raw_ranges.items) |range| {
                         if (range.ordinal != ordinal) continue;
                         if (range.start <= cursor) end = @max(end, range.end) else next = @min(next, range.start);
@@ -175,7 +252,7 @@ pub const View = struct {
                     try gaps.append(alloc, .{ .offset = cursor, .bytes = next - cursor });
                     cursor = next;
                 }
-                return std.json.Stringify.valueAlloc(alloc, .{ .id = id, .sha256 = try payloadHash(alloc, self.payloads[ordinal]), .bytes = self.payloads[ordinal].len, .missing = gaps.items }, .{});
+                return std.json.Stringify.valueAlloc(alloc, .{ .id = id, .sha256 = self.payloadDigest(ordinal), .bytes = self.payloadSize(ordinal), .missing = gaps.items }, .{});
             }
             return error.InvalidContractEvidence;
         }
@@ -202,8 +279,11 @@ pub const View = struct {
                 if (!matched) continue;
             }
             if (command.query) |query| {
-                if (std.ascii.findIgnoreCase(record.content, query) == null and
-                    std.ascii.findIgnoreCase(record.arguments orelse "", query) == null and
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const value = try record_json.decode(struct { arguments: ?[]const u8, content: []const u8 }, scratch.allocator(), try self.loadPayload(scratch.allocator(), ordinal), .{});
+                if (std.ascii.findIgnoreCase(value.content, query) == null and
+                    std.ascii.findIgnoreCase(value.arguments orelse "", query) == null and
                     std.ascii.findIgnoreCase(record.tool orelse "", query) == null) continue;
             }
             if (total >= command.offset and rows.items.len < command.limit) try rows.appendSlice(alloc, try self.index(alloc, ordinal, 1));
@@ -238,8 +318,10 @@ pub const View = struct {
             try seen.put(alloc, key, {});
             for (self.records, 0..) |record, i| {
                 if (!std.mem.eql(u8, record.id, page_value.id)) continue;
-                const payload = self.payloads[i];
-                if (payload.len != page_value.bytes or !std.mem.eql(u8, try payloadHash(alloc, payload), page_value.sha256)) break;
+                if (self.payloadSize(i) != page_value.bytes or !std.mem.eql(u8, self.payloadDigest(i), page_value.sha256)) break;
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const payload = try self.loadPayload(scratch.allocator(), i);
                 if (page_value.offset > payload.len or page_value.content.len > payload.len - page_value.offset or !std.mem.eql(u8, payload[page_value.offset..][0..page_value.content.len], page_value.content)) break;
                 if (page_value.offset + page_value.content.len <= self.inspected[i]) break;
                 // Large records advance through independent segment decisions,
@@ -263,7 +345,7 @@ pub const View = struct {
     pub fn requireInspected(self: View, id: []const u8) !void {
         for (self.records, 0..) |record, i| {
             if (!std.mem.eql(u8, record.id, id)) continue;
-            if (self.inspected[i] != self.payloads[i].len) return error.UninspectedContractEvidence;
+            if (self.inspected[i] != self.payloadSize(i)) return error.UninspectedContractEvidence;
             return;
         }
         return error.InvalidContractEvidence;

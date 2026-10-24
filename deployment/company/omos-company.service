@@ -1,0 +1,22 @@
+[Unit]
+Description=Omniseed company workspace gateway and review worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=%h/.local/share/omos/company
+EnvironmentFile=%h/.config/omos/company.env
+ExecStart=%h/.local/bin/omos fossil serve 8765 --write --json
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=35
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.fx %h/.local/share/omos/company
+
+[Install]
+WantedBy=default.target

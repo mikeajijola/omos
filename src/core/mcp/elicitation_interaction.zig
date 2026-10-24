@@ -948,7 +948,7 @@ fn answerUrl(
     }
 
     const failure_question = try alloc.print(
-        "omniseedos could not open the browser for {s}. The URL was not fetched. Continue manually, retry the browser, or cancel?",
+        "omniseedos could not open {s}; no URL was fetched. Continue manually, retry the browser, or cancel?",
         .{display_host},
     );
     defer alloc.free(failure_question);

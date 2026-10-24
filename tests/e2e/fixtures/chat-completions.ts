@@ -32,6 +32,12 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
       const body = request.method === "POST" ? await request.json() : null;
       requests.push({ path, authorization: request.headers.get("authorization"), body });
       if (path !== "/v1/chat/completions") return new Response("unexpected endpoint", { status: 500 });
+      // Saved personal instances now plan against a pinned declaration. Keep
+      // transport fixtures deterministic without counting planning as actor work.
+      const modeled = body as any;
+      if (modeled.tools?.some((tool: any) => tool.function?.name === "omos_task_plan")) {
+        return toolCompletion(modeled.model, "omos_task_plan", { capability: "general_task", summary: "Answer the requested question", obligations: [], checks: [] });
+      }
       return respond ? respond(body) : completion((body as any).model);
     },
   });

@@ -1,0 +1,74 @@
+name: Preview installation bundles
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/omos-installation.yml'
+      - 'scripts/*omos*'
+      - 'scripts/*fossil*'
+      - 'scripts/tests/test_fossil_helper.py'
+      - 'scripts/tests/test_omos_package.py'
+      - 'deployment/INSTALL.md'
+      - 'src/**'
+      - 'build.zig'
+      - 'build.zig.zon'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omos-installation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Install preview (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: macos-aarch64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: '0.17.0'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Check packaging Python
+        run: python3 -c 'import sys; assert sys.version_info >= (3, 12), "Packaging requires Python 3.12 or newer"'
+      - name: Build preview runtime
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Stage the pinned Fossil helper
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/stage-fossil-helper.py --platform "$PLATFORM"
+      - name: Package preview installation
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/package-omos.py --platform "$PLATFORM" --output "dist/omos-$PLATFORM.tar.gz" > package-report.json
+      - name: Verify installation without system Fossil
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/smoke-omos-package.py "dist/omos-$PLATFORM.tar.gz" > installation-smoke.json
+      - name: Retain preview and installation evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: omos-preview-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            package-report.json
+            installation-smoke.json

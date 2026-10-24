@@ -134,7 +134,7 @@ fn safeContentPath(path: []const u8) bool {
     if (path.len == 0 or path[0] == '/' or std.mem.findScalar(u8, path, '\\') != null or std.mem.findScalar(u8, path, 0) != null) return false;
     var parts = std.mem.splitScalar(u8, path, '/');
     while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-    for ([_][]const u8{ "history/", "records/", "memory/", "artifacts/", "skills/", "ui/", "tasks/", "omniform/", "execution/", "proposals/", "acceptances/", "jobs/" }) |root| if (std.mem.startsWith(u8, path, root)) return true;
+    for ([_][]const u8{ "history/", "records/", "memory/", "documents/", "artifacts/", "skills/", "ui/", "tasks/", "omniform/", "execution/", "proposals/", "acceptances/", "jobs/" }) |root| if (std.mem.startsWith(u8, path, root)) return true;
     return false;
 }
 
