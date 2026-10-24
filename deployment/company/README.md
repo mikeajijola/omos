@@ -70,10 +70,11 @@ on loopback; this configuration does not authorize exposing its other routes.
 
 ## Connect an external MCP client
 
-The optional `deployment/company/mcp.mjs` companion exposes the same signed
-operations over MCP stdio. It requires Node.js 22 or newer and the source tree
-containing the pinned `src/core/workspace/standard/omos.json` contract. The native
-installation and company server do not require Node.js. The companion negotiates
+The optional company MCP companion exposes the same signed operations over
+MCP stdio. The installer retains the companion and its pinned operation
+declaration; keeping the source checkout or unpacked download is unnecessary.
+The transport requires Node.js 22 or newer. The native installation and
+company server do not require Node.js. The companion negotiates
 MCP `2025-11-25` or `2025-06-18`; newer clients receive an explicit supported-version
 response and must negotiate a supported version.
 
@@ -105,16 +106,17 @@ the advertised interface; the native service checks the live grant on every
 operation. After issuer recovery, update these pins only after verifying the new
 identity and enrolling the client again.
 
-Configure your MCP client to launch:
+Read the installed entry path and register it with an omos MCP client:
 
 ```sh
-node "$OMOS_SOURCE/deployment/company/mcp.mjs" "$HOME/.config/omos/company-mcp.json"
+company_mcp_entry=$(node -p 'require(process.env.HOME+"/.fx/libexec/company-mcp.json").file')
+omos mcp add company -- node "$HOME/.fx/$company_mcp_entry" "$HOME/.config/omos/company-mcp.json"
 ```
 
-`OMOS_SOURCE` is the absolute path to the verified source checkout. For an omos
-client, register that command with `omos mcp add company -- node SCRIPT CONFIG`,
-using those absolute script and configuration paths. `omos mcp show company
---json` verifies connection and lists the tools.
+Other MCP clients use the same Node command, installed script, and absolute
+configuration path. `omos mcp show company --json` verifies connection and lists
+the tools. Development checkouts can still run `node
+deployment/company/mcp.mjs CONFIG`, with an absolute private configuration path.
 
 `company_context` returns the public instance discovery, configured actor and
 grant, current time, and configured actions. It does not certify live access.

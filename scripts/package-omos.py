@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--compression-level", type=int, choices=range(1, 10), default=6)
     args = parser.parse_args()
     helper = validate_inputs(root, args.platform, lock)
-    paths = ["zig-out/bin/fx", "zig-out/libexec/fossil", "scripts/install-omos.sh", "scripts/fossil-helper.lock.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "deployment/company/FOSSIL-NOTICES.md", "deployment/INSTALL.md"]
+    paths = ["zig-out/bin/fx", "zig-out/libexec/fossil", "scripts/install-omos.sh", "scripts/fossil-helper.lock.json", "deployment/company/mcp.mjs", "src/core/workspace/standard/omos.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "deployment/company/FOSSIL-NOTICES.md", "deployment/INSTALL.md"]
     with tempfile.TemporaryDirectory(prefix="omos-package-") as directory:
         tree = Path(directory) / "omos"
         for name in paths:

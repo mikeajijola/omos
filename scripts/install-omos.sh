@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 checkout_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 binary_path="$checkout_dir/zig-out/bin/fx"
@@ -26,11 +27,20 @@ if [ ! -x "$binary_path" ]; then
     exit 1
 fi
 source_binary="$binary_path"
+runtime_hash=$(sha256_file "$binary_path")
+runtime_dir="$HOME/.fx/releases/$runtime_hash"
 if [ "$copy_binary" -eq 1 ]; then
-    runtime_hash=$(sha256_file "$binary_path")
-    runtime_dir="$HOME/.fx/releases/$runtime_hash"
     binary_path="$runtime_dir/fx"
 fi
+
+company_source="$checkout_dir/deployment/company/mcp.mjs"
+company_schema="$checkout_dir/src/core/workspace/standard/omos.json"
+if [ ! -f "$company_source" ] || [ ! -f "$company_schema" ]; then
+    echo 'The installation is missing its company MCP companion or operation schema.' >&2
+    exit 1
+fi
+company_hash=$(sha256_file "$company_source")
+company_schema_hash=$(sha256_file "$company_schema")
 
 mkdir -p "$install_dir"
 for command in omos omo; do
@@ -74,6 +84,52 @@ mv "$helper_temporary" "$helper_dir/fossil-$helper_hash"
 mv "$helper_temporary.manifest" "$helper_dir/fossil.json"
 trap - EXIT HUP INT TERM
 
+# Publish each immutable companion file exclusively. The locator is activated
+# only after both files are verified, so interrupted installation can resume.
+install_component() {
+    component_source="$1"
+    component_target="$2"
+    component_expected="$3"
+    if [ -e "$component_target" ] || [ -L "$component_target" ]; then
+        if [ -L "$component_target" ] || [ ! -f "$component_target" ] || [ "$(sha256_file "$component_target")" != "$component_expected" ]; then
+            echo "Refusing to replace a changed installation component: $component_target" >&2
+            exit 1
+        fi
+        return
+    fi
+    component_parent=$(dirname -- "$component_target")
+    mkdir -p "$component_parent"
+    component_temporary=$(mktemp "$component_parent/.component.install.XXXXXXXX")
+    trap 'rm -f "$component_temporary"' EXIT HUP INT TERM
+    cp "$component_source" "$component_temporary"
+    chmod 600 "$component_temporary"
+    if [ "$(sha256_file "$component_temporary")" != "$component_expected" ]; then
+        echo 'An installation component changed while it was being copied.' >&2
+        exit 1
+    fi
+    if ln "$component_temporary" "$component_target" 2>/dev/null; then
+        :
+    elif [ -L "$component_target" ] || [ ! -f "$component_target" ] || [ "$(sha256_file "$component_target")" != "$component_expected" ]; then
+        echo "Refusing to replace a concurrent installation component: $component_target" >&2
+        exit 1
+    fi
+    rm -f "$component_temporary"
+    trap - EXIT HUP INT TERM
+}
+
+mkdir -p "$runtime_dir"
+chmod 700 "$runtime_dir"
+company_relative="releases/$runtime_hash/deployment/company/mcp.mjs"
+schema_relative="releases/$runtime_hash/src/core/workspace/standard/omos.json"
+install_component "$company_source" "$HOME/.fx/$company_relative" "$company_hash"
+install_component "$company_schema" "$HOME/.fx/$schema_relative" "$company_schema_hash"
+company_locator=$(mktemp "$helper_dir/company-mcp.install.XXXXXXXX")
+trap 'rm -f "$company_locator"' EXIT HUP INT TERM
+printf '{"version":"omos.company-mcp-installation/v1","file":"%s","runtime_sha256":"%s","files":[{"path":"%s","sha256":"%s"},{"path":"%s","sha256":"%s"}]}\n' "$company_relative" "$runtime_hash" "$company_relative" "$company_hash" "$schema_relative" "$company_schema_hash" > "$company_locator"
+chmod 600 "$company_locator"
+mv "$company_locator" "$helper_dir/company-mcp.json"
+trap - EXIT HUP INT TERM
+
 if [ "$copy_binary" -eq 1 ]; then
     mkdir -p "$runtime_dir"
     chmod 700 "$runtime_dir"
@@ -100,6 +156,8 @@ for command in omos omo; do
     fi
     echo "Installed $command: $destination"
 done
+
+echo "Optional company MCP companion: $HOME/.fx/$company_relative"
 
 "$install_dir/omos" fossil ensure --json
 

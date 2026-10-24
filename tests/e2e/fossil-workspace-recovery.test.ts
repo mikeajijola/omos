@@ -69,8 +69,8 @@ function commitFixtureAmendment(f: ReturnType<typeof fixture>, taskId: string, c
   command("close");
 }
 
-async function companyMcp(config: string, home: string) {
-  const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), config], {
+async function companyMcp(config: string, home: string, script = join(import.meta.dir, "../../deployment/company/mcp.mjs")) {
+  const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, script, config], {
     env: { ...process.env, HOME: home, OMOS_WORKSPACE_TOKEN: "owner-token-must-never-be-forwarded" }, stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
   let next = 0;
@@ -238,6 +238,10 @@ describe("portable Fossil workspace recovery", () => {
   test("connects native MCP clients to signed company operations without owner credentials or unsafe retries", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
+    const installed = spawnSync("sh", [join(import.meta.dir, "../../scripts/install-omos.sh")], { cwd: f.cwd, env: { ...process.env, ...f.env, XDG_BIN_HOME: join(f.home, "commands") }, encoding: "utf8", timeout: 60000 });
+    expect(installed.status, installed.stderr).toBe(0);
+    const installation = JSON.parse(readFileSync(join(f.home, ".fx/libexec/company-mcp.json"), "utf8"));
+    const companionEntry = join(f.home, ".fx", installation.file);
     const admin = async (body: object) => {
       const filename = join(f.home, "operator.json");
       writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
@@ -280,7 +284,7 @@ describe("portable Fossil workspace recovery", () => {
     const filename = join(f.home, "company-mcp.json");
     const config = { version: "omos.company-mcp/v1", endpoint: `http://127.0.0.1:${proxy.port}`, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "mcp-editor", key_handle: "mcp-worker", actions: ["discover", "read", "create_view", "checkpoint", "status", "reconcile"] };
     writeFileSync(filename, JSON.stringify(config), { mode: 0o600 });
-    const client = await companyMcp(filename, f.home);
+    const client = await companyMcp(filename, f.home, companionEntry);
     const call = async (name: string, args: object = {}) => {
       const response = await client.rpc("tools/call", { name, arguments: args });
       expect(response.error).toBeUndefined();
@@ -353,7 +357,7 @@ describe("portable Fossil workspace recovery", () => {
       expect(redirects).toBe(0);
       mode = "normal";
       expect(authorityHeaders.every(value => value === "")).toBe(true);
-      const added = await f.run(["mcp", "add", "company", "--", process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), filename], { FX_MCP_ENGINE: "v2" });
+      const added = await f.run(["mcp", "add", "company", "--", process.execPath, companionEntry, filename], { FX_MCP_ENGINE: "v2" });
       expect(added.code, added.stderr).toBe(0);
       const shown = await f.run(["mcp", "show", "company", "--json"], { FX_MCP_ENGINE: "v2" });
       expect(shown.code, shown.stderr + shown.stdout).toBe(0);
@@ -377,7 +381,7 @@ describe("portable Fossil workspace recovery", () => {
       await admin({ action: "revoke", revision: current.revision, id: "mcp-editor" });
       expect((await call("company_workspace", args("read", { view: created.value.view, revision: saved.value.revision, path: "documents/team/mcp.txt" }))).isError).toBe(true);
       const rejectedConfiguration = async (configuration: string) => {
-        const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, join(import.meta.dir, "../../deployment/company/mcp.mjs"), configuration], { env: { HOME: f.home, PATH: process.env.PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+        const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? process.execPath, companionEntry, configuration], { env: { HOME: f.home, PATH: process.env.PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
         const stdout = new Response(child.stdout).text(), stderr = new Response(child.stderr).text();
         expect(await child.exited).toBe(1);
         expect(await stdout).toBe("");
@@ -2859,11 +2863,34 @@ sys.exit(result.returncode)
       expect(alias.status, alias.stderr).toBe(0);
       expect(JSON.parse(alias.stdout).workspace_id).toBe(JSON.parse(status.stdout).workspace_id);
     }
+    const companion = JSON.parse(readFileSync(join(f.home, ".fx/libexec/company-mcp.json"), "utf8"));
+    expect(companion.version).toBe("omos.company-mcp-installation/v1");
+    expect(companion.files).toHaveLength(2);
+    for (const file of companion.files) {
+      const path = join(f.home, ".fx", file.path);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(createHash("sha256").update(readFileSync(path)).digest("hex")).toBe(file.sha256);
+    }
+    // Reproduce interruption after one immutable file was installed but before
+    // its pair and locator were acknowledged. Keep the first file intact.
+    const schemaFile = companion.files.find((file: any) => file.path.endsWith("/omos.json"));
+    rmSync(join(f.home, ".fx", schemaFile.path));
+    rmSync(join(f.home, ".fx/libexec/company-mcp.json"));
+    const again = spawnSync("sh", [script], { cwd: f.cwd, env: { ...process.env, ...f.env, XDG_BIN_HOME: join(f.home, ".local/bin") }, encoding: "utf8", timeout: 60000 });
+    expect(again.status, again.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(join(f.home, ".fx/libexec/company-mcp.json"), "utf8"))).toEqual(companion);
+    expect(createHash("sha256").update(readFileSync(join(f.home, ".fx", schemaFile.path))).digest("hex")).toBe(schemaFile.sha256);
+    const entry = join(f.home, ".fx", companion.file);
+    appendFileSync(entry, "\n// Retain this changed installation component.\n");
+    const refused = spawnSync("sh", [script], { cwd: f.cwd, env: { ...process.env, ...f.env, XDG_BIN_HOME: join(f.home, ".local/bin") }, encoding: "utf8", timeout: 60000 });
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain("Refusing to replace a changed installation component");
+    expect(readFileSync(entry, "utf8")).toContain("Retain this changed installation component");
     appendFileSync(helper, "changed");
     const changed = await f.run(["fossil", "status", "--json"]);
     expect(changed.code).toBe(1);
     expect(changed.stderr).toContain("FossilExecutableChanged");
-  }, 90000);
+  }, 180000);
 
   test.skipIf(!existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")))("installs a portable bundle without system Fossil and survives removal of the download", async () => {
     const f = fixture();
@@ -2891,6 +2918,23 @@ sys.exit(result.returncode)
       expect(status.tasks).toEqual([]);
       expect(status.repository).toBe(binding.repository);
     }
+    const keyResult = spawnSync(join(bin, "omos"), ["fossil", "company-key", "packaged-worker", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env, PATH: emptyPath }, encoding: "utf8", timeout: 30000 });
+    expect(keyResult.status, keyResult.stderr).toBe(0);
+    const key = JSON.parse(keyResult.stdout);
+    const companion = JSON.parse(readFileSync(join(f.home, ".fx/libexec/company-mcp.json"), "utf8"));
+    const entry = join(f.home, ".fx", companion.file);
+    expect(existsSync(entry)).toBe(true);
+    const config = join(f.home, "packaged-mcp.json");
+    writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: "http://127.0.0.1:9", workspace: binding.workspace_id, issuer: key.public_key, epoch: 1, actor: "worker", grant: "packaged-grant", key_handle: "packaged-worker", actions: ["status"] }), { mode: 0o600 });
+    const client = await companyMcp(config, f.home, entry);
+    try {
+      expect((await client.rpc("initialize", { protocolVersion: "2025-11-25" })).result.protocolVersion).toBe("2025-11-25");
+      const tools = (await client.rpc("tools/list")).result.tools;
+      expect(tools.map((tool: any) => tool.name)).toEqual(["company_context", "company_workspace"]);
+      expect(tools[1].inputSchema.properties.action.enum).toEqual(["status"]);
+      expect(tools[1].inputSchema.properties.progress_cursor.maxLength).toBe(4096);
+    } finally { await client.close(); }
+    expect(await client.stderr).toBe("");
   }, 180000);
 
   test("creates one empty personal instance automatically without importing existing sessions", async () => {

@@ -32,6 +32,15 @@ the runtime header and helper identity must match the requested platform.
 `installation.json` marks these bundles as previews; packaging alone does not
 establish production signing or PGSO qualification.
 
+The installer also retains the optional company MCP companion and its native
+operation declaration under the runtime's versioned release directory. Their
+hashes and the entry path are recorded in `~/.fx/libexec/company-mcp.json`.
+Interrupted installation can resume; changed files at an existing immutable
+component path are retained and rejected. The unpacked download is not needed
+after installation. Native CLI operation requires no Node.js runtime; using
+this optional MCP transport requires Node.js 22 or newer. See the
+[company connection procedure](company/README.md#connect-an-external-mcp-client).
+
 The `Preview installation bundles` workflow builds Linux Intel, Linux ARM,
 macOS Intel, and macOS Apple Silicon candidates on matching native runners.
 It stages the pinned helper and tests two fresh installations, both CLI aliases,
