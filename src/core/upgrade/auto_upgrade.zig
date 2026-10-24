@@ -43,6 +43,8 @@ pub const RelaunchRequest = struct {
 };
 
 pub fn shouldEnableForCurrentExecutable() bool {
+    // The upstream fx release does not contain this workspace runtime.
+    if (@import("../agent/runtime/completion_review.zig").enabled()) return false;
     var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.process.executablePath(io_mod.getIo(), &exe_buf) catch return true;
     return !isDevelopmentBuildPath(exe_buf[0..n]);
@@ -487,6 +489,15 @@ test "development build paths disable auto upgrade" {
     try std.testing.expect(isDevelopmentBuildPath("/repo/zig-out/bin/fx"));
     try std.testing.expect(isDevelopmentBuildPath("C:\\repo\\zig-out\\bin\\fx.exe"));
     try std.testing.expect(!isDevelopmentBuildPath("/Users/me/.local/bin/fx"));
+}
+
+test "workspace invocations disable upstream auto upgrade" {
+    const review = @import("../agent/runtime/completion_review.zig");
+    defer review.configureInvocation("fx");
+    for ([_][]const u8{ "omos", "omo", "ui-host" }) |program| {
+        review.configureInvocation(program);
+        try std.testing.expect(!shouldEnableForCurrentExecutable());
+    }
 }
 
 test "statusLabel downloading shows ellipsis" {

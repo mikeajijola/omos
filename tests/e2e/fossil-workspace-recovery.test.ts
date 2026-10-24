@@ -2847,6 +2847,30 @@ sys.exit(result.returncode)
     expect(existsSync(join(f.home, ".fx/instances/personal.fossil"))).toBe(false);
   }, 60000);
 
+  test("rejects the upstream updater before contacting it in a managed workspace", async () => {
+    const f = fixture();
+    let requests = 0;
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { requests++; return new Response("99.0.0"); } });
+    try {
+      const before = createHash("sha256").update(readFileSync(join(import.meta.dir, "../../zig-out/bin/fx"))).digest("hex");
+      const result = await f.run(["upgrade", "--json"], { FX_E2E_UPGRADE_BASE_URL: `http://127.0.0.1:${server.port}` }, 15000);
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain("WorkspaceRuntimeUpgradeUnsupported");
+      expect(result.stdout).toContain("verified omos bundle");
+      expect(requests).toBe(0);
+      expect(createHash("sha256").update(readFileSync(join(import.meta.dir, "../../zig-out/bin/fx"))).digest("hex")).toBe(before);
+      for (const name of ["omos", "omo"]) {
+        const alias = join(f.home, name);
+        symlinkSync(join(import.meta.dir, "../../zig-out/bin/fx"), alias);
+        const result = spawnSync(alias, ["upgrade", "--json"], { cwd: f.cwd, env: { ...process.env, ...f.env, FX_CONTRACT_REVIEW: undefined, FX_E2E_UPGRADE_BASE_URL: `http://127.0.0.1:${server.port}` }, encoding: "utf8", timeout: 5000 });
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout).toContain("WorkspaceRuntimeUpgradeUnsupported");
+      }
+      expect(requests).toBe(0);
+      expect(existsSync(join(f.home, ".fx/omos-workspace.json"))).toBe(false);
+    } finally { server.stop(true); }
+  }, 30000);
+
   test("installs a verified Fossil helper and rejects changes before executing it", async () => {
     const f = fixture();
     const script = join(import.meta.dir, "../../scripts/install-omos.sh");

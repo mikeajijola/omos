@@ -271,7 +271,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .kind = .upgrade,
         .token = "upgrade",
         .usage = "upgrade [--channel <stable|dev>] [--json]",
-        .summary = "Upgrade omniseedos on the selected release channel",
+        .summary = "Manage runtime updates",
+        .notes = &.{"Managed omos workspaces require a verified bundle installer; the upstream fx updater is disabled."},
         .options = &.{
             .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
             json_option,
@@ -366,7 +367,7 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .workspace, .usage = "workspace" },
         .{ .kind = .fossil, .usage = "fossil" },
         .{ .kind = .schedule, .usage = "schedule <command>" },
-        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Upgrade fx on the selected release channel" },
+        .{ .kind = .upgrade, .usage = "upgrade", .summary = "Manage runtime updates" },
         .{ .kind = .acp, .usage = "acp" },
         .{ .kind = .ui_host, .usage = "ui-host --stdio" },
         .{ .kind = .help, .usage = "help" },

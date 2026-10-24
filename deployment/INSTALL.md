@@ -23,6 +23,11 @@ Source installations can continue using `sh scripts/install-omos.sh` to link
 the current checkout's built runtime. Use `--copy` for a durable runtime copy.
 Both modes preserve a verified helper and refuse unrelated existing aliases.
 
+Update an installation by running the installer from a verified newer bundle.
+Managed workspace invocations disable the upstream fx background updater and
+reject `upgrade` before contacting that service. An upstream fx binary would
+not preserve the Omniseed workspace runtime or its installed companions.
+
 To package a freshly built runtime, stage the matching pinned upstream helper
 with `python3 scripts/stage-fossil-helper.py --platform PLATFORM`, then run
 `python3 scripts/package-omos.py --platform PLATFORM --output PATH.tar.gz`.

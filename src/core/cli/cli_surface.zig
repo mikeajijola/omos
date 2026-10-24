@@ -2083,6 +2083,16 @@ fn runNonInteractiveWithDeps(
                 return .handled_failure;
             };
 
+            if (@import("../agent/runtime/completion_review.zig").enabled()) {
+                const message = "Install a verified omos bundle with its installer; the upstream fx updater cannot update the workspace runtime";
+                if (opts.format == .json) {
+                    try writeJsonCommandFailure(alloc, deps, "upgrade", error.WorkspaceRuntimeUpgradeUnsupported, message);
+                } else {
+                    try writeStderr(deps, message ++ "\n");
+                }
+                return .handled_failure;
+            }
+
             var startup = deps.load_startup_state_without_credentials(
                 alloc,
                 cfg.default_model,
