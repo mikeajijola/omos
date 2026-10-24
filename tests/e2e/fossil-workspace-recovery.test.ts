@@ -1417,6 +1417,102 @@ sys.exit(result.returncode)
     expect(readFileSync(join(checkouts, recoveries[0], "memory/preference.md"), "utf8")).toBe("An uncommitted host scratch change");
   }, 120000);
 
+  for (const committed of [false, true]) test(`initializes company authority atomically across a sparse ${committed ? "commit" : "staging"} interruption`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const file = join(f.home, "initialize-sparse.json");
+    writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", action: "initialize" }));
+    const first = await f.run(["fossil", "company", file, "--json"], { FX_E2E_FOSSIL_FAULT: committed ? "company-sparse-commit-verified" : "company-sparse-written" });
+    expect(first.code, first.stderr).toBe(1);
+    expect(first.stderr).toContain("WorkspaceInjectedFailure");
+    const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const issuerPath = join(f.home, ".fx/authority", snapshot.workspace_id, "issuer.json");
+    const prepared = JSON.parse(readFileSync(issuerPath, "utf8"));
+    if (committed) {
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", action: "status" }));
+    } else {
+      expect(f.fossil("branch", "list", "--all")).not.toContain("omos-company");
+    }
+    const recovered = await f.run(["fossil", "company", file, "--json"]);
+    expect(recovered.code, recovered.stderr).toBe(0);
+    const result = JSON.parse(recovered.stdout).model_data;
+    expect(result.authority).toMatchObject({ issuer: prepared.public_key, epoch: 1, grants: [] });
+    expect(f.fossil("branch", "list", "--all")).toContain("omos-company");
+    const actor = generateKeyPairSync("ed25519");
+    writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", action: "grant", revision: result.revision, grant: { id: "recovered-reader", actor: "reader", public_key: actor.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["read"], expires_ms: Date.now() + 3600000 } }));
+    const granted = await f.run(["fossil", "company", file, "--json"]);
+    expect(granted.code, granted.stderr).toBe(0);
+    const active = JSON.parse(granted.stdout).model_data;
+    expect(active.authority.issuer).toBe(prepared.public_key);
+    const updated = JSON.parse(readFileSync(issuerPath, "utf8"));
+    expect(updated.control_revision).toBe(active.revision);
+    const verified = await f.run(["fossil", "verify", "--json"]);
+    expect(verified.code, verified.stderr).toBe(0);
+  }, 90000);
+
+  for (const interrupted of ["company-sparse-written", "company-sparse-commit-verified"]) test(`keeps company control writes sparse and recovers ${interrupted} without discarding local files`, async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("A sparse control write cannot dispatch an actor"); });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const data = "Shared company baseline.\n".repeat(32768);
+    const tree = join(f.home, "baseline-source"); mkdirSync(tree);
+    const helper = join(import.meta.dir, "../../zig-out/libexec/fossil");
+    const seed = (...args: string[]) => {
+      const result = spawnSync(existsSync(helper) ? helper : "fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    seed("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+    mkdirSync(join(tree, "documents/team"), { recursive: true });
+    writeFileSync(join(tree, "documents/team/shared.txt"), data);
+    seed("add", "documents/team/shared.txt"); seed("commit", "--nosync", "--nosign", "-m", "Retain an existing company baseline"); seed("close");
+    const admin = async (body: object) => {
+      const file = join(f.home, "sparse-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "sparse-worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "status"], expires_ms: Date.now() + 3600000 } });
+    const snapshot = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const cache = join(f.home, ".fx/fossil", createHash("sha256").update(snapshot.repository).digest("hex"));
+    const scratch = join(cache, "company-scratch");
+    expect(existsSync(scratch)).toBe(false);
+    mkdirSync(scratch); writeFileSync(join(scratch, "retain-local-note.txt"), "This independently edited note must survive");
+    let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: interrupted });
+    try {
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      const operation = crypto.randomUUID();
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "sparse-worker", operation, expires_ms: Date.now() + 120000, action: "create_view", revision: boot.revision, objective: "Retain a lightweight isolated company view" });
+      const raw = JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") });
+      const post = () => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: raw });
+      const failed = await post(); expect(failed.status).toBe(400);
+      expect(await failed.text()).toContain("WorkspaceInjectedFailure");
+      expect(existsSync(join(scratch, "documents"))).toBe(false);
+      expect(existsSync(join(scratch, "omniform"))).toBe(false);
+      const staged = readdirSync(join(scratch, "company/operations"));
+      expect(staged).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(scratch, "company/operations", staged[0]), "utf8")).request).toBe(raw);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      const retry = await post();
+      const envelope = await retry.json() as any;
+      expect(retry.status, JSON.stringify(envelope)).toBe(200);
+      expect(JSON.parse(envelope.payload).result).toHaveProperty("view");
+      expect(existsSync(scratch)).toBe(false);
+      const recoveries = readdirSync(cache).filter((name: string) => name.startsWith("company-scratch.recovery-")).map((name: string) => join(cache, name));
+      expect(recoveries).toHaveLength(2);
+      expect(recoveries.some((path: string) => existsSync(join(path, "retain-local-note.txt")) && readFileSync(join(path, "retain-local-note.txt"), "utf8") === "This independently edited note must survive")).toBe(true);
+      expect(recoveries.some((path: string) => existsSync(join(path, "company/operations", staged[0])) && JSON.parse(readFileSync(join(path, "company/operations", staged[0]), "utf8")).request === raw)).toBe(true);
+      expect(createHash("sha256").update(f.fossil("cat", "documents/team/shared.txt", "-r", "trunk")).digest("hex")).toBe(createHash("sha256").update(data).digest("hex"));
+      expect(createHash("sha256").update(f.fossil("cat", "documents/team/shared.txt", "-r", "omos-company")).digest("hex")).toBe(createHash("sha256").update(data).digest("hex"));
+      expect(f.fossil("ls", "-r", "omos-company")).not.toContain("retain-local-note.txt");
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+      const verified = await f.run(["fossil", "verify", "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 120000);
+
   test("keeps company drafts isolated without copying the company files for every view", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

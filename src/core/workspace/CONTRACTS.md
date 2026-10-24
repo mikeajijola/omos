@@ -815,6 +815,19 @@ trust in that company issuer separately. The resulting check-in contains the
 proof; it cannot embed its own final check-in hash. Fossil ancestry and the
 immutable receipt path connect the proof to the resulting revision.
 
+Protected company-control records use a metadata-only host checkout and commit
+only explicitly named changed files. The first authority commit creates its
+control branch atomically; an interruption before that commit leaves the
+instance uninitialized and permits a retry with the prepared issuer key. Unchanged company content stays referenced
+in Fossil and is not materialized in that scratch directory. The host compares
+the complete parent and resulting manifests, verifies the changed object hashes
+and saved bytes, and rejects unrelated changes. Healthy scratch files are removed
+after verification. An interrupted or independently edited scratch tree is
+retained under a recovery name before reuse. Generic add/remove scans and
+incremental VCS import are not used for these writes. Task content, publication,
+and actor filesystem projections keep their existing paths; this change does
+not provide a remote filesystem mount or fully sparse actor views.
+
 This service currently supports path scopes and file or record conflict
 boundaries. Field-level record merges, dependency closure packaging, remote
 filesystem mounting, hosted actor isolation, federated identity enrollment, and

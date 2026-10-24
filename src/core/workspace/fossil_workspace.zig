@@ -576,17 +576,103 @@ pub const Manager = struct {
             if (file.content.len > max_bytes) return error.WorkspaceRecordTooLarge;
             for (files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.DuplicateWorkspacePath;
         }
-        if (current == null) _ = try self.run(null, &.{ "branch", "new", company_branch, "trunk", "-R", self.repository });
-        const tree = try self.checkout(company_branch);
+        const mutation = try self.commitCompanyFiles(current, files);
+        try @import("company_keys.zig").observe(self);
+        for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
+        if (mutation.tree) |tree| self.cleanCompanyTree(tree, files) catch |err| {
+            debug_trace.logf("workspace", "company scratch retained for recovery error={s}", .{@errorName(err)});
+        };
+        return mutation.revision;
+    }
+
+    // Only protected control records use this path. Explicit commit filenames
+    // preserve every absent base file; generic addremove/commit is forbidden.
+    fn commitCompanyFiles(self: Manager, current: ?[]const u8, files: []const CompanyFile) !struct { revision: []const u8, tree: ?[]const u8 = null } {
+        const base = current orelse try self.revision("trunk");
+        const before = try self.fileManifest(base);
+        var changed: std.ArrayList(CompanyFile) = .empty;
         for (files) |file| {
+            for (before) |entry| if (caseCollides(entry.path, file.path)) return error.WorkspaceProjectionConflict;
+            for (changed.items) |entry| if (caseCollides(entry.path, file.path)) return error.WorkspaceProjectionConflict;
+            const prior = for (before) |entry| {
+                if (std.mem.eql(u8, entry.path, file.path)) break entry;
+            } else null;
+            if (prior) |entry| if (entry.mode == .regular and std.mem.eql(u8, file.content, try self.contentAt(file.path, base))) continue;
+            try changed.append(self.alloc, file);
+        }
+        if (changed.items.len == 0) return .{ .revision = base };
+        const tree = try join(self.alloc, self.root, "company-scratch");
+        if (exists(tree)) {
+            // A successful transaction removes its scratch tree. Anything left
+            // is interrupted or independently edited, including local DB state.
+            var nonce: [16]u8 = undefined;
+            io_mod.getIo().random(&nonce);
+            try std.Io.Dir.rename(std.Io.Dir.cwd(), tree, std.Io.Dir.cwd(), try self.alloc.print("{s}.recovery-{s}", .{ tree, std.fmt.bytesToHex(&nonce, .lower) }), io_mod.getIo());
+        }
+        try mkdir(tree);
+        _ = try self.run(tree, &.{ "open", "--keep", "--nosync", self.repository, if (current == null) "trunk" else company_branch });
+        if (!std.mem.eql(u8, base, try self.fullRevision(tree, "current"))) return error.WorkspaceRevisionChanged;
+        var add: std.ArrayList([]const u8) = .empty;
+        try add.appendSlice(self.alloc, &.{ "add", "--" });
+        var commit_args: std.ArrayList([]const u8) = .empty;
+        try commit_args.appendSlice(self.alloc, &.{ "commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Record company operation outcome" });
+        if (current == null) try commit_args.appendSlice(self.alloc, &.{ "--branch", company_branch });
+        for (changed.items) |file| {
             var parent = try contentParent(self.alloc, tree, file.path);
             defer parent.close(io_mod.getIo());
             try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(file.path), file.content);
+            try add.append(self.alloc, file.path);
+            try commit_args.append(self.alloc, file.path);
         }
-        const revision_id = if ((try self.run(tree, &.{ "changes", "--hash", "--differ" })).len == 0 and (try self.run(tree, &.{ "extras", "--dotfiles" })).len == 0) try self.revision(company_branch) else try self.commit(tree, "Record company operation outcome");
-        try @import("company_keys.zig").observe(self);
-        for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
-        return revision_id;
+        try fault("company-sparse-written");
+        _ = try self.run(tree, add.items);
+        _ = try self.run(tree, commit_args.items);
+        const revision_id = try self.fullRevision(tree, "current");
+        const after = try self.fileManifest(revision_id);
+        const changes = try fossil_manifest.compare(self.alloc, before, after);
+        if (changes.len != changed.items.len) return error.WorkspaceVerificationFailed;
+        for (changes) |change| {
+            const expected = for (changed.items) |file| {
+                if (std.mem.eql(u8, file.path, change.path)) break file;
+            } else return error.WorkspaceVerificationFailed;
+            const saved = change.after orelse return error.WorkspaceVerificationFailed;
+            if (saved.mode != .regular) return error.WorkspaceVerificationFailed;
+            try fossil_manifest.verifyObject(saved.artifact orelse return error.WorkspaceVerificationFailed, expected.content);
+            if (!std.mem.eql(u8, expected.content, try self.contentAt(expected.path, revision_id))) return error.WorkspaceVerificationFailed;
+        }
+        try fault("company-sparse-commit-verified");
+        return .{ .revision = revision_id, .tree = tree };
+    }
+
+    fn cleanCompanyTree(self: Manager, tree: []const u8, files: []const CompanyFile) !void {
+        for (files) |file| {
+            const path = try join(self.alloc, tree, file.path);
+            if (!exists(path)) continue;
+            // Keep a concurrent out-of-band edit rather than deleting it.
+            var parent = try contentParent(self.alloc, tree, file.path);
+            defer parent.close(io_mod.getIo());
+            var stored = try parent.openFile(io_mod.getIo(), std.Io.Dir.path.basename(file.path), .{ .allow_directory = false, .follow_symlinks = false });
+            const stat = stored.stat(io_mod.getIo()) catch |err| {
+                stored.close(io_mod.getIo());
+                return err;
+            };
+            const saved = io_mod.readFileToEnd(self.alloc, &stored, max_bytes) catch |err| {
+                stored.close(io_mod.getIo());
+                return err;
+            };
+            stored.close(io_mod.getIo());
+            if (stat.kind != .file or stat.nlink != 1 or !std.mem.eql(u8, file.content, saved)) return error.WorkspaceProjectionConflict;
+            try parent.deleteFile(io_mod.getIo(), std.Io.Dir.path.basename(file.path));
+            var directory = std.Io.Dir.path.dirname(path).?;
+            while (!std.mem.eql(u8, directory, tree)) {
+                std.Io.Dir.cwd().deleteDir(io_mod.getIo(), directory) catch break;
+                directory = std.Io.Dir.path.dirname(directory) orelse break;
+            }
+        }
+        _ = try self.run(tree, &.{ "close", "--force" });
+        // Unknown files or directories keep the tree for the next recovery
+        // archive. Never recursively delete a host working directory.
+        try std.Io.Dir.cwd().deleteDir(io_mod.getIo(), tree);
     }
 
     pub fn companyOperationLease(self: Manager) !ExecutionLease {
