@@ -1426,15 +1426,14 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer environ.deinit();
     try environ.put(ansi_span_fixture_env, "1");
 
-    // The fixture reaches the shell tool, which imports the `test_paths`
-    // module that `zig build test` generates, so the nested compile needs the
-    // same module.
+    // The fixture reaches managed shell execution. Its nested compilation
+    // needs the same generated paths, build options, and session boundary.
     const test_paths = @import("test_paths");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const test_paths_source = try alloc.print(
-        "pub const product_exe: []const u8 = \"{f}\";\npub const source_root: []const u8 = \"{f}\";\n",
-        .{ std.zig.fmtString(test_paths.product_exe), std.zig.fmtString(test_paths.source_root) },
+        "pub const product_exe: []const u8 = \"{f}\";\npub const source_root: []const u8 = \"{f}\";\npub const build_options: []const u8 = \"{f}\";\npub const session_manager_options: []const u8 = \"{f}\";\n",
+        .{ std.zig.fmtString(test_paths.product_exe), std.zig.fmtString(test_paths.source_root), std.zig.fmtString(test_paths.build_options), std.zig.fmtString(test_paths.session_manager_options) },
     );
     defer alloc.free(test_paths_source);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "test_paths.zig", .data = test_paths_source });
@@ -1442,11 +1441,15 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer alloc.free(test_paths_path);
     const test_paths_module = try alloc.print("-Mtest_paths={s}", .{test_paths_path});
     defer alloc.free(test_paths_module);
+    const options_module = try alloc.print("-Mbuild_options={s}", .{test_paths.build_options});
+    defer alloc.free(options_module);
+    const session_options_module = try alloc.print("-Msession_manager_options={s}", .{test_paths.session_manager_options});
+    defer alloc.free(session_options_module);
 
     const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
     defer alloc.free(cwd);
     const result = try std.process.run(alloc, std.testing.io, .{
-        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "-Mroot=src/main.zig", test_paths_module, "--test-filter", ansi_span_test_name },
+        .argv = &.{ "zig", "test", "-lc", "--dep", "test_paths", "--dep", "build_options", "--dep", "session_manager", "-Mroot=src/main.zig", test_paths_module, options_module, "--dep", "build_options=session_manager_options", "-Msession_manager=src/core/session_manager/api.zig", session_options_module, "--test-filter", ansi_span_test_name },
         .cwd = .{ .path = cwd },
         .environ_map = &environ,
         .stdout_limit = .limited(64 * 1024),
@@ -1455,6 +1458,7 @@ test "streamed presentation preserves ANSI OSC 8 code fence and table spans" {
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
+    if (result.term != .exited or result.term.exited != 0) std.debug.print("Nested stream fixture failed:\n{s}\n", .{result.stderr});
     switch (result.term) {
         .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => return error.TestExpectedEqual,

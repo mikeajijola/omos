@@ -90,6 +90,8 @@ pub fn build(b: *std.Build) void {
     const test_paths = b.addOptions();
     test_paths.addOptionPathUntracked("product_exe", b.graph.path(.install_bin, "fx"));
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
+    test_paths.addOptionPathUntracked("build_options", build_options.getOutput());
+    test_paths.addOptionPathUntracked("session_manager_options", session_manager.import_table.get("build_options").?.root_source_file.?);
     exe.root_module.addImport("test_paths", test_paths.createModule());
 
     // The session manager's own tests, as fx compiles it (no hooks).

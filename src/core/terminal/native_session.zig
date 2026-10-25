@@ -1663,7 +1663,13 @@ const Session = struct {
         // a filesystem path supplied in terminal request parameters.
         var pin_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer pin_arena.deinit();
-        const pin_path = if (request.persistence) |persistence| (if (request.projection_task) |task| try @import("../workspace/filesystem_projection.zig").retentionPathForTask(pin_arena.allocator(), task, persistence.grant.principal.durable_session_id, persistence.grant.principal.workspace_root) else try @import("../workspace/filesystem_projection.zig").retentionPathForSession(pin_arena.allocator(), persistence.grant.principal.durable_session_id)) else null;
+        const profile_home = std.Io.Dir.path.dirname(std.Io.Dir.path.dirname(self.durable.profile.display_sessions_path) orelse return error.InvalidResourcePin) orelse return error.InvalidResourcePin;
+        const ambient_home = io_mod.homeDir();
+        const managed_profile = if (ambient_home) |home| std.mem.eql(u8, home, profile_home) else false;
+        if (request.projection_task != null and !managed_profile) return error.WorkspaceProfileMismatch;
+        // An SDK host may use an explicit terminal profile without configuring
+        // process-wide workspace state. Never borrow another profile's binding.
+        const pin_path = if (!managed_profile) null else if (request.persistence) |persistence| (if (request.projection_task) |task| try @import("../workspace/filesystem_projection.zig").retentionPathForTask(pin_arena.allocator(), task, persistence.grant.principal.durable_session_id, persistence.grant.principal.workspace_root) else try @import("../workspace/filesystem_projection.zig").retentionPathForSession(pin_arena.allocator(), persistence.grant.principal.durable_session_id)) else null;
         const retained = if (pin_path) |path| try @import("../shared/resource_pin.zig").acquire(path, null) else null;
         defer if (retained) |pin| pin.close();
         var invocation = try shell_resolver.resolve(
