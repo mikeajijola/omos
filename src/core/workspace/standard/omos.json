@@ -1718,6 +1718,257 @@
         "interfaces": [
           "cli"
         ]
+      },
+      {
+        "id": "omos_plan_capability_package",
+        "capability": "general_task",
+        "description": "Resolve selected capability dependencies and pinned file identities while retaining explicit external runtime requirements.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "selections": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "capability": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "realisation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "capability"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "selections"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "plan": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.capability-package-plan/v1"
+                },
+                "definition_hash": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "declaration_complete": {
+                  "type": "boolean"
+                },
+                "runtime_verification": {
+                  "const": "required"
+                },
+                "capabilities": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  },
+                  "maxItems": 256
+                },
+                "realisations": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  },
+                  "maxItems": 256
+                },
+                "resources": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "family": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "definition": {
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "family",
+                      "definition"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 1024
+                },
+                "paths": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "resource": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "resource",
+                      "path"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 10000
+                },
+                "external_dependencies": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "resource": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "dependency": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "runtime",
+                              "configuration",
+                              "service",
+                              "host_implementation"
+                            ]
+                          },
+                          "handle": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "constraint": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "handle",
+                          "constraint"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "resource",
+                      "dependency"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 4096
+                },
+                "problems": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "subject": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "required": [
+                      "subject",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "artifact": {
+                        "type": "string",
+                        "minLength": 40,
+                        "maxLength": 64
+                      },
+                      "executable": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "artifact",
+                      "executable"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 10000
+                }
+              },
+              "required": [
+                "version",
+                "definition_hash",
+                "declaration_complete",
+                "runtime_verification",
+                "capabilities",
+                "realisations",
+                "resources",
+                "paths",
+                "external_dependencies",
+                "problems",
+                "files"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "workspace",
+            "revision",
+            "plan"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
       }
     ],
     "semantic": {

@@ -215,6 +215,37 @@ write host-owned entity types. An `omos_plan` write records a refinement proposa
 it cannot replace a host contract or remove an obligation. Indexes and query
 results are derived from canonical records and are not another editable source.
 
+## Inspect capability dependencies
+
+`omos fossil package plan CAPABILITY --json` follows the selected OmniForm
+realisation and transitive `capabilityHierarchy.dependsOn` requirements. Use
+`--realisation ID` when a capability has multiple choices. The result pins the
+company revision and declaration hash, lists required files with their Fossil
+object identities and executable flags, and reports missing inputs.
+
+A skill resource declares its portable inputs in `spec.portability`:
+
+```json
+{
+  "implementation": "fossil_skill",
+  "portability": {
+    "version": "omos.resource-portability/v1",
+    "paths": ["skills/cv-builder/"],
+    "dependencies": [
+      {"kind": "runtime", "handle": "node", "constraint": ">=22"}
+    ]
+  }
+}
+```
+
+A trailing slash includes all canonical files under that directory. Paths cannot
+refer to credentials, checkout caches, or project source owned by Git. External
+entries name configuration, service, runtime, or host implementation handles;
+they carry no credentials or authority. `declaration_complete` establishes that
+the declared requirements and files are accounted for. The separate
+`runtime_verification: "required"` result preserves the distinction between
+retained files and an executable capability.
+
 ## Plan and bound an invocation
 
 Before the first actor call of a modeled task, a separate read-only planner

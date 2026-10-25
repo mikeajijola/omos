@@ -355,6 +355,47 @@ describe("portable Fossil workspace recovery", () => {
     expect(f.fossil("cat", "documents/shared.txt", "-r", "trunk")).toBe(content);
   }, 180000);
 
+  test("plans declared capability packages with transitive requirements, missing files, and explicit runtime handles", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    declaration.spec.capabilities.push({ id: "cv_builder", name: "Versioned CV builder", requires: [{ id: "cv_package", primitiveFamily: "skills" }], realisations: ["cv_builder_skill"] });
+    declaration.spec.resources.skills.push({ id: "versioned_cv_package", name: "Portable CV package", offers: ["cv_package"], spec: { implementation: "fossil_skill", portability: { version: "omos.resource-portability/v1", paths: ["skills/cv-builder/"], dependencies: [{ kind: "runtime", handle: "node", constraint: ">=22" }] } } });
+    declaration.spec.realisations.push({ id: "cv_builder_skill", name: "Versioned CV skill", capability: "cv_builder", participants: [{ resource: "versioned_cv_package", supplies: ["cv_package"] }] });
+    declaration.spec.semantic.capabilityHierarchy = [{ capability: "cv_builder", dependsOn: ["general_task"] }];
+    const definition = join(f.home, "package-definition.json");
+    writeFileSync(definition, JSON.stringify(declaration));
+    const proposed = await f.run(["fossil", "definition", "propose", definition, "--json"]);
+    expect(proposed.code, proposed.stderr).toBe(0);
+    const missing = await f.run(["fossil", "package", "plan", "cv_builder", "--json"]);
+    expect(missing.code, missing.stderr).toBe(0);
+    const initial = JSON.parse(missing.stdout).model_data;
+    expect(initial.plan.declaration_complete).toBe(false);
+    expect(initial.plan.problems.some((problem: any) => problem.reason === "required_path_missing:skills/cv-builder/")).toBe(true);
+    model(f, (_body, count) => {
+      if (count === 1) return { tool_calls: [
+        { path: "skills/cv-builder/SKILL.md", content: "# Portable CV builder\nUse node career.mjs.\n" },
+        { path: "skills/cv-builder/career.mjs", content: "console.log('Portable fixture');\n" },
+      ].map((args, index) => ({ index, id: `package-file-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...args }) } })) };
+      return { content: "Retained the complete declared fixture package." };
+    });
+    const saved = await f.run(["ask", "Save the portable skill fixture", "--json"]);
+    expect(saved.code, saved.stderr).toBe(0);
+    const result = await f.run(["fossil", "package", "plan", "cv_builder", "--realisation", "cv_builder_skill", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    const snapshot = JSON.parse(result.stdout).model_data;
+    expect(snapshot.revision).not.toBe(initial.revision);
+    expect(snapshot.plan.declaration_complete).toBe(true);
+    expect(snapshot.plan.runtime_verification).toBe("required");
+    expect(snapshot.plan.capabilities.map((row: any) => row.id).sort()).toEqual(["cv_builder", "general_task"]);
+    expect(snapshot.plan.files.map((row: any) => row.path).sort()).toEqual(["skills/cv-builder/SKILL.md", "skills/cv-builder/career.mjs"]);
+    expect(snapshot.plan.external_dependencies.some((row: any) => row.dependency.kind === "runtime" && row.dependency.handle === "node" && row.dependency.constraint === ">=22")).toBe(true);
+    for (const file of snapshot.plan.files) {
+      const bytes = Buffer.from(f.fossil("cat", file.path, "-r", snapshot.revision));
+      expect(createHash(file.artifact.length === 40 ? "sha1" : "sha3-256").update(bytes).digest("hex")).toBe(file.artifact);
+    }
+  }, 180000);
+
   test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
     const f = fixture();
     const inference = model(f, () => { throw Error("Schema discovery must not run an actor"); });
