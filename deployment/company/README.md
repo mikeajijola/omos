@@ -5,6 +5,10 @@ workers. They do not provide hosted actor isolation, SSO enrollment, or a comple
 company reconciliation coordinator. See the supported operations and limits in
 [the workspace contracts](../../src/core/workspace/CONTRACTS.md#scoped-company-service).
 
+The [isolated worker runtime components](WORKERS.md) provide a Linux launcher
+and a Unix service broker for coordinator integration. Their presence does not
+enable hosted actor execution in the gateway.
+
 Use a dedicated service account with persistent home storage. Install the built
 `omos` and `omo` aliases and verified Fossil helper for that account using
 `scripts/install-omos.sh`. Keep this profile separate from a person's installation.

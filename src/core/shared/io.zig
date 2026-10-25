@@ -20,7 +20,8 @@ var global_raw_environ: ?RawEnviron = null;
 var global_libc_environ: bool = false;
 
 pub fn setIo(zio: std.Io) void {
-    real_io = process_io_for(builtin.target.os.tag, zio);
+    const selected = process_io_for(builtin.target.os.tag, zio);
+    real_io = if (getenv("OMOS_WORKER_BROKER")) |path| @import("worker_broker_io.zig").wrap(selected, path) else selected;
 }
 
 fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
@@ -1141,7 +1142,7 @@ pub fn dirRealpathAlloc(alloc: std.mem.Allocator, dir: std.Io.Dir, sub_path: []c
     } else if (comptime builtin.target.os.tag == .linux) {
         const dir_path = handlePathAlloc(alloc, dir.handle) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => return error.FileNotFound,
+            else => try @import("directory_path.zig").resolve(alloc, getIo(), dir),
         };
         if (sub_path.len == 0) return dir_path;
         defer alloc.free(dir_path);

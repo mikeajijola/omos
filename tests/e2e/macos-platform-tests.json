@@ -1,5 +1,6 @@
 [
   "cli.test.ts",
+  "company-worker.test.ts",
   "file-tool-permissions.test.ts",
   "fossil-workspace-recovery.test.ts",
   "fossil-workspace.test.ts",

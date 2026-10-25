@@ -1,0 +1,133 @@
+// Fixed destinations for an isolated worker. The broker owns provider
+// credentials; the company gateway still authenticates every signed operation.
+import http from "node:http";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { once } from "node:events";
+
+const failure = code => { throw new Error(code); };
+function endpoint(raw) {
+  const url = new URL(raw);
+  if (url.username || url.password || url.search || url.hash || (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) failure("InvalidBrokerEndpoint");
+  return url;
+}
+async function body(request, maximum) {
+  const chunks = []; let bytes = 0;
+  for await (const chunk of request) {
+    bytes += chunk.length;
+    if (bytes > maximum) failure("BrokerRequestTooLarge");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+function parsed(bytes) {
+  const value = JSON.parse(bytes.toString("utf8"));
+  const pending = [[value, 0]]; let count = 0;
+  while (pending.length) {
+    const [item, depth] = pending.pop();
+    if (++count > 100000 || depth > 64) failure("BrokerRequestTooComplex");
+    if (item && typeof item === "object") for (const key of Object.keys(item)) {
+      if (["__proto__", "prototype", "constructor"].includes(key)) failure("InvalidBrokerRequest");
+      pending.push([item[key], depth + 1]);
+      if (pending.length > 100000) failure("BrokerRequestTooComplex");
+    }
+  }
+  return value;
+}
+
+async function isolatedSocketParent(socket) {
+  const owner = process.getuid?.();
+  if (owner === undefined) failure("WorkerBrokerSocketBoundaryRequired");
+  let selected = path.dirname(socket), first = true, privateBoundary = false;
+  for (;;) {
+    const info = await fs.lstat(selected);
+    if (!info.isDirectory() || info.isSymbolicLink() || ![0, owner].includes(info.uid)) failure("WorkerBrokerSocketBoundaryRequired");
+    if (first && (info.uid !== owner || !(info.mode & 0o200))) failure("WorkerBrokerSocketBoundaryRequired");
+    if ((info.mode & 0o022) && !(info.mode & 0o1000)) failure("WorkerBrokerSocketBoundaryRequired");
+    if (info.uid === owner && (info.mode & 0o077) === 0) privateBoundary = true;
+    if (selected === path.dirname(selected)) break;
+    selected = path.dirname(selected); first = false;
+  }
+  if (!privateBoundary) failure("WorkerBrokerSocketBoundaryRequired");
+}
+
+export async function createWorkerBroker({ socket, model, company, expiresMs, maxRequests = 256, maxConcurrent = 4, socketMode = 0o600 }) {
+  if (typeof socket !== "string" || !socket.startsWith("/") || socket.length > 100 || socket.includes("\0") || !Number.isSafeInteger(expiresMs) || expiresMs <= Date.now() || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 10000 || !Number.isInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 16 || ![0o600, 0o666].includes(socketMode)) failure("InvalidWorkerBroker");
+  const modelUrl = endpoint(model.endpoint), companyUrl = endpoint(company.endpoint);
+  if (socketMode === 0o666) await isolatedSocketParent(socket);
+  if (typeof model.model !== "string" || !model.model || typeof model.handle !== "string" || !model.handle || !Array.isArray(company.actions) || !company.actions.length) failure("InvalidWorkerBroker");
+  for (const field of ["workspace", "actor", "grant"]) if (typeof company[field] !== "string" || !company[field]) failure("InvalidWorkerBroker");
+  let active = 0, requests = 0;
+  const controllers = new Set();
+  const server = http.createServer(async (request, response) => {
+    let claimed = false, controller;
+    const error = (status, code) => {
+      if (!response.headersSent) response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({ error: { message: code, type: "worker_broker_error" } }));
+    };
+    try {
+      if (Date.now() >= expiresMs) return error(403, "WorkerBrokerExpired");
+      if (active >= maxConcurrent) return error(429, "WorkerBrokerBusy");
+      if (++requests > maxRequests) return error(429, "WorkerBrokerBudgetExceeded");
+      active++; claimed = true;
+      controller = new AbortController(); controllers.add(controller);
+      const timer = setTimeout(() => controller.abort(), Math.min(120000, expiresMs - Date.now()));
+      response.once("close", () => { clearTimeout(timer); controller.abort(); });
+      let target, payload;
+      const headers = { "content-type": "application/json" };
+      if (request.method === "POST" && request.url === "/model/v1/chat/completions") {
+        const input = parsed(await body(request, 8 * 1024 * 1024));
+        if (!input || input.model !== model.handle || !Array.isArray(input.messages)) return error(403, "WorkerModelDenied");
+        target = modelUrl;
+        payload = JSON.stringify({ ...input, model: model.model });
+        if (model.credential) headers.authorization = `Bearer ${model.credential}`;
+      } else if (request.method === "GET" && request.url === "/model/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" });
+        return response.end(JSON.stringify({ data: [{ id: model.handle }] }));
+      } else if (request.method === "POST" && request.url === "/company/v1/company") {
+        const input = parsed(await body(request, 1024 * 1024));
+        if (!input || typeof input.payload !== "string" || typeof input.signature !== "string") return error(403, "WorkerCompanyDenied");
+        const operation = parsed(Buffer.from(input.payload));
+        if (!operation || !["workspace", "actor", "grant"].every(field => operation[field] === company[field]) || !company.actions.includes(operation.action) || (company.view && operation.view && operation.view !== company.view)) return error(403, "WorkerCompanyDenied");
+        target = companyUrl; payload = JSON.stringify(input);
+      } else if (request.method === "GET" && request.url === "/company/v1/company") {
+        target = companyUrl;
+      } else return error(403, "WorkerBrokerRouteDenied");
+      const upstream = await fetch(target, { method: request.method, headers, body: payload, signal: controller.signal, redirect: "error", credentials: "omit" });
+      if (!upstream.ok) {
+        // Provider errors can echo privileged request headers. Expose status
+        // without forwarding their bodies or server-owned credentials.
+        await upstream.body?.cancel();
+        return error(upstream.status, "WorkerUpstreamRejected");
+      }
+      response.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json", "cache-control": "no-store" });
+      let received = 0;
+      for await (const chunk of upstream.body ?? []) {
+        received += chunk.byteLength;
+        if (received > 16 * 1024 * 1024) failure("WorkerBrokerResponseTooLarge");
+        if (!response.write(chunk)) await once(response, "drain", { signal: controller.signal });
+      }
+      response.end();
+    } catch {
+      if (!response.destroyed) error(502, "WorkerBrokerRequestFailed");
+    } finally {
+      if (claimed) active--;
+      if (controller) { controllers.delete(controller); controller.abort(); }
+    }
+  });
+  server.keepAliveTimeout = 0;
+  server.headersTimeout = 5000;
+  server.requestTimeout = 30000;
+  server.listen(socket);
+  await once(server, "listening");
+  try { await fs.chmod(socket, socketMode); }
+  catch (error) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); throw error; }
+  return {
+    server,
+    async close() {
+      for (const controller of controllers) controller.abort();
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    },
+  };
+}

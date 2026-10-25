@@ -532,6 +532,7 @@ jobs:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
       FX_REQUIRE_TMUX: "1"
+      OMOS_E2E_REQUIRE_WORKER_NAMESPACES: "1"
       SHARD_INDEX: ${{ matrix.shard.index }}
       SHARD_COUNT: 4
     steps:
