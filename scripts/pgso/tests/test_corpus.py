@@ -54,6 +54,7 @@ TRAINING_E2E_TESTS = (
 )
 
 VERIFICATION_E2E_TESTS = (
+    "company-worker.test.ts",
     "fossil-workspace-recovery.test.ts",
     "slack-install.test.ts",
     "auto-mode-reliability.test.ts",
