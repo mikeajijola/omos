@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
 
@@ -495,3 +498,73 @@ test("company worker jobs checkpoint dispatch, fence replacement owners and surv
     owner?.close(); if (service) { service.child.kill(); await service.child.exited; }
   }
 }, 360000);
+
+
+test("the private worker controller uses verified native job operations and disposable transport files", async () => {
+  const f = fixture();
+  model(f, () => { throw Error("The control transport must not run actors"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (body: object) => {
+    const file = join(f.home, "control-operator.json");
+    writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+    const result = await f.run(["fossil", "company", file, "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyResult = await f.run(["fossil", "company-key", "controller", "--json"]);
+  expect(keyResult.code, keyResult.stderr).toBe(0);
+  const key = JSON.parse(keyResult.stdout);
+  const actions = ["create_view", "execution", "status", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "controller", actor: "controller", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, human_approval: true, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true);
+  let signer, control;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "control-client.json");
+    writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "controller", grant: "controller", key_handle: "controller", actions }), { mode: 0o600 });
+    signer = await createCompanyClient(config, { home: f.home });
+    const created = await signer.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: "Retain the native controller invocation." });
+    expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const view = JSON.parse(created.content[0].text).view;
+    const binary = join(import.meta.dir, "../../zig-out/bin/fx");
+    const digest = createHash("sha256");
+    for await (const chunk of createReadStream(binary)) digest.update(chunk);
+    const settings = { binary, executableSha256: digest.digest("hex"), home: f.home, workspace: f.cwd, workspaceId: boot.workspace };
+    await expect(createWorkerControl({ ...settings, executableSha256: "0".repeat(64) })).rejects.toThrow("WorkerControlExecutableChanged");
+    control = await createWorkerControl(settings);
+    const empty = await control.call({ change: "inspect" });
+    expect(empty.ok).toBe(true); expect(empty.jobs).toEqual([]);
+    const nodeInput = join(f.home, "node-control.json");
+    writeFileSync(nodeInput, JSON.stringify({ ...settings, request: { change: "queue", operation: crypto.randomUUID(), view, max_runtime_ms: 1000 } }), { mode: 0o600 });
+    const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-worker-control.mjs"), nodeInput], { env: { HOME: f.home, PATH: process.env.PATH }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
+    const queue = JSON.parse(stdout);
+    expect(queue.ok, JSON.stringify(queue)).toBe(true);
+    expect(queue.jobs[0].record.state).toBe("queued");
+    const conflict = await control.call({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: "0".repeat(64), execution: { runtime: "controller", generation: 0 } });
+    expect(conflict).toMatchObject({ ok: false, error: "CompanyWorkerJobChanged", uncertain: true });
+    const running = await control.call({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: queue.jobs[0].sha256, execution: { runtime: "controller", generation: 0 } });
+    expect(running.ok, JSON.stringify(running)).toBe(true); expect(running.jobs[0].record.generation).toBe(1);
+    const cancelled = await control.call({ change: "cancel", operation: crypto.randomUUID(), view, expected_sha256: running.jobs[0].sha256 });
+    expect(cancelled.ok).toBe(true); expect(cancelled.jobs[0].record.state).toBe("cancelled");
+    const bindingPath = join(f.home, ".fx/omos-workspace.json"), binding = readFileSync(bindingPath);
+    try {
+      const changed = JSON.parse(binding.toString()); changed.workspace_id = "0".repeat(64);
+      writeFileSync(bindingPath, JSON.stringify(changed));
+      await expect(control.call({ change: "inspect" })).rejects.toThrow("WorkerControlBindingChanged");
+      changed.workspace_id = boot.workspace; changed.repository = join(f.home, "another-company.fossil");
+      writeFileSync(bindingPath, JSON.stringify(changed));
+      await expect(control.call({ change: "inspect" })).rejects.toThrow("WorkerControlBindingChanged");
+    } finally { writeFileSync(bindingPath, binding); }
+    const requestRoot = join(f.home, ".fx/worker-control");
+    const { readdir } = await import("node:fs/promises");
+    expect(await readdir(requestRoot)).toEqual([]);
+    expect(statSync(requestRoot).mode & 0o777).toBe(0o700);
+    control.close();
+    await expect(control.call({ change: "inspect" })).rejects.toThrow("WorkerControlClosed");
+    const verified = await f.run(["fossil", "verify", "--json"]);
+    expect(verified.code, verified.stderr).toBe(0);
+  } finally { control?.close(); signer?.close(); service.child.kill(); await service.child.exited; }
+}, 180000);

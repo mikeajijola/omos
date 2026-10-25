@@ -199,6 +199,9 @@ remains available after actor revocation so an operator
 can account for retained and cancelled work.
 
 Queue a view with `change: "queue"`, a unique `operation`, and its `view`.
+The actor's current grant must permit execution, status, and submission within
+the task's scope. A grant that requires human approval can prepare and execute
+its task; that approval is checked against the evaluated publication candidate.
 Defaults permit three invocations of at most four minutes each. The operator
 can select 1–32 invocations and a runtime limit between one second and four
 minutes. These limits supplement the task's actor-step, progress, and review
@@ -229,3 +232,18 @@ Job records and their immutable operation history travel with a full Fossil
 export. Private issuer material, provider credentials, actor signing keys,
 prepared images, and provider replay caches remain outside that export. Restoring
 a job history does not grant a runtime permission to execute it.
+
+### Connect an operator coordinator
+
+`worker-control.mjs` provides the private Node.js transport for these operations.
+`createWorkerControl` requires the native binary's SHA-256 identity, a private
+operator home, the project directory, and the expected workspace identity. It
+pins the repository path and file identity and checks the executable fingerprint
+before each invocation. A changed binding requires a new control instance.
+
+The transport invokes only native `company` requests with action `workers`.
+It uses private temporary JSON files, bounded output and deadlines, and a
+restricted child environment. It deletes transport files after each call.
+Requests and outcomes remain in Fossil. An interrupted or failed mutation is
+reported as uncertain; inspect its original operation before dispatching an
+actor or repeating work. Closing the control instance cancels active calls.

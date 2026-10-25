@@ -276,8 +276,9 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         if (request.expected_sha256 == null or !std.mem.eql(u8, request.expected_sha256.?, try workspace.hash(manager.alloc, raw))) return error.CompanyWorkerJobChanged;
     } else if (request.expected_sha256 != null) return error.CompanyWorkerJobChanged;
     if (request.change == .queue or request.change == .claim or request.change == .renew or request.change == .requeue) {
-        try authority.authorizeTask(manager, selected.task);
-        if (!selected.live or !authority.permitsAction(selected.grant, .execution) or !authority.permitsAction(selected.grant, .status)) return error.CompanyAccessDenied;
+        try authority.authorizeExecution(manager, selected.task);
+        try manager.validateTaskBasis(selected.task);
+        if (!selected.live or !authority.permitsAction(selected.grant, .submit) or !authority.permitsAction(selected.grant, .status)) return error.CompanyAccessDenied;
         if (selected.task.state == .accepted or selected.task.state == .publication_pending) return error.TaskIsReadOnly;
         if (selected.task.review_job) |job_id| {
             const job = try manager.loadReviewJob(selected.task, job_id);
