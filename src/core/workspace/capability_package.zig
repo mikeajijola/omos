@@ -20,6 +20,7 @@ pub const Plan = struct {
     version: []const u8 = "omos.capability-package-plan/v1",
     definition_hash: []const u8,
     declaration_complete: bool,
+    file_verification: []const u8 = "required",
     runtime_verification: []const u8 = "required",
     capabilities: []const Value,
     realisations: []const Value,
@@ -178,6 +179,7 @@ pub fn inspect(manager: workspace.Manager, selections: []const Selection) !Value
     plan.files = files.items;
     plan.problems = problems.items;
     plan.declaration_complete = plan.problems.len == 0;
+    plan.file_verification = "manifest_inspected";
     const output = try std.json.parseFromSliceLeaky(Value, manager.alloc, try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .revision = revision, .plan = plan }, .{}), .{});
     try model.validateOperation(manager.alloc, declaration, "omos_plan_capability_package", output, .output);
     return output;

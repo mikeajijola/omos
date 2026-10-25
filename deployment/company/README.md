@@ -32,6 +32,19 @@ profile. Enroll actors with local operator `grant` requests that specify exact
 actions, path scopes, public keys, and expiry. Enrollment does not follow from
 editing the OmniForm definition.
 
+Capability definitions require a separate metadata assignment. After enrolling
+a grant, inspect company control with a local `inspect_capabilities` request,
+then submit `grant_capabilities` with that grant ID, the returned
+`expected_revision`, and the permitted capability IDs in `capabilities`.
+Assign every dependency needed for the chosen realisation. Use an empty list to
+remove this access. File paths and executable authority remain separate.
+
+Scoped clients discover their catalogue with `discover` and `capability: "*"`.
+Selecting an ID returns bounded, hash-verifiable package metadata. This metadata
+identifies declared dependencies; clients must still verify files and runtime
+requirements before treating the capability as available. Delegation may carry
+`delegated_capabilities`, bounded by the parent's current metadata scope.
+
 Create a private environment file for the local owner endpoint:
 
 ```sh

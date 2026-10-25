@@ -396,6 +396,154 @@ describe("portable Fossil workspace recovery", () => {
     }
   }, 180000);
 
+  test("versions explicit company capability metadata scopes without expanding file grants", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const file = join(f.home, "capability-authority-request.json");
+    const command = async (value: object) => {
+      writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...value }));
+      return f.run(["fossil", "company", file, "--json"]);
+    };
+    const admin = async (value: object) => {
+      const result = await command(value);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const absent = await command({ action: "inspect_capabilities" });
+    expect(absent.code).toBe(1);
+    expect(absent.stderr).toContain("CompanyNotInitialized");
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    const grant = { id: "metadata-reader", actor: "reader", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["skills/cv/"], actions: ["discover", "read"], expires_ms: Date.now() + 3600000 };
+    const granted = await admin({ action: "grant", revision: initialized.revision, grant });
+    const empty = await admin({ action: "inspect_capabilities" });
+    expect(empty.policy.entries).toEqual([]);
+    const scoped = await admin({ action: "grant_capabilities", revision: granted.revision, id: grant.id, capabilities: ["general_task"] });
+    expect(scoped.policy.entries[0].capabilities).toEqual(["general_task"]);
+    expect(scoped.policy.entries[0].grant_hash).toMatch(/^[a-f0-9]{64}$/);
+    const stale = await command({ action: "grant_capabilities", revision: granted.revision, id: grant.id, capabilities: ["coding_task"] });
+    expect(stale.code).toBe(1);
+    expect(stale.stderr).toContain("WorkspaceRevisionChanged");
+    const unchanged = await admin({ action: "inspect_capabilities" });
+    expect(unchanged.revision).toBe(scoped.revision);
+    expect(unchanged.policy.entries[0].capabilities).toEqual(["general_task"]);
+    const removed = await admin({ action: "grant_capabilities", revision: scoped.revision, id: grant.id, capabilities: [] });
+    expect(removed.policy.entries[0].capabilities).toEqual([]);
+    const authority = JSON.parse(f.fossil("cat", "authority/state.json", "-r", "omos-company"));
+    expect(authority.grants[0].paths).toEqual(grant.paths);
+    const archived = JSON.parse(f.fossil("cat", "authority/capabilities.json", "-r", "omos-company"));
+    expect(archived).toEqual(removed.policy);
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+    expect((await f.run(["fossil", "export", join(f.home, "scoped-company.fossil"), "--json"])).code).toBe(0);
+  }, 120000);
+
+  test("discovers scoped capability declarations with signed pages, pinned task models, and live metadata revocation", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Capability inspection must not execute an actor"); });
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const operator = join(f.home, "capability-operator.json");
+    const admin = async (body: object) => {
+      writeFileSync(operator, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", operator, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    let control = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    control = await admin({ action: "grant", revision: control.revision, grant: { id: "capability-reader", actor: "reader", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["skills/cv/"], actions: ["discover", "read", "create_view", "status", "delegate"], expires_ms: Date.now() + 3600000 } });
+    const service = await startWorkspaceService(f, true);
+    try {
+      const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+      expect(boot.features.capability_discovery).toBe(true);
+      const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+      const post = async (action: string, params: object = {}, principal = { actor: "reader", grant: "capability-reader", key }) => {
+        const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: principal.actor, grant: principal.grant, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+        let response: Response;
+        try {
+          response = await fetch(service.url + "/v1/company", { method: "POST", keepalive: false, headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), principal.key.privateKey).toString("hex") }) });
+        } catch (error) {
+          const before = service.child.exitCode;
+          service.child.kill(); await service.child.exited;
+          throw Error(`${String(error)}; service exit before cleanup: ${before}; action=${action}; params=${JSON.stringify(params)}\n${await new Response(service.child.stderr).text()}\n${readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-16000)}`);
+        }
+        const envelope = await response.json() as any;
+        if (response.status !== 200) return { status: response.status, error: envelope.error, result: null, operation: JSON.parse(payload).operation };
+        expect(envelope.issuer).toBe(boot.issuer);
+        expect(verify(null, Buffer.from(envelope.payload), issuer, Buffer.from(envelope.signature, "hex"))).toBe(true);
+        const receipt = JSON.parse(envelope.payload);
+        expect(receipt.request_hash).toBe(createHash("sha256").update(payload).digest("hex"));
+        expect(receipt.actor).toBe(principal.actor);
+        expect(receipt.grant).toBe(principal.grant);
+        return { status: response.status, error: null, result: receipt.result };
+      };
+      const send = async (action: string, params: object = {}) => {
+        const result = await post(action, params);
+        expect(result.status, result.error ?? "").toBe(200);
+        return result.result;
+      };
+      expect((await send("discover", { capability: "*" })).capabilities).toEqual([]);
+      expect((await post("discover", { capability: "general_task" })).status).toBe(403);
+      control = await admin({ action: "grant_capabilities", revision: control.revision, id: "capability-reader", capabilities: ["general_task"] });
+      const visible = await send("discover", { capability: "*", limit: 1 });
+      expect(visible.capabilities).toEqual(["general_task"]);
+      expect(visible.total).toBe(1);
+      expect(visible.next_offset).toBeNull();
+      for (const capability of ["coding_task", "unknown_task"]) expect((await post("discover", { capability })).status).toBe(403);
+      expect(boot.features.capability_delegation).toBe(true);
+      const childKey = generateKeyPairSync("ed25519");
+      const child = { id: "capability-child", actor: "child", public_key: childKey.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), parent: "capability-reader", paths: ["skills/cv/"], actions: ["discover", "read"], expires_ms: Date.now() + 1800000 };
+      const denied = await post("delegate", { revision: boot.revision, delegated_grant: { ...child, id: "denied-capability-child", actor: "denied-child" }, delegated_capabilities: ["coding_task"] });
+      expect(denied.status).toBe(403);
+      expect((await send("status", { outcome: denied.operation })).state).toBe("failed");
+      const delegated = await send("delegate", { revision: boot.revision, delegated_grant: child, delegated_capabilities: ["general_task"] });
+      expect(delegated.grant).toBe(child.id);
+      const childPrincipal = { actor: child.actor, grant: child.id, key: childKey };
+      const childCatalog = await post("discover", { capability: "*" }, childPrincipal);
+      expect(childCatalog.status).toBe(200);
+      expect(childCatalog.result.capabilities).toEqual(["general_task"]);
+      const currentAuthority = await admin({ action: "status" });
+      expect(currentAuthority.authority.grants.some((row: any) => row.id === "denied-capability-child")).toBe(false);
+      await admin({ action: "grant_capabilities", revision: currentAuthority.revision, id: child.id, capabilities: [] });
+      const retry = await post("delegate", { revision: boot.revision, delegated_grant: child, delegated_capabilities: ["general_task"] });
+      expect(retry.error).toBe("CompanyGrantAlreadyExists");
+      expect((await send("status", { outcome: retry.operation })).state).toBe("failed");
+      control = await admin({ action: "status" });
+      await admin({ action: "grant_capabilities", revision: control.revision, id: child.id, capabilities: ["general_task"] });
+      const view = await send("create_view", { revision: boot.revision, objective: "Inspect the pinned capability declaration" });
+      const first = await send("discover", { capability: "general_task", view: view.view, limit: 128 });
+      expect(first.read_tracking).toBe("model_basis");
+      expect(first.definition_hash).toBe(view.basis.definition_hash);
+      expect(first.package.next_offset).toBe(128);
+      const parts = [Buffer.from(first.package.content, "base64")];
+      let offset = first.package.next_offset;
+      while (offset !== null) {
+        const page = await send("discover", { capability: "general_task", view: view.view, revision: first.revision, offset, limit: 128 });
+        expect(page.package.sha256).toBe(first.package.sha256);
+        expect(page.definition_hash).toBe(first.definition_hash);
+        const bytes = Buffer.from(page.package.content, "base64");
+        expect(bytes.length).toBeLessThanOrEqual(128);
+        parts.push(bytes); offset = page.package.next_offset;
+      }
+      const bytes = Buffer.concat(parts);
+      expect(bytes.length).toBe(first.package.bytes);
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(first.package.sha256);
+      const plan = JSON.parse(bytes.toString());
+      expect(plan.capabilities.map((row: any) => row.id)).toEqual(["general_task"]);
+      expect(plan.file_verification).toBe("required");
+      expect(plan.runtime_verification).toBe("required");
+      expect(plan.files).toEqual([]);
+      expect((await post("discover", { capability: "general_task", entity: "*" })).status).toBe(400);
+      expect((await post("read", { path: "documents/private.txt" })).status).toBe(403);
+      control = await admin({ action: "status" });
+      await admin({ action: "grant_capabilities", revision: control.revision, id: "capability-reader", capabilities: [] });
+      expect((await post("discover", { capability: "general_task", view: view.view, revision: first.revision, offset: 128, limit: 128 })).status).toBe(403);
+      expect((await send("discover", { capability: "*" })).total).toBe(0);
+      expect((await post("discover", { capability: "general_task" }, childPrincipal)).status).toBe(403);
+      expect((await send("read", { path: "skills/cv/not-present.txt" })).exists).toBe(false);
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
+
   test("closes idle keep-alive and partial-header connections without aborting the workspace service", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

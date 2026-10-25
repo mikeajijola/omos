@@ -577,6 +577,37 @@ absence. Schema discovery describes expected data and cannot establish that
 a capability has been realised. Older declarations enable it through explicit
 `omos fossil migrate --contracts`, which adds `omos_company_schema`.
 
+Capability metadata has separate authority from file paths. The operator uses
+`grant_capabilities` with a live `grant`, an explicit `capabilities` array, and
+`expected_revision` matching the company control revision. `inspect_capabilities`
+returns the current policy and revision. An empty array removes a metadata scope.
+The protected `authority/capabilities.json` policy binds each assignment to its
+grant hash and issuer epoch. Existing file grants receive no metadata scope by
+default. Every delegated scope remains bounded by all live ancestors.
+
+When discovery reports `features.capability_discovery: true`, use `discover` with
+`capability: "*"` for the authorised capability catalogue, or a capability ID for
+its selected realisation and transitive dependency metadata. Specify
+`realisation` when the root has multiple choices. Every transitive capability
+requires metadata authority before its resources are inspected. Unknown and
+inaccessible names both return access denied.
+
+The `omos.company-capability/v1` response identifies the definition revision,
+hash, semantic version, and task model basis. Its `package` field contains
+16 KiB base64 pages with a complete SHA-256 digest. Read and verify all pages
+against the same revision. This is declared metadata: `file_verification` and
+`runtime_verification` remain `required`, and no file bodies are retrieved.
+Ordinary content reads continue to require path authority and retain their
+usual read dependencies. A declared dependency cannot grant tool permissions.
+
+A signed `delegate` request can include `delegated_capabilities` when discovery
+advertises `features.capability_delegation`. The request pins the accepted
+revision. Grant and metadata scope are committed together. Replaying a prior
+delegation cannot restore a scope narrowed by an operator. Legacy delegation
+without this optional field preserves its existing behavior. Explicit
+`omos fossil migrate --contracts` adds these operations to older declarations
+without changing active task contracts.
+
 When public discovery reports `features.progress_history: true`, signed
 `status` requests for the caller's own view can include `progress_cursor: ""`
 to start a revision feed. Each page contains at most 32 `view_revision` events,

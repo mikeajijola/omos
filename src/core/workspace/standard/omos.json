@@ -1236,6 +1236,36 @@
                 "bytes"
               ],
               "additionalProperties": false
+            },
+            "capability": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "maxLength": 128,
+              "description": "With discover, list explicitly authorised capability identities using * or inspect a selected dependency declaration."
+            },
+            "realisation": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "delegated_capabilities": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "maxItems": 256,
+              "uniqueItems": true
             }
           },
           "required": [
@@ -1936,6 +1966,12 @@
                     "additionalProperties": false
                   },
                   "maxItems": 10000
+                },
+                "file_verification": {
+                  "enum": [
+                    "required",
+                    "manifest_inspected"
+                  ]
                 }
               },
               "required": [
@@ -1949,7 +1985,8 @@
                 "paths",
                 "external_dependencies",
                 "problems",
-                "files"
+                "files",
+                "file_verification"
               ],
               "additionalProperties": false
             }
@@ -1968,6 +2005,410 @@
         "approval": "policy",
         "interfaces": [
           "cli"
+        ]
+      },
+      {
+        "id": "omos_grant_capability_scope",
+        "capability": "general_task",
+        "description": "Assign explicit capability metadata authority within the existing live grant chain.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "grant_capabilities"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "maxItems": 256,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "revision",
+            "id",
+            "capabilities"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "policy": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-capabilities/v1"
+                },
+                "workspace": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "grant": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "grant_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64
+                      },
+                      "epoch": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "capabilities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "maxItems": 256,
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "grant",
+                      "grant_hash",
+                      "epoch",
+                      "capabilities"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 1024
+                }
+              },
+              "required": [
+                "version",
+                "workspace",
+                "entries"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "revision",
+            "policy"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_inspect_capability_scopes",
+        "capability": "general_task",
+        "description": "Inspect protected capability metadata authority as the local operator.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "inspect_capabilities"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "policy": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-capabilities/v1"
+                },
+                "workspace": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "entries": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "grant": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "grant_hash": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64
+                      },
+                      "epoch": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "capabilities": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "maxItems": 256,
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "grant",
+                      "grant_hash",
+                      "epoch",
+                      "capabilities"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 1024
+                }
+              },
+              "required": [
+                "version",
+                "workspace",
+                "entries"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "revision",
+            "policy"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_company_capability",
+        "capability": "general_task",
+        "description": "Discover scoped capability dependencies from a pinned OmniForm declaration without granting file or execution access.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "discover"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "capability": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "realisation": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "action",
+            "capability"
+          ],
+          "additionalProperties": true
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-capability/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "definition_revision": {
+              "type": "string"
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "semantic_version": {
+              "const": "omniseedos.semantic/v1"
+            },
+            "scope_filtered": {
+              "const": true
+            },
+            "read_tracking": {
+              "enum": [
+                "model_basis",
+                "not_recorded"
+              ]
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "capability": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128
+            },
+            "package": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "sha256": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 8388608
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 8388608
+                },
+                "content": {
+                  "type": "string",
+                  "maxLength": 21848
+                },
+                "encoding": {
+                  "const": "base64"
+                },
+                "next_offset": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 8388608
+                }
+              },
+              "required": [
+                "sha256",
+                "bytes",
+                "offset",
+                "content",
+                "encoding",
+                "next_offset"
+              ],
+              "additionalProperties": false
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "maxItems": 32
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "revision",
+            "definition_revision",
+            "definition_hash",
+            "semantic_version",
+            "scope_filtered",
+            "read_tracking",
+            "capability",
+            "package",
+            "capabilities",
+            "total",
+            "next_offset"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api"
         ]
       }
     ],
@@ -2360,6 +2801,20 @@
             "sha256",
             "content"
           ]
+        },
+        {
+          "id": "omos_company_capability_policy",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "entries": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "entries"
+          ],
+          "indexed": []
         }
       ],
       "relationships": [

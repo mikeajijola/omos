@@ -57,7 +57,10 @@ pub const Request = struct {
     candidate: ?[]const u8 = null,
     outcome: ?[]const u8 = null,
     delegated_grant: ?Grant = null,
+    delegated_capabilities: ?[]const []const u8 = null,
     entity: ?[]const u8 = null,
+    capability: ?[]const u8 = null,
+    realisation: ?[]const u8 = null,
     record_id: ?[]const u8 = null,
     progress_cursor: ?[]const u8 = null,
 };

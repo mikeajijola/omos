@@ -244,7 +244,11 @@ entries name configuration, service, runtime, or host implementation handles;
 they carry no credentials or authority. `declaration_complete` establishes that
 the declared requirements and files are accounted for. The separate
 `runtime_verification: "required"` result preserves the distinction between
-retained files and an executable capability.
+retained files and an executable capability. Owner inspection reports
+`file_verification: "manifest_inspected"`; scoped metadata discovery reports
+`file_verification: "required"` until content has been retrieved and verified.
+See [capability metadata authority](CONTRACTS.md#scoped-company-service) for
+company grant and delegation rules.
 
 ## Plan and bound an invocation
 
