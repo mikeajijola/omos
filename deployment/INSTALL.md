@@ -46,6 +46,12 @@ after installation. Native CLI operation requires no Node.js runtime; using
 this optional MCP transport requires Node.js 22 or newer. See the
 [company connection procedure](company/README.md#connect-an-external-mcp-client).
 
+The archive also contains the optional company gateway and Linux worker
+companions under `deployment/company/`. Their bytes appear in the same verified
+installation manifest. Personal installation does not enable the privileged
+worker service. Retain the verified archive if you intend to install that
+separate operator service, and follow [the worker deployment procedure](company/WORKERS.md).
+
 The `Preview installation bundles` workflow builds Linux Intel, Linux ARM,
 macOS Intel, and macOS Apple Silicon candidates on matching native runners.
 It stages the pinned helper and tests two fresh installations, both CLI aliases,

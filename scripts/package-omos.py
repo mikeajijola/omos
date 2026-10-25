@@ -40,6 +40,13 @@ def main():
     args = parser.parse_args()
     helper = validate_inputs(root, args.platform, lock)
     paths = ["zig-out/bin/fx", "zig-out/libexec/fossil", "scripts/install-omos.sh", "scripts/fossil-helper.lock.json", "deployment/company/mcp.mjs", "src/core/workspace/standard/omos.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "deployment/company/FOSSIL-NOTICES.md", "deployment/INSTALL.md"]
+    paths.extend("deployment/company/" + name for name in (
+        "worker-broker.mjs", "worker-control.mjs", "worker-http-control.mjs",
+        "worker-coordinator.mjs", "worker-snapshot.mjs", "worker-linux.mjs",
+        "worker-server.mjs", "worker-launcher.py", "worker-image.py",
+        "omos-company.service", "omos-company-workers.service", "Caddyfile",
+        "README.md", "WORKERS.md",
+    ))
     with tempfile.TemporaryDirectory(prefix="omos-package-") as directory:
         tree = Path(directory) / "omos"
         for name in paths:

@@ -1,0 +1,29 @@
+[Unit]
+Description=Omniseed isolated company worker coordinator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/node /usr/local/lib/omos-company/current/deployment/company/worker-server.mjs /etc/omos/company-workers.json
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=45
+UMask=0077
+StateDirectory=omos-workers
+StateDirectoryMode=0700
+RuntimeDirectory=omos-worker-leases
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/omos-workers /run/omos-worker-leases
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD CAP_SETPCAP
+
+[Install]
+WantedBy=multi-user.target

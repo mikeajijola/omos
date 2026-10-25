@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { createWorkerHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
@@ -547,8 +548,24 @@ test("the private worker controller uses verified native job operations and disp
     expect(queue.jobs[0].record.state).toBe("queued");
     const conflict = await control.call({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: "0".repeat(64), execution: { runtime: "controller", generation: 0 } });
     expect(conflict).toMatchObject({ ok: false, error: "CompanyWorkerJobChanged", uncertain: true });
+    const remoteControl = createWorkerHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    const remote = await remoteControl.call({ change: "inspect", view });
+    expect(remote.ok, JSON.stringify(remote)).toBe(true); expect(remote.jobs[0].record.state).toBe("queued");
+    const ownerEnvelope = { version: "omos.company-worker-api/v1", workspace: boot.workspace, request: { change: "inspect" } };
+    const deniedOwnerRequest = (headers: Record<string, string>) => new Promise<number>((resolve, reject) => {
+      const body = JSON.stringify(ownerEnvelope);
+      const request = http.request(service.url + "/v1/company/workers", { method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": Buffer.byteLength(body), connection: "close", ...headers } }, response => {
+        response.resume(); response.once("end", () => resolve(response.statusCode!)); response.once("error", reject);
+      });
+      request.once("error", reject); request.end(body);
+    });
+    expect(await deniedOwnerRequest({})).toBe(401);
+    expect(await deniedOwnerRequest({ ...service.headers, origin: "https://untrusted.example" })).toBe(401);
+    const wrongWorkspace = createWorkerHttpControl({ endpoint: service.url, workspaceId: "0".repeat(64), token: service.headers.authorization.slice(7) });
+    expect(await wrongWorkspace.call({ change: "inspect" })).toMatchObject({ ok: false, error: "WorkspaceIdentityMismatch" });
+    wrongWorkspace.close();
     let invoked = 0;
-    const coordinator = createWorkerCoordinator({ control, runtime: "controller", backend: { async run(row, signal) {
+    const coordinator = createWorkerCoordinator({ control: remoteControl, runtime: "controller", backend: { async run(row, signal) {
       invoked++; expect(signal.aborted).toBe(false);
       expect(row.record.binding.view).toBe(view); expect(row.contract).toBeDefined(); expect(row.request).toBeDefined();
       expect(row.execution).toMatchObject({ runtime: "controller", generation: 1 });
@@ -560,9 +577,15 @@ test("the private worker controller uses verified native job operations and disp
     expect(running.ok, JSON.stringify(running)).toBe(true); expect(running.jobs[0].record.generation).toBe(1);
     expect(running.jobs[0].record.state).toBe("waiting"); expect(running.jobs[0].execution.runtime).toBeNull();
     expect((await coordinator.tick()).started).toBe(0); expect(invoked).toBe(1);
-    await coordinator.close();
+    await coordinator.close(); remoteControl.close();
     const cancelled = await control.call({ change: "cancel", operation: crypto.randomUUID(), view, expected_sha256: running.jobs[0].sha256 });
     expect(cancelled.ok).toBe(true); expect(cancelled.jobs[0].record.state).toBe("cancelled");
+    const readonly = await startWorkspaceService(f, false);
+    const readonlyControl = createWorkerHttpControl({ endpoint: readonly.url, workspaceId: boot.workspace, token: readonly.headers.authorization.slice(7) });
+    try {
+      expect((await readonlyControl.call({ change: "inspect", view })).ok).toBe(true);
+      expect(await readonlyControl.call({ change: "queue", operation: crypto.randomUUID(), view })).toMatchObject({ ok: false, error: "ServiceReadOnly" });
+    } finally { readonlyControl.close(); readonly.child.kill(); await readonly.child.exited; }
     const bindingPath = join(f.home, ".fx/omos-workspace.json"), binding = readFileSync(bindingPath);
     try {
       const changed = JSON.parse(binding.toString()); changed.workspace_id = "0".repeat(64);
@@ -607,12 +630,16 @@ test("local read-only workspace requests page immutable file identities and comp
   const declaration = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
   const base = { version: "omos.workspace-api/v1", workspace: state.workspace_id, definition_hash: declaration.basis.definition_hash, revision: state.trunk_revision };
   const call = async (input: object, successful = true) => {
-    const file = join(f.home, "workspace-read.json"); writeFileSync(file, JSON.stringify({ ...base, ...input }));
+    const envelope = { ...base, ...input };
+    if ((input as any).action === "head") delete (envelope as any).revision;
+    const file = join(f.home, "workspace-read.json"); writeFileSync(file, JSON.stringify(envelope));
     const result = await f.run(["fossil", "request", file, "--json"]);
     if (!successful) { expect(result.code).not.toBe(0); return result; }
     expect(result.code, result.stderr + result.stdout).toBe(0);
     return JSON.parse(result.stdout);
   };
+  const head = await call({ action: "head" });
+  expect(head.data).toEqual({ revision: base.revision, task: null, definition_hash: base.definition_hash });
   const first = await call({ action: "inventory", path: "documents/snapshot/" });
   expect(first.data.files).toHaveLength(32); expect(first.data.total).toBe(38); expect(first.data.next_offset).toBe(32);
   const second = await call({ action: "inventory", path: "documents/snapshot/", offset: first.data.next_offset });
@@ -656,12 +683,21 @@ test("local read-only workspace requests page immutable file identities and comp
   const latest = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision;
   expect(latest).not.toBe(base.revision);
   const retained = await call({ action: "inventory", path: "documents/snapshot/" });
-  expect(retained.data.revision).toBe(base.revision); expect(retained.data.files).toEqual(first.data.files);
+  expect(retained.revision).toBe(base.revision); expect(retained.data.revision).toBe(base.revision); expect(retained.data.files).toEqual(first.data.files);
   const latestFiles = await call({ action: "inventory", path: "documents/snapshot/", revision: latest });
   expect(latestFiles.data.files.find((item: any) => item.path.endsWith("/f00.txt")).artifact).not.toBe(files.find(item => item.path.endsWith("/f00.txt")).artifact);
   expect((await call({ action: "read", path: "documents/snapshot/f00.txt" })).data.content).toBe("file 0");
   expect((await call({ action: "read", path: "documents/snapshot/f00.txt", revision: latest })).data.content).toBe("changed");
   expect((await call({ action: "inventory", path: "documents/snapshot/run.sh", revision: latest })).data.files[0].executable).toBe(false);
+  model(f, (_body, count) => count === 1 ? writeMemory("An unpublished worker checkpoint.") : { content: "Retain the pending reader fixture." }, () => "blocked");
+  const pending = await f.run(["ask", "Retain an unpublished reader checkpoint.", "--json"]);
+  expect(pending.code).toBe(1);
+  const task = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks[0];
+  const taskHead = await call({ action: "head", task: task.id });
+  expect(taskHead.data.task).toBe(task.id); expect(taskHead.data.revision).not.toBe(latest);
+  expect((await call({ action: "read", path: "memory/preference.md", task: task.id, revision: taskHead.data.revision })).data.content).toBe("An unpublished worker checkpoint.");
+  expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
+
 }, 240000);
 
 
@@ -741,4 +777,123 @@ test("worker coordinator resolves lost claim acknowledgements and fences revoked
   await expect(changed.tick()).rejects.toThrow("WorkerCoordinatorClaimChanged");
   expect(called).toBe(false);
   await changed.close();
+  current.record.state = "queued"; current.execution = null;
+  const releaseCount = calls.filter(call => call.change === "finish").length;
+  const uncertain = createWorkerCoordinator({ control, runtime: "cleanup-pending", backend: { async run() {
+    const error: any = new Error("WorkerCleanupPending"); error.executionUncertain = true; throw error;
+  } } });
+  expect((await uncertain.tick()).started).toBe(1); await uncertain.drain();
+  expect(current.record.state).toBe("running");
+  expect(current.execution.runtime).toBe("cleanup-pending");
+  expect(calls.filter(call => call.change === "finish")).toHaveLength(releaseCount);
+  expect((await uncertain.tick()).started).toBe(0);
+  await uncertain.close();
 });
+
+test.skipIf(!support?.kernel_supported)("production worker images pin trusted runtime bytes and reject active deletion or changed identities", async () => {
+  const helper = join(import.meta.dir, "fixtures/company-worker-image.py");
+  const run = (value: object) => {
+    const result = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", helper], { input: JSON.stringify(value), encoding: "utf8", timeout: 180000 });
+    expect(result.status, result.stderr + result.stdout).toBe(0);
+    return result.stdout ? JSON.parse(result.stdout) : null;
+  };
+  const { base } = run({ action: "setup", owner: process.getuid!(), group: process.getgid!() });
+  const request = { version: "omos.worker-image-request/v1", action: "prepare", id: createHash("sha256").update(crypto.randomUUID()).digest("hex"), workspace: "a".repeat(64), view: "b".repeat(64), generation: 1, max_runtime_ms: 60000, model: "worker-model" };
+  try {
+    const prepared = run({ base, action: "invoke", request });
+    expect(prepared.code, prepared.stderr).toBe(0);
+    const marker = JSON.parse(prepared.stdout);
+    expect(marker).toMatchObject({ workspace: request.workspace, view: request.view, generation: 1, executable: "/runtime/bin/omos" });
+    expect(marker.root.length + "/run/omos-broker.sock".length).toBeLessThanOrEqual(100);
+    const profile = run({ base, action: "profile", request });
+    expect(profile.keys).toBe(2);
+    expect(profile.settings.providers.worker.auth).toEqual({ type: "none" });
+    expect(profile.settings.providers.worker.base_url).toBe("http://127.0.0.1/model/v1");
+    expect(profile.mcp.mcp.company.url).toBe("http://127.0.0.1:1/company/mcp");
+    expect(profile.marker.namespaces).toBeUndefined();
+    expect(profile.directories).toMatchObject({ runtime: 0o755, "runtime/bin": 0o755, home: 0o755, "home/worker": 0o700, "home/worker/.fx": 0o700, run: 0o711, dev: 0o755 });
+    expect(run({ base, action: "invoke", request }).stdout).toBe(prepared.stdout);
+    const changed = run({ base, action: "invoke", request: { ...request, generation: 2 } });
+    expect(changed.code).toBe(125); expect(changed.stderr).toContain("ImageIdentityChanged");
+    const model = run({ base, action: "invoke", request: { ...request, model: "other-model" } });
+    expect(model.code).toBe(125); expect(model.stderr).toContain("ImageIdentityChanged");
+    const crowded = run({ base, action: "invoke", request: { ...request, id: "c".repeat(64) } });
+    expect(crowded.code).toBe(125); expect(crowded.stderr).toContain("ImagePoolBudgetExceeded");
+    const active = run({ base, action: "active_remove", request });
+    expect(active.code).toBe(125); expect(active.stderr).toContain("ImageExecutionActive");
+    const stopped = run({ base, action: "quiesce", request });
+    expect(stopped.code, stopped.stderr).toBe(0); expect(JSON.parse(stopped.stdout).quiescent).toBe(true); expect(stopped.child_code).toBe(-9);
+    const launched = run({ base, action: "launch", request });
+    if (support.private_namespaces) {
+      expect(launched.code, launched.stderr).toBe(0);
+      expect(JSON.parse(launched.stdout).workspace_id).toMatch(/^[0-9a-f]{64}$/);
+    } else {
+      expect(launched.code).toBe(125); expect(launched.stdout).toBe("");
+      expect(launched.stderr).toContain("private namespaces unavailable");
+    }
+    expect(run({ base, action: "invoke", request: { ...request, action: "remove" } }).code).toBe(0);
+    const corrupted = run({ base, action: "corrupt_template", request });
+    expect(corrupted.code).toBe(125); expect(corrupted.stderr).toMatch(/UnsafeImageTemplateFile|ImageTemplateChanged/);
+    expect(run({ base, action: "invoke", request: { ...request, action: "inspect" } }).stderr).toContain("ImageNotFound");
+  } finally { run({ base, action: "cleanup" }); }
+}, 240000);
+
+test.skipIf(!support?.kernel_supported)("the production company coordinator runs isolated native work and publishes only independently verified file proposals", async () => {
+  const f = fixture(), worker = fixture();
+  const host = model(f, () => { throw Error("The company host must never execute the actor"); });
+  const inference = model(worker, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "private-output", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) } }] } : { content: "Retained the proposed document in the private Fossil workspace." });
+  const provider = JSON.parse(readFileSync(join(worker.home, ".fx/settings.json"), "utf8")).providers.local.base_url;
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const file = join(f.home, "production-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]);
+    expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "production-worker", "--json"]);
+  expect(keyed.code, keyed.stderr).toBe(0);
+  const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit", "reconcile", "discover"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true);
+  const imageFixture = join(import.meta.dir, "fixtures/company-worker-image.py");
+  const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0 }), encoding: "utf8", timeout: 120000 });
+  expect(setup.status, setup.stderr).toBe(0);
+  const { base } = JSON.parse(setup.stdout);
+  let client;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
+    const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
+    client = await createCompanyClient(file, { home: f.home });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const view = JSON.parse(created.content[0].text).view;
+    await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
+    const settings = { company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" } };
+    const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
+    const result = JSON.parse(stdout), outcome = JSON.parse(result.stdout);
+    const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+    if (support.private_namespaces) {
+      expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
+      expect(outcome).toMatchObject({ ok: true, started: 1, state: "completed", invocations: 1, generation: 1, published: true });
+      expect(result.images).toBe(0);
+      expect(current.record.state).toBe("completed"); expect(current.publication).not.toBeNull();
+      expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
+      expect(inference.counts().actors).toBe(2); expect(host.counts().assessments).toBeGreaterThan(0);
+    } else {
+      expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
+      expect(result.images).toBe(0); expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0);
+      expect(inference.counts().actors).toBe(0); expect(host.counts().assessments).toBe(0);
+    }
+    expect(host.counts().actors).toBe(0);
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally {
+    client?.close(); service.child.kill(); await service.child.exited;
+    const cleaned = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ base, action: "cleanup" }), encoding: "utf8", timeout: 30000 });
+    expect(cleaned.status, cleaned.stderr).toBe(0);
+  }
+}, 480000);

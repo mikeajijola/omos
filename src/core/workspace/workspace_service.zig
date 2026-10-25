@@ -37,12 +37,27 @@ pub fn executeSchedule(manager: workspace.Manager, raw: []const u8, writable: bo
     }), .{});
 }
 
+/// Owner transport for native worker control. Scoped actors cannot enter this
+/// route, and the canonical admin operation still validates every transition.
+pub fn executeWorkers(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    if (raw.len > 65536) return error.ServiceRequestTooLarge;
+    const Envelope = struct { version: []const u8, workspace: []const u8, request: @import("company_worker_jobs.zig").Request };
+    const envelope = try records.decode(Envelope, manager.alloc, raw, .{});
+    if (!std.mem.eql(u8, envelope.version, "omos.company-worker-api/v1")) return error.UnsupportedCompanyApi;
+    if (!std.mem.eql(u8, envelope.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
+    if (envelope.request.change != .inspect and !writable) return error.ServiceReadOnly;
+    const parsed = try parse(manager.alloc, raw);
+    const request = parsed.object.get("request") orelse return error.InvalidCompanyWorkerJob;
+    const response = try @import("company_service.zig").administer(manager, try std.json.Stringify.valueAlloc(manager.alloc, .{ .version = "omos.company-admin/v1", .action = "workers", .worker = request }, .{}));
+    return std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .data = try parse(manager.alloc, response) }, .{});
+}
+
 pub const Request = struct {
     version: []const u8,
     workspace: []const u8,
     definition_hash: []const u8,
-    revision: []const u8,
-    action: enum { definition, query, read, inventory, record, propose, audit, queue_review, job },
+    revision: []const u8 = "",
+    action: enum { head, definition, query, read, inventory, record, propose, audit, queue_review, job },
     task: ?[]const u8 = null,
     entity: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -62,21 +77,22 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     const task: ?workspace.Task = if (request.task) |id| try manager.loadTask(id) else null;
     if (task) |selected| if (!std.mem.eql(u8, selected.workspace_id, request.workspace)) return error.WorkspaceIdentityMismatch;
     const revision = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
-    if (request.action != .job and request.action != .read and request.action != .inventory and !std.mem.eql(u8, request.revision, revision)) return error.WorkspaceRevisionChanged;
+    if (request.action != .head and request.action != .job and request.action != .read and request.action != .inventory and !std.mem.eql(u8, request.revision, revision)) return error.WorkspaceRevisionChanged;
     if (request.action == .read or request.action == .inventory) {
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", request.revision), .{});
         if (!std.mem.eql(u8, manifest.id, request.workspace)) return error.WorkspaceIdentityMismatch;
     }
     const transport_basis = (try manager.modelBasis(try manager.revision("trunk"))) orelse return error.WorkspaceMigrationRequired;
-    const basis = (if (task) |selected| selected.model_basis else transport_basis) orelse transport_basis;
+    const basis = (if (request.action == .head) transport_basis else if (task) |selected| selected.model_basis else transport_basis) orelse transport_basis;
     if (!std.mem.eql(u8, request.definition_hash, basis.definition_hash)) return error.StaleWorkspaceDefinition;
     // Workspace API contracts govern transport. A task keeps its own older
     // declaration and policy for record writes and independent assessment.
     const declaration = try manager.loadDeclaration(transport_basis.revision);
-    const operation = if (request.action == .inventory) "omos_workspace_inventory" else "omos_workspace_request";
+    const operation = if (request.action == .head) "omos_workspace_head" else if (request.action == .inventory) "omos_workspace_inventory" else "omos_workspace_request";
     try model.validateOperation(alloc, declaration, operation, (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value, .input);
     manager.expected_revision = request.revision;
     const data: std.json.Value = switch (request.action) {
+        .head => try parse(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .revision = revision, .task = if (task) |selected| @as(?[]const u8, selected.id) else null, .definition_hash = if (task) |selected| (selected.model_basis orelse return error.WorkspaceMigrationRequired).definition_hash else transport_basis.definition_hash }, .{})),
         .definition => try manager.definitionSnapshot(task),
         .query => try parse(alloc, try manager.queryRecords(task, request.entity, request.offset)),
         .audit => try parse(alloc, try manager.auditContracts()),
@@ -142,8 +158,8 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     };
     const result_revision = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
     const mutation = request.action == .record or request.action == .propose or request.action == .queue_review;
-    if (!mutation and request.action != .read and !std.mem.eql(u8, result_revision, revision)) return error.WorkspaceRevisionChanged;
-    const response = try std.json.Stringify.valueAlloc(alloc, .{ .workspace = manager.manifest.id, .definition_hash = basis.definition_hash, .revision = if (request.action == .read) request.revision else result_revision, .data = data }, .{});
+    if (!mutation and request.action != .read and request.action != .inventory and !std.mem.eql(u8, result_revision, revision)) return error.WorkspaceRevisionChanged;
+    const response = try std.json.Stringify.valueAlloc(alloc, .{ .workspace = manager.manifest.id, .definition_hash = basis.definition_hash, .revision = if (request.action == .read or request.action == .inventory) request.revision else result_revision, .data = data }, .{});
     try model.validateOperation(alloc, declaration, operation, try parse(alloc, response), .output);
     return response;
 }

@@ -281,3 +281,160 @@ scope and checkpoint changes through the signed company service.
 
 The coordinator and reader do not yet supply production image preparation,
 execution, or proposal collection. They do not enable `hosted_execution`.
+
+### Prepare a production image
+
+`worker-image.py` is an operator-only image preparer. Run it with Python's
+isolated mode and a root-owned `0600` configuration file. Its configuration
+version is `omos.worker-images/v1` and requires these fields:
+
+| Field | Purpose |
+| --- | --- |
+| `root` | Root-owned image pool, mode `0710`, with `service_gid` as its group. |
+| `template` | Root-owned runtime tree. The preparer follows no symlinks. |
+| `template_manifest` | Root-owned `0600` manifest of permitted runtime files. |
+| `template_manifest_sha256` | SHA-256 of that exact manifest file. |
+| `executable_sha256` | Verified SHA-256 of `runtime/bin/omos`. |
+| `service_uid`, `service_gid` | Operator-selected broker account identities. |
+| `max_images` | Pool bound, from 1 to 32, including interrupted preparations. |
+| `context_window`, `max_output_tokens` | Verified limits for the selected provider model. |
+
+Ancestor directories must be root-owned and reject group or other writes,
+except for a root-owned sticky temporary directory. The pool path must leave
+room for its 24-character image name and Unix socket within 100 bytes. A
+private host directory must also protect the shared broker socket, as described
+above. Image preparation does not establish this broker boundary by itself.
+
+The template manifest has version `omos.worker-template/v1` and a `files`
+array. Each entry declares `path`, `sha256`, `bytes`, and `executable`. Only
+files beneath `runtime/`, `bin/`, `lib/`, `lib64/`, and `usr/` can be copied.
+The template must include `runtime/bin/omos`, `runtime/bin/fossil`, `bin/sh`,
+and every runtime dependency they require. The preparer verifies all copied
+bytes and modes without executing template programs. Limits are 10,000 files,
+512 MiB per file, and 2 GiB per image.
+
+Send one JSON request on standard input:
+
+```json
+{
+  "version": "omos.worker-image-request/v1",
+  "action": "prepare",
+  "id": "INVOCATION_SHA256",
+  "workspace": "COMPANY_WORKSPACE_SHA256",
+  "view": "COMPANY_VIEW_SHA256",
+  "generation": 1,
+  "max_runtime_ms": 240000,
+  "model": "worker-model"
+}
+```
+
+Replace the identity placeholders with full SHA-256 identities, and use the
+claimed execution generation and a broker-approved model handle. Invoke the
+installed root-owned preparer as the operator:
+
+```sh
+sudo /usr/bin/python3 -I deployment/company/worker-image.py /etc/omos/worker-images.json < request.json
+```
+
+The generated profile contains only fixed broker routes and model metadata.
+It contains no issuer key, actor signing seed, provider credential, or owner
+token. The launcher still requires private namespaces. Repeat the exact
+preparation request to inspect its existing image; changed identity, model,
+configuration, or template pins are rejected. `inspect` and `remove` use the
+same request with a different action. Removal refuses an active worker UID.
+Failed preparation removes its partial tree; an interrupted preparation
+remains retained and consumes pool capacity for operator inspection.
+
+### Use the private gateway transport
+
+A coordinator on a separate operator account can use
+`createWorkerHttpControl({ endpoint, workspaceId, token })` from
+`worker-http-control.mjs`. The endpoint must be an explicit loopback IPv4
+address and port. Keep the owner token in the operator's private configuration.
+It is never a worker credential.
+
+`POST /v1/company/workers` accepts
+`{"version":"omos.company-worker-api/v1","workspace":"WORKSPACE_SHA256","request":{"change":"inspect"}}`.
+The native gateway requires its owner bearer token, rejects browser origins,
+and checks the workspace identity. A read-only gateway permits inspection and
+rejects job changes. The supplied public Caddy route does not expose this owner
+endpoint. Updates use the existing native job contracts and publication gates.
+
+`head` is a read-only `omos.workspace-api/v1` action for discovering a current
+immutable revision. Supply the current transport declaration hash and optional
+`task`, omitting `revision`. Its data includes the selected task identity,
+current full revision, and pinned definition hash. Subsequent inventory and
+content requests use those immutable pins. Looking up a head never activates,
+resumes, or publishes the task.
+
+### Connect the Linux execution backend
+
+`worker-linux.mjs` provides `createLinuxWorkerBackend` for a separate privileged
+operator process. It requires root-owned, hash-pinned launcher and image tools,
+a private image configuration, a private company-client configuration and key
+home, and an explicit broker model. The broker account in that image
+configuration must be root. Its socket still needs a private root-owned host
+directory boundary. The native gateway can remain on its separate service
+account; the coordinator controls jobs through the private owner endpoint.
+
+The backend probes the actual kernel before claiming work. It rejects hosts
+without private namespaces. It prepares one root for the exact company view
+and execution generation, then starts native `ask` inside that root. The prompt
+travels through standard input. Provider credentials and signing keys remain in
+host-side clients and the broker.
+
+After stopping and joining the actor, the backend verifies a quiescent worker
+UID and reads its private Fossil snapshot through native read-only commands.
+It proposes permitted managed files through signed company checkpoints, with
+hash and executable-mode preconditions. Larger files use the existing durable
+128 KiB upload protocol. Bounds are 8 MiB per file and 64 MiB of verified
+content per invocation. Existing company content remains available through the
+scoped MCP interface; this adapter does not infer file deletions or provide a
+transparent remote filesystem.
+
+Company submission queues independent host assessment. Private worker reviews
+and actor prose do not establish company acceptance. Failed or interrupted
+collection retains the bounded image and its private Fossil checkpoint for
+operator inspection. Unconfirmed process cleanup leaves the native job fenced
+until recovery or expiry. A frozen company proposal with additional private
+files also retains its image. The host removes an image only after accounting
+for its proposed files. Native `hosted_execution` remains disabled pending
+qualification and gateway integration of the complete backend.
+
+### Supervise the coordinator
+
+`worker-server.mjs` runs the optional Linux coordinator with Node.js 22 or newer.
+Its root-owned `0600` configuration has version `omos.company-workers/v1`,
+`concurrency` from 1 to 4, `poll_ms` from 250 to 5,000, and these two objects:
+
+- `control`: `endpoint`, `workspaceId`, and the private owner `token` for
+  `createWorkerHttpControl`.
+- `backend`: `imageTool`, `imageToolSha256`, `launcher`, `launcherSha256`,
+  `imageConfiguration`, `companyConfiguration`, `companyHome`, and `model` for
+  `createLinuxWorkerBackend`. The model declares its exact completion endpoint,
+  worker handle, provider model, and optional credential.
+
+Install the reviewed companion tree and its pinned operation schema beneath a
+root-owned version directory. Preserve their repository-relative locations:
+`deployment/company/` and `src/core/workspace/standard/omos.json`. The image and
+launcher paths in the configuration must name their real, hash-pinned paths;
+a mutable `current` symlink is insufficient for those pins. Keep image pools,
+operator key homes, and broker directories under private persistent storage.
+
+The supplied `omos-company-workers.service` is a separate system service. It
+keeps the gateway on its original service account and grants the privileged
+coordinator only the host capabilities its launcher and image preparer require.
+Its default writable locations are `/var/lib/omos-workers` and
+`/run/omos-worker-leases`. Install Node.js and the reviewed companion tree at
+the unit's explicit paths, then install private operator configuration and the
+runtime template before starting it. Configure an independent actor grant and
+signing key for its company client. Queue a test view and inspect the resulting
+job, independent assessment, and verified publication before onboarding users.
+
+The supervisor logs sanitized lifecycle and inspection events. Task intent,
+provider credentials, signing keys, and owner tokens are omitted. Job state,
+invocation budgets, proposals, and publication remain in native Fossil records.
+Stopping the supervisor cancels and joins its current workers. Restarting reads
+those records and does not replay unexpired or paused actor work. The dedicated
+Linux CI job requires private namespaces and exercises the actual production
+adapter; tests on a restricted host verify refusal before claiming a job.

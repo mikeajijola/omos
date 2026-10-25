@@ -1,13 +1,16 @@
 # Run the company service on one host
 
-These files deploy the current signed company gateway and independent review
-workers. They do not provide hosted actor isolation, SSO enrollment, or a complete
-company reconciliation coordinator. See the supported operations and limits in
+These files deploy the signed company gateway and independent review workers.
+An optional privileged Linux coordinator dispatches retained jobs through the
+private owner API and an isolated native runtime. Its production qualification
+is separate from the gateway; native `hosted_execution` remains disabled.
+See the supported operations and limits in
 [the workspace contracts](../../src/core/workspace/CONTRACTS.md#scoped-company-service).
 
-The [isolated worker runtime components](WORKERS.md) provide a Linux launcher
-and a Unix service broker for coordinator integration. Their presence does not
-enable hosted actor execution in the gateway.
+The [isolated worker runtime components](WORKERS.md) describe the operator
+configuration, verified image template, process boundary, result collection,
+and separate system service. Their presence does not enable native hosted
+execution or enroll an actor automatically.
 
 Use a dedicated service account with persistent home storage. Install the built
 `omos` and `omo` aliases and verified Fossil helper for that account using

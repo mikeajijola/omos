@@ -32,7 +32,7 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
     entry.promise = (async () => {
       let result;
       try { result = await backend.run(structuredClone(row), controller.signal); }
-      catch { result = { outcome: "failed", note: "The isolated invocation failed; inspect its retained checkpoint before resuming." }; }
+      catch (error) { if (error?.executionUncertain) return; const cause = /^[A-Z][A-Za-z0-9]{0,95}$/.test(error?.message) ? error.message : "IsolatedInvocationFailed"; result = { outcome: "failed", note: `${cause}. Inspect the retained isolated checkpoint before resuming.` }; }
       finally { clearTimeout(timer); }
       // run() must have joined cleanup here. A revoked/cancelled/fenced worker
       // cannot release a newer execution owner or overwrite its job outcome.

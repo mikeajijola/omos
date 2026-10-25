@@ -90,6 +90,11 @@ Local hosts can invoke the read-only workspace API with
 `omos.workspace-api/v1` envelope and active declaration hash as the HTTP API.
 This command cannot write records, propose definitions, or queue reviews.
 
+The `head` action discovers the current full revision of the workspace or an
+optional `task`. It takes the current transport declaration hash and omits
+`revision`. Its data supplies the immutable revision and selected task's pinned
+definition hash for subsequent retrieval. It never resumes or publishes work.
+
 The `inventory` action lists up to 32 portable file identities per page at an
 immutable Fossil revision. Supply `offset` to continue, and an optional exact
 `path` or directory prefix ending in `/` to select content. Rows contain a path,
@@ -99,7 +104,7 @@ SHA-256 receipt. Use `read` for bounded byte pages with the complete content's
 SHA-256 and byte count. Binary pages use base64; text pages preserve UTF-8
 boundaries. Subsequent accepted revisions do not change a pinned inventory or
 read. Existing instances must explicitly upgrade their contracts before using
-the new `omos_workspace_inventory` operation.
+the new `omos_workspace_inventory` and `omos_workspace_head` operations.
 
 `fossil_workspace` supports `verify_manifest` with a workspace-relative `path`.
 The referenced JSON has a `files` array whose entries contain `path`, `sha256`,

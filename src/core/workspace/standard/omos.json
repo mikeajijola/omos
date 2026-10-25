@@ -3286,7 +3286,8 @@
         ],
         "approval": "policy",
         "interfaces": [
-          "cli"
+          "cli",
+          "api"
         ]
       },
       {
@@ -3417,6 +3418,107 @@
           "api",
           "cli"
         ]
+      },
+      {
+        "id": "omos_workspace_head",
+        "capability": "general_task",
+        "description": "Inspect the immutable current workspace or task revision without loading task history.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.workspace-api/v1"
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "action": {
+              "const": "head"
+            },
+            "task": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "definition_hash",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "workspace": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 40,
+              "maxLength": 64
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "revision": {
+                  "type": "string",
+                  "minLength": 40,
+                  "maxLength": 64
+                },
+                "task": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "definition_hash": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                }
+              },
+              "required": [
+                "revision",
+                "task",
+                "definition_hash"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "workspace",
+            "definition_hash",
+            "revision",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "interfaces": [
+          "api",
+          "cli"
+        ],
+        "approval": "policy"
       }
     ],
     "semantic": {

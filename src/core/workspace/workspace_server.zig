@@ -196,10 +196,11 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         defer lease.release();
         @import("company_service.zig").validateInstance(manager) catch |err| return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = .conflict, .keep_alive = keep_alive.* });
         const snapshot = try manager.definitionSnapshot(null);
-        return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = (try manager.snapshot("")).trunk_revision }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+        return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = try manager.revision("trunk") }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
     const schedules = std.mem.eql(u8, request.head.target, "/v1/schedules");
-    if (request.head.method != .POST or (!company and !schedules and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    const workers = std.mem.eql(u8, request.head.target, "/v1/company/workers");
+    if (request.head.method != .POST or (!company and !schedules and !workers and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
@@ -216,7 +217,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         subscription.respond(request) catch return error.HttpConnectionClosing;
         return;
     }
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
         return reject(manager, request, keep_alive.*, err);
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });

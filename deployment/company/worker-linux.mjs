@@ -1,0 +1,178 @@
+// Privileged execution adapter. Install with its Python helpers under an
+// operator-owned directory; company/provider keys never enter the worker root.
+import fs from "node:fs/promises";
+import { constants } from "node:fs";
+import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createCompanyClient } from "./mcp.mjs";
+import { createWorkerBroker } from "./worker-broker.mjs";
+import { createWorkerSnapshot } from "./worker-snapshot.mjs";
+
+const fail = code => { throw new Error(code); };
+const hex = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+const fingerprint = info => [info.dev, info.ino, info.size, info.mode, info.uid, info.mtimeNs, info.ctimeNs].map(String).join(":");
+async function trustedFile(filename, expected, limit = 65536) {
+  if (!path.isAbsolute(filename) || await fs.realpath(filename) !== filename) fail("UnsafeWorkerHostFile");
+  let parent = path.dirname(filename);
+  for (;;) {
+    const info = await fs.lstat(parent);
+    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== 0 || ((info.mode & 0o022) && !(info.mode & 0o1000))) fail("UnsafeWorkerHostFile");
+    if (parent === path.dirname(parent)) break;
+    parent = path.dirname(parent);
+  }
+  const file = await fs.open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = await file.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || before.uid !== 0n || (before.mode & 0o6022n) || before.size > BigInt(limit)) fail("UnsafeWorkerHostFile");
+    const bytes = await file.readFile();
+    if (fingerprint(before) !== fingerprint(await file.stat({ bigint: true })) || (expected && createHash("sha256").update(bytes).digest("hex") !== expected)) fail("WorkerHostFileChanged");
+    return bytes;
+  } finally { await file.close(); }
+}
+
+async function command(program, args, { input, signal, timeout = 120000, maxBytes = 8 * 1024 * 1024 } = {}) {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const child = spawn(program, args, { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] });
+    const output = [], errors = [];
+    let size = 0, errorSize = 0, killed = false, force;
+    const stop = () => {
+      if (killed) return;
+      killed = true; child.kill("SIGTERM");
+      force = setTimeout(() => child.kill("SIGKILL"), 10000);
+    };
+    const timer = setTimeout(stop, timeout);
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
+    child.stdout.on("data", chunk => { size += chunk.length; if (size <= maxBytes) output.push(chunk); else stop(); });
+    child.stderr.on("data", chunk => { errorSize += chunk.length; if (errorSize <= 65536) errors.push(chunk); });
+    child.stdin.on("error", () => {});
+    child.once("error", reject);
+    child.once("close", code => {
+      clearTimeout(timer); clearTimeout(force); signal?.removeEventListener("abort", stop);
+      if (size > maxBytes) reject(new Error("WorkerHostOutputBudgetExceeded"));
+      else resolve({ code, killed, stdout: Buffer.concat(output).toString("utf8"), stderr: Buffer.concat(errors).toString("utf8") });
+    });
+    child.stdin.end(input);
+  });
+}
+
+export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, launcher, launcherSha256, imageConfiguration, companyConfiguration, companyHome, model }) {
+  if (process.platform !== "linux" || process.getuid?.() !== 0 || !hex(imageToolSha256) || !hex(launcherSha256) || !model || typeof model.handle !== "string") fail("WorkerOperatorPrivilegesRequired");
+  model = structuredClone(model);
+  await trustedFile(imageTool, imageToolSha256, 131072);
+  await trustedFile(launcher, launcherSha256, 131072);
+  const configurationBytes = await trustedFile(imageConfiguration);
+  const configuration = JSON.parse(configurationBytes.toString("utf8"));
+  if (configuration.service_uid !== 0 || configuration.service_gid !== 0) fail("WorkerRootBrokerRequired");
+  const probe = await command("/usr/bin/python3", ["-I", launcher, "--probe"], { timeout: 10000, maxBytes: 8192 });
+  const support = probe.code === 0 ? JSON.parse(probe.stdout) : null;
+  if (!support?.kernel_supported || !support.private_namespaces) fail("WorkerPrivateNamespacesRequired");
+  const image = async (request, signal) => {
+    await trustedFile(imageTool, imageToolSha256, 131072);
+    if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
+    const result = await command("/usr/bin/python3", ["-I", imageTool, imageConfiguration], { input: JSON.stringify(request), signal, maxBytes: 8192 });
+    if (result.code !== 0) fail("WorkerImageOperationFailed");
+    return JSON.parse(result.stdout);
+  };
+  const run = async (root, args, signal, input) => {
+    await trustedFile(launcher, launcherSha256, 131072);
+    return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
+  };
+  return Object.freeze({
+    async run(row, signal) {
+      const job = row.record, binding = job.binding;
+      if (!row.authority_live || job.state !== "running" || !hex(binding.workspace) || !hex(binding.view) || !job.runtime || job.generation !== row.execution?.generation || row.execution?.runtime !== job.runtime || row.pending_operation) fail("InvalidWorkerInvocation");
+      const deadline = Math.min(Date.now() + job.max_runtime_ms, job.expires_ms - 1000);
+      const request = { version: "omos.worker-image-request/v1", action: "prepare", id: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), workspace: binding.workspace, view: binding.view, generation: job.generation, max_runtime_ms: job.max_runtime_ms, model: model.handle };
+      const prepared = await image(request, signal);
+      if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== job.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
+      let client, broker, complete = false;
+      const actions = ["discover", "read", "query", "checkpoint", "record", "submit", "status", "reconcile"].filter(action => row.grant.actions.includes(action));
+      if (!["read", "checkpoint", "submit", "status"].every(action => actions.includes(action))) fail("WorkerGrantIncomplete");
+      const call = async (action, rest = {}) => {
+        if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
+        const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: randomUUID(), expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
+        if (result.isError) fail("WorkerCompanyOutcomeUnresolved");
+        return JSON.parse(result.content[0].text);
+      };
+      try {
+        client = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions } });
+        if (client.identity.workspace !== binding.workspace || client.identity.actor !== binding.actor || client.identity.grant !== binding.grant) fail("WorkerCompanyIdentityChanged");
+        broker = await createWorkerBroker({ socket: prepared.root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: job.expires_ms, model, companyClient: client, company: { endpoint: JSON.parse((await trustedFile(companyConfiguration)).toString("utf8")).endpoint, workspace: binding.workspace, actor: binding.actor, grant: binding.grant, view: binding.view, actions } });
+        const state = await call("status");
+        if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
+        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths })}`;
+        if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
+        const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
+        // The launcher joins and kills descendants before returning. Ignore
+        // actor prose, local assessments and claimed completion as authority.
+        await image({ ...request, action: "quiesce" });
+        signal?.throwIfAborted();
+        if (actor.killed || ![0, 1].includes(actor.code)) fail("WorkerInvocationFailed");
+        let current = await call("status");
+        const frozen = !!current.publication || ["queued", "running"].includes(current.job?.state);
+        const snapshot = await run(prepared.root, ["fossil", "status", "--json"], signal);
+        if (snapshot.code !== 0) fail("WorkerSnapshotUnavailable");
+        const local = JSON.parse(snapshot.stdout);
+        if (!hex(local.workspace_id) || !hex(local.trunk_revision) || !Array.isArray(local.tasks) || local.tasks.length !== 1) fail("WorkerSnapshotAmbiguous");
+        const selected = local.tasks[0];
+        if (!/^[0-9a-f]{64}$/.test(selected.id) || !hex(selected.model_basis?.definition_hash)) fail("WorkerSnapshotAmbiguous");
+        const requestNative = async input => {
+          const filename = ".omos-host-read-" + randomUUID() + ".json";
+          const output = path.join(prepared.root, "workspace", filename);
+          const file = await fs.open(output, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+          try { await file.writeFile(JSON.stringify(input)); await file.chown(prepared.uid, prepared.uid); }
+          finally { await file.close(); }
+          try {
+            const result = await run(prepared.root, ["fossil", "request", "/workspace/" + filename, "--json"], signal);
+            if (result.code !== 0) fail("WorkerSnapshotUnavailable");
+            return JSON.parse(result.stdout);
+          } finally { await fs.unlink(output); }
+        };
+        const head = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id });
+        const reader = createWorkerSnapshot({ workspace: local.workspace_id, definitionHash: head.data.definition_hash, revision: head.data.revision, request: input => requestNative({ ...input, task: selected.id }), maxFileBytes: 8 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
+        const inventory = await reader.inventory(signal);
+        for (const file of inventory) {
+          if (!row.grant.paths.some(scope => scope.endsWith("/") ? file.path.startsWith(scope) : file.path === scope)) fail("WorkerOutputOutsideScope");
+          const bytes = await reader.read(file.path, signal);
+          const previous = await call("read", { revision: current.revision, path: file.path, offset: 0 });
+          if (previous.exists !== false && previous.sha256 === bytes.sha256 && previous.executable === file.executable) continue;
+          if (frozen) return { outcome: current.publication ? "completed" : "submitted", note: "Additional private files remain retained in the worker image after the company candidate was frozen." };
+          const mutation = { revision: current.revision, path: file.path, encoding: "base64", content: bytes.content.toString("base64"), executable: file.executable };
+          if (previous.exists !== false) { mutation.previous_hash = previous.sha256; mutation.previous_executable = previous.executable; }
+          let checkpoint;
+          if (bytes.bytes <= 512 * 1024) checkpoint = await call("checkpoint", mutation);
+          else {
+            const upload = { sha256: bytes.sha256, bytes: bytes.bytes };
+            const metadata = { ...mutation, upload }; delete metadata.content;
+            for (let offset = 0; offset < bytes.bytes; offset += 128 * 1024) {
+              const part = await call("checkpoint", { ...metadata, offset, content: bytes.content.subarray(offset, offset + 128 * 1024).toString("base64") });
+              if (part.state !== "uploading" || part.revision !== current.revision || part.offset !== offset) fail("WorkerCompanyUploadChanged");
+            }
+            checkpoint = await call("checkpoint", metadata);
+          }
+          current = { ...current, revision: checkpoint.revision };
+        }
+        if (frozen) { complete = true; return { outcome: current.publication ? "completed" : "submitted" }; }
+        if (!inventory.length && current.revision === state.revision) return { outcome: "waiting", note: "The invocation produced no company checkpoint; inspect retained local task evidence before requeueing." };
+        await call("submit", { revision: current.revision, candidate: "The stopped isolated invocation retained its proposed company changes. Assess the original task contract against the exact candidate and host-recorded evidence." });
+        complete = true;
+        return { outcome: "submitted", note: "Company changes are checkpointed and queued for independent host review." };
+      } finally {
+        if (broker) await broker.close();
+        if (client) client.close();
+        // Retain an unsuccessful image, including its private Fossil checkpoint,
+        // for operator recovery. It consumes the bounded pool until resolved.
+        try {
+          await image({ ...request, action: "quiesce" });
+          if (complete) await image({ ...request, action: "remove" });
+        } catch {
+          const error = new Error("WorkerCleanupPending"); error.executionUncertain = true;
+          throw error;
+        }
+      }
+    },
+  });
+}
