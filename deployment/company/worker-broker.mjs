@@ -4,6 +4,7 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 
 const failure = code => { throw new Error(code); };
 function endpoint(raw) {
@@ -64,7 +65,8 @@ export async function createWorkerBroker({ socket, model, company, companyClient
   if (typeof model.model !== "string" || !model.model || typeof model.handle !== "string" || !model.handle || !Array.isArray(company.actions) || !company.actions.length) failure("InvalidWorkerBroker");
   for (const field of ["workspace", "actor", "grant"]) if (typeof company[field] !== "string" || !company[field]) failure("InvalidWorkerBroker");
   if (companyClient && (!companyClient.scope || companyClient.scope.view !== company.view || companyClient.scope.expiresMs < expiresMs || !["workspace", "actor", "grant"].every(field => companyClient.identity[field] === company[field]) || companyClient.scope.actions.some(action => !company.actions.includes(action)))) failure("InvalidWorkerCompanyClient");
-  let active = 0, requests = 0;
+  if (company.source_revision !== undefined && (!companyClient || !/^[0-9a-f]{64}$/.test(company.source_revision) || !company.actions.includes("read") || !company.actions.includes("discover"))) failure("InvalidWorkerProjection");
+  let active = 0, requests = 0, projectionRequests = 0;
   const controllers = new Set();
   const server = http.createServer(async (request, response) => {
     let claimed = false, controller;
@@ -75,11 +77,23 @@ export async function createWorkerBroker({ socket, model, company, companyClient
     try {
       if (Date.now() >= expiresMs) return error(403, "WorkerBrokerExpired");
       if (active >= maxConcurrent) return error(429, "WorkerBrokerBusy");
-      if (++requests > maxRequests) return error(429, "WorkerBrokerBudgetExceeded");
+      const projection = request.url === "/company/projection" && company.source_revision !== undefined;
+      if (projection ? ++projectionRequests > 20000 : ++requests > maxRequests) return error(429, "WorkerBrokerBudgetExceeded");
       active++; claimed = true;
       controller = new AbortController(); controllers.add(controller);
       const timer = setTimeout(() => controller.abort(), Math.min(120000, expiresMs - Date.now()));
       response.once("close", () => { clearTimeout(timer); controller.abort(); });
+      if (projection) {
+        if (request.method !== "POST") return error(405, "WorkerProjectionMethodDenied");
+        const input = parsed(await body(request, 8192, controller.signal));
+        if (!input || Array.isArray(input) || Object.keys(input).some(key => !["action", "path", "offset"].includes(key)) || !["inventory", "read"].includes(input.action) || !Number.isSafeInteger(input.offset ?? 0) || (input.offset ?? 0) < 0 || (input.action === "read" && typeof input.path !== "string") || (input.action === "inventory" && input.path !== undefined)) return error(400, "InvalidWorkerProjectionRequest");
+        const result = await companyClient.call("company_workspace", { version: "omos.company/v2", action: input.action === "inventory" ? "discover" : "read", operation: randomUUID(), expires_ms: Math.min(expiresMs, Date.now() + 300000), revision: company.source_revision, offset: input.offset ?? 0, ...(input.action === "read" ? { path: input.path } : {}) }, controller.signal);
+        if (result.isError) return error(403, "WorkerProjectionReadDenied");
+        const data = JSON.parse(result.content[0].text);
+        if (data.revision !== company.source_revision || data.read_tracking !== "recorded") return error(409, "WorkerProjectionChanged");
+        response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+        return response.end(JSON.stringify({ workspace: company.workspace, view: company.view, revision: company.source_revision, generation: companyClient.scope.execution.generation, data }));
+      }
       if (request.url === "/company/mcp" && companyClient) {
         if (request.method !== "POST") { response.setHeader("allow", "POST"); return error(405, "WorkerMcpMethodDenied"); }
         const rpc = parsed(await body(request, 1024 * 1024, controller.signal));

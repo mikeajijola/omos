@@ -55,6 +55,7 @@ Store this descriptor as `.omos-worker-root.json`, owned by root with mode
   "workspace": "COMPANY_WORKSPACE_SHA256",
   "view": "COMPANY_VIEW_SHA256",
   "generation": 1,
+  "source_revision": "COMPANY_VIEW_REVISION_SHA256",
   "max_runtime_ms": 300000,
   "executable": "/runtime/bin/omos",
   "executable_sha256": "VERIFIED_EXECUTABLE_SHA256"
@@ -343,6 +344,10 @@ token. The launcher still requires private namespaces. Repeat the exact
 preparation request to inspect its existing image; changed identity, model,
 configuration, or template pins are rejected. `inspect` and `remove` use the
 same request with a different action. Removal refuses an active worker UID.
+The optional `source_revision` pins company input for native file tools. The
+production backend supplies the claimed view revision and writes that identity
+into the image's read-only runtime configuration. Omitting it creates an image
+without the company filesystem projection.
 Failed preparation removes its partial tree; an interrupted preparation
 remains retained and consumes pool capacity for operator inspection.
 
@@ -392,14 +397,32 @@ Unresolved outcomes remain fenced; recovery never replays actor tools or an
 external effect. Backends without this recovery interface leave pending jobs
 queued for operator inspection.
 
+Ordinary file tools fetch selected company files into the private Fossil branch
+before materialising them on disk. Skill discovery fetches skill entrypoints;
+loading a skill fetches its package. A shell can open arbitrary files, so it
+fetches the permitted managed roots before execution. The broker fixes the
+workspace, view, revision and execution generation for these reads and the
+native service checks current authority on every request. No source tree is
+copied when the logical company view is created.
+
+The private `omos_worker_projection` record commits each fetched file's hash,
+size and executable flag together with its bytes. Interrupted fetches can
+resume without restoring later local deletions. Bounds are 10,000 inventory
+entries, 8 MiB per file and 64 MiB of materialised input. The broker allows at
+most 20,000 projection requests within the invocation deadline, separately from
+its actor request budget. This is an on-demand projection for native managed
+roots; it is not a general network filesystem.
+
 After stopping and joining the actor, the backend verifies a quiescent worker
 UID and reads its private Fossil snapshot through native read-only commands.
 It proposes permitted managed files through signed company checkpoints, with
 hash and executable-mode preconditions. Larger files use the existing durable
 128 KiB upload protocol. Bounds are 8 MiB per file and 64 MiB of verified
-content per invocation. Existing company content remains available through the
-scoped MCP interface; this adapter does not infer file deletions or provide a
-transparent remote filesystem.
+content per invocation. The host verifies the projection ledger against the
+original company revision before proposing deletions. Files that were never
+fetched cannot be inferred deleted. Changed files use the original input hash
+and mode as preconditions, so an intervening edit produces a retained conflict.
+Unchanged projected files remain references to their company originals.
 
 Company submission queues independent host assessment. Private worker reviews
 and actor prose do not establish company acceptance. The adapter submits the

@@ -145,8 +145,9 @@ def main():
             raw = sys.stdin.buffer.read(65537)
             require(len(raw) <= 65536, "ImageRequestTooLarge")
             request = json.loads(raw)
-            require(isinstance(request, dict) and set(request) == {"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model"} and request["version"] == "omos.worker-image-request/v1" and request["action"] in ("prepare", "inspect", "remove", "quiesce") and all(identity(request[key]) for key in ("id", "workspace", "view")) and type(request["generation"]) is int and request["generation"] > 0 and type(request["max_runtime_ms"]) is int and 1000 <= request["max_runtime_ms"] <= 240000 and isinstance(request["model"], str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", request["model"]), "InvalidImageRequest")
+            require(isinstance(request, dict) and set(request) in ({"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model"}, {"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model", "source_revision"}) and request["version"] == "omos.worker-image-request/v1" and request["action"] in ("prepare", "inspect", "remove", "quiesce") and all(identity(request[key]) for key in ("id", "workspace", "view")) and type(request["generation"]) is int and request["generation"] > 0 and type(request["max_runtime_ms"]) is int and 1000 <= request["max_runtime_ms"] <= 240000 and isinstance(request["model"], str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", request["model"]), "InvalidImageRequest")
             root = pathlib.Path(config["root"])
+            require("source_revision" not in request or identity(request["source_revision"]), "InvalidImageSourceRevision")
             target = root / request["id"][:24]
             uid = 100000 + int(request["id"][:12], 16) % 15900001
             descriptor = {"version": "omos.worker-root/v1", "uid": uid, "workspace": request["workspace"], "view": request["view"], "generation": request["generation"], "max_runtime_ms": request["max_runtime_ms"], "executable": "/runtime/bin/omos", "executable_sha256": config["executable_sha256"]}
@@ -227,6 +228,10 @@ def main():
                     (profile / name).write_text(json.dumps(value))
                     os.chown(profile / name, uid, uid)
                 os.chown(profile, uid, uid)
+                if "source_revision" in request:
+                    source = {"version": "omos.worker-source/v1", "workspace": request["workspace"], "view": request["view"], "revision": request["source_revision"], "generation": request["generation"]}
+                    (staging / "runtime/worker-source.json").write_text(json.dumps(source))
+                    (staging / "runtime/worker-source.json").chmod(0o444)
                 marker = staging / ".omos-worker-root.json"
                 marker.write_text(json.dumps(descriptor))
                 marker.chmod(0o600)

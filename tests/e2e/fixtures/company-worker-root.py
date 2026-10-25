@@ -96,6 +96,10 @@ for relative in ['workspace','home/worker','tmp','run','dev']:(root/relative).mk
 (root/'etc/passwd').write_text(f'worker:x:{spec["uid"]}:{spec["uid"]}:Isolated worker:/home/worker:/bin/sh\n')
 (root/'etc/group').write_text(f'worker:x:{spec["uid"]}:\n')
 if spec.get('profile'):shutil.copytree(spec['profile'],root/'home/worker/.fx')
+if spec.get('source'):
+ value=spec['source']
+ assert value['version']=='omos.worker-source/v1' and all(re.fullmatch('[0-9a-f]{64}',value[key]) for key in ('workspace','view','revision')) and type(value['generation']) is int and value['generation']>0
+ (root/'runtime/worker-source.json').write_text(json.dumps(value));(root/'runtime/worker-source.json').chmod(0o444)
 os.mknod(root/'dev/null',stat.S_IFCHR|0o666,os.makedev(1,3))
 os.mknod(root/'dev/urandom',stat.S_IFCHR|0o666,os.makedev(1,9))
 (root/'dev/null').chmod(0o666)

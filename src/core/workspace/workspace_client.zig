@@ -93,6 +93,13 @@ fn http(alloc: std.mem.Allocator, base_url: []const u8, endpoint: []const u8, bo
     return httpControlled(alloc, base_url, endpoint, body, token, null);
 }
 
+/// The isolated launcher installs the fixed Unix broker before any threads.
+/// Neither the worker nor this request chooses a remote endpoint or identity.
+pub fn workerProjection(alloc: std.mem.Allocator, body: []const u8, control: ?Control) !std.json.Value {
+    if (io.getenv("OMOS_WORKER_BROKER") == null) return error.WorkerProjectionUnavailable;
+    return httpControlled(alloc, "http://127.0.0.1:1", "/company/projection", body, null, control);
+}
+
 const Body = struct {
     bytes: []u8,
     pub fn deinit(self: *Body, alloc: std.mem.Allocator) void {

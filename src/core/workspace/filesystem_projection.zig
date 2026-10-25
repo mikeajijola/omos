@@ -289,12 +289,12 @@ pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
     try materialise(manager, task, .{});
 }
 
-const Selection = struct {
+pub const Selection = struct {
     all: bool = false,
     path: ?[]const u8 = null,
     skill_index: bool = false,
 
-    fn includes(self: Selection, path: []const u8) bool {
+    pub fn includes(self: Selection, path: []const u8) bool {
         if (self.all) return true;
         if (self.skill_index and std.mem.startsWith(u8, path, "skills/") and std.mem.endsWith(u8, path, "/SKILL.md")) return true;
         const prefix = self.path orelse return false;
@@ -615,6 +615,7 @@ pub fn skillsDirectory(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     const lease = try manager.projectionLease(task);
     defer lease.release();
+    try @import("worker_projection.zig").hydrate(manager, task, .{ .skill_index = true });
     try materialise(manager, task, .{ .skill_index = true });
     return try std.Io.Dir.path.join(alloc, &.{ try directory(manager, task), "skills" });
 }
@@ -622,7 +623,8 @@ pub fn skillsDirectory(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const
 /// Hydrate only a requested managed path before ordinary permission preflight.
 /// An opaque process can open arbitrary files, so shell execution explicitly
 /// hydrates its complete personal view instead of exposing missing placeholders.
-/// This changes caches, never canonical content or the tool's permission policy.
+/// Company worker hydration also records pinned input provenance in its private
+/// Fossil branch. Tool permission policy remains unchanged.
 pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: []const u8, name: []const u8, raw: []const u8, cancel_flag: ?*std.atomic.Value(bool)) !void {
     if (comptime builtin.target.cpu.arch.isWasm()) return;
     const id = session orelse return;
@@ -668,6 +670,7 @@ pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: [
     }
     const lease = try manager.projectionLease(task);
     defer lease.release();
+    try @import("worker_projection.zig").hydrate(manager, task, selection);
     try materialise(manager, task, selection);
 }
 

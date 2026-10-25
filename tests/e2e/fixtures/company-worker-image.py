@@ -42,6 +42,7 @@ if spec["action"] == "setup":
     binary("/bin/sh", "/bin/sh")
     binary("/bin/bash", "/bin/bash")
     binary("/usr/bin/env", "/usr/bin/env")
+    binary("/bin/rm", "/bin/rm")
     manifest = base / "template.json"
     manifest.write_text(json.dumps({"version": "omos.worker-template/v1", "files": list(files.values())}))
     manifest.chmod(0o600)

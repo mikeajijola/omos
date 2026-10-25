@@ -215,6 +215,25 @@ test.skipIf(!support?.kernel_supported)("Linux workers isolate host content, cre
 }, 240000);
 
 
+test("worker projection reads pin identity and revision without exposing credentials or mutation routes", async () => {
+  const f = fixture(), calls: any[] = [];
+  const revision = "a".repeat(64), workspace = "b".repeat(64), view = "c".repeat(64), expiresMs = Date.now() + 60000;
+  const companyClient = { identity: { workspace, actor: "worker", grant: "grant" }, scope: { view, expiresMs, execution: { runtime: "runtime", generation: 2 }, actions: ["read", "discover"] }, async call(name, input) {
+    calls.push({ name, input }); return { content: [{ text: JSON.stringify({ revision, read_tracking: "recorded", files: [], total: 0, next_offset: null }) }] };
+  } };
+  const socket = join(f.home, "projection.sock");
+  const broker = await createWorkerBroker({ socket, expiresMs, companyClient, maxRequests: 1, model: { endpoint: "http://127.0.0.1:1/model", handle: "fixture", model: "fixture" }, company: { endpoint: "http://127.0.0.1:1/company", workspace, actor: "worker", grant: "grant", view, source_revision: revision, actions: ["read", "discover"] } });
+  try {
+    const first = await local(socket, "/company/projection", { action: "inventory", offset: 0 });
+    expect(first.status).toBe(200); expect(JSON.parse(first.text)).toMatchObject({ workspace, view, revision, generation: 2 });
+    const second = await local(socket, "/company/projection", { action: "read", path: "documents/team/a.txt", offset: 16384 });
+    expect(second.status).toBe(200); expect(calls[1].input).toMatchObject({ version: "omos.company/v2", action: "read", revision, path: "documents/team/a.txt", offset: 16384 });
+    expect(calls[1].input.view).toBeUndefined(); expect(calls[1].input.execution).toBeUndefined();
+    for (const input of [{ action: "checkpoint", path: "documents/a" }, { action: "read", path: "documents/a", revision: "d".repeat(64) }, { action: "inventory", view }, { action: "inventory", offset: -1 }]) expect((await local(socket, "/company/projection", input)).status).toBe(400);
+    expect(calls).toHaveLength(2);
+  } finally { await broker.close(); }
+});
+
 test("host-held company keys bind native worker MCP calls to one view and execution generation", async () => {
   const f = fixture();
   const hostInference = model(f, () => { throw Error("The company host must not run actor tools"); });
@@ -230,7 +249,7 @@ test("host-held company keys bind native worker MCP calls to one view and execut
   const keyed = await f.run(["fossil", "company-key", "broker-worker", "--json"]);
   expect(keyed.code, keyed.stderr).toBe(0);
   const key = JSON.parse(keyed.stdout);
-  const actions = ["create_view", "checkpoint", "read", "status", "reconcile", "execution", "submit"];
+  const actions = ["create_view", "checkpoint", "read", "status", "reconcile", "execution", "submit", "discover"];
   await admin({ action: "grant", revision: initial.revision, grant: { id: "hosted-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
   const service = await startWorkspaceService(f, true);
   let owner, bound, broker;
@@ -256,7 +275,7 @@ test("host-held company keys bind native worker MCP calls to one view and execut
     const execution = { runtime: "hosted-test", generation: 1 };
     await value(owner, args("execution", { view: first.view, revision: first.revision, execution: { ...execution, generation: 0 }, execution_change: "claim", execution_lease_ms: 240000 }));
     const expiresMs = Date.now() + 210000;
-    bound = await createCompanyClient(config, { home: f.home, binding: { view: first.view, execution, expiresMs, actions: ["checkpoint", "read", "status", "reconcile", "submit"] } });
+    bound = await createCompanyClient(config, { home: f.home, binding: { view: first.view, execution, expiresMs, actions: ["checkpoint", "read", "status", "reconcile", "submit", "discover"] } });
     expect(Object.keys(bound)).not.toContain("key");
     const advertised = bound.tools();
     expect(advertised[1].inputSchema.properties.view).toBeUndefined();
@@ -312,7 +331,7 @@ test("host-held company keys bind native worker MCP calls to one view and execut
       for (const file of ["settings.json", "mcp.json"]) writeFileSync(join(profile, file), readFileSync(join(worker.home, ".fx", file)));
       const root = join(worker.home, "worker-root"), imageFile = join(worker.home, "scoped-image.json");
       const packagedFossil = join(import.meta.dir, "../../zig-out/libexec/fossil");
-      const image = { root, uid: 1000000 + Number.parseInt(crypto.randomUUID().slice(0, 6), 16) % 14000000, owner: process.getuid!(), namespaces: support.private_namespaces, executable: join(import.meta.dir, "../../zig-out/bin/fx"), fossil: existsSync(packagedFossil) ? packagedFossil : Bun.which("fossil"), profile };
+      const image = { root, uid: 1000000 + Number.parseInt(crypto.randomUUID().slice(0, 6), 16) % 14000000, owner: process.getuid!(), namespaces: support.private_namespaces, executable: join(import.meta.dir, "../../zig-out/bin/fx"), fossil: existsSync(packagedFossil) ? packagedFossil : Bun.which("fossil"), profile, source: { version: "omos.worker-source/v1", workspace: boot.workspace, view: first.view, revision: checkpoint.revision, generation: execution.generation } };
       const stage = (action?: string) => {
         writeFileSync(imageFile, JSON.stringify({ ...image, ...(action ? { action } : {}) }));
         return spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", rootFixture, imageFile], { encoding: "utf8", timeout: 120000 });
@@ -322,17 +341,30 @@ test("host-held company keys bind native worker MCP calls to one view and execut
       try {
         // Reuse the exact checkpoint request. The real service must recover its
         // receipt rather than apply the already committed mutation again.
-        model(worker, (_body, count) => count === 1 ? tool("mcp_select_tool", { name: "mcp_company_company_workspace" }) : count === 2 ? tool("mcp_company_company_workspace", operation) : { content: "Recovered the same company checkpoint." });
+        let inspectedSource = false;
+        model(worker, (body, count) => {
+          const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
+          const rootMatch = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/);
+          expect(rootMatch).not.toBeNull();
+          const directory = JSON.parse(rootMatch![1]);
+          if (count === 2) inspectedSource = body.messages.some(message => message.role === "tool" && typeof message.content === "string" && message.content.includes(operation.content));
+          return count === 1 ? tool("read_file", { path: join(directory, "documents/team/worker.txt") }) : count === 2 ? tool("mcp_select_tool", { name: "mcp_company_company_workspace" }) : count === 3 ? tool("mcp_company_company_workspace", operation) : { content: "Recovered the same company checkpoint." };
+        });
         // A fresh model sequence drives the isolated process through normal
         // discovery and the retained operation; no private seed is staged.
         const secondProfile = JSON.parse(readFileSync(join(worker.home, ".fx/settings.json"), "utf8"));
         const secondProvider = secondProfile.providers.local.base_url;
-        broker = await createWorkerBroker({ socket: root + "/run/omos-broker.sock", socketMode: 0o666, companyClient: bound, expiresMs, model: { endpoint: secondProvider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "provider-only-host-secret" }, company: { endpoint: service.url + "/v1/company", workspace: boot.workspace, actor: "worker", grant: "hosted-worker", view: first.view, actions: bound.scope!.actions } });
+        broker = await createWorkerBroker({ socket: root + "/run/omos-broker.sock", socketMode: 0o666, companyClient: bound, expiresMs, model: { endpoint: secondProvider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "provider-only-host-secret" }, company: { endpoint: service.url + "/v1/company", workspace: boot.workspace, actor: "worker", grant: "hosted-worker", view: first.view, source_revision: checkpoint.revision, actions: bound.scope!.actions } });
         const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", launcher, root, "--", "ask", "Recover the same team document checkpoint through company_workspace.", "--json"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
         const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
         expect(code, stderr + stdout).toBe(0);
         expect(JSON.parse(stdout).tool_calls.find((item: any) => item.name === "mcp_company_company_workspace").status).toBe("success");
+        expect(JSON.parse(stdout).tool_calls.find((item: any) => item.name === "read_file").status, stdout).toBe("success");
+        expect(inspectedSource).toBe(true);
         expect(existsSync(root + "/home/worker/.fx/company-keys")).toBe(false);
+        const verified = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", launcher, root, "--", "fossil", "verify", "--json"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+        const [verifiedCode, verifiedOutput, verifiedError] = await Promise.all([verified.exited, new Response(verified.stdout).text(), new Response(verified.stderr).text()]);
+        expect(verifiedCode, verifiedError + verifiedOutput).toBe(0); expect(verifiedError).toBe("");
         expect((await value(bound, args("status"))).revision).toBe(checkpoint.revision);
       } finally {
         await broker?.close(); broker = null;
@@ -880,15 +912,44 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "answer", "recovery"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : "file proposals"}`, async () => {
+for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const answerOnly = scenario === "answer";
+  const projected = scenario === "projection";
   const recovering = scenario === "recovery" && support.private_namespaces;
   const answer = answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
   const f = fixture(), worker = fixture();
   const host = model(f, () => { throw Error("The company host must never execute the actor"); });
-  const inference = model(worker, (_body, count) => !answerOnly && count === 1 ? { tool_calls: [{ index: 0, id: "private-output", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) } }] } : { content: answer });
+  const inference = model(worker, (body, count) => {
+    const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+    if (projected && count <= 3) {
+      const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
+      const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/); expect(match).not.toBeNull();
+      const directory = JSON.parse(match![1]);
+      if (count === 1) return tool("read_file", { path: join(directory, "documents/team/production.txt") });
+      if (count === 2) {
+        expect(body.messages.some(message => message.role === "tool" && typeof message.content === "string" && message.content.includes("Original projected company document"))).toBe(true);
+        return tool("write_file", { path: join(directory, "documents/team/production.txt"), content: "Retained by the isolated native worker and collected by its host." });
+      }
+      return tool("shell", { request: { action: "run", command: `rm '${directory}/documents/team/remove.txt'`, timeout_ms: 10000 } });
+    }
+    return !answerOnly && !projected && count === 1 ? tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) : { content: answer };
+  });
   const provider = JSON.parse(readFileSync(join(worker.home, ".fx/settings.json"), "utf8")).providers.local.base_url;
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  if (projected) {
+    const tree = join(f.home, "projection-source"); mkdirSync(tree);
+    const binding = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8"));
+    const helper = existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")) ? join(import.meta.dir, "../../zig-out/libexec/fossil") : Bun.which("fossil")!;
+    const fossil = (...args: string[]) => { const result = spawnSync(helper, args, { cwd: tree, env: { ...process.env, ...f.env }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); };
+    fossil("open", "--nosync", binding.repository, "trunk");
+    mkdirSync(join(tree, "documents/team"), { recursive: true }); mkdirSync(join(tree, "documents/private"));
+    writeFileSync(join(tree, "documents/team/production.txt"), "Original projected company document\n" + "Unchanged source line.\n".repeat(1000));
+    writeFileSync(join(tree, "documents/team/remove.txt"), "Delete only after this file is materialised.");
+    writeFileSync(join(tree, "documents/team/keep.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(tree, "documents/private/nope.txt"), "Outside the worker grant.");
+    fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "--user", "omos", "-m", "Retain scoped source projection fixture");
+  }
+
   const admin = async (input: object) => {
     const file = join(f.home, "production-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
     const result = await f.run(["fossil", "company", file, "--json"]);
@@ -911,7 +972,7 @@ for (const scenario of ["files", "answer", "recovery"]) test.skipIf(!support?.ke
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
     const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
     client = await createCompanyClient(file, { home: f.home });
-    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
     expect(created.isError, JSON.stringify(created)).not.toBe(true);
     const createdView = JSON.parse(created.content[0].text), view = createdView.view;
     await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
@@ -953,7 +1014,14 @@ for (const scenario of ["files", "answer", "recovery"]) test.skipIf(!support?.ke
       expect(publication.review.candidate).toBe(answer);
       if (answerOnly) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
       else expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      if (projected) {
+        expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/remove.txt");
+        expect(f.fossil("cat", "documents/team/keep.sh", "-r", "trunk")).toBe("#!/bin/sh\nexit 0\n");
+        expect(f.fossil("cat", "documents/private/nope.txt", "-r", "trunk")).toBe("Outside the worker grant.");
+        const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+        expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
+      }
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : projected ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0);

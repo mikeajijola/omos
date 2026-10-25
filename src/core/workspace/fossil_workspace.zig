@@ -2489,7 +2489,19 @@ pub const Manager = struct {
     /// One writer transaction fences an entire filesystem projection checkpoint.
     /// A retry recognizes the desired bytes; divergent canonical changes fail.
     pub fn checkpointContent(self: Manager, task: Task, changes: []const ContentChange) ![]const u8 {
-        return self.checkpointContentInternal(task, changes, null, .checkpoint);
+        return self.checkpointContentInternal(task, changes, null, .checkpoint, null);
+    }
+
+    /// Hydrated source bytes and their provenance become durable together.
+    /// This host entry point is unavailable to ordinary record/file tools.
+    pub fn hydrateWorkerContent(self: Manager, task: Task, change: ContentChange, ledger: []const u8) ![]const u8 {
+        if (task.authority != null or io_mod.getenv("OMOS_WORKER_BROKER") == null) return error.WorkerProjectionUnavailable;
+        const parsed = try record_json.decode(@import("worker_projection.zig").Ledger, self.alloc, ledger, .{});
+        try @import("worker_projection.zig").validateLedger(parsed);
+        if (!std.mem.eql(u8, parsed.task, task.id)) return error.WorkspaceBindingMismatch;
+        const declaration = try self.loadDeclaration((task.model_basis orelse return error.WorkspaceMigrationRequired).revision);
+        try model.validateRecord(declaration.semantic, "omos_worker_projection", try parse(self.alloc, std.json.Value, ledger), true);
+        return self.checkpointContentInternal(task, &.{change}, null, .checkpoint, ledger);
     }
 
     pub fn companyCheckpointRevision(self: Manager, task: Task, operation: []const u8) !?[]const u8 {
@@ -2532,7 +2544,7 @@ pub const Manager = struct {
 
     pub fn checkpointCompanyContent(self: Manager, task: Task, changes: []const ContentChange, operation: []const u8) ![]const u8 {
         if (!safeId(operation)) return error.InvalidCompanyIdentity;
-        return self.checkpointContentInternal(task, changes, operation, .checkpoint);
+        return self.checkpointContentInternal(task, changes, operation, .checkpoint, null);
     }
 
     pub fn writeCompanyRecord(self: Manager, task: Task, entity: []const u8, id: []const u8, record_content: ?[]const u8, previous_hash: ?[]const u8, operation: []const u8) ![]const u8 {
@@ -2562,10 +2574,10 @@ pub const Manager = struct {
             if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(self.alloc, value, .{}), try std.json.Stringify.valueAlloc(self.alloc, saved, .{}))) return error.CompanyRecordNotPortable;
             break :bytes encoded;
         } else null;
-        return self.checkpointContentInternal(task, &.{.{ .path = path, .content = bytes, .previous_hash = previous_hash }}, operation, .record);
+        return self.checkpointContentInternal(task, &.{.{ .path = path, .content = bytes, .previous_hash = previous_hash }}, operation, .record, null);
     }
 
-    fn checkpointContentInternal(self: Manager, task: Task, changes: []const ContentChange, operation: ?[]const u8, action: @import("company_authority.zig").Action) ![]const u8 {
+    fn checkpointContentInternal(self: Manager, task: Task, changes: []const ContentChange, operation: ?[]const u8, action: @import("company_authority.zig").Action, worker_ledger: ?[]const u8) ![]const u8 {
         const lease = try self.writerLease();
         defer lease.release();
         if (operation) |id| if (try self.companyCheckpointRevision(task, id)) |revision_id| return revision_id;
@@ -2627,6 +2639,12 @@ pub const Manager = struct {
                 };
             }
         }
+        const ledger_path = if (worker_ledger != null) try @import("worker_projection.zig").ledgerPath(self.alloc, task.id) else null;
+        if (worker_ledger) |bytes| {
+            var parent = try contentParent(self.alloc, tree, ledger_path.?);
+            defer parent.close(io_mod.getIo());
+            try atomicWriteAt(self.alloc, parent, std.Io.Dir.path.basename(ledger_path.?), bytes);
+        }
         if (operation) |id| {
             const path = try self.alloc.print("company/checkpoints/{s}/{s}.json", .{ task.id, id });
             var file_rows: std.ArrayList(struct { path: []const u8, sha256: ?[]const u8, bytes: usize, deleted: bool, executable: ?bool }) = .empty;
@@ -2639,6 +2657,7 @@ pub const Manager = struct {
         const committed = try self.commit(tree, "Checkpoint workspace filesystem changes");
         const committed_paths = try self.inventory(committed);
         const committed_metadata = try self.fileManifest(committed);
+        if (worker_ledger) |bytes| if (!std.mem.eql(u8, bytes, try self.contentAt(ledger_path.?, committed))) return error.WorkspaceVerificationFailed;
         for (changes, 0..) |change, index| {
             const present = for (committed_paths) |path| {
                 if (std.mem.eql(u8, path, change.path)) break true;
@@ -2650,6 +2669,7 @@ pub const Manager = struct {
             } else if (present) return error.WorkspaceVerificationFailed;
         }
         for (try self.changedPaths(revision_id, committed)) |path| {
+            if (ledger_path) |expected| if (std.mem.eql(u8, expected, path)) continue;
             const expected = for (changes) |change| {
                 if (std.mem.eql(u8, change.path, path)) break true;
             } else if (operation) |id| std.mem.eql(u8, path, try self.alloc.print("company/checkpoints/{s}/{s}.json", .{ task.id, id })) else false;
@@ -2958,9 +2978,10 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
         if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
-            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
+            const entity: ?[]const u8 = if (std.mem.startsWith(u8, path, "records/omos_worker_projection/")) "omos_worker_projection" else if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
             if (entity) |kind| {
                 try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
+                if (std.mem.eql(u8, kind, "omos_worker_projection")) try @import("worker_projection.zig").validateLedger(try record_json.decode(@import("worker_projection.zig").Ledger, self.alloc, bytes, .{}));
                 if (std.mem.eql(u8, kind, "omos_company_worker_job")) try @import("company_worker_jobs.zig").validateStored(self.alloc, try record_json.decode(@import("company_worker_jobs.zig").Record, self.alloc, bytes, .{}), path);
                 if (std.mem.eql(u8, kind, "omos_company_execution")) try @import("company_execution.zig").validateStored(self.alloc, try record_json.decode(@import("company_execution.zig").Record, self.alloc, bytes, .{}), path);
                 if (std.mem.eql(u8, kind, "omos_company_capability_policy")) _ = try @import("company_capabilities.zig").decode(self.alloc, self.manifest.id, bytes);
@@ -3050,7 +3071,7 @@ pub const Manager = struct {
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
                 const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
-                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
+                const needs_body = std.mem.startsWith(u8, path, "records/omos_worker_projection/") or std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
                 if (!needs_body) continue;
                 var digest = std.crypto.hash.sha2.Sha256.init(.{});
                 digest.update(if (company) "company" else "content");

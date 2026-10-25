@@ -221,7 +221,7 @@ def child(root, config, arguments, parent, parent_fd=None):
         stage = "seccomp"
         seccomp()
         os.closerange(3, 1048576)
-        environment = {"HOME": "/home/worker", "USER": "worker", "LOGNAME": "worker", "PATH": "/runtime/bin:/usr/bin:/bin", "SHELL": "/bin/bash", "LANG": "C", "LC_ALL": "C", "TERM": "dumb", "FX_SOUND": "0", "FX_CONTRACT_REVIEW": "1", "FX_DISABLE_KEYCHAIN": "1", "FX_SKIP_ONBOARDING": "1", "FX_AUTO_UPGRADE": "0", "OMOS_FOSSIL_BIN": "/runtime/bin/fossil", "OMOS_WORKER_BROKER": "/run/omos-broker.sock"}
+        environment = {"HOME": "/home/worker", "USER": "worker", "LOGNAME": "worker", "PATH": "/runtime/bin:/usr/bin:/bin", "SHELL": "/bin/bash", "LANG": "C", "LC_ALL": "C", "TERM": "dumb", "FX_SOUND": "0", "FX_CONTRACT_REVIEW": "1", "FX_DISABLE_KEYCHAIN": "1", "FX_SKIP_ONBOARDING": "1", "FX_AUTO_UPGRADE": "0", "OMOS_FOSSIL_BIN": "/runtime/bin/fossil", "OMOS_WORKER_BROKER": "/run/omos-broker.sock", "OMOS_WORKER_PROJECTION": "/runtime/worker-source.json"}
         stage = "exec"
         os.execve(config["executable"], [config["executable"], *arguments], environment)
     except BaseException as error:

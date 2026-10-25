@@ -4905,6 +4905,7 @@ test {
     _ = @import("core/workspace/runtime_handles.zig");
     _ = @import("core/workspace/capability_runtime.zig");
     _ = @import("core/workspace/filesystem_projection.zig");
+    _ = @import("core/workspace/worker_projection.zig");
     _ = @import("core/shared/resource_pin.zig");
     if (builtin.target.os.tag == .macos) _ = @import("core/shared/darwin_process_spawn.zig");
     _ = @import("core/workspace/company_records.zig");

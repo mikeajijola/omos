@@ -4114,6 +4114,22 @@
             "request"
           ],
           "indexed": []
+        },
+        {
+          "id": "omos_worker_projection",
+          "fields": {
+            "version": "string",
+            "task": "string",
+            "source": "json",
+            "files": "json"
+          },
+          "required": [
+            "version",
+            "task",
+            "source",
+            "files"
+          ],
+          "indexed": []
         }
       ],
       "relationships": [

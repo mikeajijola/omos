@@ -228,9 +228,9 @@ export async function createCompanyClient(filename, { home, binding } = {}) {
           if (scope.expiresMs <= Date.now()) fail("CompanyWorkerExpired");
           if (name === "company_workspace") {
             if (!object(args) || Object.hasOwn(args, "view") || Object.hasOwn(args, "execution") || !scope.actions.includes(args.action) || (args.outcome !== undefined && !issued.has(args.outcome))) fail("CompanyWorkerScopeDenied");
-            if (issued.size >= 1024 && !issued.has(args.operation)) fail("CompanyWorkerOperationBudgetExceeded");
+            if (mutation.has(args.action) && issued.size >= 1024 && !issued.has(args.operation)) fail("CompanyWorkerOperationBudgetExceeded");
             args = { ...structuredClone(args), view: scope.view, execution: scope.execution };
-            if (identity(args.operation)) issued.add(args.operation);
+            if (mutation.has(args.action) && identity(args.operation)) issued.add(args.operation);
           }
           const expiry = setTimeout(() => controller.abort(), Math.max(1, scope.expiresMs - Date.now()));
           try {

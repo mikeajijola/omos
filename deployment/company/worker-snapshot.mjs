@@ -5,11 +5,14 @@ import { createHash } from "node:crypto";
 const fail = code => { throw new Error(code); };
 const hash = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 const artifact = value => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);
-const safePath = value => typeof value === "string" && value.length <= 4096 && /^(memory|skills|documents|artifacts|ui)\//.test(value) && !/[\x00-\x1f\x7f\\]/.test(value) && value.split("/").every(part => part && part !== "." && part !== "..");
+const contentRoots = ["memory/", "skills/", "documents/", "artifacts/", "ui/"];
+const safePath = (value, roots) => typeof value === "string" && value.length <= 4096 && roots.some(root => value.startsWith(root)) && !/[\x00-\x1f\x7f\\]/.test(value) && value.split("/").every(part => part && part !== "." && part !== "..");
 
-export function createWorkerSnapshot({ request, workspace, definitionHash, revision, maxFiles = 10000, maxFileBytes = 32 * 1024 * 1024, maxBytes = 256 * 1024 * 1024 }) {
+export function createWorkerSnapshot({ request, workspace, definitionHash, revision, maxFiles = 10000, maxFileBytes = 32 * 1024 * 1024, maxBytes = 256 * 1024 * 1024, roots = contentRoots }) {
   if (typeof request !== "function" || !hash(workspace) || !hash(definitionHash) || !hash(revision)) fail("InvalidWorkerSnapshot");
   if (![maxFiles, maxFileBytes, maxBytes].every(value => Number.isSafeInteger(value) && value > 0) || maxFiles > 10000 || maxFileBytes > 32 * 1024 * 1024 || maxBytes > 256 * 1024 * 1024) fail("InvalidWorkerSnapshotBudget");
+  if (!Array.isArray(roots) || !roots.length || new Set(roots).size !== roots.length || roots.some(root => ![...contentRoots, "records/omos_worker_projection/"].includes(root))) fail("InvalidWorkerSnapshotRoots");
+  roots = Object.freeze([...roots]);
   const envelope = { version: "omos.workspace-api/v1", workspace, definition_hash: definitionHash, revision };
   const selected = new Map();
   let inventory;
@@ -34,14 +37,14 @@ export function createWorkerSnapshot({ request, workspace, definitionHash, revis
       try {
         const files = [];
         const seen = new Set();
-        for (const root of ["memory/", "skills/", "documents/", "artifacts/", "ui/"]) {
+        for (const root of roots) {
         let offset = 0, total;
         for (;;) {
           const page = await call({ action: "inventory", path: root, offset }, signal);
           if (!Number.isSafeInteger(page.total) || page.total < 0 || page.total > maxFiles || (total !== undefined && total !== page.total) || !Array.isArray(page.files) || page.files.length > 32 || page.files.length > page.total - offset) fail("InvalidWorkerSnapshotInventory");
           total = page.total;
           for (const file of page.files) {
-            if (!file || !safePath(file.path) || !file.path.startsWith(root) || !artifact(file.artifact) || typeof file.executable !== "boolean" || seen.has(file.path)) fail("InvalidWorkerSnapshotInventory");
+            if (!file || !safePath(file.path, roots) || !file.path.startsWith(root) || !artifact(file.artifact) || typeof file.executable !== "boolean" || seen.has(file.path)) fail("InvalidWorkerSnapshotInventory");
             seen.add(file.path);
             if (files.length >= maxFiles) fail("WorkerSnapshotFileBudgetExceeded");
             files.push({ path: file.path, artifact: file.artifact, executable: file.executable });
