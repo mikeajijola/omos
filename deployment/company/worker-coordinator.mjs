@@ -31,7 +31,18 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
     active.set(view, entry);
     entry.promise = (async () => {
       let result;
-      try { result = await backend.run(structuredClone(row), controller.signal); }
+      try {
+        let invocation = row;
+        if (invocation.pending_operation) {
+          if (typeof backend.recover !== "function") fail("WorkerRecoveryRequired");
+          await backend.recover(structuredClone(invocation), controller.signal);
+          invocation = await inspect(view);
+          if (!sameOwner(invocation, owned) || !invocation.authority_live || invocation.record.expires_ms <= Date.now()) fail("WorkerExecutionRevoked");
+          if (invocation.pending_operation) fail("WorkerRecoveryRequired");
+        }
+        if (invocation.publication || ["queued", "running"].includes(invocation.review_state)) result = { outcome: "submitted" };
+        else result = await backend.run(structuredClone(invocation), controller.signal);
+      }
       catch (error) { if (error?.executionUncertain) return; const cause = /^[A-Z][A-Za-z0-9]{0,95}$/.test(error?.message) ? error.message : "IsolatedInvocationFailed"; result = { outcome: "failed", note: `${cause}. Inspect the retained isolated checkpoint before resuming.` }; }
       finally { clearTimeout(timer); }
       // run() must have joined cleanup here. A revoked/cancelled/fenced worker
@@ -72,10 +83,10 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
               await update({ change: "complete", operation: randomUUID(), view, expected_sha256: row.sha256 });
             } else if (row.record.state === "running" && row.record.expires_ms <= Date.now()) {
               await update({ change: "expire", operation: randomUUID(), view, expected_sha256: row.sha256 });
-            } else if (!closed && row.record.state === "queued" && row.authority_live && active.size < concurrency && !row.pending_operation) {
+            } else if (!closed && row.record.state === "queued" && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function")) {
               const claimed = await update({ change: "claim", operation: randomUUID(), view, expected_sha256: row.sha256, execution: { runtime, generation: row.execution?.generation ?? 0 } });
               const owned = { runtime, generation: claimed.record.generation };
-              if (!sameOwner(claimed, owned) || !claimed.authority_live || claimed.record.expires_ms - Date.now() < 1000 || claimed.pending_operation || !claimed.contract || !claimed.request || !claimed.basis || !claimed.grant) fail("WorkerCoordinatorClaimChanged");
+              if (!sameOwner(claimed, owned) || !claimed.authority_live || claimed.record.expires_ms - Date.now() < 1000 || (claimed.pending_operation && typeof backend.recover !== "function") || !claimed.contract || !claimed.request || !claimed.basis || !claimed.grant) fail("WorkerCoordinatorClaimChanged");
               if (closed) {
                 await update({ change: "finish", operation: randomUUID(), view, expected_sha256: claimed.sha256, execution: owned, outcome: "waiting", note: "Coordinator stopped before actor dispatch." });
               } else { dispatch(claimed, new AbortController()); started++; }

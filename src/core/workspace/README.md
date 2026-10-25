@@ -51,6 +51,13 @@ file against Fossil, then renames and rechecks the view before deletion. A crash
 can leave a quarantined directory for inspection. It does not erase task history,
 canonical content, or uncommitted recovery directories.
 
+Read dependency records retain up to 10,000 distinct personal file paths and
+20,000 company read selectors, including inventory pages. They store identities
+and hashes rather than combining the referenced file bodies. Completion checks
+still verify the retained observations against the publication candidate.
+Company inventory requests release each hashed file body before inspecting the
+next one, so a metadata page does not retain 32 full documents in memory.
+
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
 Its read action returns UTF-8 byte slices of JSON containing the original
@@ -105,6 +112,13 @@ SHA-256 and byte count. Binary pages use base64; text pages preserve UTF-8
 boundaries. Subsequent accepted revisions do not change a pinned inventory or
 read. Existing instances must explicitly upgrade their contracts before using
 the new `omos_workspace_inventory` and `omos_workspace_head` operations.
+
+The read-only `candidate` action returns a task's exact recorded answer at its
+current immutable revision. It requires a task and revision, marks the text as
+`actor_claim`, and rejects answers larger than 32 KiB. A returned claim is input
+for independent review; it does not establish completion or permission to
+publish. The company worker adapter uses this operation to preserve answers
+even when the original task requested no file changes.
 
 `fossil_workspace` supports `verify_manifest` with a workspace-relative `path`.
 The referenced JSON has a `files` array whose entries contain `path`, `sha256`,

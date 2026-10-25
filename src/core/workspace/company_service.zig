@@ -459,7 +459,7 @@ fn retainRead(manager: workspace.Manager, grant: authority.Grant, request: autho
     var active: std.ArrayList(read_dependencies.Reference) = .empty;
     for (view.reads) |previous| if (!std.mem.eql(u8, previous.selector, reference.selector)) try active.append(manager.alloc, previous);
     try active.append(manager.alloc, reference);
-    if (active.items.len > 100) return error.CompanyReadSetTooLarge;
+    if (active.items.len > read_dependencies.max_references) return error.CompanyReadSetTooLarge;
     view.reads = active.items;
     const control = try manager.companyWrite(try manager.companyRevision(), &.{
         .{ .path = reference.path, .content = try encode(manager.alloc, observation) },
@@ -763,9 +763,13 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             if (!authority.permitsPath(grant, path)) continue;
             if (export_plan) |plan| if (!package.includes(plan, path)) continue;
             if (count >= request.offset and files.items.len < 32) {
-                const bytes = try manager.contentAt(path, pinned);
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                var reader = manager;
+                reader.alloc = scratch.allocator();
+                const bytes = try reader.contentAt(path, pinned);
                 if (attributes) try fossil_manifest.verifyObject((flags.get(path) orelse return error.WorkspaceVerificationFailed).artifact.?, bytes);
-                var result = try parse(alloc, try encode(alloc, .{ .path = path, .sha256 = try workspace.hash(alloc, bytes), .bytes = bytes.len }));
+                var result = try parse(alloc, try encode(alloc, .{ .path = path, .sha256 = try workspace.hash(scratch.allocator(), bytes), .bytes = bytes.len }));
                 if (attributes) try result.object.put(alloc, "executable", .{ .bool = (flags.get(path) orelse return error.WorkspaceVerificationFailed).mode == .executable });
                 try files.append(alloc, result);
             }

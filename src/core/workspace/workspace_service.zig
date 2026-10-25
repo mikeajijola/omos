@@ -57,7 +57,7 @@ pub const Request = struct {
     workspace: []const u8,
     definition_hash: []const u8,
     revision: []const u8 = "",
-    action: enum { head, definition, query, read, inventory, record, propose, audit, queue_review, job },
+    action: enum { head, candidate, definition, query, read, inventory, record, propose, audit, queue_review, job },
     task: ?[]const u8 = null,
     entity: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -75,6 +75,7 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     if (!std.mem.eql(u8, request.version, "omos.workspace-api/v1")) return error.UnsupportedWorkspaceApi;
     if (!std.mem.eql(u8, request.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
     const task: ?workspace.Task = if (request.task) |id| try manager.loadTask(id) else null;
+    if (request.action == .candidate and task == null) return error.TaskIdRequired;
     if (task) |selected| if (!std.mem.eql(u8, selected.workspace_id, request.workspace)) return error.WorkspaceIdentityMismatch;
     const revision = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
     if (request.action != .head and request.action != .job and request.action != .read and request.action != .inventory and !std.mem.eql(u8, request.revision, revision)) return error.WorkspaceRevisionChanged;
@@ -88,11 +89,22 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     // Workspace API contracts govern transport. A task keeps its own older
     // declaration and policy for record writes and independent assessment.
     const declaration = try manager.loadDeclaration(transport_basis.revision);
-    const operation = if (request.action == .head) "omos_workspace_head" else if (request.action == .inventory) "omos_workspace_inventory" else "omos_workspace_request";
+    const operation = switch (request.action) {
+        .head => "omos_workspace_head",
+        .candidate => "omos_workspace_candidate",
+        .inventory => "omos_workspace_inventory",
+        else => "omos_workspace_request",
+    };
     try model.validateOperation(alloc, declaration, operation, (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value, .input);
     manager.expected_revision = request.revision;
     const data: std.json.Value = switch (request.action) {
         .head => try parse(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .revision = revision, .task = if (task) |selected| @as(?[]const u8, selected.id) else null, .definition_hash = if (task) |selected| (selected.model_basis orelse return error.WorkspaceMigrationRequired).definition_hash else transport_basis.definition_hash }, .{})),
+        .candidate => blk: {
+            const selected = task orelse return error.TaskIdRequired;
+            const text = try manager.candidateAnswerAt(selected, revision);
+            if (text) |value| if (value.len > 32768) return error.ReviewCandidateTooLarge;
+            break :blk try parse(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .task = selected.id, .candidate = text, .authority = "actor_claim" }, .{}));
+        },
         .definition => try manager.definitionSnapshot(task),
         .query => try parse(alloc, try manager.queryRecords(task, request.entity, request.offset)),
         .audit => try parse(alloc, try manager.auditContracts()),

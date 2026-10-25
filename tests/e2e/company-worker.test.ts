@@ -700,6 +700,10 @@ test("local read-only workspace requests page immutable file identities and comp
   const task = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks[0];
   const taskHead = await call({ action: "head", task: task.id });
   expect(taskHead.data.task).toBe(task.id); expect(taskHead.data.revision).not.toBe(latest);
+  const claim = await call({ action: "candidate", task: task.id, revision: taskHead.data.revision });
+  expect(claim.data).toEqual({ task: task.id, candidate: "Retain the pending reader fixture.", authority: "actor_claim" });
+  expect((await call({ action: "candidate", task: task.id, revision: latest }, false)).stderr).toContain("WorkspaceRevisionChanged");
+  expect((await call({ action: "candidate" }, false)).stderr).toContain("TaskIdRequired");
   expect((await call({ action: "read", path: "memory/preference.md", task: task.id, revision: taskHead.data.revision })).data.content).toBe("An unpublished worker checkpoint.");
   expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
 
@@ -795,6 +799,39 @@ test("worker coordinator resolves lost claim acknowledgements and fences revoked
   await uncertain.close();
 });
 
+test("worker recovery refreshes native state before dispatch and never replays an actor after submission", async () => {
+  const view = "b".repeat(64);
+  let current: any;
+  const reset = () => { current = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Retain the original task", basis: {}, grant: {}, execution: null, task_state: "active", review_job_id: null, review_state: null, pending_operation: "retained-operation", publication: null,
+    record: { state: "queued", binding: { view }, generation: 0, max_runtime_ms: 10000, expires_ms: 0, operation: "queued" } }; };
+  const control = { async call(input) {
+    if (input.change === "claim") { current.record = { ...current.record, state: "running", runtime: input.execution.runtime, generation: 1, expires_ms: Date.now() + 120000, operation: input.operation }; current.execution = { runtime: input.execution.runtime, generation: 1 }; }
+    if (input.change === "finish") current.record = { ...current.record, state: input.outcome, operation: input.operation };
+    return { ok: true, jobs: [structuredClone(current)], next_offset: null };
+  } };
+  reset();
+  const unavailable = createWorkerCoordinator({ control, backend: { async run() { throw Error("Actor must not start with unresolved input"); } } });
+  expect((await unavailable.tick()).started).toBe(0); expect(current.record.state).toBe("queued"); await unavailable.close();
+  for (const outcome of ["checkpoint", "submitted", "uncertain", "replacement"]) {
+    reset(); let actors = 0, recovered = 0;
+    const backend = {
+      async recover(row) {
+        recovered++; expect(row.pending_operation).toBe("retained-operation"); expect(row.record.state).toBe("running");
+        if (outcome === "uncertain") { const error: any = new Error("WorkerRecoveryPending"); error.executionUncertain = true; throw error; }
+        current.pending_operation = null; current.view_revision = "c".repeat(64);
+        if (outcome === "submitted") { current.review_job_id = "review"; current.review_state = "queued"; }
+        if (outcome === "replacement") current.execution.runtime = "replacement-owner";
+      },
+      async run(row) { actors++; expect(row.pending_operation).toBeNull(); expect(row.view_revision).toBe("c".repeat(64)); return { outcome: "waiting" }; },
+    };
+    const coordinator = createWorkerCoordinator({ control, backend });
+    expect((await coordinator.tick()).started).toBe(1); await coordinator.drain();
+    expect(recovered).toBe(1); expect(actors).toBe(outcome === "checkpoint" ? 1 : 0);
+    expect(current.record.state).toBe(outcome === "checkpoint" ? "waiting" : outcome === "submitted" ? "submitted" : "running");
+    await coordinator.close();
+  }
+});
+
 test.skipIf(!support?.kernel_supported)("production worker images pin trusted runtime bytes and reject active deletion or changed identities", async () => {
   const helper = join(import.meta.dir, "fixtures/company-worker-image.py");
   const run = (value: object) => {
@@ -843,10 +880,13 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-test.skipIf(!support?.kernel_supported)("the production company coordinator runs isolated native work and publishes only independently verified file proposals", async () => {
+for (const scenario of ["files", "answer", "recovery"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : "file proposals"}`, async () => {
+  const answerOnly = scenario === "answer";
+  const recovering = scenario === "recovery" && support.private_namespaces;
+  const answer = answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
   const f = fixture(), worker = fixture();
   const host = model(f, () => { throw Error("The company host must never execute the actor"); });
-  const inference = model(worker, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "private-output", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) } }] } : { content: "Retained the proposed document in the private Fossil workspace." });
+  const inference = model(worker, (_body, count) => !answerOnly && count === 1 ? { tool_calls: [{ index: 0, id: "private-output", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) } }] } : { content: answer });
   const provider = JSON.parse(readFileSync(join(worker.home, ".fx/settings.json"), "utf8")).providers.local.base_url;
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   const admin = async (input: object) => {
@@ -860,7 +900,7 @@ test.skipIf(!support?.kernel_supported)("the production company coordinator runs
   const key = JSON.parse(keyed.stdout);
   const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit", "reconcile", "discover"];
   await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
-  const service = await startWorkspaceService(f, true);
+  let service = await startWorkspaceService(f, true, recovering ? { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" } : {});
   const imageFixture = join(import.meta.dir, "fixtures/company-worker-image.py");
   const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0 }), encoding: "utf8", timeout: 120000 });
   expect(setup.status, setup.stderr).toBe(0);
@@ -871,10 +911,27 @@ test.skipIf(!support?.kernel_supported)("the production company coordinator runs
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
     const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
     client = await createCompanyClient(file, { home: f.home });
-    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
     expect(created.isError, JSON.stringify(created)).not.toBe(true);
-    const view = JSON.parse(created.content[0].text).view;
+    const createdView = JSON.parse(created.content[0].text), view = createdView.view;
     await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
+    let recoveredOperation: string | undefined;
+    if (recovering) {
+      let retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+      retained = (await admin({ action: "workers", worker: { change: "claim", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256, execution: { runtime: "interrupted-worker", generation: 0 } } })).jobs[0];
+      recoveredOperation = crypto.randomUUID();
+      const interrupted = await client.call("company_workspace", { version: "omos.company/v1", action: "checkpoint", operation: recoveredOperation, expires_ms: Date.now() + 120000, view, execution: { runtime: "interrupted-worker", generation: retained.record.generation }, revision: createdView.revision, path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
+      expect(interrupted.isError).toBe(true);
+      retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+      expect(retained.pending_operation).toBe(recoveredOperation);
+      client.close(); service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true); company.endpoint = service.url;
+      writeFileSync(file, JSON.stringify(company), { mode: 0o600 }); client = await createCompanyClient(file, { home: f.home });
+      retained = (await admin({ action: "workers", worker: { change: "finish", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256, execution: { runtime: "interrupted-worker", generation: retained.record.generation }, outcome: "failed" } })).jobs[0];
+      retained = (await admin({ action: "workers", worker: { change: "requeue", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256 } })).jobs[0];
+      expect(retained.pending_operation).toBe(recoveredOperation); expect(retained.record.invocations).toBe(1);
+    }
+
     const settings = { company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" } };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
@@ -884,11 +941,19 @@ test.skipIf(!support?.kernel_supported)("the production company coordinator runs
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: 1, state: "completed", invocations: 1, generation: 1, published: true });
+      expect(outcome).toMatchObject({ ok: true, started: 1, state: "completed", invocations: recovering ? 2 : 1, generation: recovering ? 2 : 1, published: true });
       expect(result.images).toBe(0);
+      if (recovering) {
+        expect(current.pending_operation).toBeNull();
+        const recovered = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, outcome: recoveredOperation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+        expect(recovered.isError, JSON.stringify(recovered)).not.toBe(true); expect(JSON.parse(recovered.content[0].text).state).toBe("completed");
+      }
       expect(current.record.state).toBe("completed"); expect(current.publication).not.toBeNull();
-      expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
-      expect(inference.counts().actors).toBe(2); expect(host.counts().assessments).toBeGreaterThan(0);
+      const publication = JSON.parse(f.fossil("cat", current.publication.receipt_path, "-r", current.publication.revision));
+      expect(publication.review.candidate).toBe(answer);
+      if (answerOnly) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
+      else expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0);
@@ -902,3 +967,72 @@ test.skipIf(!support?.kernel_supported)("the production company coordinator runs
     expect(cleaned.status, cleaned.stderr).toBe(0);
   }
 }, 480000);
+
+test("personal tasks retain more than one hundred distinct read dependencies without discarding earlier observations", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const tree = join(f.home, "many-read-checkout"); mkdirSync(tree);
+  const fossil = (...args: string[]) => {
+    const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+  mkdirSync(join(tree, "memory/many"), { recursive: true });
+  for (let index = 0; index < 120; index++) writeFileSync(join(tree, "memory/many", `${index}.txt`), `Retained read fixture ${index}.`);
+  fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Seed individual read dependency fixtures");
+  const inference = model(f, (_body, count) => count <= 3 ? { tool_calls: Array.from({ length: 40 }, (_, index) => {
+    const selected = (count - 1) * 40 + index;
+    return { index, id: `read-${selected}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: `memory/many/${selected}.txt` }) } };
+  }) } : { content: "Retain all 120 distinct dependency observations for later verification." }, () => "blocked");
+  const result = await f.run(["ask", "Read all 120 memory/many fixture documents and retain their individual read observations.", "--json"], {}, 240000);
+  expect(result.code).toBe(1);
+  const output = JSON.parse(result.stdout);
+  expect(output.tool_calls.filter(call => call.name === "fossil_workspace")).toHaveLength(120);
+  expect(output.tool_calls.filter(call => call.name === "fossil_workspace").every(call => call.status === "success"), result.stdout).toBe(true);
+  expect(inference.counts().actors).toBe(4);
+  const task = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks[0];
+  expect(task.dependencies).toHaveLength(120);
+  expect(new Set(task.dependencies.map(item => item.path)).size).toBe(120);
+  expect(task.dependencies.every(item => /^[0-9a-f]{64}$/.test(item.observed_hash))).toBe(true);
+  expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+}, 300000);
+
+test("company submissions freeze more than one hundred signed read selectors and retain every original observation", async () => {
+  const f = fixture();
+  model(f, () => { throw Error("A read-only company dependency fixture must not run actors"); }, () => "blocked");
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const file = join(f.home, "read-capacity-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]);
+    expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "many-reads", "--json"]);
+  expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "read", "status", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "many-reads", actor: "reader", public_key: (key.model_data ?? key).public_key, paths: ["documents/many/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true);
+  let client;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "many-reads-client.json");
+    writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "reader", grant: "many-reads", key_handle: "many-reads", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const call = async (action: string, rest: object = {}) => {
+      const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest });
+      expect(result.isError, JSON.stringify({ action, ...rest, result })).not.toBe(true); return JSON.parse(result.content[0].text);
+    };
+    const view = await call("create_view", { revision: boot.revision, objective: "Retain the complete signed set of absent scoped read dependencies for independent review." });
+    for (let index = 0; index < 105; index++) {
+      const read = await call("read", { view: view.view, revision: view.revision, path: `documents/many/${index}.txt` });
+      expect(read.exists).toBe(false); expect(read.read_tracking).toBe("recorded");
+    }
+    const submitted = await call("submit", { view: view.view, revision: view.revision, candidate: "All 105 scoped input paths were observed absent; retain every observation for independent verification." });
+    expect(submitted.state).toBe("verification_pending");
+    const task = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks.find(task => task.authority?.grant === "many-reads");
+    expect(task.company_reads).toHaveLength(105);
+    expect(new Set(task.company_reads.map(reference => reference.selector)).size).toBe(105);
+    expect(task.company_reads.every(reference => reference.revision.length === 64)).toBe(true);
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally { client?.close(); service.child.kill(); await service.child.exited; }
+}, 360000);

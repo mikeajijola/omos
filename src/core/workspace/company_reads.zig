@@ -19,6 +19,9 @@ pub fn supported(declaration: model.Declaration) bool {
     return observation and submission and view;
 }
 
+// File observations and inventory pages retain identities, never aggregate bodies.
+pub const max_references: usize = 20000;
+
 pub const Reference = struct { path: []const u8, revision: []const u8 = "", selector: []const u8 };
 const File = struct { path: []const u8, observed_hash: ?[]const u8, base_hash: ?[]const u8, flags_observed: bool = false, observed_executable: ?bool = null, base_executable: ?bool = null };
 const Kind = enum { file, query, inventory };
@@ -160,7 +163,7 @@ fn matchesFile(current: ?[]const u8, flag: ?bool, file: File) bool {
 pub fn validate(manager: workspace.Manager, task: workspace.Task, references: []const Reference, target: []const u8) !void {
     if (references.len == 0) return;
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
-    if (references.len > 100) return error.CompanyReadSetTooLarge;
+    if (references.len > max_references) return error.CompanyReadSetTooLarge;
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const inventory = try manager.inventory(target);
     var target_metadata: ?[]const fossil_manifest.File = null;

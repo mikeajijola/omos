@@ -745,7 +745,7 @@ pub const Manager = struct {
 
     pub fn freezeCompanyReads(self: Manager, previous: Task, references: []const @import("company_reads.zig").Reference) !Task {
         if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
-        if (references.len > 100) return error.CompanyReadSetTooLarge;
+        if (references.len > @import("company_reads.zig").max_references) return error.CompanyReadSetTooLarge;
         const lease = try self.writerLease();
         defer lease.release();
         var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
@@ -2060,6 +2060,16 @@ pub const Manager = struct {
     }
 
     pub fn retainedReviewCandidateAt(self: Manager, task: Task, revision_id: []const u8) !?[]const u8 {
+        return self.reviewCandidateAt(task, revision_id, true);
+    }
+
+    /// Read an actor's recorded claim without treating it as accepted or
+    /// resumable. Company workers submit this exact claim for independent review.
+    pub fn candidateAnswerAt(self: Manager, task: Task, revision_id: []const u8) !?[]const u8 {
+        return self.reviewCandidateAt(task, revision_id, false);
+    }
+
+    fn reviewCandidateAt(self: Manager, task: Task, revision_id: []const u8, resumable_only: bool) !?[]const u8 {
         var candidate: std.ArrayList(u8) = .empty;
         defer candidate.deinit(std.heap.page_allocator);
         var have_candidate = false;
@@ -2116,6 +2126,7 @@ pub const Manager = struct {
             }
         }
         if (!have_candidate or actor_at > candidate_at) return null;
+        if (!resumable_only) return try self.alloc.dupe(u8, candidate.items);
         if (failure_at >= candidate_at) return try self.alloc.dupe(u8, candidate.items);
         // An abrupt stop can precede both the assessment and its failure
         // record. Resume that retained answer through independent verification.
@@ -2137,7 +2148,7 @@ pub const Manager = struct {
         var dependencies: std.ArrayList(ReadDependency) = .empty;
         for (current.dependencies) |existing| if (!std.mem.eql(u8, existing.path, path)) try dependencies.append(self.alloc, existing);
         try dependencies.append(self.alloc, dependency);
-        if (dependencies.items.len > 100) return error.WorkspaceDependenciesTooLarge;
+        if (dependencies.items.len > 10000) return error.WorkspaceDependenciesTooLarge;
         current.dependencies = try dependencies.toOwnedSlice(self.alloc);
         try self.saveTask(current);
         return bytes;

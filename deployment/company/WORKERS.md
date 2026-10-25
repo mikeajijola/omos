@@ -384,6 +384,14 @@ and execution generation, then starts native `ask` inside that root. The prompt
 travels through standard input. Provider credentials and signing keys remain in
 host-side clients and the broker.
 
+When an explicitly requeued job has a pending native operation, the coordinator
+first claims a fresh execution fence. The backend reconciles that exact retained
+operation through the signed service and the coordinator inspects native state
+again before dispatch. A recovered submission goes straight to host review.
+Unresolved outcomes remain fenced; recovery never replays actor tools or an
+external effect. Backends without this recovery interface leave pending jobs
+queued for operator inspection.
+
 After stopping and joining the actor, the backend verifies a quiescent worker
 UID and reads its private Fossil snapshot through native read-only commands.
 It proposes permitted managed files through signed company checkpoints, with
@@ -394,7 +402,12 @@ scoped MCP interface; this adapter does not infer file deletions or provide a
 transparent remote filesystem.
 
 Company submission queues independent host assessment. Private worker reviews
-and actor prose do not establish company acceptance. Failed or interrupted
+and actor prose do not establish company acceptance. The adapter submits the
+exact answer recorded in the stopped worker's task, including answers that
+change no files. The read-only `candidate` workspace action requires that task's
+current immutable revision and returns `authority: "actor_claim"`. Missing or
+oversized answers retain the image for inspection instead of substituting a
+generated summary. Failed or interrupted
 collection retains the bounded image and its private Fossil checkpoint for
 operator inspection. Unconfirmed process cleanup leaves the native job fenced
 until recovery or expiry. A frozen company proposal with additional private

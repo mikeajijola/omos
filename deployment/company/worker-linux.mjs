@@ -81,6 +81,20 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
   };
   return Object.freeze({
+    async recover(row, signal) {
+      const job = row.record, binding = job.binding;
+      if (!row.authority_live || job.state !== "running" || !hex(binding.workspace) || !hex(binding.view) || !job.runtime || job.generation !== row.execution?.generation || row.execution?.runtime !== job.runtime || !/^[A-Za-z0-9_-]{1,128}$/.test(row.pending_operation) || !row.grant.actions.includes("reconcile")) fail("WorkerRecoveryRequired");
+      // A new owner can reconcile a retained native operation, never replay
+      // actor tools or provider effects. This client stays outside the image.
+      const client = await createCompanyClient(companyConfiguration, { home: companyHome });
+      try {
+        if (client.identity.workspace !== binding.workspace || client.identity.actor !== binding.actor || client.identity.grant !== binding.grant) fail("WorkerCompanyIdentityChanged");
+        const result = await client.call("company_workspace", { version: "omos.company/v1", action: "reconcile", view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, outcome: row.pending_operation, operation: randomUUID(), expires_ms: Math.min(job.expires_ms, Date.now() + 300000) }, signal);
+        if (result.isError || JSON.parse(result.content[0].text).state !== "completed") {
+          const error = new Error("WorkerRecoveryPending"); error.executionUncertain = true; throw error;
+        }
+      } finally { client.close(); }
+    },
     async run(row, signal) {
       const job = row.record, binding = job.binding;
       if (!row.authority_live || job.state !== "running" || !hex(binding.workspace) || !hex(binding.view) || !job.runtime || job.generation !== row.execution?.generation || row.execution?.runtime !== job.runtime || row.pending_operation) fail("InvalidWorkerInvocation");
@@ -106,8 +120,8 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths })}`;
         if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
         const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
-        // The launcher joins and kills descendants before returning. Ignore
-        // actor prose, local assessments and claimed completion as authority.
+        // The launcher joins and kills descendants before returning. Actor
+        // answers and private assessments never establish company acceptance.
         await image({ ...request, action: "quiesce" });
         signal?.throwIfAborted();
         if (actor.killed || ![0, 1].includes(actor.code)) fail("WorkerInvocationFailed");
@@ -132,6 +146,8 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           } finally { await fs.unlink(output); }
         };
         const head = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id });
+        const claim = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: head.data.definition_hash, revision: head.data.revision, action: "candidate", task: selected.id });
+        if (claim.revision !== head.data.revision || claim.data.task !== selected.id || claim.data.authority !== "actor_claim") fail("WorkerCandidateChanged");
         const reader = createWorkerSnapshot({ workspace: local.workspace_id, definitionHash: head.data.definition_hash, revision: head.data.revision, request: input => requestNative({ ...input, task: selected.id }), maxFileBytes: 8 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
         const inventory = await reader.inventory(signal);
         for (const file of inventory) {
@@ -156,8 +172,8 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           current = { ...current, revision: checkpoint.revision };
         }
         if (frozen) { complete = true; return { outcome: current.publication ? "completed" : "submitted" }; }
-        if (!inventory.length && current.revision === state.revision) return { outcome: "waiting", note: "The invocation produced no company checkpoint; inspect retained local task evidence before requeueing." };
-        await call("submit", { revision: current.revision, candidate: "The stopped isolated invocation retained its proposed company changes. Assess the original task contract against the exact candidate and host-recorded evidence." });
+        if (typeof claim.data.candidate !== "string" || !claim.data.candidate.trim() || Buffer.byteLength(claim.data.candidate) > 32768) return { outcome: "waiting", note: "The invocation has no bounded recorded answer; inspect retained local task evidence before requeueing." };
+        await call("submit", { revision: current.revision, candidate: claim.data.candidate });
         complete = true;
         return { outcome: "submitted", note: "Company changes are checkpointed and queued for independent host review." };
       } finally {
