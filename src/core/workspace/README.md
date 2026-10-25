@@ -7,6 +7,13 @@ an empty personal instance automatically when no repository is bound.
 `omos fossil ensure --json` performs the same bootstrap without importing
 existing sessions.
 
+Managed turns checkpoint changes in the task's projected `memory/`, `skills/`,
+`documents/`, `artifacts/`, and `ui/` directories. The host hashes local files
+through fixed-size buffers and retains their metadata while identifying
+changes. It loads changed bodies on demand and rechecks their hashes, sizes,
+and executable flags before committing. A concurrent edit leaves the previous
+baseline intact for the next checkpoint.
+
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
 Its read action returns UTF-8 byte slices of JSON containing the original

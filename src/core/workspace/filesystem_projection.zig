@@ -9,7 +9,7 @@ const records = @import("../shared/record_json.zig");
 
 const Entry = struct { path: []const u8, sha256: []const u8, executable: bool = false };
 const Baseline = struct { version: u32 = 2, workspace: []const u8, task: []const u8, revision: []const u8, entries: []const Entry };
-const File = struct { path: []const u8, content: []const u8, sha256: []const u8, executable: bool };
+const File = struct { path: []const u8, bytes: usize, sha256: []const u8, executable: bool };
 const Desired = struct { path: []const u8, content: ?[]const u8, sha256: []const u8, executable: bool };
 const roots = [_][]const u8{ "memory/", "skills/", "documents/", "artifacts/", "ui/" };
 const max_file_bytes = 8 * 1024 * 1024;
@@ -53,8 +53,40 @@ fn readFile(alloc: std.mem.Allocator, parent: std.Io.Dir, name: []const u8, path
     defer file.close(io_mod.getIo());
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file) return error.WorkspaceProjectionSymlink;
+    if (stat.size > max_file_bytes) return error.WorkspaceProjectionTooLarge;
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    var reader_buffer: [8192]u8 = undefined;
+    var transfer: [8192]u8 = undefined;
+    var reader = file.reader(io_mod.getIo(), &reader_buffer);
+    var bytes: usize = 0;
+    while (true) {
+        const count = try reader.interface.readSliceShort(&transfer);
+        if (count == 0) break;
+        bytes = try std.math.add(usize, bytes, count);
+        if (bytes > max_file_bytes) return error.WorkspaceProjectionTooLarge;
+        digest.update(transfer[0..count]);
+    }
+    var hash: [32]u8 = undefined;
+    digest.final(&hash);
+    const hex = std.fmt.bytesToHex(&hash, .lower);
+    return .{ .path = path, .bytes = bytes, .sha256 = try alloc.dupe(u8, &hex), .executable = stat.permissions.toMode() & 0o111 != 0 };
+}
+
+/// Materialise a changed body only after scanning its metadata. A concurrent
+/// edit leaves the baseline unchanged and is inspected again on the next try.
+fn changedBytes(alloc: std.mem.Allocator, parent: std.Io.Dir, name: []const u8, expected: File) ![]const u8 {
+    var file = try parent.openFile(io_mod.getIo(), name, .{ .allow_directory = false, .follow_symlinks = false });
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.kind != .file or stat.size != expected.bytes or (stat.permissions.toMode() & 0o111 != 0) != expected.executable) return error.WorkspaceProjectionConflict;
     const bytes = try io_mod.readFileToEnd(alloc, &file, max_file_bytes);
-    return .{ .path = path, .content = bytes, .sha256 = try workspace.hash(alloc, bytes), .executable = stat.permissions.toMode() & 0o111 != 0 };
+    errdefer alloc.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(&digest, .lower);
+    const after = try file.stat(io_mod.getIo());
+    if (bytes.len != expected.bytes or after.size != expected.bytes or (after.permissions.toMode() & 0o111 != 0) != expected.executable or !std.mem.eql(u8, expected.sha256, &hex)) return error.WorkspaceProjectionConflict;
+    return bytes;
 }
 
 fn scan(alloc: std.mem.Allocator, parent: std.Io.Dir, prefix: []const u8, files: *std.ArrayList(File), total: *usize) anyerror!void {
@@ -73,7 +105,7 @@ fn scan(alloc: std.mem.Allocator, parent: std.Io.Dir, prefix: []const u8, files:
         } else if (kind == .file) {
             if (entry.name[0] == '.') return error.WorkspacePathDenied;
             const file = try readFile(alloc, parent, entry.name, path);
-            total.* = try std.math.add(usize, total.*, file.content.len);
+            total.* = try std.math.add(usize, total.*, file.bytes);
             if (total.* > max_view_bytes or files.items.len >= max_files) return error.WorkspaceProjectionTooLarge;
             try files.append(alloc, file);
         } else return error.WorkspaceProjectionSymlink;
@@ -182,7 +214,7 @@ pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
         const current_file = fileByPath(local, path);
         const need_bytes = altered or (current_file == null and prior == null);
         const bytes: ?[]const u8 = if (need_bytes) try manager.contentAt(path, revision_id) else null;
-        total = try std.math.add(usize, total, if (bytes) |value| value.len else if (current_file) |value| value.content.len else 0);
+        total = try std.math.add(usize, total, if (bytes) |value| value.len else if (current_file) |value| value.bytes else 0);
         if (total > max_view_bytes or entries.items.len >= max_files) return error.WorkspaceProjectionTooLarge;
         const digest = if (bytes) |value| try workspace.hash(manager.alloc, value) else prior.?.sha256;
         const expected: Entry = .{ .path = path, .sha256 = digest, .executable = executable };
@@ -226,7 +258,9 @@ pub fn checkpoint(manager: workspace.Manager, task: workspace.Task) !bool {
         const prior = lookup(saved.entries, file.path);
         try entries.append(manager.alloc, state(file));
         if (equal(prior, state(file))) continue;
-        try changes.append(manager.alloc, .{ .path = file.path, .content = file.content, .previous_hash = if (prior) |value| value.sha256 else null, .previous_executable = if (prior) |value| value.executable else null, .executable = file.executable });
+        var parent = try parentDirectory(manager.alloc, try directory(manager, task), file.path);
+        defer parent.close(io_mod.getIo());
+        try changes.append(manager.alloc, .{ .path = file.path, .content = try changedBytes(manager.alloc, parent, std.Io.Dir.path.basename(file.path), file), .previous_hash = if (prior) |value| value.sha256 else null, .previous_executable = if (prior) |value| value.executable else null, .executable = file.executable });
     }
     for (saved.entries) |entry| if (fileByPath(local, entry.path) == null) {
         try changes.append(manager.alloc, .{ .path = entry.path, .content = null, .previous_hash = entry.sha256, .previous_executable = entry.executable });
@@ -245,4 +279,30 @@ pub fn skillsDirectory(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const
     const manager = (try workspace.Manager.bound(alloc)) orelse return null;
     const task = (try manager.active(id)) orelse return null;
     return try std.Io.Dir.path.join(alloc, &.{ try directory(manager, task), "skills" });
+}
+
+test "filesystem projection scans bodies with bounded metadata allocation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var payload: [65537]u8 = @splat('x');
+    payload[payload.len - 1] = 'z';
+    var file = try temporary.dir.createFile(std.testing.io, "input.txt", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, &payload);
+    var storage: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const observed = try readFile(fixed.allocator(), temporary.dir, "input.txt", "documents/input.txt");
+    try std.testing.expectEqual(payload.len, observed.bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&payload, &digest, .{});
+    const hex = std.fmt.bytesToHex(&digest, .lower);
+    try std.testing.expectEqualStrings(&hex, observed.sha256);
+    const body = try changedBytes(std.testing.allocator, temporary.dir, "input.txt", observed);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualSlices(u8, &payload, body);
+    payload[0] = 'y';
+    var replacement = try temporary.dir.createFile(std.testing.io, "input.txt", .{});
+    defer replacement.close(std.testing.io);
+    try replacement.writeStreamingAll(std.testing.io, &payload);
+    try std.testing.expectError(error.WorkspaceProjectionConflict, changedBytes(std.testing.allocator, temporary.dir, "input.txt", observed));
 }
