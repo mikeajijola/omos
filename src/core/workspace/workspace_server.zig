@@ -4,6 +4,7 @@ const std = @import("std");
 const io = @import("../shared/io.zig");
 const workspace = @import("fossil_workspace.zig");
 const service = @import("workspace_service.zig");
+const bounded = @import("../shared/bounded_operation.zig");
 
 pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor, schedule_executor: ?@import("schedule_worker.zig").Executor) !void {
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
@@ -83,18 +84,59 @@ const Connection = struct {
         defer finished.store(true, .release);
         defer std.heap.c_allocator.destroy(self);
         defer self.stream.close(io.getIo());
-        if (comptime @import("builtin").os.tag == .linux or @import("builtin").os.tag == .macos) {
-            const timeout: std.posix.timeval = .{ .sec = 10, .usec = 0 };
-            if (std.c.setsockopt(self.stream.socket.handle, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &timeout, @sizeOf(std.posix.timeval)) != 0 or
-                std.c.setsockopt(self.stream.socket.handle, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &timeout, @sizeOf(std.posix.timeval)) != 0) return;
-        }
         handle(self.manager, self.stream, self.token, self.writable) catch |err| {
             if (err != error.HttpConnectionClosing) @import("../shared/debug_trace.zig").logf("workspace", "workspace service connection failed error={s}", .{@errorName(err)});
         };
         self.stream.shutdown(io.getIo(), .send) catch {};
-        var drain_buffer: [1024]u8 = undefined;
-        var drain = self.stream.reader(io.getIo(), &drain_buffer);
-        _ = drain.interface.discardShort(16384) catch {};
+        var cancelled = std.atomic.Value(bool).init(false);
+        _ = bounded.run(Empty, std.heap.c_allocator, &cancelled, deadline(2), Drain{ .stream = self.stream }) catch {};
+    }
+};
+
+fn deadline(seconds: i64) std.Io.Clock.Timestamp {
+    return .fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromSeconds(seconds) });
+}
+
+const Empty = struct {
+    pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+};
+
+const Drain = struct {
+    stream: std.Io.net.Stream,
+
+    pub fn run(self: @This()) !Empty {
+        var buffer: [1024]u8 = undefined;
+        var reader = self.stream.reader(io.getIo(), &buffer);
+        _ = try reader.interface.discardShort(16384);
+        return .{};
+    }
+};
+
+const Head = struct {
+    request: std.http.Server.Request,
+
+    pub fn deinit(_: *@This(), _: std.mem.Allocator) void {}
+};
+
+const ReceiveHead = struct {
+    server: *std.http.Server,
+
+    pub fn run(self: @This()) !Head {
+        return .{ .request = try self.server.receiveHead() };
+    }
+};
+
+const Dispatch = struct {
+    manager: workspace.Manager,
+    request: *std.http.Server.Request,
+    stream: std.Io.net.Stream,
+    token: []const u8,
+    writable: bool,
+    keep_alive: *bool,
+
+    pub fn run(self: @This()) !Empty {
+        try dispatch(self.manager, self.request, self.stream, self.token, self.writable, self.keep_alive);
+        return .{};
     }
 };
 
@@ -105,13 +147,19 @@ fn handle(manager: workspace.Manager, stream: std.Io.net.Stream, token: []const 
     var writer = stream.writer(io.getIo(), &write_buffer);
     var server = std.http.Server.init(&reader.interface, &writer.interface);
     for (0..100) |index| {
-        var request = try server.receiveHead();
+        // Kernel socket timeouts turn a blocking recv into EAGAIN, which the
+        // Zig threaded I/O adapter treats as a programming error. Cancel and
+        // drain an owned I/O task instead; no request buffers outlive it.
+        var cancelled = std.atomic.Value(bool).init(false);
+        var request = (try bounded.run(Head, std.heap.c_allocator, &cancelled, deadline(10), ReceiveHead{ .server = &server })).request;
         var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer arena.deinit();
         var request_manager = manager;
         request_manager.alloc = arena.allocator();
+        const request_deadline = deadline(60);
+        request_manager.operation_control = .{ .cancel = &cancelled, .deadline = request_deadline };
         var keep_alive = request.head.keep_alive and index < 99;
-        try dispatch(request_manager, &request, stream, token, writable, &keep_alive);
+        _ = try bounded.run(Empty, arena.allocator(), &cancelled, request_deadline, Dispatch{ .manager = request_manager, .request = &request, .stream = stream, .token = token, .writable = writable, .keep_alive = &keep_alive });
         if (!keep_alive) return;
     }
 }

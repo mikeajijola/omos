@@ -396,6 +396,53 @@ describe("portable Fossil workspace recovery", () => {
     }
   }, 180000);
 
+  test("closes idle keep-alive and partial-header connections without aborting the workspace service", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const operator = join(f.home, "idle-service-operator.json");
+    writeFileSync(operator, JSON.stringify({ version: "omos.company-admin/v1", action: "initialize" }));
+    expect((await f.run(["fossil", "company", operator, "--json"])).code).toBe(0);
+    const service = await startWorkspaceService(f, false);
+    const { createConnection } = await import("node:net");
+    const sockets: ReturnType<typeof createConnection>[] = [];
+    const open = async () => {
+      const socket = createConnection({ host: "127.0.0.1", port: service.ready.port });
+      sockets.push(socket);
+      await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+      return socket;
+    };
+    try {
+      const idle = await open(), partial = await open();
+      const closed = (socket: typeof idle) => new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(Error("Timed-out connection remained open")), 15000);
+        socket.once("close", () => { clearTimeout(timeout); resolve(); });
+      });
+      const idleClosed = closed(idle), partialClosed = closed(partial);
+      let response = "";
+      const received = new Promise<void>((resolve, reject) => {
+        idle.on("data", bytes => { response += bytes.toString(); if (response.includes('"issuer"')) resolve(); });
+        idle.once("error", reject);
+      });
+      idle.write("GET /v1/company HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n");
+      partial.write("GET /v1/company HTTP/1.1\r\nHost: localhost\r\n");
+      partial.resume();
+      await received;
+      expect(response).toContain("200 OK");
+      const start = Date.now();
+      await Promise.all([idleClosed, partialClosed]);
+      expect(Date.now() - start).toBeGreaterThan(8000);
+      expect(service.child.exitCode).toBeNull();
+      const fresh = await fetch(service.url + "/v1/company", { keepalive: false, headers: { connection: "close" } });
+      expect(fresh.status).toBe(200);
+      expect((await fresh.json() as any).workspace).toBe(service.ready.workspace);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      service.child.kill(); await service.child.exited;
+      const stderr = await new Response(service.child.stderr).text();
+      expect(stderr).not.toContain("panic:");
+    }
+  }, 60000);
+
   test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
     const f = fixture();
     const inference = model(f, () => { throw Error("Schema discovery must not run an actor"); });
