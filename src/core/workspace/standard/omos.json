@@ -1106,7 +1106,8 @@
                 "delegate",
                 "reconcile",
                 "query",
-                "record"
+                "record",
+                "execution"
               ]
             },
             "view": {
@@ -1296,6 +1297,48 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            },
+            "execution_change": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "claim",
+                "renew",
+                "release",
+                null
+              ]
+            },
+            "execution_lease_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 300000
             }
           },
           "required": [
@@ -2912,6 +2955,155 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_execution",
+        "capability": "general_task",
+        "description": "Scoped discovery, reads, isolated views, checkpoints, proposals and outcomes.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.company/v1",
+                "omos.company/v2"
+              ]
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "execution"
+            },
+            "view": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "execution": {
+              "type": "object",
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            },
+            "execution_change": {
+              "type": "string",
+              "enum": [
+                "claim",
+                "renew",
+                "release"
+              ]
+            },
+            "execution_lease_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 300000
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision",
+            "execution",
+            "execution_change"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-execution/v1"
+            },
+            "view": {
+              "type": "string"
+            },
+            "task": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "runtime": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "generation": {
+              "type": "integer"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "request_hash": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "view",
+            "task",
+            "actor",
+            "grant",
+            "runtime",
+            "generation",
+            "expires_ms",
+            "operation",
+            "request_hash"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -3336,6 +3528,34 @@
             "host",
             "receipt"
           ]
+        },
+        {
+          "id": "omos_company_execution",
+          "fields": {
+            "version": "string",
+            "view": "string",
+            "task": "string",
+            "actor": "string",
+            "grant": "string",
+            "runtime": "json",
+            "generation": "number",
+            "expires_ms": "number",
+            "operation": "string",
+            "request_hash": "string"
+          },
+          "required": [
+            "version",
+            "view",
+            "task",
+            "actor",
+            "grant",
+            "runtime",
+            "generation",
+            "expires_ms",
+            "operation",
+            "request_hash"
+          ],
+          "indexed": []
         }
       ],
       "relationships": [

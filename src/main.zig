@@ -4897,6 +4897,7 @@ test {
     _ = @import("core/workspace/company_subscription.zig");
     _ = @import("core/workspace/company_schema.zig");
     _ = @import("core/workspace/company_capabilities.zig");
+    _ = @import("core/workspace/company_execution.zig");
     _ = @import("core/workspace/capability_package.zig");
     _ = @import("core/workspace/runtime_handles.zig");
     _ = @import("core/workspace/capability_runtime.zig");

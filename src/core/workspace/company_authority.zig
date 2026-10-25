@@ -4,11 +4,11 @@ const std = @import("std");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
-pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record };
+pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record, execution };
 
 pub fn isMutation(action: Action) bool {
     return switch (action) {
-        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record => true,
+        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record, .execution => true,
         .discover, .read, .status, .export_scope, .query => false,
     };
 }
@@ -65,6 +65,9 @@ pub const Request = struct {
     capability_selections: ?[]const CapabilitySelection = null,
     record_id: ?[]const u8 = null,
     progress_cursor: ?[]const u8 = null,
+    execution: ?@import("company_execution.zig").Fence = null,
+    execution_change: ?@import("company_execution.zig").Change = null,
+    execution_lease_ms: ?u32 = null,
 };
 
 /// Version 2 adds authenticated file attributes to read-only file operations.
@@ -167,7 +170,7 @@ pub fn authenticateRetained(alloc: std.mem.Allocator, state: State, raw: []const
     if (fresh.action != .reconcile) return error.CompanyAccessDenied;
     const original = try authenticateRequest(alloc, state, raw, now, true);
     if (!std.mem.eql(u8, fresh.actor, original.actor) or !std.mem.eql(u8, fresh.grant, original.grant) or fresh.outcome == null or !std.mem.eql(u8, fresh.outcome.?, original.operation)) return error.CompanyAccessDenied;
-    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate) return error.CompanyRecoveryActionDenied;
+    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate and original.action != .execution) return error.CompanyRecoveryActionDenied;
     return original;
 }
 

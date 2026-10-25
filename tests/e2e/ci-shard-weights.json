@@ -1,6 +1,6 @@
 [
   { "file": "fossil-workspace.test.ts", "weight": 60 },
-  { "file": "fossil-workspace-recovery.test.ts", "weight": 1900 },
+  { "file": "fossil-workspace-recovery.test.ts", "weight": 1970 },
   { "file": "slack-install.test.ts", "weight": 6 },
   { "file": "auto-mode-reliability.test.ts", "weight": 4 },
   { "file": "review-model-override.test.ts", "weight": 4 },

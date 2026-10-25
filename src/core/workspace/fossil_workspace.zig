@@ -589,8 +589,9 @@ pub const Manager = struct {
         const declaration = try self.loadDeclaration(basis.revision);
         for (files, 0..) |file, index| {
             if (!allowedPath(file.path) or (!std.mem.startsWith(u8, file.path, "authority/") and !std.mem.startsWith(u8, file.path, "company/"))) return error.WorkspacePathDenied;
-            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
+            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, file.path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
             try model.validateRecord(declaration.semantic, entity, try parse(self.alloc, std.json.Value, file.content), true);
+            if (std.mem.eql(u8, entity, "omos_company_execution")) try @import("company_execution.zig").validateStored(self.alloc, try record_json.decode(@import("company_execution.zig").Record, self.alloc, file.content, .{}), file.path);
             if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) _ = try @import("company_capabilities.zig").decode(self.alloc, self.manifest.id, file.content);
             if (file.content.len > max_bytes) return error.WorkspaceRecordTooLarge;
             for (files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.DuplicateWorkspacePath;
@@ -598,6 +599,7 @@ pub const Manager = struct {
         const mutation = try self.commitCompanyFiles(current, files);
         try @import("company_keys.zig").observe(self);
         for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
+        for (files) |file| if (std.mem.startsWith(u8, file.path, "company/execution/")) try fault("company-execution-committed");
         if (mutation.tree) |tree| self.cleanCompanyTree(tree, files) catch |err| {
             debug_trace.logf("workspace", "company scratch retained for recovery error={s}", .{@errorName(err)});
         };
@@ -2944,9 +2946,10 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
         if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
-            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
+            const entity: ?[]const u8 = if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
             if (entity) |kind| {
                 try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
+                if (std.mem.eql(u8, kind, "omos_company_execution")) try @import("company_execution.zig").validateStored(self.alloc, try record_json.decode(@import("company_execution.zig").Record, self.alloc, bytes, .{}), path);
                 if (std.mem.eql(u8, kind, "omos_company_capability_policy")) _ = try @import("company_capabilities.zig").decode(self.alloc, self.manifest.id, bytes);
                 if (std.mem.eql(u8, kind, "omos_company_authority")) {
                     const authority = try record_json.decode(@import("company_authority.zig").State, self.alloc, bytes, .{});
@@ -3034,7 +3037,7 @@ pub const Manager = struct {
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
                 const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
-                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
+                const needs_body = std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
                 if (!needs_body) continue;
                 var digest = std.crypto.hash.sha2.Sha256.init(.{});
                 digest.update(if (company) "company" else "content");

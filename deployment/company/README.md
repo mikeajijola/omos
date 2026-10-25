@@ -66,6 +66,26 @@ chmod 600 "$HOME/.config/omos/company.env"
 The bearer token belongs to local administration or a trusted server bridge.
 External company actors use their signed, scoped requests instead.
 
+## Hand a view between runtimes
+
+Add `execution` to the actor's enrolled actions and optional MCP configuration
+when clients need durable execution ownership. Discover support through
+`features.execution_ownership`. Claim the view with action `execution`, change
+`claim`, its current revision, and fence
+`{"runtime":"worker-instance","generation":0}`. Specify a lease duration in
+`execution_lease_ms`, up to five minutes. The signed response returns the new
+generation and expiry.
+
+Carry that runtime and generation in `execution` on subsequent mutations and
+active input reads. Renew before expiry or release ownership explicitly. A
+replacement runtime reads `status` for the contract, model basis, checkpoint,
+and previous generation, then claims a new generation after release or expiry.
+Once claimed, the view continues to require ownership after either event;
+old runtimes and unfenced mutations are rejected. Lost acknowledgements retain
+their original outcome and cannot restore an older owner. See
+[scoped company execution ownership](../../src/core/workspace/CONTRACTS.md#scoped-company-execution-ownership)
+for request fields and recovery rules.
+
 ## Start and expose the service
 
 Copy `omos-company.service` into `~/.config/systemd/user/`, then run:

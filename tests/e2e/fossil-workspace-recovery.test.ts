@@ -691,6 +691,105 @@ describe("portable Fossil workspace recovery", () => {
     } finally { service.child.kill(); await service.child.exited; }
   }, 420000);
 
+  test("transfers durable company execution ownership and rejects stale runtimes without replaying a lost lease acknowledgement", async () => {
+    const f = fixture();
+    const inference = model(f, () => ({ content: "Only the independent assessor should run." }));
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const filename = join(f.home, "operator.json");
+      writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", filename, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initial = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initial.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/"], actions: ["discover", "read", "export_scope", "create_view", "checkpoint", "submit", "status", "reconcile", "execution"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    expect(boot.features.execution_ownership).toBe(true);
+    const seal = (action: string, params: object = {}) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "worker", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const post = (request: object) => fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(request) });
+    const success = async (request: object) => {
+      const response = await post(request), data = await response.json() as any;
+      expect(response.status, JSON.stringify(data)).toBe(200);
+      return JSON.parse(data.payload).result;
+    };
+    const rejected = async (request: object, error: string) => {
+      const response = await post(request), data = await response.json() as any;
+      expect(response.status, JSON.stringify(data)).not.toBe(200); expect(data.error).toBe(error);
+    };
+    try {
+      const view = await success(seal("create_view", { revision: boot.revision, objective: "Save the report through one execution owner at a time." }));
+      const first = { runtime: "first", generation: 1 };
+      const claim = await success(seal("execution", { view: view.view, revision: view.revision, execution_change: "claim", execution: { ...first, generation: 0 }, execution_lease_ms: 60000 }));
+      expect(claim).toMatchObject({ runtime: "first", generation: 1, view: view.view });
+      await rejected(seal("execution", { view: view.view, revision: view.revision, execution_change: "claim", execution: { runtime: "second", generation: 1 }, execution_lease_ms: 60000 }), "CompanyExecutionBusy");
+      const beforeDenied = (await admin({ action: "status" })).revision;
+      await rejected(seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/report.md", content: "Unfenced change" }), "CompanyExecutionFenceRequired");
+      expect((await admin({ action: "status" })).revision).toBe(beforeDenied);
+      const saved = await success(seal("checkpoint", { view: view.view, revision: view.revision, execution: first, path: "documents/report.md", content: "Owned report", previous_hash: null }));
+      await rejected(seal("read", { view: view.view, path: "documents/report.md" }), "CompanyExecutionFenceRequired");
+      expect((await success(seal("read", { view: view.view, execution: first, path: "documents/report.md" }))).read_tracking).toBe("recorded");
+      expect((await success(seal("execution", { view: view.view, revision: saved.revision, execution_change: "release", execution: first }))).runtime).toBeNull();
+      await rejected(seal("checkpoint", { view: view.view, revision: saved.revision, path: "documents/report.md", content: "Unfenced after release" }), "CompanyExecutionFenceRequired");
+      const second = { runtime: "second", generation: 2 };
+      expect((await success(seal("execution", { view: view.view, revision: saved.revision, execution_change: "claim", execution: { ...second, generation: 1 }, execution_lease_ms: 60000 }))).generation).toBe(2);
+      await rejected(seal("checkpoint", { view: view.view, revision: saved.revision, execution: first, path: "documents/report.md", content: "Stale first runtime" }), "CompanyExecutionFenced");
+      const short = await success(seal("execution", { view: view.view, revision: saved.revision, execution_change: "renew", execution: second, execution_lease_ms: 1 }));
+      await Bun.sleep(Math.max(0, short.expires_ms - Date.now() + 1));
+      await rejected(seal("checkpoint", { view: view.view, revision: saved.revision, execution: second, path: "documents/report.md", content: "Expired runtime" }), "CompanyExecutionExpired");
+      const third = { runtime: "third", generation: 3 };
+      expect((await success(seal("execution", { view: view.view, revision: saved.revision, execution_change: "claim", execution: { ...third, generation: 2 }, execution_lease_ms: 60000 }))).generation).toBe(3);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-execution-committed" });
+      const lost = seal("execution", { view: view.view, revision: saved.revision, execution_change: "renew", execution: third, execution_lease_ms: 1 });
+      await rejected(lost, "WorkspaceInjectedFailure");
+      const operation = JSON.parse(lost.payload).operation;
+      expect((await success(seal("status", { outcome: operation }))).state).toBe("uncertain");
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      const fourth = { runtime: "fourth", generation: 4 };
+      expect((await success(seal("execution", { view: view.view, revision: saved.revision, execution_change: "claim", execution: { ...fourth, generation: 3 }, execution_lease_ms: 60000 }))).generation).toBe(4);
+      const recovered = await success(lost);
+      expect(recovered.generation).toBe(3); expect(recovered.runtime).toBe("third");
+      const resumed = await success(seal("status", { view: view.view }));
+      expect(resumed.execution).toMatchObject({ runtime: "fourth", generation: 4 });
+      expect(resumed.contract).toEqual(view.contract); expect(resumed.basis).toEqual(view.basis); expect(resumed.revision).toBe(saved.revision);
+      expect((await success(seal("status", { outcome: operation }))).state).toBe("completed");
+      await rejected(seal("checkpoint", { view: view.view, revision: saved.revision, execution: third, path: "documents/report.md", content: "Stale recovered runtime" }), "CompanyExecutionFenced");
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" });
+      const uncertainWrite = seal("checkpoint", { view: view.view, revision: saved.revision, execution: fourth, path: "documents/handoff.md", content: "Checkpointed once before handoff", previous_hash: null });
+      await rejected(uncertainWrite, "WorkspaceInjectedFailure");
+      const retained = await success(seal("status", { view: view.view }));
+      await success(seal("execution", { view: view.view, revision: retained.revision, execution_change: "release", execution: fourth }));
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      const fifth = { runtime: "fifth", generation: 5 };
+      await success(seal("execution", { view: view.view, revision: retained.revision, execution_change: "claim", execution: { ...fifth, generation: 4 }, execution_lease_ms: 60000 }));
+      await rejected(uncertainWrite, "CompanyExecutionFenced");
+      const repaired = await success(seal("reconcile", { outcome: JSON.parse(uncertainWrite.payload).operation, execution: fifth }));
+      expect(repaired.state).toBe("completed");
+      expect(repaired.result.revision).toBe(retained.revision);
+      const submitted = await success(seal("submit", { view: view.view, revision: retained.revision, execution: fifth, candidate: "Saved the owned report and its retained handoff checkpoint." }));
+      const deadline = Date.now() + 60000;
+      let status: any;
+      do { status = await success(seal("status", { view: view.view })); if (status.state === "accepted" || status.job?.state === "failed") break; await Bun.sleep(20); } while (Date.now() < deadline);
+      expect(status.state, JSON.stringify(status)).toBe("accepted");
+      expect(status.job.id).toBe(submitted.job);
+      expect(f.fossil("cat", "documents/report.md", "-r", "trunk")).toBe("Owned report");
+      expect(f.fossil("cat", "documents/handoff.md", "-r", "trunk")).toBe("Checkpointed once before handoff");
+      const inspected = await success(seal("export_scope", { version: "omos.company/v2", view: view.view, path: "documents/report.md" }));
+      expect(Buffer.from(inspected.content, "base64").toString()).toBe("Owned report");
+      expect(inference.counts().actors).toBe(0);
+      expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 180000);
+
   test("versions explicit company capability metadata scopes without expanding file grants", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -2560,15 +2659,18 @@ sys.exit(result.returncode)
     // Reconstruct the earlier persisted declaration, including its view shape,
     // to exercise an upgrade rather than only initializing the newest seed.
     const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
-    legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission", "omos_company_upload"].includes(entity.id));
+    legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission", "omos_company_upload", "omos_company_execution"].includes(entity.id));
     delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
-    legacy.spec.operations = legacy.spec.operations.filter((operation: any) => !["omos_company_subscription", "omos_company_schema"].includes(operation.id));
+    legacy.spec.operations = legacy.spec.operations.filter((operation: any) => !["omos_company_subscription", "omos_company_schema", "omos_company_execution"].includes(operation.id));
     const legacyInput = legacy.spec.operations.find((operation: any) => operation.id === "omos_company_operation").input.properties;
     legacyInput.version = { const: "omos.company/v1" };
     delete legacyInput.executable;
     delete legacyInput.previous_executable;
     delete legacyInput.progress_cursor;
     delete legacyInput.upload;
+    delete legacyInput.execution;
+    delete legacyInput.execution_change;
+    delete legacyInput.execution_lease_ms;
     const tree = join(f.home, "legacy-declaration");
     mkdirSync(tree);
     const fossil = (...args: string[]) => {

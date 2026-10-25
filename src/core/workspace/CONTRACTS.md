@@ -287,6 +287,55 @@ work. Selecting other work does not pause a task another runtime is executing.
 An idle selected task's paused state is committed with the selection change.
 These leases coordinate runtimes on one host; they are not distributed leases.
 
+### Scoped company execution ownership
+
+The company gateway exposes durable execution ownership separately from the
+native host's process locks. A grant needs the `execution` action to claim,
+renew, or release ownership of its own view. Requests use `action: "execution"`,
+the current view `revision`, `execution_change: "claim" | "renew" | "release"`,
+and an `execution` fence containing a runtime identity and generation:
+
+```json
+{
+  "action": "execution",
+  "view": "VIEW_ID",
+  "revision": "CURRENT_VIEW_REVISION",
+  "execution_change": "claim",
+  "execution": {"runtime": "worker-instance", "generation": 0},
+  "execution_lease_ms": 60000
+}
+```
+
+These fields belong inside the normal signed company envelope. The initial
+claim expects generation zero and returns generation one. Later claims use
+the last retained generation and increment it. An active owner must release
+or expire before another runtime can claim the view. Renewals require the
+current runtime and generation before expiry. Lease duration is 1–300,000
+milliseconds, clipped to the grant's expiry; release omits the duration.
+Every operation also checks the current grant and its delegation chain.
+
+Unclaimed legacy views retain their existing protocol. Once a view has been
+claimed, content mutations and active input observations must carry its live
+`execution` fence. Release and expiry preserve a tombstone, so they never
+restore unfenced writes. `status` remains available without ownership and
+returns the current fence, retained contract, pinned model basis, and checkpoint
+revision. Frozen proposal inspection also remains read-only. A replacement
+runtime can obtain this context, claim a new generation, and continue from
+the recorded checkpoint. Former generations cannot mutate the view.
+
+Ownership records and immutable transition records live under the protected
+`company/execution/` tree. The company operation lease serializes transitions
+with scoped mutations on the single server. Each transition commits its
+current record and exact operation outcome together. Retrying a transition
+whose acknowledgement was lost returns the retained generation and expiry;
+it doesn't renew a lease or replace a newer owner. A fresh `reconcile` request
+can inspect and resolve a retained internal mutation under the current owner's
+fence. These operations run no actor tools or external effects.
+
+Ownership fences coordinate authorized clients of this gateway. They don't
+provide a sandbox, cross-server consensus, or permission to execute a hosted
+company actor. Hosted execution still requires an isolated backend.
+
 Copied personal tasks retain their original project directory. Ordinary resume
 refuses a different directory with `TaskProjectMismatch`. Select the new project
 explicitly with `/task resume <id> --rebind-project`, or supply
