@@ -175,8 +175,9 @@ fn addWorkspaceResults(ctx: tool_dispatch.DispatchContext, input: *const Input, 
                         if (declared.items.len >= 16) break;
                         var row = capability;
                         const native = model.nativeCapability(declaration, id);
-                        try row.object.put(arena.allocator(), "host_binding", .{ .string = if (native) "native_task_runtime" else "unbound" });
-                        try row.object.put(arena.allocator(), "availability", .{ .string = if (native) "available_subject_to_host_permissions" else "declared_only" });
+                        const verified = if (native) false else try @import("../../core/workspace/capability_runtime.zig").available(manager, declaration, id, if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk"));
+                        try row.object.put(arena.allocator(), "host_binding", .{ .string = if (native) "native_task_runtime" else if (verified) "verified_workspace_implementation" else "unbound" });
+                        try row.object.put(arena.allocator(), "availability", .{ .string = if (native or verified) "available_subject_to_host_permissions" else "declared_only" });
                         try declared.append(arena.allocator(), row);
                     }
                     var parsed_output = try std.json.parseFromSlice(std.json.Value, arena.allocator(), combined, .{});

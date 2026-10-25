@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync, chmodSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, realpathSync, rmSync, copyFileSync, chmodSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
@@ -538,8 +538,158 @@ describe("portable Fossil workspace recovery", () => {
       }
       writeFileSync(copy, archive); writeFileSync(pins, JSON.stringify({ ...config, selections: [{ capability: "portable_cv" }, { capability: "package_support", realisation: "support_primary" }] }));
       expect((await offline.run(["fossil", "verify-scope", pins, copy, "--json"])).code).toBe(1);
+      const missingRuntime = await offline.run(["fossil", "package", "verify", staged.task, "--json"]);
+      expect(missingRuntime.code, missingRuntime.stderr).toBe(0);
+      expect(JSON.parse(missingRuntime.stdout).model_data.verified).toBe(false);
+      const beforeRuntime = JSON.parse((await offline.run(["fossil", "status", "--json"])).stdout).trunk_revision;
+      const installedNode = realpathSync(Bun.which("node")!);
+      const node = join(offline.home, "verified-node"); copyFileSync(installedNode, node); chmodSync(node, 0o700);
+      const bindings = join(offline.home, "runtime-bindings.json");
+      writeFileSync(bindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: node }] }));
+      const checked = await offline.run(["fossil", "package", "verify", staged.task, "--bindings", bindings, "--json"], { NODE_OPTIONS: "--this-must-not-reach-the-probe" });
+      expect(checked.code, checked.stderr).toBe(0);
+      const verifiedRuntime = JSON.parse(checked.stdout).model_data;
+      expect(verifiedRuntime.verified, JSON.stringify(verifiedRuntime.requirements)).toBe(true);
+      const observed = verifiedRuntime.requirements.find((row: any) => row.kind === "runtime");
+      expect(observed).toMatchObject({ handle: "node", constraint: ">=22", verified: true });
+      expect(observed.probe.executable_sha256).toBe(createHash("sha256").update(readFileSync(node)).digest("hex"));
+      const proof = JSON.parse(offline.fossil("cat", verifiedRuntime.receipt, "-r", `task/${staged.task}`));
+      expect(JSON.stringify(proof)).not.toContain(node);
+      const proofKey = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(proof.host, "hex")]), type: "spki", format: "der" });
+      expect(verify(null, Buffer.from(proof.payload), proofKey, Buffer.from(proof.signature, "hex"))).toBe(true);
+      expect(statSync(join(offline.home, ".fx/runtimes/handles.json")).mode & 0o777).toBe(0o600);
+      const checkedAgain = await offline.run(["fossil", "package", "verify", staged.task, "--json"]);
+      expect(checkedAgain.code, checkedAgain.stderr).toBe(0);
+      expect(JSON.parse(checkedAgain.stdout).model_data.revision).toBe(verifiedRuntime.revision);
+      expect(JSON.parse((await offline.run(["fossil", "status", "--json"])).stdout).trunk_revision).toBe(beforeRuntime);
+      let phase = "start", searched = false, verifiedInTurn = false;
+      const availability: string[] = [];
+      model(offline, (body) => {
+        if (phase === "publish" && !verifiedInTurn) { verifiedInTurn = true; return { tool_calls: [{ index: 0, id: "verify-current-runtime", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "verify_runtime" }) } }] }; }
+        if (phase === "search" && !searched) { searched = true; return { tool_calls: [{ index: 0, id: "imported-capability", type: "function", function: { name: "capability_search", arguments: JSON.stringify({ query: "portable_cv" }) } }] }; }
+        if (phase === "publish" && verifiedInTurn) {
+          const last = body.messages.filter((message: any) => message.role === "tool").at(-1);
+          expect(last && /"verified"\s*:\s*true/.test(typeof last.content === "string" ? last.content : JSON.stringify(last.content)), JSON.stringify(last)).toBe(true);
+        }
+        if (phase === "search") for (const message of body.messages) if (message.role === "tool" && typeof message.content === "string" && message.content.includes("workspace_capabilities")) availability.push(message.content);
+        return { content: "Retained the capability package and its verified runtime evidence." };
+      });
+      const session = await offline.run(["ask", "Start the package verification session", "--json"]);
+      expect(session.code, session.stderr).toBe(0);
+      const sessionId = JSON.parse(session.stdout).session_id;
+      const native = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: offline.cwd, env: { ...process.env, ...offline.env } });
+      const runtimeEvents: any[] = []; native.on("event", (event: any) => runtimeEvents.push(event));
+      try {
+        await native.request("initialize");
+        await native.request("task.resume", { revision: verifiedRuntime.revision, task: staged.task, session: sessionId });
+        const turn = crypto.randomUUID();
+        const ended = new Promise<any>((resolve, reject) => {
+          const timer = setTimeout(() => reject(Error("Imported capability publication did not finish")), 90000);
+          native.on("event", (event: any) => { if (event.turn === turn && event.data.type === "turn_end") { clearTimeout(timer); resolve(event); } });
+        });
+        phase = "publish";
+        await native.request("prompt", { session: sessionId, text: "Finish the retained package import using the verified host receipt and publish its additive declaration." }, { id: turn });
+        const result = await ended;
+        expect(result.data.exit_code, JSON.stringify(runtimeEvents).slice(-12000) + native.stderr).toBe(0);
+        const accepted = JSON.parse(offline.fossil("cat", "omniform/company.json", "-r", "trunk"));
+        expect(accepted.spec.capabilities.some((row: any) => row.id === "portable_cv")).toBe(true);
+        expect(accepted.spec.capabilities.find((row: any) => row.id === "package_support").realisations).toEqual(["support_alternative"]);
+        expect((await offline.run(["fossil", "verify", "--json"])).code).toBe(0);
+        expect(native.stderr).toBe("");
+      } finally { await native.close(); }
+      phase = "search";
+      const found = await offline.run(["ask", "Inspect the portable_cv capability implementation", "--json"]);
+      expect(found.code, found.stderr).toBe(0);
+      expect(availability.some(value => value.includes("verified_workspace_implementation") && value.includes("available_subject_to_host_permissions"))).toBe(true);
+      const drive = async (target: ReturnType<typeof fixture>, taskId: string, revision: string, publicSession: string, rebind = false, extraEnv: Record<string, string> = {}) => {
+        const client = new NativeClient({ binary: join(import.meta.dir, "../../zig-out/bin/fx"), project: target.cwd, env: { ...process.env, ...target.env, ...extraEnv } });
+        const events: any[] = []; client.on("event", (event: any) => events.push(event));
+        try {
+          await client.request("initialize");
+          await client.request("task.resume", { revision, task: taskId, session: publicSession, rebind_project: rebind });
+          const turn = crypto.randomUUID();
+          const ended = new Promise<any>((resolve, reject) => {
+            const timer = setTimeout(() => reject(Error("Capability verification turn did not finish")), 90000);
+            client.on("event", (event: any) => { if (event.turn === turn && event.data.type === "turn_end") { clearTimeout(timer); resolve(event); } });
+          });
+          await client.request("prompt", { session: publicSession, text: "continue" }, { id: turn });
+          return { ended: await ended, events };
+        } finally { await client.close(); }
+      };
+      const unverifiedModel = model(restored, () => ({ content: "The package is ready." }));
+      const unverifiedSession = await restored.run(["ask", "Prepare a separate verification conversation", "--json"]);
+      expect(unverifiedSession.code, unverifiedSession.stderr).toBe(0);
+      const denied = await drive(restored, staged.task, staged.revision, JSON.parse(unverifiedSession.stdout).session_id, true);
+      expect(denied.ended.data.exit_code).toBe(1);
+      expect(JSON.stringify(denied.events)).toContain("CapabilityRuntimeVerificationRequired");
+      expect(unverifiedModel.counts().assessments).toBeGreaterThan(1);
+      expect(JSON.parse(restored.fossil("cat", "omniform/company.json", "-r", "trunk")).spec.capabilities.some((row: any) => row.id === "portable_cv")).toBe(false);
+      const restoredBindings = join(restored.home, "runtime-bindings.json");
+      writeFileSync(restoredBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: installedNode }] }));
+      const recoveryProof = await restored.run(["fossil", "package", "verify", staged.task, "--bindings", restoredBindings, "--json"]);
+      expect(recoveryProof.code, recoveryProof.stderr).toBe(0);
+      const interrupted = await drive(restored, staged.task, JSON.parse(recoveryProof.stdout).model_data.revision, JSON.parse(unverifiedSession.stdout).session_id, false, { FX_E2E_FOSSIL_FAULT: "publication-committed" });
+      expect(interrupted.ended.data.exit_code, JSON.stringify(interrupted.events).slice(-12000)).toBe(1);
+      expect(JSON.stringify(interrupted.events)).toContain("WorkspaceInjectedFailure");
+      expect(JSON.parse(restored.fossil("cat", "omniform/company.json", "-r", "trunk")).spec.capabilities.some((row: any) => row.id === "portable_cv")).toBe(true);
+      const beforeRecovery = unverifiedModel.counts();
+      rmSync(join(restored.home, ".fx/runtimes"), { recursive: true });
+      const recovered = await restored.run(["fossil", "recover", "--json"]);
+      expect(recovered.code, recovered.stderr).toBe(0);
+      expect(unverifiedModel.counts()).toEqual(beforeRecovery);
+      expect(JSON.parse((await restored.run(["fossil", "tasks", "--json"])).stdout).tasks.find((row: any) => row.id === staged.task).state).toBe("accepted");
+      const privateBindings = join(offline.home, ".fx/runtimes/handles.json"), originalBindings = readFileSync(privateBindings);
+      writeFileSync(privateBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "python", executable: node }] }));
+      searched = false; availability.length = 0;
+      expect((await offline.run(["ask", "Inspect portable_cv after runtime configuration changed", "--json"])).code).toBe(0);
+      expect(availability.some(value => value.includes("declared_only"))).toBe(true);
+      writeFileSync(privateBindings, originalBindings);
+      searched = false; availability.length = 0;
+      expect((await offline.run(["ask", "Inspect portable_cv after restoring its runtime binding", "--json"])).code).toBe(0);
+      expect(availability.some(value => value.includes("verified_workspace_implementation"))).toBe(true);
+      const acceptedArchive = join(offline.home, "accepted-capability.fossil");
+      const acceptedExport = await offline.run(["fossil", "export", acceptedArchive, "--json"]);
+      expect(acceptedExport.code, acceptedExport.stderr).toBe(0);
+      const destination = fixture(); copyFileSync(acceptedArchive, join(destination.cwd, "omos.fossil"));
+      expect((await destination.run(["fossil", "use", join(destination.cwd, "omos.fossil"), "--json"])).code).toBe(0);
+      let destinationMode = "search", destinationSearched = false;
+      const destinationCapabilities: string[] = [];
+      model(destination, (body) => {
+        if (destinationMode === "search" && !destinationSearched) { destinationSearched = true; return { tool_calls: [{ index: 0, id: "destination-search", type: "function", function: { name: "capability_search", arguments: JSON.stringify({ query: "portable_cv" }) } }] }; }
+        if (destinationMode === "search") for (const message of body.messages) if (message.role === "tool" && typeof message.content === "string" && message.content.includes("workspace_capabilities")) destinationCapabilities.push(message.content);
+        if (destinationMode === "change") { destinationMode = "changed"; return { tool_calls: [{ index: 0, id: "change-input", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "skills/cv-builder/SKILL.md", content: skill + "\nUpdated local instructions.\n" }) } }] }; }
+        return { content: "Retained the capability checks and reported its current implementation availability." };
+      });
+      const freshSearch = await destination.run(["ask", "Inspect the portable_cv capability on this new host", "--json"]);
+      expect(freshSearch.code, freshSearch.stderr).toBe(0);
+      expect(destinationCapabilities.some(value => value.includes("declared_only"))).toBe(true);
+      const destinationBindings = join(destination.home, "runtime-bindings.json");
+      writeFileSync(destinationBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: installedNode }] }));
+      const rechecked = await destination.run(["fossil", "package", "verify", staged.task, "--bindings", destinationBindings, "--json"]);
+      expect(rechecked.code, rechecked.stderr).toBe(0);
+      const destinationTask = JSON.parse(rechecked.stdout).model_data;
+      expect(destinationTask.verified).toBe(true); expect(destinationTask.task).not.toBe(staged.task);
+      destinationMode = "publish";
+      const acceptedDestination = await drive(destination, destinationTask.task, destinationTask.revision, JSON.parse(freshSearch.stdout).session_id);
+      expect(acceptedDestination.ended.data.exit_code, JSON.stringify(acceptedDestination.events).slice(-12000)).toBe(0);
+      destinationMode = "search"; destinationSearched = false; destinationCapabilities.length = 0;
+      expect((await destination.run(["ask", "Inspect portable_cv after destination verification", "--json"])).code).toBe(0);
+      expect(destinationCapabilities.some(value => value.includes("verified_workspace_implementation"))).toBe(true);
+      const immutableOriginal = JSON.parse(destination.fossil("cat", `tasks/${staged.task}.json`, "-r", `task/${staged.task}`));
+      expect(immutableOriginal.capability_runtime_receipt).toBe(verifiedRuntime.receipt);
+      chmodSync(node, 0o600);
+      searched = false; availability.length = 0;
+      expect((await offline.run(["ask", "Inspect portable_cv after the runtime executable changed", "--json"])).code).toBe(0);
+      expect(availability.some(value => value.includes("declared_only"))).toBe(true);
+      destinationMode = "change";
+      expect((await destination.run(["ask", "Update the local skill instructions", "--json"])).code).toBe(0);
+      destinationMode = "search"; destinationSearched = false; destinationCapabilities.length = 0;
+      expect((await destination.run(["ask", "Inspect portable_cv after its input changed", "--json"])).code).toBe(0);
+      expect(destinationCapabilities.some(value => value.includes("declared_only"))).toBe(true);
+      const destinationIntegrity = await destination.run(["fossil", "verify", "--json"]);
+      expect(destinationIntegrity.code, destinationIntegrity.stderr).toBe(0);
     } finally { service.child.kill(); await service.child.exited; }
-  }, 240000);
+  }, 420000);
 
   test("versions explicit company capability metadata scopes without expanding file grants", async () => {
     const f = fixture();
@@ -2426,7 +2576,7 @@ sys.exit(result.returncode)
       expect(result.status, result.stderr).toBe(0);
     };
     fossil("open", join(f.cwd, "omos.fossil"));
-    writeFileSync(join(tree, "omniform/company.json"), JSON.stringify(legacy));
+    writeFileSync(join(tree, "omniform/company.json"), JSON.stringify(legacy, null, 2) + "\n");
     fossil("commit", "--nosign", "-m", "Retain the prior company input contracts");
     fossil("close");
     const admin = async (body: object) => {

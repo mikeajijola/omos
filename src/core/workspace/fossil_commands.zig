@@ -7,7 +7,8 @@ pub const Options = struct {
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
     selections_path: ?[]const u8 = null,
-    package_action: enum { plan, import } = .plan,
+    package_action: enum { plan, import, verify } = .plan,
+    bindings_path: ?[]const u8 = null,
     cache_action: @import("filesystem_projection.zig").CacheMode = .status,
     execution_path: ?[]const u8 = null,
     offset: usize = 0,
@@ -48,6 +49,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingPath;
             options.selections_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--bindings")) {
+            if (options.bindings_path != null) return error.UnexpectedArgument;
+            index += 1;
+            if (index >= args.len) return error.MissingPath;
+            options.bindings_path = args[index];
         } else if (std.mem.eql(u8, arg, "--execution")) {
             index += 1;
             if (index >= args.len) return error.MissingPath;
@@ -91,6 +97,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
     if ((options.realisation != null or options.selections_path != null) and !(options.action == .package and options.package_action == .plan)) return error.UnexpectedArgument;
     if (options.realisation != null and options.selections_path != null) return error.UnexpectedArgument;
+    if (options.bindings_path != null and !(options.action == .package and options.package_action == .verify)) return error.UnexpectedArgument;
     if (offset_seen and options.action != .query) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
     if (options.upgrade_contracts and options.action != .migrate) return error.UnexpectedArgument;
@@ -183,7 +190,14 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         },
         .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
         .package => {
-            if (options.package_action == .import) {
+            if (options.package_action == .verify) {
+                const declaration = try manager.loadDeclaration("trunk");
+                const model = @import("definition.zig");
+                const input = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .task = options.path.? }, .{}), .{});
+                try model.validateOperation(alloc, declaration, "omos_verify_capability_runtime", input, .input);
+                model_data = try @import("capability_runtime.zig").verify(manager, options.path.?, if (options.bindings_path) |path| try readDefinition(alloc, path) else null);
+                try model.validateOperation(alloc, declaration, "omos_verify_capability_runtime", model_data.?, .output);
+            } else if (options.package_action == .import) {
                 const raw = try readDefinition(alloc, options.path.?);
                 const model = @import("definition.zig");
                 const declaration = try manager.loadDeclaration("trunk");

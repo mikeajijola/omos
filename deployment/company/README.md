@@ -45,6 +45,17 @@ identifies declared dependencies; clients must still verify files and runtime
 requirements before treating the capability as available. Delegation may carry
 `delegated_capabilities`, bounded by the parent's current metadata scope.
 
+Selected capability exports preserve the signed graph, required files, and
+source revision. On a personal destination, import retains an isolated task;
+the owner supplies private runtime bindings with `omos fossil package verify
+TASK --bindings BINDINGS.json --json`. Resume that task through independent
+review to publish its additive declaration and files together. Runtime checks
+establish declared inputs and version constraints; functional checks still
+belong in the task contract. A copied workspace requires destination host
+verification before discovery reports its imported implementation available.
+See [selected capability packages](../../src/core/workspace/CONTRACTS.md#selected-capability-packages)
+for binding formats, deadlines, and recovery behavior.
+
 Create a private environment file for the local owner endpoint:
 
 ```sh

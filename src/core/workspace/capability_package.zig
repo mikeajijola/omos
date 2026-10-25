@@ -46,11 +46,7 @@ fn mergeRows(alloc: std.mem.Allocator, target: *Value, additions: []const Value)
     }
 }
 
-/// Build an additive candidate only. Caller retains this as an artifact until
-/// runtime verification and normal host publication establish activation.
-pub fn importDefinition(alloc: std.mem.Allocator, current: model.Declaration, plan: Plan) !model.Declaration {
-    var value = try std.json.parseFromSliceLeaky(Value, alloc, try model.canonical(alloc, current.value), .{});
-    const root = value.object.getPtr("spec").?;
+fn selectedCapabilities(alloc: std.mem.Allocator, plan: Plan) ![]const Value {
     var capabilities: std.ArrayList(Value) = .empty;
     for (plan.capabilities) |capability| {
         var selected = try std.json.parseFromSliceLeaky(Value, alloc, try model.canonical(alloc, capability), .{});
@@ -61,7 +57,28 @@ pub fn importDefinition(alloc: std.mem.Allocator, current: model.Declaration, pl
         try selected.object.getPtr("realisations").?.array.appendSlice(realisations.items);
         try capabilities.append(alloc, selected);
     }
-    try mergeRows(alloc, root.object.getPtr("capabilities").?, capabilities.items);
+    return capabilities.items;
+}
+
+pub fn graphHash(alloc: std.mem.Allocator, plan: Plan) ![]const u8 {
+    return workspace.hash(alloc, try model.canonical(alloc, try std.json.parseFromSliceLeaky(Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{
+        .version = "omos.capability-graph/v1",
+        .capabilities = try selectedCapabilities(alloc, plan),
+        .realisations = plan.realisations,
+        .resources = plan.resources,
+        .paths = plan.paths,
+        .external_dependencies = plan.external_dependencies,
+        .hierarchy = plan.hierarchy,
+    }, .{}), .{})));
+}
+
+/// Build an additive candidate only. Caller retains this as an artifact until
+/// runtime verification and normal host publication establish activation.
+pub fn importDefinition(alloc: std.mem.Allocator, current: model.Declaration, plan: Plan) !model.Declaration {
+    var value = try std.json.parseFromSliceLeaky(Value, alloc, try model.canonical(alloc, current.value), .{});
+    const root = value.object.getPtr("spec").?;
+    const capabilities = try selectedCapabilities(alloc, plan);
+    try mergeRows(alloc, root.object.getPtr("capabilities").?, capabilities);
     try mergeRows(alloc, root.object.getPtr("realisations").?, plan.realisations);
     const resources = root.object.getPtr("resources").?;
     for (plan.resources) |resource| {

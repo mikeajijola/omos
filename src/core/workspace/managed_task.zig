@@ -222,6 +222,13 @@ pub const Turn = struct {
                 try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try reader.alloc.print("workspace-checkpoint:{s}", .{try workspace.hash(reader.alloc, bytes)}), .kind = .verification, .status = .success, .content = bytes });
             }
         }
+        if (self.task.capability_runtime_receipt != null) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var reader = self.manager;
+            reader.alloc = scratch.allocator();
+            if (try @import("capability_runtime.zig").reviewReceipt(reader, self.task, self.reviewed_revision.?)) |receipt| try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try reader.alloc.print("capability-runtime:{s}", .{try workspace.hash(reader.alloc, receipt)}), .kind = .verification, .status = .success, .content = receipt });
+        }
         var history = try self.manager.historyCursor(self.task, self.reviewed_revision.?);
         while (history.offset < history.paths.len) {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);

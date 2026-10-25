@@ -2845,6 +2845,73 @@
         "interfaces": [
           "cli"
         ]
+      },
+      {
+        "id": "omos_verify_capability_runtime",
+        "capability": "general_task",
+        "description": "Verify imported capability files and explicitly configured owner runtime handles; retain host evidence without executing package programs.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "task"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.capability-runtime-result/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "task": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "verified": {
+              "type": "boolean"
+            },
+            "receipt": {
+              "type": "string"
+            },
+            "requirements": {
+              "type": "array",
+              "maxItems": 4096,
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "revision",
+            "verified",
+            "receipt",
+            "requirements"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -3250,6 +3317,25 @@
             "entries"
           ],
           "indexed": []
+        },
+        {
+          "id": "omos_capability_implementation",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "graph_hash": "string",
+            "host": "string",
+            "receipt": "string"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "graph_hash",
+            "host",
+            "receipt"
+          ]
         }
       ],
       "relationships": [

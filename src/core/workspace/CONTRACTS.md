@@ -806,6 +806,59 @@ package programs or publish the branch. Resume that task through the normal
 agent and independent-review path. Repeating the same import reuses its retained
 task and checkpoint. A portable Fossil export preserves this pending work.
 
+The local owner runs `omos fossil package verify TASK --bindings BINDINGS.json
+--json` to check the retained package against explicitly selected destination
+runtimes. The private bindings file has this shape:
+
+```json
+{
+  "version": "omos.runtime-handles/v1",
+  "handles": [
+    {"handle": "node", "kind": "node", "executable": "/opt/omos/bin/node"}
+  ]
+}
+```
+
+Supported runtime kinds are `node` and `python`. Executable paths must be
+absolute, regular executable files without group or world write permission.
+The host rejects symlinks. It hashes each executable, records its file
+fingerprint, and runs only the fixed version query in a clean environment:
+`node --version` or `python -I --version`. Each query has a five-second ceiling
+within the shared 60-second operation deadline and cancellation control.
+Constraints accept exact versions or numeric minimums such as `>=22`.
+Configuration and service requirements without a verifier remain unverified.
+Definitions and imported files cannot supply probe commands.
+
+The command saves bindings with owner-only permissions under
+`~/.fx/runtimes/handles.json`; later checks can omit `--bindings`. The signing
+key stays in the private profile. Signed receipts retain handle names, version
+observations, executable hashes, and fingerprints without executable paths or
+credentials. These observations verify the declared inputs and runtime
+constraints. Functional behavior and external outcomes still need their own
+contract evidence.
+
+The canonical task records its package context and latest host receipt. A
+managed agent can refresh that receipt with `fossil_workspace` action
+`verify_runtime` for its currently leased task, but cannot supply private
+bindings. Independent completion review receives a compact host receipt only
+after live validation. Publication checks it again under the writer boundary
+and atomically commits the files, additive declaration, implementation record,
+and acceptance receipt. Missing, stale, or invalid evidence prevents activation.
+
+`capability_search` reports `verified_workspace_implementation` only while the
+accepted files, selected graph, private bindings, host identity, and executable
+fingerprints match. Source changes, configuration changes, and executable
+changes invalidate availability. Historical acceptance verification remains
+possible without the private signing key or current runtime configuration,
+including recovery after a commit whose acknowledgement was interrupted.
+
+A portable export preserves accepted files and signed historical evidence; it
+doesn't export private bindings or signing keys. Verifying an accepted import
+on another host creates a separate retained verification task. Resume and
+publish that task to establish destination availability. The original accepted
+task remains immutable. An active managed task can adopt an accepted package's
+references with `verify_runtime` and `path` set to the source task ID.
+
 Exports use at most 32 inventory entries per page and 16 KiB per content
 request. Files are limited to 8 MiB, inventories to 10,000 paths and 8 MiB of
 receipt metadata. `max_bytes` defaults to 1 GiB of logical file content and

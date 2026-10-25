@@ -393,6 +393,7 @@ pub fn importArchive(manager: workspace.Manager, raw: []const u8, archive: []con
     defer task_lease.release();
     // Do not replay a completed import, including one subsequently published by
     // normal review. Existing changed tasks still pass the same collision fence.
+    task = try manager.bindCapabilityImport(task, .{ .manifest = manifest_path, .declaration = definition_path, .source_workspace = config.workspace, .source_revision = config.revision, .issuer = config.issuer });
     const existing_paths = try manager.inventory(try manager.currentRevision(task));
     const retained = for (existing_paths) |path| {
         if (std.mem.eql(u8, path, manifest_path)) break true;

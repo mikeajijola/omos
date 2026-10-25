@@ -3,7 +3,7 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
     entity: ?[]const u8 = null,
@@ -33,7 +33,7 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
 
 pub fn readsOnly(input: dispatch.ToolInput) bool {
     return switch (input.as(Parsed).value.action) {
-        .write, .artifact, .record, .propose_definition, .restore_ui => false,
+        .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime => false,
         else => true,
     };
 }
@@ -54,7 +54,9 @@ pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.D
 
 fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input) ![]const u8 {
     if (!ctx.fossil_workspace_available) return error.UnmanagedHost;
-    const manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
+    var manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
+    var cancel = std.atomic.Value(bool).init(false);
+    if (input.action == .verify_runtime) manager.operation_control = .{ .cancel = ctx.cancel_flag orelse &cancel, .deadline = .fromNow(@import("../../core/shared/io.zig").getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60000) }) };
     const task = if (ctx.fossil_session_id) |session| try manager.active(session) else null;
     if (input.action == .status) {
         var snapshot = try manager.snapshot("");
@@ -70,6 +72,10 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
     }
     const active = task orelse return error.SavedTaskRequired;
     switch (input.action) {
+        .verify_runtime => {
+            if (input.content != null or input.execution != null or input.revision != null or input.entity != null or input.offset != 0) return error.InvalidCapabilitySelection;
+            return std.json.Stringify.valueAlloc(alloc, try @import("../../core/workspace/capability_runtime.zig").verifyCurrent(manager, active, input.path), .{});
+        },
         .restore_ui => return manager.restoreUi(active, input.revision orelse return error.MissingRevision),
         .propose_definition => return manager.proposeDefinition(active, input.content orelse return error.MissingContent, input.execution),
         .record => return manager.writeRecord(active, input.entity orelse return error.MissingEntityType, input.content orelse return error.MissingContent),

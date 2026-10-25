@@ -254,7 +254,18 @@ company grant and delegation rules.
 Selected company packages can be exported with a version 2 export configuration
 and verified offline. `omos fossil package import CONFIG.json ARCHIVE.tar --json`
 retains a verified package and additive declaration candidate on a paused task
-branch. Runtime verification and independent publication remain outstanding.
+branch. Configure trusted destination runtimes and verify the retained task with
+`omos fossil package verify TASK --bindings BINDINGS.json --json`. Bindings stay
+in the private profile. A successful check produces signed host evidence for the
+exact imported files, declared implementations, and runtime constraints. It
+doesn't execute package programs or establish their functional behavior.
+
+Resume the import through the normal agent and independent-review path. The
+host requires current runtime evidence before publishing the imported files,
+additive declaration, and implementation record in the same Fossil commit.
+Capability discovery reports verified availability while the files and local
+runtime bindings still match. A copied workspace retains historical evidence
+but needs verification on the destination host before reporting availability.
 See [selected capability packages](CONTRACTS.md#selected-capability-packages) for
 request fields, authority, integrity checks, and import bounds.
 
