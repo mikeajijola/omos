@@ -12,6 +12,24 @@ const byte_budget = 1024 * 1024;
 const event_budget = 32;
 var active = std.atomic.Value(usize).init(0);
 
+fn peerDisconnected(handle: std.posix.fd_t) bool {
+    var descriptors = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const count = std.posix.poll(&descriptors, 0) catch return true;
+    if (count == 0) return false;
+    const events = descriptors[0].revents;
+    if (events & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return true;
+    if (events & std.posix.POLL.IN == 0) return false;
+    // EOF can be readable without HUP. Peek without taking bytes from the HTTP
+    // reader or changing socket flags shared with the response writer.
+    var byte: [1]u8 = undefined;
+    const read = std.c.recv(handle, &byte, 1, std.c.MSG.PEEK | std.c.MSG.DONTWAIT);
+    if (read >= 0) return read == 0;
+    return switch (std.c.errno(read)) {
+        .AGAIN, .INTR => false,
+        else => true,
+    };
+}
+
 fn position(alloc: std.mem.Allocator, response: []const u8) ![]const u8 {
     const envelope = try records.decode(struct { payload: []const u8 }, alloc, response, .{ .ignore_unknown_fields = true });
     const payload = try std.json.parseFromSliceLeaky(std.json.Value, alloc, envelope.payload, .{});
@@ -51,9 +69,7 @@ const Subscription = struct {
         while (!self.stopped.load(.acquire)) {
             if (self.parent_cancel) |parent| if (parent.load(.seq_cst)) break;
             self.control.check() catch break;
-            var descriptors = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = 0, .revents = 0 }};
-            const count = std.posix.poll(&descriptors, 0) catch break;
-            if (count != 0 and descriptors[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) break;
+            if (peerDisconnected(stream.socket.handle)) break;
             io.sleep(100 * std.time.ns_per_ms);
         }
         if (!self.stopped.load(.acquire)) {
@@ -151,4 +167,20 @@ pub fn prepare(original: workspace.Manager, raw: []const u8, writable: bool, str
     @memcpy(subscription.cursor[0..cursor.len], cursor);
     subscription.cursor_len = cursor.len;
     return subscription;
+}
+
+test "company progress detects inbound EOF without consuming input" {
+    if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.SkipZigTest;
+    var handles: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &handles) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(handles[0]);
+    defer _ = std.c.close(handles[1]);
+    try std.testing.expect(!peerDisconnected(handles[1]));
+    try (std.Io.File{ .handle = handles[0], .flags = .{ .nonblocking = false } }).writeStreamingAll(io.getIo(), "x");
+    try std.testing.expect(!peerDisconnected(handles[1]));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 1), std.c.recv(handles[1], &byte, 1, std.c.MSG.DONTWAIT));
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    if (std.c.shutdown(handles[0], std.c.SHUT.WR) != 0) return error.SocketShutdownFailed;
+    try std.testing.expect(peerDisconnected(handles[1]));
 }

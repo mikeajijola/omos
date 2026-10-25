@@ -552,6 +552,9 @@ At most four subscriptions run per service process. Each stream shares one
 pages. A socket watcher cancels disconnected or expired streams, including
 while initial admission is pending. Streams also stop after 32 workspace
 events or 1 MiB of SSE body data, leaving room for transport termination.
+Subscriptions treat request-side EOF as cancellation, including a write
+half-close after the POST body. Keep the connection open while consuming the
+stream and retain the last verified cursor before disconnecting.
 Heartbeats, `error` events, `end` events, and connection closure are transport
 information and never establish task acceptance. Grant revocation stops new
 workspace events; reconnecting still requires live authority. Consumers keep

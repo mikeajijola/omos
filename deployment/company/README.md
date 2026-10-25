@@ -143,6 +143,9 @@ The service rechecks the live grant and request expiry before every page.
 There are at most four streams per process, each bounded to 30 seconds,
 32 workspace events, and 1 MiB of SSE data. A client reconnects after the bound;
 an end event or closed connection does not establish task completion.
+Keep the request side open while waiting for updates. Request-side EOF,
+including a write half-close after sending the POST body, cancels a subscription
+even while it is waiting for admission. Resume using the last verified cursor.
 The MCP companion keeps using JSON polling. Browser interfaces still need
 their trusted bridge; raw browser-origin requests are rejected.
 

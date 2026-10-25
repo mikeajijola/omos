@@ -4894,6 +4894,7 @@ test {
     _ = @import("core/workspace/context_contract.zig");
     _ = @import("core/workspace/definition.zig");
     _ = @import("core/workspace/company_authority.zig");
+    _ = @import("core/workspace/company_subscription.zig");
     _ = @import("core/workspace/company_records.zig");
     _ = @import("core/workspace/company_reads.zig");
     _ = @import("core/workspace/workspace_client.zig");
