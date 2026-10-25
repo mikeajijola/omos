@@ -145,7 +145,6 @@ describe("portable Fossil workspace recovery", () => {
   test("passes a filesystem lifetime pin through captured commands and releases every descriptor after completion", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const managerRoot = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
     const sentinel = join(f.home, "inherited-pin-confirmed");
     let pin = "";
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -155,7 +154,7 @@ describe("portable Fossil workspace recovery", () => {
     model(f, (body, count) => {
       const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
       const view = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
-      pin = join(managerRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      pin = join(view, "..", ".pins", createHash("sha256").update(view).digest("hex") + ".lock");
       if (count === 1) return { tool_calls: [{ index: 0, id: "inherited-captured-pin", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", profile: "clean", command: `${quote(python)} -c ${quote(inspect)} ${quote(pin)} ${quote(sentinel)}`, timeout_ms: 10000 } }) } }] };
       expect(readFileSync(sentinel, "utf8")).toBe("confirmed");
       return { content: "The captured command inherited the workspace lifetime pin." };
@@ -174,11 +173,10 @@ describe("portable Fossil workspace recovery", () => {
     const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
     const inspect = "import os,sys,pathlib\ntarget=os.stat(sys.argv[1])\nfound=False\nfor value in os.listdir('/dev/fd'):\n try: stat=os.fstat(int(value))\n except OSError: continue\n if (stat.st_dev,stat.st_ino)==(target.st_dev,target.st_ino): found=True\nif not found: sys.exit(7)\npathlib.Path(sys.argv[2]).write_text('ready')";
     const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
-    const repositoryRoot = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
     model(f, (body, count) => {
       const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
       view = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
-      const inherited = join(repositoryRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      const inherited = join(view, "..", ".pins", createHash("sha256").update(view).digest("hex") + ".lock");
       if (count === 1) return { tool_calls: [{ index: 0, id: "retained-terminal", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", tty: true, profile: "clean", yield_time_ms: 100, command: `${quote(python)} -c ${quote(inspect)} ${quote(inherited)} ${quote(ready)} && while [ ! -f '${release}' ]; do sleep 0.05; done` } }) } }] };
       return { content: "Resource pin terminal started." };
     });
@@ -205,7 +203,7 @@ describe("portable Fossil workspace recovery", () => {
         if (!task) await Bun.sleep(100);
       }
       await until(() => available(join(managerRoot, `task-actor-${task.id}.lock`)), "Completed turn retained its execution lease");
-      const pin = join(managerRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      const pin = join(view, "..", ".pins", createHash("sha256").update(view).digest("hex") + ".lock");
       expect(existsSync(pin)).toBe(true);
       expect(available(pin)).toBe(false);
       writeFileSync(release, "finish");

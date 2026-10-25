@@ -22,8 +22,23 @@ pub fn directory(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
 }
 
 pub fn retentionPath(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
-    const root = try std.Io.Dir.path.join(manager.alloc, &.{ manager.root, "projection-pins" });
-    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), root, .fromMode(0o700));
+    // Repository copies and profiles can refer to the same physical view. Its
+    // lifetime lock belongs beside that view, independently of repository caches.
+    var project = try io_mod.openDirAbsoluteNoFollow(task.project_root, .{ .iterate = true });
+    defer project.close(io_mod.getIo());
+    project.createDir(io_mod.getIo(), ".fx", .fromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    var fx = try project.openDir(io_mod.getIo(), ".fx", .{ .iterate = true, .follow_symlinks = false });
+    defer fx.close(io_mod.getIo());
+    var views = try io_mod.openOrCreateVerifiedPrivateDirFromDir(fx, "workspaces");
+    defer views.close();
+    var instance = try io_mod.openOrCreateVerifiedPrivateDir(&views, manager.manifest.id);
+    defer instance.close();
+    var pins = try io_mod.openOrCreateVerifiedPrivateDir(&instance, ".pins");
+    defer pins.close();
+    const root = try std.Io.Dir.path.join(manager.alloc, &.{ task.project_root, ".fx", "workspaces", manager.manifest.id, ".pins" });
     return std.Io.Dir.path.join(manager.alloc, &.{ root, try manager.alloc.print("{s}.lock", .{try workspace.hash(manager.alloc, try directory(manager, task))}) });
 }
 
@@ -572,4 +587,25 @@ test "resource pin ownership allows descendants and rejects unrelated or company
     parent.parent_task_id = parent.id;
     parent.session = "cycle";
     try std.testing.expectError(error.WorkspaceAccessDenied, verifyRetentionOwner(child, "root-owner", parent.project_root, Source{ .task = parent }));
+}
+
+test "resource pin follows the physical view across repository bindings" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const project = try io_mod.dirRealpathAlloc(alloc, temporary.dir, ".");
+    var manager = workspace.Manager{ .alloc = alloc, .repository = "/Users/example/original.fossil", .root = "/Users/example/cache/original", .manifest = .{ .id = "workspace", .format = 2 } };
+    const task = workspace.Task{ .id = "task", .workspace_id = "workspace", .session = "owner", .branch = "task/task", .base_revision = "base", .project_root = project, .definition = .{ .id = "contract", .version = 1, .objective = "Retain the view", .obligations = &.{} } };
+    const first = try retentionPath(manager, task);
+    manager.repository = "/Users/example/copied.fossil";
+    manager.root = "/Users/example/cache/copied";
+    const second = try retentionPath(manager, task);
+    try std.testing.expectEqualStrings(first, second);
+    const pin = try @import("../shared/resource_pin.zig").acquire(first, null);
+    try std.testing.expect((try @import("../shared/resource_pin.zig").tryExclusive(second)) == null);
+    pin.close();
+    const exclusive = (try @import("../shared/resource_pin.zig").tryExclusive(second)) orelse return error.TestExpectedExclusiveLease;
+    exclusive.close();
 }
