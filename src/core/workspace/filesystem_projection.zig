@@ -21,6 +21,56 @@ pub fn directory(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
     return std.Io.Dir.path.join(manager.alloc, &.{ task.project_root, ".fx", "workspaces", manager.manifest.id, task.id });
 }
 
+pub fn retentionPath(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
+    const root = try std.Io.Dir.path.join(manager.alloc, &.{ manager.root, "projection-pins" });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), root, .fromMode(0o700));
+    return std.Io.Dir.path.join(manager.alloc, &.{ root, try manager.alloc.print("{s}.lock", .{try workspace.hash(manager.alloc, try directory(manager, task))}) });
+}
+
+pub fn retentionPathForSession(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const u8 {
+    if (comptime builtin.target.cpu.arch.isWasm()) return null;
+    const id = session orelse return null;
+    const manager = (try workspace.Manager.bound(alloc)) orelse return null;
+    const task = (try manager.active(id)) orelse return null;
+    if (task.authority != null) return error.CompanyExecutionIsolationRequired;
+    return try retentionPath(manager, task);
+}
+
+pub fn retentionTaskForSession(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const u8 {
+    if (comptime builtin.target.cpu.arch.isWasm()) return null;
+    const id = session orelse return null;
+    const manager = (try workspace.Manager.bound(alloc)) orelse return null;
+    const task = (try manager.active(id)) orelse return null;
+    if (task.authority != null) return error.CompanyExecutionIsolationRequired;
+    return task.id;
+}
+
+/// A persistent terminal may belong to a root session while running a child
+/// task. Validate the explicit task against that authenticated ancestry.
+pub fn retentionPathForTask(alloc: std.mem.Allocator, id: []const u8, owner_session: []const u8, project: []const u8) ![]const u8 {
+    const manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
+    const task = try manager.loadTask(id);
+    const owner = try workspace.hash(alloc, owner_session);
+    try verifyRetentionOwner(task, owner, project, manager);
+    return retentionPath(manager, task);
+}
+
+fn verifyRetentionOwner(task: workspace.Task, owner: []const u8, project: []const u8, source: anytype) !void {
+    if (!std.mem.eql(u8, task.project_root, project)) return error.TaskProjectMismatch;
+    var ancestor = task;
+    var owned = false;
+    for (0..64) |_| {
+        if (ancestor.authority != null) return error.CompanyExecutionIsolationRequired;
+        if (std.mem.eql(u8, ancestor.session, owner)) owned = true;
+        const parent = ancestor.parent_task_id orelse {
+            if (owned) return;
+            return error.WorkspaceAccessDenied;
+        };
+        ancestor = try source.loadTask(parent);
+    }
+    return error.WorkspaceAccessDenied;
+}
+
 fn baselinePath(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
     return std.Io.Dir.path.join(manager.alloc, &.{ manager.root, "projections", try manager.alloc.print("{s}.json", .{try workspace.hash(manager.alloc, try directory(manager, task))}) });
 }
@@ -492,4 +542,34 @@ test "filesystem projection scans bodies with bounded metadata allocation" {
     defer replacement.close(std.testing.io);
     try replacement.writeStreamingAll(std.testing.io, &payload);
     try std.testing.expectError(error.WorkspaceProjectionConflict, changedBytes(std.testing.allocator, temporary.dir, "input.txt", observed));
+}
+
+test "resource pin ownership allows descendants and rejects unrelated or company task scopes" {
+    const Source = struct {
+        task: workspace.Task,
+        fn loadTask(self: @This(), id: []const u8) !workspace.Task {
+            if (!std.mem.eql(u8, self.task.id, id)) return error.WorkspaceAccessDenied;
+            return self.task;
+        }
+    };
+    var parent = workspace.Task{ .id = "parent", .workspace_id = "workspace", .session = "root-owner", .branch = "task/parent", .base_revision = "base", .project_root = "/Users/example/project", .definition = .{ .id = "contract", .version = 1, .objective = "Retain the view", .obligations = &.{} } };
+    var child = parent;
+    child.id = "child";
+    child.session = "child-owner";
+    child.parent_task_id = parent.id;
+    try verifyRetentionOwner(child, "root-owner", parent.project_root, Source{ .task = parent });
+    try std.testing.expectError(error.WorkspaceAccessDenied, verifyRetentionOwner(child, "unrelated-owner", parent.project_root, Source{ .task = parent }));
+    try std.testing.expectError(error.TaskProjectMismatch, verifyRetentionOwner(child, "root-owner", "/Users/example/other-project", Source{ .task = parent }));
+    parent.authority = .{ .actor = "company-actor", .grant = "company-grant" };
+    try std.testing.expectError(error.CompanyExecutionIsolationRequired, verifyRetentionOwner(child, "root-owner", parent.project_root, Source{ .task = parent }));
+    try std.testing.expectError(error.CompanyExecutionIsolationRequired, verifyRetentionOwner(child, "child-owner", child.project_root, Source{ .task = parent }));
+    parent.authority = null;
+    // The independently authenticated terminal grant fixes the selected task's
+    // project. A parent contract can delegate work in another project.
+    parent.project_root = "/Users/example/parent-project";
+    try verifyRetentionOwner(child, "root-owner", child.project_root, Source{ .task = parent });
+    parent.project_root = child.project_root;
+    parent.parent_task_id = parent.id;
+    parent.session = "cycle";
+    try std.testing.expectError(error.WorkspaceAccessDenied, verifyRetentionOwner(child, "root-owner", parent.project_root, Source{ .task = parent }));
 }

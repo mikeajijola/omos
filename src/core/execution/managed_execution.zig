@@ -29,6 +29,7 @@ pub const StartCapturedInput = struct {
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
+    resource_pin_path: ?[]const u8 = null,
     replay_capability: ?*const session_child_store.SessionChildCapability = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
@@ -172,6 +173,7 @@ const Entry = struct {
     max_output_bytes: usize,
     timeout_ms: ?usize,
     command_artifact_dir: ?[]const u8,
+    resource_pin_path: ?[]const u8 = null,
     backend_kind: contract.Backend,
     persistence_kind: contract.Persistence,
     mutex: std.Io.Mutex = .init,
@@ -267,6 +269,7 @@ const Entry = struct {
             .max_output_bytes = input.max_output_bytes,
             .timeout_ms = input.timeout_ms,
             .command_artifact_dir = command_artifact_dir,
+            .resource_pin_path = if (input.resource_pin_path) |path| try owned.dupe(u8, path) else null,
             .backend_kind = .captured,
             .persistence_kind = .process,
             .backend_state = .{ .captured = .{ .route = route } },
@@ -374,7 +377,8 @@ const Entry = struct {
             self.environment.eql(input.environment) and
             self.max_output_bytes == input.max_output_bytes and
             self.timeout_ms == input.timeout_ms and
-            optionalStringEql(self.command_artifact_dir, input.command_artifact_dir);
+            optionalStringEql(self.command_artifact_dir, input.command_artifact_dir) and
+            optionalStringEql(self.resource_pin_path, input.resource_pin_path);
     }
 
     fn statusSnapshot(self: *Entry) SnapshotState {
@@ -443,6 +447,7 @@ const Entry = struct {
             .timeout_ms = self.timeout_ms,
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
+            .resource_pin_path = self.resource_pin_path,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);

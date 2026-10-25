@@ -45,7 +45,7 @@ fn process_spawn_inheriting_fd(
     if (comptime builtin.target.os.tag != .macos) return error.OperationUnsupported;
     if (options.uid != null or options.gid != null) return error.OperationUnsupported;
     if (options.exe != .detect) return error.OperationUnsupported;
-    if (options.inherit_dirs.len != 0 or options.inherit_files.len != 0) return error.OperationUnsupported;
+    if (options.inherit_dirs.len != 0) return error.OperationUnsupported;
     if (options.argv.len == 0) return error.InvalidName;
     if (options.expand_arg0 == .expand) return error.OperationUnsupported;
 
@@ -88,7 +88,13 @@ fn process_spawn_inheriting_fd(
     if (progress_pipe) |pipe| {
         try add_inherit_or_dup(&actions, pipe[1], progress_fileno);
     }
+    for (options.inherit_files) |file| {
+        if (progress_pipe != null and file.handle == progress_fileno) return error.OperationUnsupported;
+        try add_inherit_or_dup(&actions, file.handle, file.handle);
+    }
     if (inherited_fd) |fd| {
+        const target = inherited_fd_target(fd);
+        for (options.inherit_files) |file| if (file.handle == target) return error.OperationUnsupported;
         try add_inherit_or_dup(&actions, fd, inherited_fd_target(fd));
     }
 
@@ -799,4 +805,22 @@ test "Darwin spawn partial setup failure leaves no child behind" {
     const after = try wait_for_children_to_settle(io, before);
     defer reap_new_children(io, before, after);
     try std.testing.expect(!has_new_child(before, after));
+}
+
+test "Darwin resource pin descriptors survive the native spawn adapter" {
+    const io = try darwin_io();
+    const alloc = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var file = try temporary.dir.createFile(io, "retained", .{ .read = true });
+    defer file.close(io);
+    const fd = try alloc.print("{d}", .{file.handle});
+    defer alloc.free(fd);
+    const inherited = [_]std.Io.File{file};
+    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/bash", "-c", "printf retained >&$1", "resource-pin", fd }, .stdin = .ignore, .stdout = .ignore, .stderr = .pipe, .inherit_files = &inherited });
+    defer if (child.id != null) child.kill(io);
+    try wait_exited(&child, io, 0);
+    var bytes: [16]u8 = undefined;
+    const count = try file.readPositionalAll(io, &bytes, 0);
+    try std.testing.expectEqualStrings("retained", bytes[0..count]);
 }

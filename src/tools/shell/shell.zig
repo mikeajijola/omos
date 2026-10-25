@@ -576,6 +576,7 @@ fn callRun(
         else
             ctx.command_timeout_ms,
         .command_artifact_dir = ctx.command_artifact_dir,
+        .resource_pin_path = if (ctx.fossil_workspace_available) @import("../../core/workspace/filesystem_projection.zig").retentionPathForSession(request_arena, ctx.fossil_session_id) catch |err| return runtimeFailure(ctx, err) else null,
         .replay_capability = ctx.session_child_capability,
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
         .output_chunk_ctx = ctx.output_chunk_ctx,
@@ -768,6 +769,7 @@ fn callTtyRun(
     defer persistence.deinit();
     const request = terminal_contracts.ActionRequest{ .start = .{
         .cwd = cwd,
+        .projection_task = if (ctx.fossil_workspace_available) @import("../../core/workspace/filesystem_projection.zig").retentionTaskForSession(shell_arena_state.allocator(), ctx.fossil_session_id) catch |err| return runtimeFailure(ctx, err) else null,
         .command = command,
         .shell = shell,
         .backend = .native,

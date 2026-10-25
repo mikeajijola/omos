@@ -287,6 +287,7 @@ pub const MonitorLifetime = union(enum) {
 
 pub const StartRequest = struct {
     cwd: []const u8,
+    projection_task: ?[]const u8 = null,
     command: ?[]const u8 = null,
     shell: ShellSpec = .user_login,
     backend: Backend = .native,
@@ -450,6 +451,10 @@ pub const ActionRequest = union(enum) {
                     !std.Io.Dir.path.isAbsolute(request.cwd))
                 {
                     return error.InvalidCwd;
+                }
+                if (request.projection_task) |task| {
+                    if (request.persistence == null or task.len != 64) return error.InvalidStartPersistence;
+                    for (task) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return error.InvalidStartPersistence;
                 }
                 try request.shell.validate();
                 if (request.command) |command| {
@@ -674,6 +679,8 @@ fn clone_authorized_session(
 fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!StartRequest {
     const cwd = try alloc.dupe(u8, request.cwd);
     errdefer alloc.free(cwd);
+    const projection_task = if (request.projection_task) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (projection_task) |value| alloc.free(value);
     const command = if (request.command) |value| try alloc.dupe(u8, value) else null;
     errdefer if (command) |value| alloc.free(value);
     const shell = try clone_shell_spec(alloc, request.shell);
@@ -692,6 +699,7 @@ fn clone_start_request(alloc: Allocator, request: StartRequest) Allocator.Error!
         null;
     return .{
         .cwd = cwd,
+        .projection_task = projection_task,
         .command = command,
         .shell = shell,
         .backend = request.backend,
@@ -929,6 +937,7 @@ fn deinit_action_request(alloc: Allocator, request: *ActionRequest) void {
     switch (request.*) {
         .start => |value| {
             alloc.free(value.cwd);
+            if (value.projection_task) |task| alloc.free(task);
             if (value.command) |command| alloc.free(command);
             deinit_shell_spec(alloc, value.shell);
             if (value.return_when) |condition| {
@@ -3164,4 +3173,11 @@ test "next actions are the pure lifecycle authority and lease intersection" {
         .{},
     );
     try std.testing.expectEqual(lifecycle_controls(.closed), closed);
+}
+
+test "resource pin task hints require persistent terminal authority" {
+    const request = ActionRequest{ .start = .{ .cwd = "/Users/example/project", .projection_task = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    try std.testing.expectError(error.InvalidStartPersistence, request.validate());
+    const invalid = ActionRequest{ .start = .{ .cwd = "/Users/example/project", .projection_task = "../outside" } };
+    try std.testing.expectError(error.InvalidStartPersistence, invalid.validate());
 }

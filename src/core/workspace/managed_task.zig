@@ -24,6 +24,7 @@ pub const Turn = struct {
     assessment_record: ?[]const u8 = null,
     filesystem_view: bool = false,
     execution_lease: ?workspace.ExecutionLease = null,
+    projection_pin: ?@import("../shared/resource_pin.zig").Pin = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
@@ -69,6 +70,7 @@ pub const Turn = struct {
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
         _ = try manager.checkpoint(turn.task);
+        turn.projection_pin = try @import("../shared/resource_pin.zig").acquire(try @import("filesystem_projection.zig").retentionPath(manager, turn.task), manager.operation_control);
         try @import("filesystem_projection.zig").prepare(manager, turn.task);
         turn.filesystem_view = true;
         return turn;
@@ -84,6 +86,8 @@ pub const Turn = struct {
     }
 
     pub fn release(self: *Turn) void {
+        if (self.projection_pin) |pin| pin.close();
+        self.projection_pin = null;
         if (self.execution_lease) |lease| lease.release();
         self.execution_lease = null;
     }

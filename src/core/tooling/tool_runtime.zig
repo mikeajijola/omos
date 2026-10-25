@@ -1733,6 +1733,7 @@ fn toolRunCommand(
         .timeout_started_ms = timeout.started_ms,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
+        .resource_pin_path = if (ctx.fossil_workspace_available) try @import("../workspace/filesystem_projection.zig").retentionPathForSession(arena, ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id) else null,
     }, arena, route) catch |err| {
         if (err == error.TimeoutExpired) {
             return finishCommandToolResult(

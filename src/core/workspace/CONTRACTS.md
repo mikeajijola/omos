@@ -398,6 +398,23 @@ cache garbage. Views retain the existing limits of 8 MiB per file, 256 MiB of
 materialised content, and 10,000 files. This does not provide a transparent remote
 filesystem, automatic view eviction, or a sandbox for company actors.
 
+Managed turns also hold a shared kernel pin for their view. Captured-command
+workers own an additional pin; the foreground supervisor and shell inherit its
+descriptor. Persistent terminal launchers retain the corresponding task pin
+after a turn releases its execution lease. Closing a parent descriptor does not
+explicitly unlock a lease that a child still holds. Pins contain no credentials
+or execution authority and remain outside portable company state.
+
+An agent terminal carries its host-selected task identity through native
+startup. The server checks the task's project against its authenticated terminal
+grant and checks ownership through the canonical task ancestry. Company tasks
+still require an isolated execution backend. A child task can have a different
+project from its parent when the terminal grant authorises that project. Clients
+cannot supply a profile lock-file path through terminal request parameters.
+The native Darwin spawn adapter preserves these explicit descriptors separately
+from its process-tree witness. Automatic view eviction remains disabled until
+the clean-view collector is implemented.
+
 Task context lists bounded memory and skill inventories independently of body
 previews. Oversized files remain discoverable through `omos_memory` and
 `omos_skill` query pages. Managed skill calls prefer complete versioned packages

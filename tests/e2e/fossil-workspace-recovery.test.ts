@@ -6,6 +6,7 @@ import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createP
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
 import { NativeClient } from "./workspace-ui-client.mjs";
+import { TmuxSession, tmuxAvailable, terminalFixtureShell } from "./tmux-helpers";
 
 afterEach(cleanupFixtures);
 
@@ -141,6 +142,77 @@ async function companyMcp(config: string, home: string, script = join(import.met
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("passes a filesystem lifetime pin through captured commands and releases every descriptor after completion", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const managerRoot = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
+    const sentinel = join(f.home, "inherited-pin-confirmed");
+    let pin = "";
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const inspect = "import os,sys,pathlib\ntarget=os.stat(sys.argv[1])\nfound=False\nfor value in os.listdir('/dev/fd'):\n try: stat=os.fstat(int(value))\n except OSError: continue\n if (stat.st_dev,stat.st_ino)==(target.st_dev,target.st_ino): found=True\nif not found: sys.exit(7)\npathlib.Path(sys.argv[2]).write_text('confirmed')";
+    const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
+    expect(existsSync(python)).toBe(true);
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const view = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      pin = join(managerRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      if (count === 1) return { tool_calls: [{ index: 0, id: "inherited-captured-pin", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", profile: "clean", command: `${quote(python)} -c ${quote(inspect)} ${quote(pin)} ${quote(sentinel)}`, timeout_ms: 10000 } }) } }] };
+      expect(readFileSync(sentinel, "utf8")).toBe("confirmed");
+      return { content: "The captured command inherited the workspace lifetime pin." };
+    });
+    const result = await f.run(["ask", "Inspect the workspace lifetime descriptor in a captured child", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    const probe = spawnSync(python, ["-c", "import fcntl,sys\nf=open(sys.argv[1],'r+')\nfcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)", pin], { encoding: "utf8" });
+    expect(probe.status, probe.stderr).toBe(0);
+  }, 90000);
+
+  test.skipIf(!tmuxAvailable())("retains a completed task view while its terminal remains live and releases it after exit", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let view = "";
+    const ready = join(f.home, "terminal-ready"), release = join(f.home, "terminal-release");
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+    const inspect = "import os,sys,pathlib\ntarget=os.stat(sys.argv[1])\nfound=False\nfor value in os.listdir('/dev/fd'):\n try: stat=os.fstat(int(value))\n except OSError: continue\n if (stat.st_dev,stat.st_ino)==(target.st_dev,target.st_ino): found=True\nif not found: sys.exit(7)\npathlib.Path(sys.argv[2]).write_text('ready')";
+    const python = spawnSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).stdout.trim();
+    const repositoryRoot = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      view = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      const inherited = join(repositoryRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      if (count === 1) return { tool_calls: [{ index: 0, id: "retained-terminal", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", tty: true, profile: "clean", yield_time_ms: 100, command: `${quote(python)} -c ${quote(inspect)} ${quote(inherited)} ${quote(ready)} && while [ ! -f '${release}' ]; do sleep 0.05; done` } }) } }] };
+      return { content: "Resource pin terminal started." };
+    });
+    const binary = join(import.meta.dir, "../../zig-out/bin/fx");
+    const session = await TmuxSession.create({ isolated: true, cmd: binary, cwd: f.cwd, env: { ...f.env, SHELL: terminalFixtureShell() }, width: 120, height: 32 });
+    const managerRoot = join(f.home, ".fx/fossil", createHash("sha256").update(join(f.cwd, "omos.fossil")).digest("hex"));
+    const available = (path: string) => spawnSync("python3", ["-c", "import fcntl,sys\nf=open(sys.argv[1],'r+')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(3)", path], { encoding: "utf8", timeout: 3000 }).status === 0;
+    const until = async (predicate: () => boolean, message: string) => {
+      const deadline = Date.now() + 15000;
+      while (!predicate()) { if (Date.now() >= deadline) throw Error(message); await Bun.sleep(25); }
+    };
+    try {
+      await session.waitForComposer(15000);
+      await session.sendText("Start a terminal and leave it running while idle.");
+      await session.waitForText("Resource pin terminal started.", 30000);
+      await until(() => existsSync(ready), "Terminal did not execute its command");
+      let task: any;
+      const deadline = Date.now() + 20000;
+      while (!task) {
+        const result = await f.run(["fossil", "tasks", "--json"]);
+        expect(result.code, result.stderr).toBe(0);
+        task = JSON.parse(result.stdout).tasks.find((row: any) => row.state === "accepted");
+        if (!task && Date.now() >= deadline) throw Error("Terminal task did not publish");
+        if (!task) await Bun.sleep(100);
+      }
+      await until(() => available(join(managerRoot, `task-actor-${task.id}.lock`)), "Completed turn retained its execution lease");
+      const pin = join(managerRoot, "projection-pins", createHash("sha256").update(view).digest("hex") + ".lock");
+      expect(existsSync(pin)).toBe(true);
+      expect(available(pin)).toBe(false);
+      writeFileSync(release, "finish");
+      await until(() => available(pin), "Exited terminal retained its filesystem pin");
+    } finally { writeFileSync(release, "finish"); await session.kill(); }
+  }, 120000);
+
   test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
     const f = fixture();
     const inference = model(f, () => { throw Error("Schema discovery must not run an actor"); });

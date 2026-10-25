@@ -93,6 +93,7 @@ const LauncherConfig = struct {
     bootstrap: []const u8,
     command_path: ?[]const u8,
     command: ?[]const u8,
+    resource_pin_fd: ?std.posix.fd_t = null,
 };
 
 const LauncherWatchdog = struct {
@@ -363,6 +364,15 @@ pub fn runLauncher(alloc: Allocator) !void {
         .{ .allocate = .alloc_always },
     );
     defer parsed.deinit();
+    var retained_file: ?std.Io.File = null;
+    if (parsed.value.resource_pin_fd) |fd| {
+        if (fd < 3) return error.InvalidLauncherConfig;
+        const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        const stat = try file.stat(io_mod.getIo());
+        if (stat.kind != .file or stat.size != 0) return error.InvalidLauncherConfig;
+        retained_file = file;
+    }
+    defer if (retained_file) |file| file.close(io_mod.getIo());
     if (parsed.value.argv.len == 0) return error.InvalidLauncherConfig;
     if (!std.Io.Dir.path.isAbsolute(parsed.value.cwd) or
         !std.Io.Dir.path.isAbsolute(parsed.value.control_path) or
@@ -437,6 +447,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     };
     var child = std.process.spawn(io_mod.getIo(), .{
         .argv = parsed.value.argv,
+        .inherit_files = if (retained_file) |file| &.{file} else &.{},
         .stdin = .{ .file = terminal_file },
         .stdout = .{ .file = terminal_file },
         .stderr = .{ .file = terminal_file },
@@ -1648,6 +1659,13 @@ const Session = struct {
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
+        // Resolve from the authenticated persistent session instead of taking
+        // a filesystem path supplied in terminal request parameters.
+        var pin_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer pin_arena.deinit();
+        const pin_path = if (request.persistence) |persistence| (if (request.projection_task) |task| try @import("../workspace/filesystem_projection.zig").retentionPathForTask(pin_arena.allocator(), task, persistence.grant.principal.durable_session_id, persistence.grant.principal.workspace_root) else try @import("../workspace/filesystem_projection.zig").retentionPathForSession(pin_arena.allocator(), persistence.grant.principal.durable_session_id)) else null;
+        const retained = if (pin_path) |path| try @import("../shared/resource_pin.zig").acquire(path, null) else null;
+        defer if (retained) |pin| pin.close();
         var invocation = try shell_resolver.resolve(
             null,
             pinnedShell(request.shell, self.shell),
@@ -1710,6 +1728,7 @@ const Session = struct {
         };
         var child = try std.process.spawn(io_mod.getIo(), .{
             .argv = &helper_argv,
+            .inherit_files = if (retained) |pin| &.{pin.file} else &.{},
             .stdin = .pipe,
             .stdout = .{ .file = slave_file },
             .stderr = .pipe,
@@ -1731,6 +1750,7 @@ const Session = struct {
             .bootstrap = bootstrap,
             .command_path = command_path,
             .command = request.command,
+            .resource_pin_fd = if (retained) |pin| pin.file.handle else null,
         }, .{}, &config_output.writer);
         if (config_output.written().len > launcher_config_bytes) {
             return error.LauncherConfigTooLarge;

@@ -4897,6 +4897,8 @@ test {
     _ = @import("core/workspace/company_subscription.zig");
     _ = @import("core/workspace/company_schema.zig");
     _ = @import("core/workspace/filesystem_projection.zig");
+    _ = @import("core/shared/resource_pin.zig");
+    if (builtin.target.os.tag == .macos) _ = @import("core/shared/darwin_process_spawn.zig");
     _ = @import("core/workspace/company_records.zig");
     _ = @import("core/workspace/company_reads.zig");
     _ = @import("core/workspace/workspace_client.zig");

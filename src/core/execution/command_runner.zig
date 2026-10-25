@@ -16,6 +16,8 @@ const shell_resolver = @import("../terminal/shell_resolver.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
+const resource_pin = @import("../shared/resource_pin.zig");
+
 const Allocator = std.mem.Allocator;
 pub const CommandOutputStream = command_contract.CommandOutputStream;
 pub const CommandOutputCallback = command_contract.CommandOutputCallback;
@@ -25,6 +27,8 @@ pub const CommandExecutionResult = command_contract.RunCommandResult;
 /// must remain valid for the duration of executeCommand.
 pub const Config = struct {
     max_command_output_bytes: usize,
+    resource_pin_path: ?[]const u8 = null,
+    resource_pin_file: ?std.Io.File = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     force_cancel_flag: ?*std.atomic.Value(bool) = null,
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
@@ -86,6 +90,7 @@ pub const supports_foreground_session = builtin.link_libc and
     builtin.target.os.tag != .windows and
     builtin.target.os.tag != .wasi;
 const foreground_session_token = "__fx_foreground_session__";
+const foreground_pin_argument = "--workspace-retention-fd";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
@@ -162,6 +167,19 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     else
         std.fmt.parseInt(i64, args[1], 10) catch
             return error.InvalidForegroundSessionInvocation;
+    var target_args = args[2..];
+    var retained_file: ?std.Io.File = null;
+    if (std.mem.eql(u8, args[2], foreground_pin_argument)) {
+        if (args.len < 5) return error.InvalidForegroundSessionInvocation;
+        const fd = std.fmt.parseInt(std.posix.fd_t, args[3], 10) catch return error.InvalidForegroundSessionInvocation;
+        if (fd < 3) return error.InvalidForegroundSessionInvocation;
+        const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        const stat = try file.stat(io_mod.getIo());
+        if (stat.kind != .file or stat.size != 0) return error.InvalidForegroundSessionInvocation;
+        retained_file = file;
+        target_args = args[4..];
+    }
+    defer if (retained_file) |file| file.close(io_mod.getIo());
     const command_session = std.c.setsid();
     if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
@@ -217,7 +235,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
             null;
     defer if (process_witness) |*witness| witness.deinit();
     const spawn_options: std.process.SpawnOptions = .{
-        .argv = args[2..],
+        .argv = target_args,
+        .inherit_files = if (retained_file) |file| &.{file} else &.{},
         .stdin = .pipe,
         .stdout = .inherit,
         .stderr = .inherit,
@@ -720,6 +739,9 @@ pub fn executeCommand(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    const pin = try acquireCommandPin(effective_cfg);
+    defer if (pin) |held| held.close();
+    effective_cfg.resource_pin_file = if (pin) |held| held.file else null;
     return executeRawBash(arena, scratch, effective_cfg, command, cwd);
 }
 
@@ -743,6 +765,9 @@ pub fn executeCommandInEnvironment(
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    const pin = try acquireCommandPin(effective_cfg);
+    defer if (pin) |held| held.close();
+    effective_cfg.resource_pin_file = if (pin) |held| held.file else null;
     switch (environment) {
         .user => |shell_path| if (snapshotEligible(shell_path, command)) {
             if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
@@ -875,6 +900,20 @@ fn snapshotReplayFailed(result: CollectedProcess, failure_marker: []const u8) bo
 }
 
 const shell_snapshot_replay_failure_exit_code: i64 = 125;
+
+fn acquireCommandPin(cfg: Config) !?resource_pin.Pin {
+    const path = cfg.resource_pin_path orelse return null;
+    var cancelled = std.atomic.Value(bool).init(false);
+    const now = io_mod.milliTimestamp();
+    const until = ExecutionControl.init(cfg).deadlineMs() orelse now + 30_000;
+    const remaining = @min(@as(i64, 30_000), @max(@as(i64, 0), until -| now));
+    const pin = resource_pin.acquire(path, .{ .cancel = cfg.cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(remaining) }) }) catch |err| return switch (err) {
+        error.Timeout => error.TimeoutExpired,
+        error.Cancelled => error.CancelledBeforeExecution,
+        else => err,
+    };
+    return pin;
+}
 
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
@@ -1290,6 +1329,7 @@ fn executeProcessWithInput(
     try applyAgentEnvironment(&environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
+        .inherit_files = if (cfg.resource_pin_file) |file| &.{file} else &.{},
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -1408,12 +1448,14 @@ fn executeProcessWithDetachedSession(
     else
         "none";
     try helper_argv.append(scratch, deadline_text);
+    if (cfg.resource_pin_file) |file| try helper_argv.appendSlice(scratch, &.{ foreground_pin_argument, try scratch.print("{d}", .{file.handle}) });
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
     // The supervisor passes its environment through to the target shell.
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
+        .inherit_files = if (cfg.resource_pin_file) |file| &.{file} else &.{},
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
