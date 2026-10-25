@@ -161,3 +161,71 @@ It rejects deleted directories, ambiguous identities, inaccessible ancestors,
 and paths that change during verification. This permits private profile and
 Fossil operations in constrained component tests without weakening file access
 or mounting host procfs.
+
+## Retain worker dispatch in Fossil
+
+The local operator API stores worker jobs under `company/workers/` on the
+protected company-control branch. Each job pins its task intent, company view,
+actor, grant, declaration, and execution policy. The task retains ownership of
+its contract, proposed content, evidence, assessment, and publication receipt.
+Worker jobs record dispatch and invocation limits.
+
+New instances declare `omos_company_worker_admin` and
+`omos_company_worker_job`. An existing company must explicitly migrate its
+contracts before using these operations. Active task definitions retain their
+original revisions.
+
+Save this request in a private operator file and invoke
+`omos fossil company REQUEST.json --json`:
+
+```json
+{
+  "version": "omos.company-admin/v1",
+  "action": "workers",
+  "worker": {
+    "change": "inspect",
+    "offset": 0,
+    "limit": 32
+  }
+}
+```
+
+Inspection returns up to 32 job metadata records with content hashes, live
+authority status, execution ownership, review state, and any verified
+publication. Follow `next_offset` for further pages. Add `view` to retrieve one
+job's task contract, original request, amendments, and policy context. The host
+releases each inspected task body before loading the next record. Inspection
+remains available after actor revocation so an operator
+can account for retained and cancelled work.
+
+Queue a view with `change: "queue"`, a unique `operation`, and its `view`.
+Defaults permit three invocations of at most four minutes each. The operator
+can select 1–32 invocations and a runtime limit between one second and four
+minutes. These limits supplement the task's actor-step, progress, and review
+budgets. Changing them does not weaken the task contract.
+
+Further updates carry `expected_sha256` from the returned job row. A claim
+includes an `execution` runtime identity and the preceding generation. The host
+commits the new execution fence and running job in one Fossil revision. Claim
+recovery returns the original acknowledgement, including when a newer worker
+has since taken ownership. Reusing the operation ID for different request bytes
+is rejected.
+
+`finish` records a `waiting`, `submitted`, `failed`, or `completed` outcome under
+the current live fence. Waiting work requires an explicit `requeue`; exhaustion
+does not automatically grant another invocation. Submitted work requires a
+retained server review job. A submitted job can be requeued after review finishes
+without publication, within its remaining invocation budget. Completion requires
+verified company publication.
+The operator can use `complete` after asynchronous publication without restoring
+an expired worker lease. `cancel` retains the job and releases only its matching
+execution owner. These transitions do not replay actor tools or external effects.
+An `expire` request retains a worker whose invocation lease has elapsed as
+waiting or exhausted, according to its remaining budget. It releases only that
+job's matching execution fence. Each successful transition retains its original
+typed request and request hash alongside the resulting job record.
+
+Job records and their immutable operation history travel with a full Fossil
+export. Private issuer material, provider credentials, actor signing keys,
+prepared images, and provider replay caches remain outside that export. Restoring
+a job history does not grant a runtime permission to execute it.
