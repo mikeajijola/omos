@@ -247,3 +247,37 @@ restricted child environment. It deletes transport files after each call.
 Requests and outcomes remain in Fossil. An interrupted or failed mutation is
 reported as uncertain; inspect its original operation before dispatching an
 actor or repeating work. Closing the control instance cancels active calls.
+
+### Dispatch retained jobs
+
+`worker-coordinator.mjs` provides `createWorkerCoordinator({ control, backend })`.
+Call `tick()` to inspect native jobs and dispatch queued work. The default allows
+one invocation at a time; an operator can select up to four. Each pass reads at
+most 1,024 job metadata rows and retains a disposable cursor for the next pass.
+Claiming a job retrieves its full pinned contract and authority context.
+
+The backend's `run(row, signal)` must resolve or reject only after stopping and
+joining every actor process. The coordinator clips that invocation to the job's
+runtime and execution lease. Further ticks cancel revoked, cancelled, or replaced
+owners. `close()` cancels and joins active invocations. A lost claim acknowledgement
+requires inspecting the original operation before dispatch; it never causes an
+additional claim or actor retry.
+
+A backend response cannot establish completion. The coordinator records a
+submitted outcome only when native state retains a server review job, and records
+completion only when canonical state includes accepted publication. Otherwise it
+retains waiting or failed work. Waiting work requires explicit requeue and keeps
+its invocation count. Restarting the coordinator does not replay an unexpired
+running worker; expired work is retained for inspection and explicit resumption.
+
+`worker-snapshot.mjs` reads a stopped worker's immutable revision through a
+caller-supplied native read-only request transport. It inventories the five
+managed content roots in pages of 32 and retrieves content in pages of at most
+16 KiB. It verifies both the full SHA-256 and Fossil artifact identity before
+returning a file. Default limits are 10,000 files, 32 MiB per file, and 256 MiB
+of verified content per reader. These are collection bounds, not permission to
+publish those files into the company. The host must still enforce the view's
+scope and checkpoint changes through the signed company service.
+
+The coordinator and reader do not yet supply production image preparation,
+execution, or proposal collection. They do not enable `hosted_execution`.

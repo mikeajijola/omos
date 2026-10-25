@@ -3821,6 +3821,7 @@ pub fn renderSchedules(alloc: std.mem.Allocator, snapshot: @import("../workspace
 
 pub fn renderFossilCommand(alloc: std.mem.Allocator, reply: @import("../workspace/fossil_commands.zig").Reply, format: OutputFormat) ![]u8 {
     switch (reply) {
+        .api => |value| return std.json.Stringify.valueAlloc(alloc, value, .{ .whitespace = if (format == .json) .minified else .indent_2 }),
         .workspace => |snapshot| return renderFossilWorkspace(alloc, snapshot, format),
         .scope => |snapshot| {
             if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});

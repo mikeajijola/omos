@@ -3288,6 +3288,135 @@
         "interfaces": [
           "cli"
         ]
+      },
+      {
+        "id": "omos_workspace_inventory",
+        "capability": "general_task",
+        "description": "Read at most 32 immutable Fossil file identities and executable flags at a pinned workspace revision. Fetch bounded read pages to verify SHA-256 identities and byte sizes.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "const": "omos.workspace-api/v1"
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "task": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "action": {
+              "const": "inventory"
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "definition_hash",
+            "revision",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "workspace": {
+              "type": "string"
+            },
+            "definition_hash": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "revision": {
+                  "type": "string"
+                },
+                "files": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      },
+                      "artifact": {
+                        "type": "string",
+                        "minLength": 40,
+                        "maxLength": 64
+                      },
+                      "executable": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "artifact",
+                      "executable"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "next_offset": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "revision",
+                "files",
+                "total",
+                "next_offset"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "workspace",
+            "definition_hash",
+            "revision",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api",
+          "cli"
+        ]
       }
     ],
     "semantic": {

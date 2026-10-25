@@ -42,7 +42,7 @@ pub const Request = struct {
     workspace: []const u8,
     definition_hash: []const u8,
     revision: []const u8,
-    action: enum { definition, query, read, record, propose, audit, queue_review, job },
+    action: enum { definition, query, read, inventory, record, propose, audit, queue_review, job },
     task: ?[]const u8 = null,
     entity: ?[]const u8 = null,
     content: ?[]const u8 = null,
@@ -61,9 +61,9 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     if (!std.mem.eql(u8, request.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
     const task: ?workspace.Task = if (request.task) |id| try manager.loadTask(id) else null;
     if (task) |selected| if (!std.mem.eql(u8, selected.workspace_id, request.workspace)) return error.WorkspaceIdentityMismatch;
-    const revision = if (task) |selected| try manager.currentRevision(selected) else (try manager.snapshot("")).trunk_revision;
-    if (request.action != .job and request.action != .read and !std.mem.eql(u8, request.revision, revision)) return error.WorkspaceRevisionChanged;
-    if (request.action == .read) {
+    const revision = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
+    if (request.action != .job and request.action != .read and request.action != .inventory and !std.mem.eql(u8, request.revision, revision)) return error.WorkspaceRevisionChanged;
+    if (request.action == .read or request.action == .inventory) {
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", request.revision), .{});
         if (!std.mem.eql(u8, manifest.id, request.workspace)) return error.WorkspaceIdentityMismatch;
     }
@@ -73,7 +73,8 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
     // Workspace API contracts govern transport. A task keeps its own older
     // declaration and policy for record writes and independent assessment.
     const declaration = try manager.loadDeclaration(transport_basis.revision);
-    try model.validateOperation(alloc, declaration, "omos_workspace_request", (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value, .input);
+    const operation = if (request.action == .inventory) "omos_workspace_inventory" else "omos_workspace_request";
+    try model.validateOperation(alloc, declaration, operation, (try std.json.parseFromSlice(std.json.Value, alloc, raw, .{})).value, .input);
     manager.expected_revision = request.revision;
     const data: std.json.Value = switch (request.action) {
         .definition => try manager.definitionSnapshot(task),
@@ -87,6 +88,27 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
         .job => blk: {
             const job = try manager.loadReviewJob(task orelse return error.TaskIdRequired, request.job orelse return error.InvalidReviewJob);
             break :blk try parse(alloc, try std.json.Stringify.valueAlloc(alloc, job, .{}));
+        },
+        .inventory => blk: {
+            if (!@import("fossil_manifest.zig").validHash(request.revision)) return error.InvalidFossilRevision;
+            const pinned = try manager.revision(request.revision);
+            if (request.path) |selector| {
+                const candidate = if (std.mem.endsWith(u8, selector, "/")) try alloc.print("{s}_", .{selector}) else selector;
+                if (!safeContentPath(candidate)) return error.WorkspacePathDenied;
+            }
+            var files: std.ArrayList(std.json.Value) = .empty;
+            var count: usize = 0;
+            for (try manager.fileManifest(pinned)) |file| {
+                if (!safeContentPath(file.path)) continue;
+                if (request.path) |selector| {
+                    const matches = if (std.mem.endsWith(u8, selector, "/")) std.mem.startsWith(u8, file.path, selector) else std.mem.eql(u8, file.path, selector);
+                    if (!matches) continue;
+                }
+                if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
+                if (count >= request.offset and files.items.len < 32) try files.append(alloc, try parse(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .path = file.path, .artifact = file.artifact orelse return error.InvalidFossilManifest, .executable = file.mode == .executable }, .{})));
+                count += 1;
+            }
+            break :blk try parse(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .revision = pinned, .files = files.items, .total = count, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null }, .{}));
         },
         .read => blk: {
             const path = request.path orelse return error.MissingPath;
@@ -118,11 +140,11 @@ pub fn execute(original_manager: workspace.Manager, raw: []const u8, writable: b
             break :blk try parse(alloc, try manager.proposeDefinition(task, request.content orelse return error.MissingContent, null));
         },
     };
-    const result_revision = if (task) |selected| try manager.currentRevision(selected) else (try manager.snapshot("")).trunk_revision;
+    const result_revision = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
     const mutation = request.action == .record or request.action == .propose or request.action == .queue_review;
     if (!mutation and request.action != .read and !std.mem.eql(u8, result_revision, revision)) return error.WorkspaceRevisionChanged;
     const response = try std.json.Stringify.valueAlloc(alloc, .{ .workspace = manager.manifest.id, .definition_hash = basis.definition_hash, .revision = if (request.action == .read) request.revision else result_revision, .data = data }, .{});
-    try model.validateOperation(alloc, declaration, "omos_workspace_request", try parse(alloc, response), .output);
+    try model.validateOperation(alloc, declaration, operation, try parse(alloc, response), .output);
     return response;
 }
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
+    action: enum { init, ensure, request, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
@@ -90,7 +90,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             if (options.package_action == .import and options.request_path == null) return error.MissingPath;
         },
         .cache => if (options.path != null) return error.UnexpectedArgument,
-        .company, .@"company-key" => if (options.path == null) return error.MissingPath,
+        .request, .company, .@"company-key" => if (options.path == null) return error.MissingPath,
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
@@ -106,7 +106,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
     return options;
 }
 
-pub const Reply = union(enum) { workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot, scope: @import("scope_export.zig").Snapshot };
+pub const Reply = union(enum) { api: std.json.Value, workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot, scope: @import("scope_export.zig").Snapshot };
 
 pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
     if (options.action == .@"company-key") {
@@ -147,9 +147,14 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         .use => try workspace.Manager.open(alloc, options.path.?),
         else => (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace,
     };
+    if (options.action == .request) {
+        const raw = try @import("workspace_service.zig").execute(manager, try readDefinition(alloc, options.path.?), false);
+        return .{ .api = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{ .allocate = .alloc_always }) };
+    }
     var detail: []const u8 = "";
     var model_data: ?std.json.Value = null;
     switch (options.action) {
+        .request => unreachable,
         .company => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try @import("company_service.zig").administer(manager, try readDefinition(alloc, options.path.?)), .{})).value,
         .ensure => detail = "Personal instance initialized or existing workspace retained.",
         .init => {
@@ -296,4 +301,13 @@ test "capability package commands require explicit plan selection" {
     try std.testing.expectError(error.MissingCapability, parse(&.{ "package", "plan" }));
     try std.testing.expectError(error.UnknownAction, parse(&.{ "package", "activate", "coding_task" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "status", "--realisation", "coding_task_native" }));
+}
+
+test "local workspace requests require a file and cannot enable writes" {
+    const selected = try parse(&.{ "request", "request.json", "--json" });
+    try std.testing.expectEqual(.request, selected.action);
+    try std.testing.expectEqualStrings("request.json", selected.path.?);
+    try std.testing.expectError(error.MissingPath, parse(&.{"request"}));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "request", "request.json", "--write" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "request", "request.json", "extra" }));
 }

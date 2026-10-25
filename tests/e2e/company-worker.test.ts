@@ -7,6 +7,8 @@ import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
+import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
+import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
@@ -545,8 +547,20 @@ test("the private worker controller uses verified native job operations and disp
     expect(queue.jobs[0].record.state).toBe("queued");
     const conflict = await control.call({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: "0".repeat(64), execution: { runtime: "controller", generation: 0 } });
     expect(conflict).toMatchObject({ ok: false, error: "CompanyWorkerJobChanged", uncertain: true });
-    const running = await control.call({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: queue.jobs[0].sha256, execution: { runtime: "controller", generation: 0 } });
+    let invoked = 0;
+    const coordinator = createWorkerCoordinator({ control, runtime: "controller", backend: { async run(row, signal) {
+      invoked++; expect(signal.aborted).toBe(false);
+      expect(row.record.binding.view).toBe(view); expect(row.contract).toBeDefined(); expect(row.request).toBeDefined();
+      expect(row.execution).toMatchObject({ runtime: "controller", generation: 1 });
+      return { outcome: "waiting", note: "Stopped after inspecting the immutable native job context." };
+    } } });
+    expect((await coordinator.tick()).started).toBe(1);
+    await coordinator.drain();
+    const running = await control.call({ change: "inspect", view });
     expect(running.ok, JSON.stringify(running)).toBe(true); expect(running.jobs[0].record.generation).toBe(1);
+    expect(running.jobs[0].record.state).toBe("waiting"); expect(running.jobs[0].execution.runtime).toBeNull();
+    expect((await coordinator.tick()).started).toBe(0); expect(invoked).toBe(1);
+    await coordinator.close();
     const cancelled = await control.call({ change: "cancel", operation: crypto.randomUUID(), view, expected_sha256: running.jobs[0].sha256 });
     expect(cancelled.ok).toBe(true); expect(cancelled.jobs[0].record.state).toBe("cancelled");
     const bindingPath = join(f.home, ".fx/omos-workspace.json"), binding = readFileSync(bindingPath);
@@ -568,3 +582,163 @@ test("the private worker controller uses verified native job operations and disp
     expect(verified.code, verified.stderr).toBe(0);
   } finally { control?.close(); signer?.close(); service.child.kill(); await service.child.exited; }
 }, 180000);
+
+test("local read-only workspace requests page immutable file identities and complete binary contents", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const tree = join(f.home, "snapshot-checkout"); mkdirSync(tree);
+  const fossil = (...args: string[]) => {
+    const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+  const documents = join(tree, "documents/snapshot"); mkdirSync(documents, { recursive: true });
+  for (let index = 0; index < 35; index++) writeFileSync(join(documents, `f${String(index).padStart(2, "0")}.txt`), `file ${index}`);
+  writeFileSync(join(documents, "run.sh"), "#!/bin/sh\nprintf snapshot\n", { mode: 0o755 });
+  writeFileSync(join(documents, "binary.dat"), Buffer.concat(Array.from({ length: 70 }, () => Buffer.from(Array.from({ length: 256 }, (_, index) => index)))));
+  writeFileSync(join(documents, "text.txt"), "€".repeat(6000));
+  mkdirSync(join(tree, "ui")); writeFileSync(join(tree, "ui/snapshot.css"), "body { color: green; }");
+  const commit = () => {
+    fossil("addremove");
+    fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain immutable reader fixture");
+  };
+  commit();
+  const state = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+  const declaration = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
+  const base = { version: "omos.workspace-api/v1", workspace: state.workspace_id, definition_hash: declaration.basis.definition_hash, revision: state.trunk_revision };
+  const call = async (input: object, successful = true) => {
+    const file = join(f.home, "workspace-read.json"); writeFileSync(file, JSON.stringify({ ...base, ...input }));
+    const result = await f.run(["fossil", "request", file, "--json"]);
+    if (!successful) { expect(result.code).not.toBe(0); return result; }
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    return JSON.parse(result.stdout);
+  };
+  const first = await call({ action: "inventory", path: "documents/snapshot/" });
+  expect(first.data.files).toHaveLength(32); expect(first.data.total).toBe(38); expect(first.data.next_offset).toBe(32);
+  const second = await call({ action: "inventory", path: "documents/snapshot/", offset: first.data.next_offset });
+  expect(second.data.files).toHaveLength(6); expect(second.data.next_offset).toBeNull();
+  const files = [...first.data.files, ...second.data.files];
+  expect(new Set(files.map(item => item.path)).size).toBe(38);
+  expect(files.find(item => item.path.endsWith("/run.sh")).executable).toBe(true);
+  const ui = await call({ action: "inventory", path: "ui/" });
+  expect(ui.data.files.map((item: any) => item.path)).toContain("ui/snapshot.css");
+  for (const [name, expected] of [["binary.dat", Buffer.concat(Array.from({ length: 70 }, () => Buffer.from(Array.from({ length: 256 }, (_, index) => index))))], ["text.txt", Buffer.from("€".repeat(6000))]] as const) {
+    const parts: Buffer[] = []; let offset = 0;
+    do {
+      const page = (await call({ action: "read", path: `documents/snapshot/${name}`, offset })).data;
+      expect(page.offset).toBe(offset); expect(page.bytes).toBe(expected.length);
+      expect(page.sha256).toBe(createHash("sha256").update(expected).digest("hex"));
+      const bytes = Buffer.from(page.content, page.encoding);
+      expect(bytes.length).toBeLessThanOrEqual(16384); parts.push(bytes);
+      if (page.next_offset === null) break;
+      expect(page.next_offset).toBe(offset + bytes.length); offset = page.next_offset;
+    } while (offset < expected.length);
+    expect(Buffer.concat(parts)).toEqual(expected);
+    const file = files.find(item => item.path === `documents/snapshot/${name}`);
+    expect(file.artifact).toBe(createHash(file.artifact.length === 40 ? "sha1" : "sha3-256").update(expected).digest("hex"));
+  }
+  const snapshot = createWorkerSnapshot({ request: input => call(input), workspace: base.workspace, definitionHash: base.definition_hash, revision: base.revision });
+  const inventory = await snapshot.inventory();
+  expect(inventory.filter(file => file.path.startsWith("documents/snapshot/"))).toHaveLength(38);
+  const verifiedBinary = await snapshot.read("documents/snapshot/binary.dat");
+  expect(verifiedBinary.bytes).toBe(17920);
+  expect(verifiedBinary.content).toEqual(readFileSync(join(documents, "binary.dat")));
+  expect(verifiedBinary.sha256).toBe(createHash("sha256").update(verifiedBinary.content).digest("hex"));
+  await expect(snapshot.read("history/private.json")).rejects.toThrow("WorkerSnapshotPathDenied");
+  const denied = await call({ action: "record", entity: "arbitrary", content: "{}" }, false);
+  expect(denied.stderr).toContain("ServiceReadOnly");
+  expect((await call({ action: "inventory", path: "documents/../" }, false)).stderr).toContain("WorkspacePathDenied");
+  expect((await call({ action: "inventory", revision: "trunk" }, false)).stderr).toContain("InvalidFossilRevision");
+  expect(JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision).toBe(base.revision);
+  writeFileSync(join(documents, "f00.txt"), "changed");
+  const { chmodSync } = await import("node:fs"); chmodSync(join(documents, "run.sh"), 0o600);
+  commit();
+  const latest = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision;
+  expect(latest).not.toBe(base.revision);
+  const retained = await call({ action: "inventory", path: "documents/snapshot/" });
+  expect(retained.data.revision).toBe(base.revision); expect(retained.data.files).toEqual(first.data.files);
+  const latestFiles = await call({ action: "inventory", path: "documents/snapshot/", revision: latest });
+  expect(latestFiles.data.files.find((item: any) => item.path.endsWith("/f00.txt")).artifact).not.toBe(files.find(item => item.path.endsWith("/f00.txt")).artifact);
+  expect((await call({ action: "read", path: "documents/snapshot/f00.txt" })).data.content).toBe("file 0");
+  expect((await call({ action: "read", path: "documents/snapshot/f00.txt", revision: latest })).data.content).toBe("changed");
+  expect((await call({ action: "inventory", path: "documents/snapshot/run.sh", revision: latest })).data.files[0].executable).toBe(false);
+}, 240000);
+
+
+test("worker snapshot collection rejects incomplete inventories, corrupt pages and exhausted budgets", async () => {
+  const workspace = "a".repeat(64), definitionHash = "b".repeat(64), revision = "c".repeat(64);
+  const content = Buffer.alloc(17000, 255), sha256 = createHash("sha256").update(content).digest("hex");
+  const file = { path: "documents/result.bin", artifact: createHash("sha3-256").update(content).digest("hex"), executable: false };
+  const transport = async input => ({ workspace, definition_hash: definitionHash, revision, data: input.action === "inventory"
+    ? { revision, files: input.path === "documents/" ? [file] : [], total: input.path === "documents/" ? 1 : 0, next_offset: null }
+    : { path: file.path, offset: input.offset, bytes: content.length, sha256, encoding: "base64", content: content.subarray(input.offset, input.offset + 16384).toString("base64"), next_offset: input.offset + 16384 < content.length ? input.offset + 16384 : null } });
+  const make = request => createWorkerSnapshot({ request, workspace, definitionHash, revision });
+  const valid = make(transport);
+  await expect(valid.read(file.path)).rejects.toThrow("WorkerSnapshotInventoryRequired");
+  const files = await valid.inventory(); files[0].path = "documents/changed";
+  expect((await valid.inventory())[0].path).toBe(file.path);
+  expect((await valid.read(file.path)).content).toEqual(content);
+  const corrupt = make(async input => { const result = await transport(input); if (input.action === "read") result.data.content = Buffer.alloc(Math.min(16384, content.length - input.offset)).toString("base64"); return result; });
+  await corrupt.inventory(); await expect(corrupt.read(file.path)).rejects.toThrow("WorkerSnapshotHashMismatch");
+  const wrongRevision = make(async input => ({ ...await transport(input), revision: "d".repeat(64), data: { ...((await transport(input)).data), revision: "d".repeat(64) } }));
+  await expect(wrongRevision.inventory()).rejects.toThrow("WorkerSnapshotRevisionChanged");
+  const short = make(async input => { const result = await transport(input); if (input.action === "inventory" && input.path === "documents/") result.data.total = 2; return result; });
+  await expect(short.inventory()).rejects.toThrow("IncompleteWorkerSnapshotInventory");
+  const cursor = make(async input => { const result = await transport(input); if (input.action === "read") result.data.next_offset = 0; return result; });
+  await cursor.inventory(); await expect(cursor.read(file.path)).rejects.toThrow("InvalidWorkerSnapshotCursor");
+  const budget = createWorkerSnapshot({ request: transport, workspace, definitionHash, revision, maxBytes: content.length - 1 });
+  await budget.inventory(); await expect(budget.read(file.path)).rejects.toThrow("InvalidWorkerSnapshotPage");
+  const stopped = new AbortController(); stopped.abort();
+  await expect(make(transport).inventory(stopped.signal)).rejects.toThrow();
+});
+
+test("worker coordinator resolves lost claim acknowledgements and fences revoked or replacement owners", async () => {
+  let current: any = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Retain a document", basis: {}, grant: {}, execution: null, task_state: "active", review_job_id: null, pending_operation: null, publication: null,
+    record: { binding: { view: "view" }, state: "queued", generation: 0, max_runtime_ms: 60000, expires_ms: 0 } };
+  const calls: any[] = []; let loseAck = true;
+  const control = { async call(input) {
+    calls.push(input);
+    if (input.change === "inspect") return { ok: true, jobs: [structuredClone(current)], next_offset: null };
+    if (input.change === "claim") {
+      current.record = { ...current.record, state: "running", runtime: input.execution.runtime, generation: 1, expires_ms: Date.now() + 120000, operation: input.operation };
+      current.execution = { runtime: input.execution.runtime, generation: 1 };
+      if (loseAck) { loseAck = false; return { ok: false, uncertain: true }; }
+    } else if (input.change === "finish") {
+      current.record = { ...current.record, state: input.outcome, operation: input.operation };
+      current.execution = { ...current.execution, runtime: null };
+    }
+    return { ok: true, jobs: [structuredClone(current)], next_offset: null };
+  } };
+  let invoked = 0;
+  const coordinator = createWorkerCoordinator({ control, runtime: "coordinator", backend: { async run() { invoked++; return { outcome: "completed" }; } } });
+  expect((await coordinator.tick()).started).toBe(1);
+  await coordinator.drain();
+  expect(invoked).toBe(1); expect(current.record.state).toBe("waiting");
+  expect(calls.filter(call => call.change === "claim")).toHaveLength(1);
+  expect(calls.filter(call => call.change === "finish")[0].outcome).toBe("waiting");
+  expect((await coordinator.tick()).started).toBe(0);
+  await coordinator.close();
+  current.record.state = "queued"; current.execution = null;
+  let observedAbort = false;
+  const revoked = createWorkerCoordinator({ control, runtime: "revoked", backend: { async run(_row, signal) {
+    await new Promise<void>(resolve => signal.addEventListener("abort", () => { observedAbort = true; resolve(); }, { once: true }));
+    return { outcome: "waiting" };
+  } } });
+  expect((await revoked.tick()).started).toBe(1);
+  current.authority_live = false;
+  const finishCount = calls.filter(call => call.change === "finish").length;
+  await revoked.tick(); await revoked.drain();
+  expect(observedAbort).toBe(true);
+  expect(calls.filter(call => call.change === "finish")).toHaveLength(finishCount);
+  await revoked.close();
+  current.authority_live = true; current.record.state = "queued"; current.execution = null;
+  let called = false;
+  const changed = createWorkerCoordinator({ runtime: "old-owner", backend: { async run() { called = true; } }, control: { async call(input) {
+    const response = await control.call(input);
+    if (input.change === "claim") response.jobs[0].execution.runtime = "new-owner";
+    return response;
+  } } });
+  await expect(changed.tick()).rejects.toThrow("WorkerCoordinatorClaimChanged");
+  expect(called).toBe(false);
+  await changed.close();
+});

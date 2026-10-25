@@ -85,6 +85,22 @@ model reasoning remain outside the portable workspace. Review audit records are
 checkpointed before publication, with a fence against changes to the reviewed
 branch.
 
+Local hosts can invoke the read-only workspace API with
+`omos fossil request REQUEST.json --json`. The request uses the same
+`omos.workspace-api/v1` envelope and active declaration hash as the HTTP API.
+This command cannot write records, propose definitions, or queue reviews.
+
+The `inventory` action lists up to 32 portable file identities per page at an
+immutable Fossil revision. Supply `offset` to continue, and an optional exact
+`path` or directory prefix ending in `/` to select content. Rows contain a path,
+Fossil artifact identity, and executable flag. They exclude protected runtime
+records and reject symlinks. The artifact identity is a Fossil hash, not a
+SHA-256 receipt. Use `read` for bounded byte pages with the complete content's
+SHA-256 and byte count. Binary pages use base64; text pages preserve UTF-8
+boundaries. Subsequent accepted revisions do not change a pinned inventory or
+read. Existing instances must explicitly upgrade their contracts before using
+the new `omos_workspace_inventory` operation.
+
 `fossil_workspace` supports `verify_manifest` with a workspace-relative `path`.
 The referenced JSON has a `files` array whose entries contain `path`, `sha256`,
 and `bytes`. Entries can also request an `executable` boolean check. The host
