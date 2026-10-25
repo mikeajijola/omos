@@ -127,6 +127,16 @@ retain the operation ID when an outcome is uncertain. Successful calls return
 the original signed receipt in `structuredContent.receipt` for later inspection.
 Submission queues native independent review; it is not an acceptance receipt.
 
+When `company_context` reports `schema_discovery: true`, use `company_workspace`
+with `action: "discover", entity: "*"` to list authorised custom record types.
+Then set `entity` to a listed name to retrieve its OmniForm contract. Catalogue
+pages contain at most 32 names. Schema bodies use base64 byte ranges of at most
+16 KiB under `schema`; follow `schema.next_offset`, retain the returned
+`revision`, and verify the complete `schema.sha256`. A selected view uses its
+task's pinned model. Discovery requires the `discover` action and a record path
+in scope, works on read-only hosts, and rechecks live grants on every request.
+These schemas describe expected data and grant no additional permissions.
+
 For resumable view updates, call `status` with the view identity and
 `progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
 `progress.resume_cursor` for the next poll. Each signed request rechecks the

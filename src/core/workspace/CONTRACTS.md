@@ -501,6 +501,29 @@ are verified in the same checkpoint receipt as content and deletions. Conflictin
 flags fail without changing the source branch, and retries retain the original
 operation outcome.
 
+When discovery reports `features.schema_discovery: true`, `discover` with
+`entity: "*"` returns a scoped catalogue of custom record types. It lists at
+most 32 names per page, with an offset for continuation. A grant needs the
+`discover` action and a path covering records of that type. Host-owned types
+and types outside that scope are filtered before counts and pagination.
+
+Set `entity` to a listed name to retrieve its exact OmniForm contract.
+`schema.content` contains a base64 byte range; `schema.sha256` and `schema.bytes`
+identify the complete canonical entity declaration. Each byte range is bounded
+to 16 KiB. Follow `schema.next_offset` and verify the complete hash after reading
+all ranges. Retain the returned `revision` for later pages. The response also
+identifies the full declaration's hash, revision, and semantic version.
+
+With a view selected, schemas come from that task's pinned model even after
+the accepted declaration advances. Without a view, they describe the selected
+accepted revision. These reads also work on a read-only service and do not add
+content dependencies: the model basis already retains their provenance.
+The server rechecks live authority on each page. `scope_filtered: true` marks
+the response as a projection; omitted types do not establish company-wide
+absence. Schema discovery describes expected data and cannot establish that
+a capability has been realised. Older declarations enable it through explicit
+`omos fossil migrate --contracts`, which adds `omos_company_schema`.
+
 When public discovery reports `features.progress_history: true`, signed
 `status` requests for the caller's own view can include `progress_cursor: ""`
 to start a revision feed. Each page contains at most 32 `view_revision` events,

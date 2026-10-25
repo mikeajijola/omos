@@ -853,6 +853,170 @@
         ]
       },
       {
+        "id": "omos_company_schema",
+        "capability": "general_task",
+        "description": "Scoped discovery of OmniForm record schemas from an immutable declaration.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "const": "discover"
+            },
+            "entity": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            }
+          },
+          "required": [
+            "action",
+            "entity"
+          ],
+          "additionalProperties": true
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-schema/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "definition_revision": {
+              "type": "string"
+            },
+            "definition_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "semantic_version": {
+              "const": "omniseedos.semantic/v1"
+            },
+            "scope_filtered": {
+              "const": true
+            },
+            "read_tracking": {
+              "enum": [
+                "model_basis",
+                "not_recorded"
+              ]
+            },
+            "entity": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 128
+            },
+            "schema": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "sha256": {
+                  "type": "string",
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 8388608
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 8388608
+                },
+                "content": {
+                  "type": "string",
+                  "maxLength": 21848
+                },
+                "encoding": {
+                  "const": "base64"
+                },
+                "next_offset": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 8388608
+                }
+              },
+              "required": [
+                "sha256",
+                "bytes",
+                "offset",
+                "content",
+                "encoding",
+                "next_offset"
+              ],
+              "additionalProperties": false
+            },
+            "entities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "maxItems": 32
+            },
+            "total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "revision",
+            "definition_revision",
+            "definition_hash",
+            "semantic_version",
+            "scope_filtered",
+            "read_tracking",
+            "entity",
+            "schema",
+            "entities",
+            "total",
+            "next_offset"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api"
+        ]
+      },
+      {
         "id": "omos_company_subscription",
         "capability": "general_task",
         "description": "Read-only signed progress subscription; each emitted page rechecks live authority.",
@@ -1022,7 +1186,8 @@
               "type": [
                 "string",
                 "null"
-              ]
+              ],
+              "description": "Record type for record/query. With discover and advertised schema_discovery, '*' lists scoped record types and a type name retrieves its pinned contract."
             },
             "record_id": {
               "type": [

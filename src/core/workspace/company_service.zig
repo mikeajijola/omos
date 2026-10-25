@@ -224,7 +224,7 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -265,6 +265,11 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     var request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, incoming.payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
+    const schema_discovery = request.action == .discover and request.entity != null;
+    if (schema_discovery) {
+        if (!model.hasOperation(declaration, "omos_company_schema")) return error.CompanyDefinitionUpdateRequired;
+        try model.validateOperation(manager.alloc, declaration, "omos_company_schema", try parse(manager.alloc, incoming.payload), .input);
+    }
     if (request.upload != null and request.action != .checkpoint) return error.InvalidCompanyUpload;
     if (request.progress_cursor != null and (request.action != .status or request.outcome != null or request.offset != 0 or request.revision != null)) return error.InvalidCompanyProgressCursor;
     if (progress_only) if (cursor) |position| {
@@ -299,6 +304,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
         }
         return err;
     };
+    if (schema_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_schema", try parse(manager.alloc, result), .output);
     const response = try signed(manager, current, request, request_hash, result);
     if (mutation) {
         journal.state = .completed;
@@ -548,6 +554,13 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const pinned = (try manager.companyReadRevision(if (selected) |view| view.task else null, requested_revision)) orelse return error.CompanyAccessDenied;
         const manifest = try records.decode(workspace.Manifest, alloc, try manager.contentAt("workspace.json", pinned), .{});
         if (!std.mem.eql(u8, manifest.id, current.workspace)) return error.WorkspaceIdentityMismatch;
+        if (request.action == .discover) if (request.entity) |selector| {
+            const basis = (if (selected) |view| view.task.model_basis else try manager.modelBasis(pinned)) orelse return error.WorkspaceMigrationRequired;
+            const declaration = try manager.loadDeclaration(basis.revision);
+            if (!std.mem.eql(u8, basis.definition_hash, declaration.hash)) return error.StaleWorkspaceDefinition;
+            const result = try @import("company_schema.zig").inspect(alloc, declaration, grant, selector, request.offset, request.limit);
+            return encode(alloc, .{ .version = "omos.company-schema/v1", .workspace = current.workspace, .revision = pinned, .definition_revision = basis.revision, .definition_hash = declaration.hash, .semantic_version = declaration.semantic.version, .scope_filtered = true, .read_tracking = if (selected != null) "model_basis" else "not_recorded", .entity = result.entity, .schema = if (result.body) |body| try requestPage(manager, body, request.offset, request.limit) else null, .entities = result.entities, .total = result.total, .next_offset = result.next_offset });
+        };
         var flags = std.StringHashMap(fossil_manifest.File).init(alloc);
         defer flags.deinit();
         if (attributes) for (try manager.fileManifest(pinned)) |file| {

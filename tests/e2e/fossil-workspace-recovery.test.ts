@@ -141,6 +141,125 @@ async function companyMcp(config: string, home: string, script = join(import.met
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Schema discovery must not run an actor"); });
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    const largeFields = Object.fromEntries(Array.from({ length: 700 }, (_, index) => [`schema_field_${index.toString().padStart(4, "0")}`, "string"]));
+    declaration.spec.semantic.entityTypes.push({ id: "team_note", fields: { text: "string" }, required: ["text"] }, { id: "large_note", fields: largeFields }, { id: "hidden_note", fields: { text: "string" } });
+    for (let index = 0; index < 32; index++) declaration.spec.semantic.entityTypes.push({ id: `extra_${index}`, fields: { text: "string" } });
+    const proposal = join(f.home, "definition.json");
+    const propose = async () => {
+      writeFileSync(proposal, JSON.stringify(declaration));
+      const result = await f.run(["fossil", "definition", "propose", proposal, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+    };
+    await propose();
+    const admin = async (body: object) => {
+      const path = join(f.home, "operator.json");
+      writeFileSync(path, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", path, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    let authority = await admin({ action: "initialize" });
+    const keys = { scoped: generateKeyPairSync("ed25519"), broad: generateKeyPairSync("ed25519"), outside: generateKeyPairSync("ed25519") };
+    for (const [id, paths] of [
+      ["scoped", ["records/team_note/one.json", "records/large_note/", "records/later_note/"]],
+      ["broad", ["records/"]],
+      ["outside", ["documents/"]],
+    ] as const) authority = await admin({ action: "grant", revision: authority.revision, grant: { id, actor: id, public_key: keys[id].publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths, actions: ["discover", "create_view", "record", "status"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const boot = await (await fetch(service.url + "/v1/company", { keepalive: false })).json() as any;
+    const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+    const post = async (actor: keyof typeof keys, action: string, params: object) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor, grant: actor, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", keepalive: false, headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), keys[actor].privateKey).toString("hex") }) });
+      const envelope = await response.json() as any;
+      if (response.status !== 200) return { status: response.status, error: envelope.error, result: null };
+      expect(envelope.issuer).toBe(boot.issuer);
+      expect(verify(null, Buffer.from(envelope.payload), issuer, Buffer.from(envelope.signature, "hex"))).toBe(true);
+      const receipt = JSON.parse(envelope.payload);
+      expect(receipt.request_hash).toBe(createHash("sha256").update(payload).digest("hex"));
+      expect(receipt.actor).toBe(actor);
+      expect(receipt.grant).toBe(actor);
+      expect(receipt.action).toBe(action);
+      return { status: 200, error: null, result: receipt.result };
+    };
+    const send = async (actor: keyof typeof keys, action: string, params: object = {}) => {
+      const response = await post(actor, action, params);
+      expect(response.status, JSON.stringify(response)).toBe(200);
+      return response.result;
+    };
+    try {
+      expect(boot.features.schema_discovery).toBe(true);
+      const view = await send("scoped", "create_view", { revision: boot.revision, objective: "Create a note against the pinned record contract" });
+      const before = (await admin({ action: "status" })).revision;
+      const first = await send("scoped", "discover", { entity: "*", limit: 1 });
+      expect(first.scope_filtered).toBe(true);
+      expect(first.total).toBe(2);
+      expect(first.entities).toEqual(["team_note"]);
+      expect(first.next_offset).toBe(1);
+      const second = await send("scoped", "discover", { entity: "*", revision: first.revision, offset: 1, limit: 1 });
+      expect(second.entities).toEqual(["large_note"]);
+      expect(second.next_offset).toBeNull();
+      const broad = await send("broad", "discover", { entity: "*" });
+      expect(broad.total).toBe(35);
+      expect(broad.entities).toHaveLength(32);
+      expect(broad.entities.some((id: string) => id.startsWith("omos_"))).toBe(false);
+      expect(broad.next_offset).toBe(32);
+      expect((await send("broad", "discover", { entity: "*", revision: broad.revision, offset: 32 })).entities).toHaveLength(3);
+      expect((await send("outside", "discover", { entity: "*" })).total).toBe(0);
+      for (const entity of ["team_note", "missing_note", "omos_assessment"]) expect((await post("outside", "discover", { entity })).status).toBe(403);
+      expect((await post("scoped", "discover", { entity: "hidden_note" })).status).toBe(403);
+      expect((await post("broad", "discover", { entity: "missing_note" })).error).toBe("UnknownEntityType");
+      const initial = await send("scoped", "discover", { entity: "large_note", limit: 4096 });
+      expect(initial.schema.bytes).toBeGreaterThan(16384);
+      expect(initial.schema.next_offset).toBe(4096);
+      const parts = [Buffer.from(initial.schema.content, "base64")];
+      expect((await admin({ action: "status" })).revision).toBe(before);
+      declaration.spec.semantic.entityTypes.push({ id: "later_note", fields: { text: "string" } });
+      await propose();
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, false);
+      let offset = initial.schema.next_offset;
+      while (offset !== null) {
+        const page = await send("scoped", "discover", { entity: "large_note", revision: initial.revision, offset, limit: 4096 });
+        expect(page.definition_hash).toBe(initial.definition_hash);
+        expect(page.schema.sha256).toBe(initial.schema.sha256);
+        expect(page.schema.offset).toBe(offset);
+        const bytes = Buffer.from(page.schema.content, "base64");
+        expect(bytes.length).toBeLessThanOrEqual(4096);
+        parts.push(bytes); offset = page.schema.next_offset;
+      }
+      const bytes = Buffer.concat(parts);
+      expect(bytes.length).toBe(initial.schema.bytes);
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(initial.schema.sha256);
+      expect(Object.keys(JSON.parse(bytes.toString()).fields)).toHaveLength(700);
+      const current = await send("scoped", "discover", { entity: "*" });
+      expect(current.entities).toEqual(["team_note", "large_note", "later_note"]);
+      expect(current.definition_hash).not.toBe(view.basis.definition_hash);
+      const pinned = await send("scoped", "discover", { view: view.view, entity: "*" });
+      expect(pinned.definition_hash).toBe(view.basis.definition_hash);
+      expect(pinned.entities).toEqual(["team_note", "large_note"]);
+      expect(pinned.read_tracking).toBe("model_basis");
+      expect((await post("scoped", "discover", { view: view.view, entity: "later_note" })).error).toBe("UnknownEntityType");
+      expect((await post("scoped", "discover", { entity: "large_note", offset: initial.schema.bytes + 1 })).error).toBe("InvalidEvidenceOffset");
+      expect((await post("scoped", "discover", { entity: "team_note", limit: 0 })).status).toBe(400);
+      const schema = await send("scoped", "discover", { view: view.view, entity: "team_note" });
+      expect(JSON.parse(Buffer.from(schema.schema.content, "base64").toString()).required).toEqual(["text"]);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, true);
+      const written = await send("scoped", "record", { view: view.view, revision: view.revision, entity: "team_note", record_id: "one", content: JSON.stringify({ text: "Created using the pinned schema" }) });
+      expect(JSON.parse(f.fossil("cat", "records/team_note/one.json", "-r", written.revision)).data.text).toBe("Created using the pinned schema");
+      const state = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: state.revision, id: "scoped" });
+      expect((await post("scoped", "discover", { view: view.view, entity: "team_note" })).error).toBe("CompanyAccessRevoked");
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 240000);
+
   test("streams signed company progress with bounded admission, cancellation, restart and live revocation", async () => {
     const f = fixture();
     const inference = model(f, () => { throw Error("Progress transport must not execute an actor"); });
@@ -1698,7 +1817,7 @@ sys.exit(result.returncode)
     const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
     legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission", "omos_company_upload"].includes(entity.id));
     delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
-    legacy.spec.operations = legacy.spec.operations.filter((operation: any) => operation.id !== "omos_company_subscription");
+    legacy.spec.operations = legacy.spec.operations.filter((operation: any) => !["omos_company_subscription", "omos_company_schema"].includes(operation.id));
     const legacyInput = legacy.spec.operations.find((operation: any) => operation.id === "omos_company_operation").input.properties;
     legacyInput.version = { const: "omos.company/v1" };
     delete legacyInput.executable;
@@ -1724,7 +1843,7 @@ sys.exit(result.returncode)
     };
     const initialized = await admin({ action: "initialize" });
     const key = generateKeyPairSync("ed25519");
-    await admin({ action: "grant", revision: initialized.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "read", "submit", "status"], expires_ms: Date.now() + 3600000 } });
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "worker", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["discover", "create_view", "checkpoint", "read", "submit", "status"], expires_ms: Date.now() + 3600000 } });
     const service = await startWorkspaceService(f, true);
     const boot = await (await fetch(service.url + "/v1/company")).json() as any;
     const request = (action: string, params: object = {}) => {
@@ -1740,6 +1859,7 @@ sys.exit(result.returncode)
     };
     try {
       expect(boot.features.read_dependencies).toBe(false);
+      expect(boot.features.schema_discovery).toBe(false);
       expect(boot.features.file_attributes).toBeNull();
       expect(boot.features.checkpoint_attributes).toBe(false);
       expect(boot.features.chunked_upload).toBe(false);
@@ -1751,6 +1871,9 @@ sys.exit(result.returncode)
       const unavailableStream = await progressStream(service.url, request("status", { view: view.view, progress_cursor: "" }));
       expect(unavailableStream.response.status).toBe(400);
       await unavailableStream.close();
+      const oldSchema = await post(request("discover", { view: view.view, entity: "*" }));
+      expect(oldSchema.status).toBe(400);
+      expect((await oldSchema.json() as any).error).toBe("CompanyDefinitionUpdateRequired");
       const beforeRead = (await admin({ action: "status" })).revision;
       const refused = await post(request("read", { view: view.view, path: "documents/team/report.md" }));
       expect(refused.status).toBe(400);
@@ -1766,6 +1889,7 @@ sys.exit(result.returncode)
       expect((await (await fetch(service.url + "/v1/company")).json() as any).features.read_dependencies).toBe(true);
       const upgraded = await (await fetch(service.url + "/v1/company")).json() as any;
       expect(upgraded.features.file_attributes).toBe("omos.company/v2");
+      expect(upgraded.features.schema_discovery).toBe(true);
       expect(upgraded.features.checkpoint_attributes).toBe(true);
       expect(upgraded.features.chunked_upload).toBe(true);
       expect(upgraded.features.progress_history).toBe(true);
@@ -1775,6 +1899,9 @@ sys.exit(result.returncode)
         expect(availableStream.response.status).toBe(200);
         expect((await availableStream.next()).event).toBe("workspace");
       } finally { await availableStream.close(); }
+      const schema = await send("discover", { view: view.view, entity: "*" });
+      expect(schema.total).toBe(0);
+      expect(schema.definition_hash).toBe(view.basis.definition_hash);
       const read = await send("read", { view: view.view, path: "documents/team/report.md" });
       expect(read.read_tracking).toBe("recorded");
       expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");
