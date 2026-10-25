@@ -528,12 +528,39 @@ also select an operation outcome, revision, or byte offset. The cursor format
 uses immutable first-parent identities, so restart and rebuilt local indexes
 do not change its position. The feed stops before the view's original base.
 
-Clients poll this bounded feed and retain their last fully consumed position.
-This version does not hold an HTTP subscription open or push SSE events.
-The optional MCP companion accepts the same fields through
+Clients can poll this bounded feed or POST the same signed status envelope with
+`Accept: text/event-stream` to subscribe. Discovery advertises
+`features.progress_stream: "omos.company-progress/v1"` when the progress input
+and the `omos_company_subscription` operation are declared. Each `workspace`
+event contains the original signed receipt. Its `request_hash` binds the opening
+actor request, including the starting cursor. The host advances only
+issuer-signed continuation positions for that
+same view and checks live authority, expiry, and the accepted operation model
+before every page. Paging and new checkpoints follow the same cursor rules as
+polling. No subscription database or additional authority token is created.
+
+The SSE event ID is its progress page's `next_cursor`, or `resume_cursor` when
+the page is complete. Verify the receipt signature, issuer, identity, and
+opening request hash before retaining that ID. Reconnect by signing a new
+status request whose `progress_cursor` is the last fully consumed event ID.
+Native `EventSource` cannot send this authenticated POST; browser interfaces
+need their trusted bridge or a signed streaming-fetch client. Browser-origin
+requests remain rejected. The MCP companion continues to use JSON status calls.
+
+At most four subscriptions run per service process. Each stream shares one
+30-second allowance across initial admission, locks, reads, signing, and later
+pages. A socket watcher cancels disconnected or expired streams, including
+while initial admission is pending. Streams also stop after 32 workspace
+events or 1 MiB of SSE body data, leaving room for transport termination.
+Heartbeats, `error` events, `end` events, and connection closure are transport
+information and never establish task acceptance. Grant revocation stops new
+workspace events; reconnecting still requires live authority. Consumers keep
+their last verified cursor across expiry, cancellation, and service restarts.
+
+The optional MCP companion accepts the progress fields through
 `company_workspace`. Older declarations do not advertise the feed; an explicit
-`omos fossil migrate --contracts` adds its optional transport field while
-preserving existing constraints and task contracts.
+`omos fossil migrate --contracts` adds its optional transport field and the
+subscription operation while preserving existing constraints and task contracts.
 
 When `features.chunked_upload` is true, `checkpoint` also accepts
 `upload: { "sha256": "FULL_LOWERCASE_SHA256", "bytes": 1234567 }`.

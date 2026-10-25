@@ -853,6 +853,55 @@
         ]
       },
       {
+        "id": "omos_company_subscription",
+        "capability": "general_task",
+        "description": "Read-only signed progress subscription; each emitted page rechecks live authority.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "payload": {
+              "type": "string"
+            },
+            "signature": {
+              "type": "string"
+            },
+            "issuer": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "payload",
+            "signature",
+            "issuer"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "api"
+        ]
+      },
+      {
         "id": "omos_company_operation",
         "capability": "general_task",
         "description": "Scoped discovery, reads, isolated views, checkpoints, proposals and outcomes.",

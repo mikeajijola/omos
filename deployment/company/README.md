@@ -132,8 +132,19 @@ For resumable view updates, call `status` with the view identity and
 `progress.resume_cursor` for the next poll. Each signed request rechecks the
 grant. The feed remains pinned while paging and recovers its position after a
 service restart. It reports revision notifications; inspect the status snapshot
-and publication receipt to determine verification and acceptance. This version
-uses polling rather than an open HTTP subscription.
+and publication receipt to determine verification and acceptance.
+
+HTTP clients can POST that signed status request with
+`Accept: text/event-stream` when discovery advertises `progress_stream`.
+Each `workspace` event carries the normal signed receipt, bound to the opening
+request hash. Verify it before saving the event ID as your next cursor. A new
+connection signs a new status request with that saved `progress_cursor`.
+The service rechecks the live grant and request expiry before every page.
+There are at most four streams per process, each bounded to 30 seconds,
+32 workspace events, and 1 MiB of SSE data. A client reconnects after the bound;
+an end event or closed connection does not establish task completion.
+The MCP companion keeps using JSON polling. Browser interfaces still need
+their trusted bridge; raw browser-origin requests are rejected.
 
 The companion verifies response signatures, request hashes, issuer epoch, and
 identity fields. It forwards no owner bearer token or cookies and follows no

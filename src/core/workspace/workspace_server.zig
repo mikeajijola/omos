@@ -105,16 +105,17 @@ fn handle(manager: workspace.Manager, stream: std.Io.net.Stream, token: []const 
         var request_manager = manager;
         request_manager.alloc = arena.allocator();
         var keep_alive = request.head.keep_alive and index < 99;
-        try dispatch(request_manager, &request, token, writable, &keep_alive);
+        try dispatch(request_manager, &request, stream, token, writable, &keep_alive);
         if (!keep_alive) return;
     }
 }
 
-fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token: []const u8, writable: bool, keep_alive: *bool) !void {
+fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, stream: std.Io.net.Stream, token: []const u8, writable: bool, keep_alive: *bool) !void {
     @import("../shared/debug_trace.zig").logf("workspace", "workspace service request method={s}", .{@tagName(request.head.method)});
     var headers = request.iterateHeaders();
     var authorization: ?[]const u8 = null;
     var origin = false;
+    var progress_stream = false;
     while (headers.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
             if (authorization != null) {
@@ -124,12 +125,14 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
             authorization = header.value;
         }
         if (std.ascii.eqlIgnoreCase(header.name, "origin")) origin = true;
+        if (std.ascii.eqlIgnoreCase(header.name, "accept") and std.ascii.eqlIgnoreCase(header.value, "text/event-stream")) progress_stream = true;
     }
     const company = std.mem.eql(u8, request.head.target, "/v1/company");
     if (origin or (!company and !authenticated(authorization, token))) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"Unauthorized\"}", .{ .status = .unauthorized, .keep_alive = false });
     }
+    if (progress_stream and (!company or request.head.method != .POST)) return reject(manager, request, keep_alive.*, error.CompanyProgressRequired);
     if (company and request.head.method == .GET) {
         const response = @import("company_service.zig").bootstrap(manager) catch |err| return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = if (err == error.CompanyNotInitialized) .not_found else .conflict, .keep_alive = keep_alive.* });
         return request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
@@ -149,17 +152,32 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, token
     };
     const body_reader = try request.readerExpectContinue(&.{});
     const raw = try body_reader.allocRemaining(manager.alloc, .limited(1024 * 1024));
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
-        @import("../shared/debug_trace.zig").logf("workspace", "workspace service rejected error={s}", .{@errorName(err)});
-        const status: std.http.Status = switch (err) {
-            error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-            error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
-            else => .bad_request,
+    if (progress_stream) {
+        keep_alive.* = false;
+        const subscription = @import("company_subscription.zig").prepare(manager, raw, writable, stream) catch |err| {
+            if (err == error.Cancelled) return error.HttpConnectionClosing;
+            return reject(manager, request, false, err);
         };
-        return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive.* });
+        defer subscription.release();
+        subscription.respond(request) catch return error.HttpConnectionClosing;
+        return;
+    }
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
+        return reject(manager, request, keep_alive.*, err);
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     @import("../shared/debug_trace.zig").logf("workspace", "workspace service response sent bytes={d}", .{response.len});
+}
+
+fn reject(manager: workspace.Manager, request: *std.http.Server.Request, keep_alive: bool, err: anyerror) !void {
+    @import("../shared/debug_trace.zig").logf("workspace", "workspace service rejected error={s}", .{@errorName(err)});
+    const status: std.http.Status = switch (err) {
+        error.CompanySubscriptionsBusy => .too_many_requests,
+        error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
+        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+        else => .bad_request,
+    };
+    return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive });
 }
 
 fn ownerRequest(original: workspace.Manager, raw: []const u8, writable: bool, schedules: bool) ![]const u8 {

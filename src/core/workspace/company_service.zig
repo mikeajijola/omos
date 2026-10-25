@@ -11,6 +11,9 @@ const fossil_manifest = @import("fossil_manifest.zig");
 const read_dependencies = @import("company_reads.zig");
 const uploads = @import("company_upload.zig");
 
+pub const progress_stream_limit = 4;
+pub const progress_stream_seconds = 30;
+
 const Journal = struct {
     version: []const u8 = "omos.company-operation/v1",
     actor: []const u8,
@@ -221,16 +224,27 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .progress_history = model.field(properties, "progress_cursor") != null, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    return executeInner(original, raw, writable, false, null);
+}
+
+/// Transport-owned continuation of an authenticated status subscription. The
+/// cursor carries no authority; every page revalidates the original request.
+pub fn progress(original: workspace.Manager, raw: []const u8, writable: bool, cursor: ?[]const u8) ![]const u8 {
+    return executeInner(original, raw, writable, true, cursor);
+}
+
+fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, progress_only: bool, cursor: ?[]const u8) ![]const u8 {
     var manager = original;
     if (raw.len > 1024 * 1024) return error.ServiceRequestTooLarge;
     const incoming = try records.decode(authority.Envelope, manager.alloc, raw, .{});
     // This hint only installs a deadline. Authentication and declaration
     // validation below remain mandatory before inspecting workspace state.
-    const hint = try records.decode(struct { progress_cursor: ?[]const u8 = null }, manager.alloc, incoming.payload, .{ .ignore_unknown_fields = true });
+    const hint = try records.decode(struct { action: ?[]const u8 = null, progress_cursor: ?[]const u8 = null }, manager.alloc, incoming.payload, .{ .ignore_unknown_fields = true });
+    if (progress_only and (hint.progress_cursor == null or hint.action == null or !std.mem.eql(u8, hint.action.?, "status"))) return error.CompanyProgressRequired;
     var cancelled = std.atomic.Value(bool).init(false);
     if (hint.progress_cursor != null) {
         const deadline: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = std.Io.Clock.Timestamp.now(io.getIo(), .awake).raw.addDuration(.fromSeconds(30)) };
@@ -244,11 +258,18 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
     const current = try state(manager);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, raw), .input);
-    const request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
+    if (progress_only) {
+        if (!model.hasOperation(declaration, "omos_company_subscription")) return error.CompanyDefinitionUpdateRequired;
+        try model.validateOperation(manager.alloc, declaration, "omos_company_subscription", try parse(manager.alloc, raw), .input);
+    }
+    var request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, incoming.payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
     if (request.upload != null and request.action != .checkpoint) return error.InvalidCompanyUpload;
     if (request.progress_cursor != null and (request.action != .status or request.outcome != null or request.offset != 0 or request.revision != null)) return error.InvalidCompanyProgressCursor;
+    if (progress_only) if (cursor) |position| {
+        request.progress_cursor = position;
+    };
     const mutation = authority.isMutation(request.action);
     if (mutation and !writable) return error.ServiceReadOnly;
     if (mutation and request.action != .reconcile) if (request.view) |id| {
@@ -286,6 +307,7 @@ pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]
         try saveJournal(manager, path, journal);
     }
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, response), .output);
+    if (progress_only) try model.validateOperation(manager.alloc, declaration, "omos_company_subscription", try parse(manager.alloc, response), .output);
     return response;
 }
 

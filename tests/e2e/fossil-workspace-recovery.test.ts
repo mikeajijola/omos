@@ -9,6 +9,32 @@ import { NativeClient } from "./workspace-ui-client.mjs";
 
 afterEach(cleanupFixtures);
 
+async function progressStream(url: string, envelope: object, controller = new AbortController()) {
+  const response = await fetch(url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify(envelope), signal: controller.signal });
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  return { response, close: async () => { controller.abort(); await reader.cancel().catch(() => {}); }, next: async (timeoutMs = 15000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const end = buffered.indexOf("\n\n");
+      if (end >= 0) {
+        const text = buffered.slice(0, end); buffered = buffered.slice(end + 2);
+        if (text.startsWith(":")) continue;
+        const lines = text.split("\n");
+        return { event: lines.find(line => line.startsWith("event: "))?.slice(7), id: lines.find(line => line.startsWith("id: "))?.slice(4), data: JSON.parse(lines.find(line => line.startsWith("data: "))!.slice(6)) };
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const chunk = await Promise.race([reader.read(), new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => { controller.abort(); reject(Error("Progress stream did not produce its next event")); }, Math.max(1, deadline - Date.now()));
+      })]).finally(() => clearTimeout(timer));
+      if (chunk.done) throw Error("Progress stream closed before the expected event");
+      buffered += decoder.decode(chunk.value, { stream: true });
+      expect(buffered.length).toBeLessThanOrEqual(1024 * 1024);
+    }
+  } };
+}
+
 async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = false, extra: Record<string, string | undefined> = {}) {
   const token = "isolated-workspace-service-token-for-fixtures";
   const child = Bun.spawn([join(import.meta.dir, "../../zig-out/bin/fx"), "fossil", "serve", "0", "--json", ...(writable ? ["--write"] : [])], {
@@ -114,6 +140,189 @@ async function companyMcp(config: string, home: string, script = join(import.met
 
 // These fault, boundary, migration, and authority cases qualify the candidate without training it.
 describe("portable Fossil workspace recovery", () => {
+  test("streams signed company progress with bounded admission, cancellation, restart and live revocation", async () => {
+    const f = fixture();
+    const inference = model(f, () => { throw Error("Progress transport must not execute an actor"); });
+    expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
+    const admin = async (body: object) => {
+      const path = join(f.home, "operator.json");
+      writeFileSync(path, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", path, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout).model_data;
+    };
+    const initialized = await admin({ action: "initialize" });
+    const key = generateKeyPairSync("ed25519");
+    await admin({ action: "grant", revision: initialized.revision, grant: { id: "progress-reader", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "status"], expires_ms: Date.now() + 3600000 } });
+    let service = await startWorkspaceService(f, true);
+    const streams: Awaited<ReturnType<typeof progressStream>>[] = [];
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
+    const seal = (action: string, params: object) => {
+      const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "progress-reader", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
+      return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
+    };
+    const send = async (action: string, params: object) => {
+      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(seal(action, params)) });
+      const receipt = await response.json() as any;
+      expect(response.status, JSON.stringify(receipt)).toBe(200);
+      return JSON.parse(receipt.payload).result;
+    };
+    const subscribe = async (envelope: object) => {
+      const stream = await progressStream(service.url, envelope); streams.push(stream); return stream;
+    };
+    const inspect = (event: Awaited<ReturnType<Awaited<ReturnType<typeof progressStream>>["next"]>>, envelope: { payload: string }) => {
+      expect(event.event).toBe("workspace");
+      expect(event.data.issuer).toBe(boot.issuer);
+      expect(verify(null, Buffer.from(event.data.payload), issuer, Buffer.from(event.data.signature, "hex"))).toBe(true);
+      const receipt = JSON.parse(event.data.payload);
+      expect(receipt.request_hash).toBe(createHash("sha256").update(envelope.payload).digest("hex"));
+      expect(receipt.actor).toBe("worker");
+      expect(receipt.grant).toBe("progress-reader");
+      expect(receipt.action).toBe("status");
+      const progress = receipt.result.progress;
+      expect(event.id).toBe(progress.next_cursor ?? progress.resume_cursor);
+      return progress;
+    };
+    try {
+      expect(boot.features.progress_stream).toBe("omos.company-progress/v1");
+      expect(boot.features.max_progress_streams).toBe(4);
+      expect(boot.features.max_progress_seconds).toBe(30);
+      const view = await send("create_view", { revision: boot.revision, objective: "Retain and stream only this worker's document revisions" });
+      const operationLock = join(f.home, ".fx/authority", boot.workspace, "operation.lock");
+      const blocker = Bun.spawn(["python3", "-u", "-c", "import fcntl, sys\nwith open(sys.argv[1], 'r+') as lock:\n fcntl.flock(lock, fcntl.LOCK_EX)\n print('locked', flush=True)\n sys.stdin.read()\n", operationLock], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const blockedControllers = Array.from({ length: 5 }, () => new AbortController());
+      const pending: Promise<unknown>[] = [];
+      try {
+        const ready = await blocker.stdout.getReader().read();
+        expect(new TextDecoder().decode(ready.value)).toContain("locked");
+        let headersReturned = 0;
+        const admission: string[] = [];
+        for (const controller of blockedControllers) pending.push(progressStream(service.url, seal("status", { view: view.view, progress_cursor: "" }), controller).then(stream => { headersReturned++; admission.push(`HTTP ${stream.response.status}`); streams.push(stream); }, error => { admission.push(String(error)); }));
+        const probe = async () => {
+          const response = await subscribe(seal("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/not-written.txt", content: "Rejected before effects" }));
+          const status = response.response.status;
+          await response.close();
+          return status;
+        };
+        let deadline = Date.now() + 10000;
+        // A probing request can take the fourth slot itself. Start five readers
+        // and wait for the rejected fifth before probing the four held slots.
+        while (admission.length === 0) {
+          if (Date.now() >= deadline) throw Error(`Pending subscriptions did not occupy admission slots: ${JSON.stringify(admission)}\n${readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-5000)}`);
+          await Bun.sleep(20);
+        }
+        expect(admission).toEqual(["HTTP 429"]);
+        expect(headersReturned).toBe(1);
+        expect(await probe()).toBe(429);
+        for (const controller of blockedControllers) controller.abort();
+        await Promise.all(pending);
+        deadline = Date.now() + 10000;
+        for (;;) {
+          const status = await probe();
+          if (status === 400) break;
+          expect(status).toBe(429);
+          if (Date.now() >= deadline) throw Error("Cancellation did not release subscriptions waiting for the operation lock");
+          await Bun.sleep(20);
+        }
+      } finally {
+        for (const controller of blockedControllers) controller.abort();
+        blocker.stdin.end();
+        await blocker.exited;
+        await Promise.all(pending);
+      }
+      const occupied = await Promise.all(Array.from({ length: 4 }, () => subscribe(seal("status", { view: view.view, progress_cursor: "" }))));
+      for (const stream of occupied) {
+        expect(stream.response.status).toBe(200);
+        expect(stream.response.headers.get("content-type")).toBe("text/event-stream");
+        expect(stream.response.headers.get("cache-control")).toBe("no-store");
+      }
+      const busy = await subscribe(seal("status", { view: view.view, progress_cursor: "" }));
+      expect(busy.response.status).toBe(429);
+      await busy.close();
+      await occupied[0].close();
+      const admissionDeadline = Date.now() + 10000;
+      let replacement: Awaited<ReturnType<typeof progressStream>>;
+      for (;;) {
+        replacement = await subscribe(seal("status", { view: view.view, progress_cursor: "" }));
+        if (replacement.response.status === 200) break;
+        expect(replacement.response.status).toBe(429);
+        await replacement.close();
+        if (Date.now() >= admissionDeadline) throw Error("Cancelled subscription did not release admission");
+        await Bun.sleep(20);
+      }
+      await Promise.all([...occupied.slice(1), replacement].map(stream => stream.close()));
+      let head = view.revision;
+      const expected = [head];
+      for (let index = 0; index < 3; index++) {
+        head = (await send("checkpoint", { view: view.view, revision: head, path: `documents/team/${index}.txt`, content: "Scoped progress" })).revision;
+        expected.push(head);
+      }
+      const request = seal("status", { view: view.view, progress_cursor: "", limit: 1 });
+      const live = await subscribe(request);
+      expect(live.response.status).toBe(200);
+      let event = await live.next();
+      let page = inspect(event, request);
+      expect(page.events).toHaveLength(1);
+      expect(page.next_cursor).not.toBeNull();
+      const pinned = page.revision;
+      const seen = page.events.map((row: any) => row.revision);
+      head = (await send("checkpoint", { view: view.view, revision: head, path: "documents/team/arrived.txt", content: "Arrived while the stream was open" })).revision;
+      expected.push(head);
+      while (!seen.includes(head) || page.next_cursor !== null) {
+        event = await live.next(); page = inspect(event, request);
+        seen.push(...page.events.map((row: any) => row.revision));
+        expect(seen.length).toBeLessThan(100);
+      }
+      expect(pinned).not.toBe(head);
+      expect(page.revision).toBe(head);
+      expect(new Set(seen).size).toBe(seen.length);
+      for (const revision of expected) expect(seen).toContain(revision);
+      const resume = event.id!;
+      await live.close();
+      const rejected = await subscribe(seal("checkpoint", { view: view.view, revision: head, path: "documents/team/not-written.txt", content: "This must not execute through the stream transport" }));
+      expect(rejected.response.status).toBe(400);
+      await rejected.close();
+      expect((await send("status", { view: view.view })).revision).toBe(head);
+      service.child.kill(); await service.child.exited;
+      service = await startWorkspaceService(f, false);
+      const resumedRequest = seal("status", { view: view.view, progress_cursor: resume });
+      const resumed = await subscribe(resumedRequest);
+      expect(resumed.response.status).toBe(200);
+      const continued = inspect(await resumed.next(), resumedRequest);
+      expect(continued.events).toEqual([]);
+      const deadlineStarted = Date.now();
+      const ended = await resumed.next(40000).then(event => ({ event, error: null }), error => ({ event: null, error }));
+      if (ended.event !== null) expect(ended.event.event).toBe("end");
+      expect(Date.now() - deadlineStarted).toBeGreaterThan(25000);
+      expect(Date.now() - deadlineStarted).toBeLessThan(37000);
+      await resumed.close();
+      const expiringRequest = seal("status", { view: view.view, progress_cursor: resume, expires_ms: Date.now() + 5000 });
+      const expiring = await subscribe(expiringRequest);
+      expect(expiring.response.status).toBe(200);
+      inspect(await expiring.next(), expiringRequest);
+      const expired = await expiring.next();
+      expect(expired.event).toBe("error");
+      expect(expired.data.error).toBe("CompanyRequestExpired");
+      await expiring.close();
+      const revocableRequest = seal("status", { view: view.view, progress_cursor: resume });
+      const revocable = await subscribe(revocableRequest);
+      expect(revocable.response.status).toBe(200);
+      inspect(await revocable.next(), revocableRequest);
+      const current = await admin({ action: "status" });
+      await admin({ action: "revoke", revision: current.revision, id: "progress-reader" });
+      for (;;) {
+        const next = await revocable.next();
+        if (next.event === "error") { expect(next.data.error).toBe("CompanyAccessRevoked"); break; }
+        expect(inspect(next, revocableRequest).events).toEqual([]);
+      }
+      expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+    } finally {
+      await Promise.all(streams.map(stream => stream.close()));
+      service.child.kill(); await service.child.exited;
+    }
+  }, 240000);
+
   test("resumes signed company progress pages without losing concurrent revisions or crossing view authority", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "ensure", "--json"])).code).toBe(0);
@@ -1461,6 +1670,7 @@ sys.exit(result.returncode)
     const legacy = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
     legacy.spec.semantic.entityTypes = legacy.spec.semantic.entityTypes.filter((entity: any) => !["omos_company_read", "omos_company_submission", "omos_company_upload"].includes(entity.id));
     delete legacy.spec.semantic.entityTypes.find((entity: any) => entity.id === "omos_workspace_view").fields.reads;
+    legacy.spec.operations = legacy.spec.operations.filter((operation: any) => operation.id !== "omos_company_subscription");
     const legacyInput = legacy.spec.operations.find((operation: any) => operation.id === "omos_company_operation").input.properties;
     legacyInput.version = { const: "omos.company/v1" };
     delete legacyInput.executable;
@@ -1506,9 +1716,13 @@ sys.exit(result.returncode)
       expect(boot.features.checkpoint_attributes).toBe(false);
       expect(boot.features.chunked_upload).toBe(false);
       expect(boot.features.progress_history).toBe(false);
+      expect(boot.features.progress_stream).toBeNull();
       const view = await send("create_view", { revision: boot.revision, objective: "Retain the company report while upgrading its input model" });
       const saved = await send("checkpoint", { view: view.view, revision: view.revision, path: "documents/team/report.md", content: "Retained legacy report" });
       expect(JSON.parse(f.fossil("cat", `company/views/${view.view}.json`, "-r", "omos-company")).reads).toBeUndefined();
+      const unavailableStream = await progressStream(service.url, request("status", { view: view.view, progress_cursor: "" }));
+      expect(unavailableStream.response.status).toBe(400);
+      await unavailableStream.close();
       const beforeRead = (await admin({ action: "status" })).revision;
       const refused = await post(request("read", { view: view.view, path: "documents/team/report.md" }));
       expect(refused.status).toBe(400);
@@ -1527,6 +1741,12 @@ sys.exit(result.returncode)
       expect(upgraded.features.checkpoint_attributes).toBe(true);
       expect(upgraded.features.chunked_upload).toBe(true);
       expect(upgraded.features.progress_history).toBe(true);
+      expect(upgraded.features.progress_stream).toBe("omos.company-progress/v1");
+      const availableStream = await progressStream(service.url, request("status", { view: view.view, progress_cursor: "" }));
+      try {
+        expect(availableStream.response.status).toBe(200);
+        expect((await availableStream.next()).event).toBe("workspace");
+      } finally { await availableStream.close(); }
       const read = await send("read", { view: view.view, path: "documents/team/report.md" });
       expect(read.read_tracking).toBe("recorded");
       expect(Buffer.from(read.content, "base64").toString()).toBe("Retained legacy report");
