@@ -378,12 +378,25 @@ files, and the selected revision before changing a view. Files are restored
 with private permissions: `600` for regular files and `700` for executables.
 Text edits preserve an existing executable flag; mode-only edits are checkpointed
 and verified against the committed Fossil manifest. Filesystem ACLs and special
-permission bits are not portable workspace data. Version 1 baselines are
-upgraded without discarding local drafts. Divergent changes stop with
+permission bits are not portable workspace data. Earlier baselines are
+upgraded without discarding local drafts. Version 3 tracks only materialised
+canonical files. New views remain empty until file tools request content or
+skill discovery requests its instruction indexes. File mutations fetch the
+target before permission preflight, preserving existing-file approval rules.
+File searches fetch the selected managed directory; loading a skill fetches its
+package. Shell execution fetches the complete personal view before the process
+starts, since arbitrary operating-system reads cannot use the tool hook.
+Hydration and checkpoints share a kernel-owned projection lock. Content hashes
+are computed and materialised in separate per-file allocation scopes rather
+than retaining every fetched body. A private hydration intent retains expected
+hashes before writing files. Recovery adopts present files and preserves their
+local edits; it never treats an unwritten intent entry as a deletion. Baseline
+metadata is bounded to 8 MiB before atomic publication. Divergent changes stop with
 `WorkspaceProjectionConflict`; local drafts remain available. Deletions require
 a known baseline. A view with uncheckpointed edits must not be discarded as
-cache garbage. The current implementation materializes the mutable file tree;
-it does not provide a transparent remote filesystem.
+cache garbage. Views retain the existing limits of 8 MiB per file, 256 MiB of
+materialised content, and 10,000 files. This does not provide a transparent remote
+filesystem, automatic view eviction, or a sandbox for company actors.
 
 Task context lists bounded memory and skill inventories independently of body
 previews. Oversized files remain discoverable through `omos_memory` and
@@ -816,8 +829,10 @@ does not create another host checkout for each actor. Agent filesystem views
 remain separate. Dirty host scratch is retained in a private recovery directory
 before rebuilding, including when its revision has not changed. Recovery copies
 and earlier cache layouts are retained; they are not silently evicted. These host
-checkouts can still materialize a complete revision. Sparse client files and
-caching for task projections require further implementation. Scoped exports
+checkouts can still materialize a complete revision. Personal task tools fetch
+their selected files on demand; arbitrary shell commands hydrate the full view.
+Shared caching and safe eviction for these task projections require further
+implementation. Scoped exports
 use the bounded profile object cache described above.
 
 Mutations retain a request hash and pending outcome before effects. Completed

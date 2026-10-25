@@ -14,6 +14,15 @@ changes. It loads changed bodies on demand and rechecks their hashes, sizes,
 and executable flags before committing. A concurrent edit leaves the previous
 baseline intact for the next checkpoint.
 
+New task views start without document bodies. Ordinary file reads and mutations
+materialise the requested managed path before permission preflight. File searches
+materialise their selected directory. Skill discovery retrieves `SKILL.md`
+indexes; loading a skill retrieves its package. Shell commands hydrate the whole
+personal view because a process can open paths without calling the file tools.
+The baseline tracks only materialised files, so unfetched content cannot become
+a deletion. Parallel hydration and checkpoints share a projection lock. This is
+a tool-driven sparse projection, rather than a transparent filesystem mount.
+
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
 Its read action returns UTF-8 byte slices of JSON containing the original

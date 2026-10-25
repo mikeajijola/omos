@@ -509,6 +509,14 @@ pub const Manager = struct {
         return .{ .file = file };
     }
 
+    /// Serializes disposable projection metadata independently of canonical
+    /// writes. Parallel tools must never lose another materialised baseline.
+    pub fn projectionLease(self: Manager, task: Task) !ExecutionLease {
+        const key = try hash(self.alloc, try @import("filesystem_projection.zig").directory(self, task));
+        const lease = try Lease.acquireControlled(self.alloc, self.root, try self.alloc.print("projection-{s}.lock", .{key}), self.operation_control);
+        return .{ .file = lease.file };
+    }
+
     const company_branch = "omos-company";
     const runtime_branch = "omos-runtime";
     pub const CompanyFile = struct { path: []const u8, content: []const u8 };

@@ -8,9 +8,10 @@ const workspace = @import("fossil_workspace.zig");
 const records = @import("../shared/record_json.zig");
 
 const Entry = struct { path: []const u8, sha256: []const u8, executable: bool = false };
-const Baseline = struct { version: u32 = 2, workspace: []const u8, task: []const u8, revision: []const u8, entries: []const Entry };
+const Pending = struct { revision: []const u8, entries: []const Entry };
+const Baseline = struct { version: u32 = 3, workspace: []const u8, task: []const u8, revision: []const u8, entries: []const Entry, pending: ?Pending = null };
 const File = struct { path: []const u8, bytes: usize, sha256: []const u8, executable: bool };
-const Desired = struct { path: []const u8, content: ?[]const u8, sha256: []const u8, executable: bool };
+const Desired = struct { path: []const u8, sha256: []const u8, executable: bool };
 const roots = [_][]const u8{ "memory/", "skills/", "documents/", "artifacts/", "ui/" };
 const max_file_bytes = 8 * 1024 * 1024;
 const max_view_bytes = 256 * 1024 * 1024;
@@ -142,7 +143,7 @@ fn baseline(manager: workspace.Manager, task: workspace.Task) !?Baseline {
         break :blk try io_mod.readFileToEnd(manager.alloc, &file, max_file_bytes);
     };
     const value = try records.decode(Baseline, manager.alloc, bytes, .{});
-    if ((value.version != 1 and value.version != 2) or !std.mem.eql(u8, value.workspace, manager.manifest.id) or !std.mem.eql(u8, value.task, task.id)) return error.WorkspaceProjectionMismatch;
+    if ((value.version != 1 and value.version != 2 and value.version != 3) or !std.mem.eql(u8, value.workspace, manager.manifest.id) or !std.mem.eql(u8, value.task, task.id)) return error.WorkspaceProjectionMismatch;
     return value;
 }
 
@@ -177,17 +178,43 @@ fn atomicWrite(alloc: std.mem.Allocator, parent: std.Io.Dir, name: []const u8, b
 }
 
 fn saveBaseline(manager: workspace.Manager, task: workspace.Task, revision_id: []const u8, entries: []const Entry) !void {
+    try saveState(manager, task, .{ .workspace = manager.manifest.id, .task = task.id, .revision = revision_id, .entries = entries });
+}
+
+fn saveState(manager: workspace.Manager, task: workspace.Task, value: Baseline) !void {
     const path = try baselinePath(manager, task);
     const parent_path = std.Io.Dir.path.dirname(path).?;
     _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), parent_path, .fromMode(0o700));
     var parent = try io_mod.openDirAbsoluteNoFollow(parent_path, .{ .iterate = true });
     defer parent.close(io_mod.getIo());
-    try atomicWrite(manager.alloc, parent, std.Io.Dir.path.basename(path), try std.json.Stringify.valueAlloc(manager.alloc, Baseline{ .workspace = manager.manifest.id, .task = task.id, .revision = revision_id, .entries = entries }, .{}), false);
+    const bytes = try std.json.Stringify.valueAlloc(manager.alloc, value, .{});
+    if (bytes.len > max_file_bytes) return error.WorkspaceProjectionTooLarge;
+    try atomicWrite(manager.alloc, parent, std.Io.Dir.path.basename(path), bytes, false);
 }
 
 /// Compare all hashes before modifying the view. Interrupted materialisation
 /// can be repeated; local changes are never overwritten by a different revision.
 pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
+    const lease = try manager.projectionLease(task);
+    defer lease.release();
+    try materialise(manager, task, .{});
+}
+
+const Selection = struct {
+    all: bool = false,
+    path: ?[]const u8 = null,
+    skill_index: bool = false,
+
+    fn includes(self: Selection, path: []const u8) bool {
+        if (self.all) return true;
+        if (self.skill_index and std.mem.startsWith(u8, path, "skills/") and std.mem.endsWith(u8, path, "/SKILL.md")) return true;
+        const prefix = self.path orelse return false;
+        return prefix.len == 0 or std.mem.eql(u8, prefix, path) or (std.mem.startsWith(u8, path, prefix) and path.len > prefix.len and path[prefix.len] == '/');
+    }
+};
+
+fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Selection) !void {
+    if (manager.operation_control) |control| try control.check();
     var previous = try baseline(manager, task);
     const view = io_mod.openDirAbsoluteNoFollow(try directory(manager, task), .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -195,25 +222,32 @@ pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
     };
     if (view) |opened| opened.close(io_mod.getIo()) else previous = null;
     const revision_id = try manager.currentRevision(task);
-    if (previous) |saved| if (saved.version == 2 and std.mem.eql(u8, saved.revision, revision_id)) return;
+    if (previous) |saved| if (saved.version == 3 and saved.pending == null and std.mem.eql(u8, saved.revision, revision_id) and !selection.all and selection.path == null and !selection.skill_index) return;
     const local = try localFiles(manager, task);
-    const old = if (previous) |value| value.entries else &.{};
+    const old = try priorEntries(manager.alloc, previous, local);
     const changed = if (previous) |saved| try manager.changedPaths(saved.revision, revision_id) else &.{};
     var desired: std.ArrayList(Desired) = .empty;
     var entries: std.ArrayList(Entry) = .empty;
     var total: usize = 0;
     for (try manager.fileManifest(revision_id)) |metadata| {
+        if (manager.operation_control) |control| try control.check();
         const path = metadata.path;
         if (!writable(path)) continue;
+        const prior = lookup(old, path);
+        const current_file = fileByPath(local, path);
+        if (prior == null and current_file == null and !selection.includes(path)) continue;
         if (metadata.mode == .symlink) return error.WorkspaceProjectionSymlink;
         const executable = metadata.mode == .executable;
-        const prior = lookup(old, path);
         const altered = previous == null or prior == null or for (changed) |entry| {
             if (std.mem.eql(u8, entry, path)) break true;
         } else false;
-        const current_file = fileByPath(local, path);
         const need_bytes = altered or (current_file == null and prior == null);
-        const bytes: ?[]const u8 = if (need_bytes) try manager.contentAt(path, revision_id) else null;
+        var page_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer page_arena.deinit();
+        var page_manager = manager;
+        page_manager.alloc = page_arena.allocator();
+        const bytes: ?[]const u8 = if (need_bytes) try page_manager.contentAt(path, revision_id) else null;
+        if (bytes) |value| if (value.len > max_file_bytes) return error.WorkspaceProjectionTooLarge;
         total = try std.math.add(usize, total, if (bytes) |value| value.len else if (current_file) |value| value.bytes else 0);
         if (total > max_view_bytes or entries.items.len >= max_files) return error.WorkspaceProjectionTooLarge;
         const digest = if (bytes) |value| try workspace.hash(manager.alloc, value) else prior.?.sha256;
@@ -221,22 +255,35 @@ pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
         const current = fileByPath(local, path);
         const observed = if (current) |file| state(file) else null;
         if (!equal(observed, prior) and !equal(observed, expected) and !equal(prior, expected)) return error.WorkspaceProjectionConflict;
-        try desired.append(manager.alloc, .{ .path = path, .content = bytes, .sha256 = digest, .executable = executable });
+        try desired.append(manager.alloc, .{ .path = path, .sha256 = digest, .executable = executable });
         try entries.append(manager.alloc, expected);
     }
     for (old) |entry| {
         if (lookup(entries.items, entry.path) != null) continue;
         if (fileByPath(local, entry.path)) |file| if (!equal(state(file), entry)) return error.WorkspaceProjectionConflict;
     }
+    // Retain expected hashes before the first write. Recovery adopts only
+    // present files; an unwritten pending file can never become a deletion.
+    try saveState(manager, task, .{ .workspace = manager.manifest.id, .task = task.id, .revision = if (previous) |saved| saved.revision else revision_id, .entries = old, .pending = .{ .revision = revision_id, .entries = entries.items } });
     const root = try directory(manager, task);
     for (desired.items) |file| {
+        if (manager.operation_control) |control| try control.check();
         const current = fileByPath(local, file.path);
         const observed = if (current) |value| state(value) else null;
         const expected: Entry = .{ .path = file.path, .sha256 = file.sha256, .executable = file.executable };
         if (!equal(observed, lookup(old, file.path)) or equal(observed, expected)) continue;
         var parent = try parentDirectory(manager.alloc, root, file.path);
         defer parent.close(io_mod.getIo());
-        try atomicWrite(manager.alloc, parent, std.Io.Dir.path.basename(file.path), file.content orelse try manager.contentAt(file.path, revision_id), file.executable);
+        var page_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer page_arena.deinit();
+        var page_manager = manager;
+        page_manager.alloc = page_arena.allocator();
+        const body = try page_manager.contentAt(file.path, revision_id);
+        if (!std.mem.eql(u8, try workspace.hash(page_manager.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        try atomicWrite(manager.alloc, parent, std.Io.Dir.path.basename(file.path), body, file.executable);
+        if (comptime !@import("build_options").libfx) if (io_mod.getenv("FX_E2E_FOSSIL_FAULT")) |point| {
+            if (std.mem.eql(u8, point, "projection_after_file")) return error.WorkspaceInjectedFailure;
+        };
     }
     for (old) |entry| {
         if (lookup(entries.items, entry.path) != null or fileByPath(local, entry.path) == null) continue;
@@ -247,10 +294,32 @@ pub fn prepare(manager: workspace.Manager, task: workspace.Task) !void {
     try saveBaseline(manager, task, revision_id, entries.items);
 }
 
+fn priorEntries(alloc: std.mem.Allocator, previous: ?Baseline, local: []const File) ![]const Entry {
+    const saved = previous orelse return &.{};
+    var entries: std.ArrayList(Entry) = .empty;
+    try entries.appendSlice(alloc, saved.entries);
+    if (saved.pending) |pending| for (pending.entries) |entry| {
+        const observed = fileByPath(local, entry.path) orelse continue;
+        const index = for (entries.items, 0..) |prior, index| {
+            if (std.mem.eql(u8, prior.path, entry.path)) break index;
+        } else null;
+        if (index) |i| {
+            if (!equal(state(observed), entries.items[i])) entries.items[i] = entry;
+        } else try entries.append(alloc, entry);
+    };
+    return entries.items;
+}
+
 /// No baseline advancement occurs before the complete batch is committed. A
 /// crash after the commit can retry by matching the canonical desired hashes.
 pub fn checkpoint(manager: workspace.Manager, task: workspace.Task) !bool {
-    const saved = (try baseline(manager, task)) orelse return error.WorkspaceProjectionMissing;
+    const lease = try manager.projectionLease(task);
+    defer lease.release();
+    var saved = (try baseline(manager, task)) orelse return error.WorkspaceProjectionMissing;
+    if (saved.pending != null) {
+        try materialise(manager, task, .{});
+        saved = (try baseline(manager, task)) orelse return error.WorkspaceProjectionMissing;
+    }
     const local = try localFiles(manager, task);
     var changes: std.ArrayList(workspace.Manager.ContentChange) = .empty;
     var entries: std.ArrayList(Entry) = .empty;
@@ -278,7 +347,125 @@ pub fn skillsDirectory(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const
     const id = session orelse return null;
     const manager = (try workspace.Manager.bound(alloc)) orelse return null;
     const task = (try manager.active(id)) orelse return null;
+    if (task.authority != null) return error.CompanyExecutionIsolationRequired;
+    const lease = try manager.projectionLease(task);
+    defer lease.release();
+    try materialise(manager, task, .{ .skill_index = true });
     return try std.Io.Dir.path.join(alloc, &.{ try directory(manager, task), "skills" });
+}
+
+/// Hydrate only a requested managed path before ordinary permission preflight.
+/// An opaque process can open arbitrary files, so shell execution explicitly
+/// hydrates its complete personal view instead of exposing missing placeholders.
+/// This changes caches, never canonical content or the tool's permission policy.
+pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: []const u8, name: []const u8, raw: []const u8, cancel_flag: ?*std.atomic.Value(bool)) !void {
+    if (comptime builtin.target.cpu.arch.isWasm()) return;
+    const id = session orelse return;
+    const process_access = std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "run_command");
+    const skill = std.mem.eql(u8, name, "skill") or std.mem.eql(u8, name, "install_skill");
+    const file = std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "glob_files") or std.mem.eql(u8, name, "grep_files");
+    if (!process_access and !skill and !file) return;
+    const arguments = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer arguments.deinit();
+    if (arguments.value != .object) return;
+    var manager = (try workspace.Manager.bound(alloc)) orelse return;
+    var cancelled = std.atomic.Value(bool).init(false);
+    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    const task = (try manager.active(id)) orelse return;
+    if (task.authority != null) return error.CompanyExecutionIsolationRequired;
+    if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
+    const root = try directory(manager, task);
+    var selection: Selection = .{ .all = process_access };
+    if (skill) {
+        // Discovery reads only SKILL.md. Loading or installing a package makes
+        // its executable resources available to the unchanged skill runtime.
+        selection.path = "skills";
+        if (arguments.value.object.get("name")) |package_name| if (package_name == .string and @import("company_authority.zig").safeIdentity(package_name.string)) {
+            selection.path = try alloc.print("skills/{s}", .{package_name.string});
+        };
+        if (arguments.value.object.get("location")) |location| if (location == .string) {
+            const path = try relativeManagedPath(alloc, project, root, location.string);
+            if (path) |value| selection.path = std.Io.Dir.path.dirname(value) orelse value;
+        };
+    } else if (file) {
+        const path = arguments.value.object.get("path");
+        if (path != null and path.? != .string) return;
+        var requested = if (path) |value| value.string else ".";
+        if (std.mem.eql(u8, name, "glob_files")) {
+            if (arguments.value.object.get("pattern")) |pattern| if (pattern == .string) {
+                requested = try std.Io.Dir.path.resolve(alloc, &.{ project, requested, globDirectory(pattern.string) });
+            };
+        } else if (path == null) return;
+        selection.path = (try relativeManagedPath(alloc, project, root, requested)) orelse return;
+    }
+    const lease = try manager.projectionLease(task);
+    defer lease.release();
+    try materialise(manager, task, selection);
+}
+
+fn globDirectory(pattern: []const u8) []const u8 {
+    var end = pattern.len;
+    for (pattern, 0..) |byte, index| if (byte == '*' or byte == '?' or byte == '[' or byte == '{') {
+        end = index;
+        break;
+    };
+    const slash = std.mem.findScalarLast(u8, pattern[0..end], '/') orelse return ".";
+    return pattern[0..@max(slash, 1)];
+}
+
+fn relativeManagedPath(alloc: std.mem.Allocator, project: []const u8, root: []const u8, input: []const u8) !?[]const u8 {
+    const resolved = try std.Io.Dir.path.resolve(alloc, &.{ project, input });
+    if (std.mem.eql(u8, root, resolved)) return "";
+    if (!std.mem.startsWith(u8, resolved, root) or resolved.len <= root.len or resolved[root.len] != '/') return null;
+    const path = resolved[root.len + 1 ..];
+    for (roots) |prefix| if (std.mem.eql(u8, path, prefix[0 .. prefix.len - 1]) or std.mem.startsWith(u8, path, prefix)) return path;
+    return null;
+}
+
+test "sparse projection selection respects path components and skill indexes" {
+    try std.testing.expectEqualStrings("/Users/example/view/documents", globDirectory("/Users/example/view/documents/**/*.md"));
+    try std.testing.expectEqualStrings("documents", globDirectory("documents/one.txt"));
+    try std.testing.expectEqualStrings(".", globDirectory("*.md"));
+    try std.testing.expect((Selection{ .path = "documents/one" }).includes("documents/one"));
+    try std.testing.expect((Selection{ .path = "documents/one" }).includes("documents/one/a.txt"));
+    try std.testing.expect(!(Selection{ .path = "documents/one" }).includes("documents/one-other/a.txt"));
+    try std.testing.expect((Selection{ .skill_index = true }).includes("skills/career/SKILL.md"));
+    try std.testing.expect(!(Selection{ .skill_index = true }).includes("skills/career/data.json"));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const root = "/Users/example/project/.fx/workspaces/workspace/task";
+    try std.testing.expectEqualStrings("documents/a.txt", (try relativeManagedPath(alloc, "/Users/example/project", root, ".fx/workspaces/workspace/task/documents/a.txt")).?);
+    try std.testing.expect((try relativeManagedPath(alloc, "/Users/example/project", root, ".fx/workspaces/workspace/task-other/documents/a.txt")) == null);
+    try std.testing.expect((try relativeManagedPath(alloc, "/Users/example/project", root, ".fx/workspaces/workspace/task/documents/../../outside.txt")) == null);
+}
+
+test "sparse projection recovers fetched pending entries without inventing deletions or losing edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const saved = Baseline{ .workspace = "workspace", .task = "task", .revision = "before", .entries = &.{.{ .path = "documents/old", .sha256 = "old" }}, .pending = .{ .revision = "after", .entries = &.{
+        .{ .path = "documents/old", .sha256 = "new" },
+        .{ .path = "documents/fetched", .sha256 = "canonical" },
+        .{ .path = "documents/unfetched", .sha256 = "canonical" },
+    } } };
+    const local = [_]File{
+        .{ .path = "documents/old", .sha256 = "old", .bytes = 3, .executable = false },
+        .{ .path = "documents/fetched", .sha256 = "unsaved-edit", .bytes = 12, .executable = false },
+    };
+    const recovered = try priorEntries(alloc, saved, &local);
+    try std.testing.expectEqual(@as(usize, 2), recovered.len);
+    try std.testing.expectEqualStrings("old", lookup(recovered, "documents/old").?.sha256);
+    try std.testing.expectEqualStrings("canonical", lookup(recovered, "documents/fetched").?.sha256);
+    try std.testing.expect(lookup(recovered, "documents/unfetched") == null);
+    // An already known file that was deleted stays known, unlike an unfetched
+    // pending file; checkpointing can retain that deliberate local deletion.
+    const deleted = try priorEntries(alloc, saved, &.{});
+    try std.testing.expectEqual(@as(usize, 1), deleted.len);
+    try std.testing.expect(lookup(deleted, "documents/old") != null);
 }
 
 test "filesystem projection scans bodies with bounded metadata allocation" {

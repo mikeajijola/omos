@@ -361,6 +361,19 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
             .not_available => .not_registered,
         };
     };
+    if (ctx.fossil_workspace_available and spec.executor_kind != .host) {
+        @import("../workspace/filesystem_projection.zig").prepareForTool(
+            arena,
+            ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id,
+            ctx.workspace_root,
+            call.name,
+            call.arguments_json,
+            runtimeCancelFlag(ctx),
+        ) catch |err| {
+            if (err == error.Cancelled or err == error.OutOfMemory) return err;
+            return .{ .failure = try arena.print("Workspace content could not be materialised: {s}", .{@errorName(err)}) };
+        };
+    }
     switch (spec.executor_kind) {
         // Preserve execution-time argument failures for MCP control tool calls.
         .mcp_select_tool, .mcp_features => return .{ .valid = .{} },

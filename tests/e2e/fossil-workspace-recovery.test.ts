@@ -2101,8 +2101,9 @@ sys.exit(result.returncode)
     expect(new Set([...views.values()]).size).toBe(5);
     for (const task of retained) {
       expect(f.fossil("cat", "memory/preference.md", "-r", task.branch)).toBe(`Personal value ${task.phase}`);
-      expect(readFileSync(join(views.get(task.phase)!, "memory/preference.md"), "utf8")).toBe(`Personal value ${task.phase}`);
-      expect(readFileSync(join(views.get(task.phase)!, "documents/shared.txt"), "utf8")).toBe(shared);
+      expect(existsSync(join(views.get(task.phase)!, "memory/preference.md"))).toBe(false);
+      expect(existsSync(join(views.get(task.phase)!, "documents/shared.txt"))).toBe(false);
+      expect(f.fossil("cat", "documents/shared.txt", "-r", task.branch)).toBe(shared);
     }
   }, 240000);
 
@@ -3403,7 +3404,7 @@ sys.exit(result.returncode)
     model(clean, (body, count) => {
       const root = rootFrom(body);
       if (count === 1) {
-        expect(statSync(join(root, path)).mode & 0o777).toBe(0o700);
+        expect(existsSync(join(root, path))).toBe(false);
         return call("shell", { request: { action: "run", command: `test -x ${quote(join(root, path))} && ${quote(join(root, path))}`, timeout_ms: 10000 } });
       }
       if (count === 2) {
@@ -3461,8 +3462,9 @@ sys.exit(result.returncode)
     model(clean, (body, count) => {
       const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
       const root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
-      expect(readFileSync(join(root, "skills/portable-skill/SKILL.md"), "utf8")).toBe(instructions);
-      expect(readFileSync(join(root, "skills/portable-skill/run.mjs"), "utf8")).toBe(program);
+      if (count >= 2) expect(readFileSync(join(root, "skills/portable-skill/SKILL.md"), "utf8")).toBe(instructions);
+      if (count <= 2) expect(existsSync(join(root, "skills/portable-skill/run.mjs"))).toBe(false);
+      else expect(readFileSync(join(root, "skills/portable-skill/run.mjs"), "utf8")).toBe(program);
       if (count === 1) return { tool_calls: [{ index: 0, id: "find-restored", type: "function", function: { name: "capability_search", arguments: JSON.stringify({ query: "portable skill" }) } }] };
       if (count === 2) return { tool_calls: [{ index: 0, id: "load-restored", type: "function", function: { name: "skill", arguments: JSON.stringify({ name: "portable-skill" }) } }] };
       if (count === 3) {
@@ -3510,13 +3512,114 @@ sys.exit(result.returncode)
       expect(match).not.toBeNull();
       const rebuilt = JSON.parse(match![1]);
       expect(rebuilt).not.toBe(workingDirectory);
-      expect(readFileSync(join(rebuilt, "memory", "portable.md"), "utf8")).toContain("ordinary file tool");
-      expect(readFileSync(join(rebuilt, "documents", "report.txt"), "utf8")).toBe("Report from shell");
+      if (count === 1) {
+        expect(existsSync(join(rebuilt, "memory", "portable.md"))).toBe(false);
+        expect(existsSync(join(rebuilt, "documents", "report.txt"))).toBe(false);
+      } else {
+        expect(existsSync(join(rebuilt, "memory", "portable.md"))).toBe(false);
+        expect(readFileSync(join(rebuilt, "documents", "report.txt"), "utf8")).toBe("Report from shell");
+      }
       if (count === 1) return { tool_calls: [{ index: 0, id: "inspect-portable", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: join(rebuilt, "documents", "report.txt") }) } }] };
       return { content: "The report was restored from the portable workspace." };
     });
     const restored = await clean.run(["ask", "Read the portable report", "--json"]);
     expect(restored.code, restored.stderr).toBe(0);
+  }, 120000);
+
+  test("materialises requested paths without deleting unfetched content and hydrates opaque shell reads", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let root = "";
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      const call = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: `sparse-${count}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+      if (count === 1) return call("fossil_workspace", { action: "write", path: "documents/one.txt", content: "Pinned first document" });
+      if (count === 2) return call("fossil_workspace", { action: "write", path: "documents/unfetched.txt", content: "Keep this unread file" });
+      if (count === 3) {
+        expect(existsSync(join(root, "documents/one.txt"))).toBe(false);
+        expect(existsSync(join(root, "documents/unfetched.txt"))).toBe(false);
+        return call("read_file", { path: join(root, "documents/one.txt") });
+      }
+      if (count === 4) {
+        expect(readFileSync(join(root, "documents/one.txt"), "utf8")).toBe("Pinned first document");
+        expect(existsSync(join(root, "documents/unfetched.txt"))).toBe(false);
+        return call("edit_file", { path: join(root, "documents/unfetched.txt"), old_string: "Keep", new_string: "Retain" });
+      }
+      if (count === 5) {
+        expect(readFileSync(join(root, "documents/unfetched.txt"), "utf8")).toBe("Retain this unread file");
+        return call("fossil_workspace", { action: "write", path: "memory/shell-only.txt", content: "Available to opaque commands" });
+      }
+      if (count === 6) {
+        expect(existsSync(join(root, "memory/shell-only.txt"))).toBe(false);
+        return call("shell", { request: { action: "run", command: `cat '${root}/memory/shell-only.txt'`, timeout_ms: 10000 } });
+      }
+      expect(readFileSync(join(root, "memory/shell-only.txt"), "utf8")).toBe("Available to opaque commands");
+      return { content: "Read and edited the requested records while preserving all workspace content." };
+    });
+    const result = await f.run(["ask", "Read and edit workspace documents using their pinned files", "--json"], {}, 120000);
+    expect(result.code, result.stderr).toBe(0);
+    expect(f.fossil("cat", "documents/one.txt", "-r", "trunk")).toBe("Pinned first document");
+    expect(f.fossil("cat", "documents/unfetched.txt", "-r", "trunk")).toBe("Retain this unread file");
+    expect(f.fossil("cat", "memory/shell-only.txt", "-r", "trunk")).toBe("Available to opaque commands");
+  }, 150000);
+
+  test("searches sparse managed directories using absolute globs and scoped text queries", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      const call = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: `sparse-search-${count}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+      if (count === 1) return { tool_calls: [
+        { path: "documents/narrow/one.txt", content: "Narrow retained input" },
+        { path: "documents/wide/two.txt", content: "Wide retained input" },
+      ].map((file, index) => ({ index, id: `search-seed-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...file }) } })) };
+      if (count === 2) {
+        expect(existsSync(join(root, "documents/narrow/one.txt"))).toBe(false);
+        expect(existsSync(join(root, "documents/wide/two.txt"))).toBe(false);
+        return call("glob_files", { pattern: join(root, "documents/narrow/*.txt") });
+      }
+      if (count === 3) {
+        expect(readFileSync(join(root, "documents/narrow/one.txt"), "utf8")).toBe("Narrow retained input");
+        expect(existsSync(join(root, "documents/wide/two.txt"))).toBe(false);
+        expect(body.messages.some((message: any) => message.role === "tool" && message.content?.includes("one.txt"))).toBe(true);
+        return call("grep_files", { pattern: "Wide retained", path: join(root, "documents/wide") });
+      }
+      expect(readFileSync(join(root, "documents/wide/two.txt"), "utf8")).toBe("Wide retained input");
+      expect(body.messages.some((message: any) => message.role === "tool" && message.content?.includes("Wide retained input"))).toBe(true);
+      return { content: "The requested file and text searches found their pinned content." };
+    });
+    const result = await f.run(["ask", "Find retained documents with file and text search", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+  }, 90000);
+
+  test("recovers interrupted hydration without deleting unwritten files or replaying a shell", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let calls = 0;
+    model(f, (body, count) => {
+      calls = count;
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      const call = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: `hydrate-recovery-${count}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+      if (count === 1 || count === 2) return call("fossil_workspace", { action: "write", path: `documents/${count}.txt`, content: `Retained document ${count}` });
+      if (count === 3) return call("shell", { request: { action: "run", command: `touch '${root}/documents/must-not-run'`, timeout_ms: 10000 } });
+      expect(existsSync(join(root, "documents/must-not-run"))).toBe(false);
+      expect(readFileSync(join(root, "documents/1.txt"), "utf8")).toBe("Retained document 1");
+      expect(existsSync(join(root, "documents/2.txt"))).toBe(false);
+      if (count === 4) {
+        expect(body.messages.some((message: any) => message.role === "tool" && message.content?.includes("WorkspaceInjectedFailure"))).toBe(true);
+        return call("read_file", { path: join(root, "documents/1.txt") });
+      }
+      return { content: "The requested document is readable and both canonical files remain retained. The interrupted shell did not run." };
+    });
+    const result = await f.run(["ask", "Retain both documents and inspect the first after a hydration failure", "--json"], { FX_E2E_FOSSIL_FAULT: "projection_after_file" }, 90000);
+    expect(result.code, result.stderr).toBe(0);
+    expect(calls).toBe(5);
+    expect(f.fossil("cat", "documents/1.txt", "-r", "trunk")).toBe("Retained document 1");
+    expect(f.fossil("cat", "documents/2.txt", "-r", "trunk")).toBe("Retained document 2");
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain("must-not-run");
   }, 120000);
 
   test("accepts current coding validation through a compact host receipt and preserves its proof chain", async () => {
