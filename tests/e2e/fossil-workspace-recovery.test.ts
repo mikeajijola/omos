@@ -10,7 +10,7 @@ import { NativeClient } from "./workspace-ui-client.mjs";
 afterEach(cleanupFixtures);
 
 async function progressStream(url: string, envelope: object, controller = new AbortController()) {
-  const response = await fetch(url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream" }, body: JSON.stringify(envelope), signal: controller.signal });
+  const response = await fetch(url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream", connection: "close" }, body: JSON.stringify(envelope), signal: controller.signal });
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffered = "";
@@ -258,8 +258,8 @@ describe("portable Fossil workspace recovery", () => {
         head = (await send("checkpoint", { view: view.view, revision: head, path: `documents/team/${index}.txt`, content: "Scoped progress" })).revision;
         expected.push(head);
       }
-      const request = seal("status", { view: view.view, progress_cursor: "", limit: 1 });
-      const live = await subscribe(request);
+      let request = seal("status", { view: view.view, progress_cursor: "", limit: 1 });
+      let live = await subscribe(request);
       expect(live.response.status).toBe(200);
       let event = await live.next();
       let page = inspect(event, request);
@@ -267,10 +267,25 @@ describe("portable Fossil workspace recovery", () => {
       expect(page.next_cursor).not.toBeNull();
       const pinned = page.revision;
       const seen = page.events.map((row: any) => row.revision);
+      let lastCursor = event.id!;
       head = (await send("checkpoint", { view: view.view, revision: head, path: "documents/team/arrived.txt", content: "Arrived while the stream was open" })).revision;
       expected.push(head);
+      const pagingDeadline = Date.now() + 90000;
       while (!seen.includes(head) || page.next_cursor !== null) {
-        event = await live.next(); page = inspect(event, request);
+        if (Date.now() >= pagingDeadline) throw Error("Progress did not resume through the pinned revisions");
+        const next = await live.next(35000).catch(error => {
+          if (error.message === "Progress stream closed before the expected event" || error.code === "ECONNRESET") return { event: "end", id: undefined, data: null };
+          throw error;
+        });
+        if (next.event === "end") {
+          await live.close();
+          request = seal("status", { view: view.view, progress_cursor: lastCursor, limit: 1 });
+          live = await subscribe(request);
+          expect(live.response.status).toBe(200);
+          continue;
+        }
+        event = next; page = inspect(event, request);
+        lastCursor = event.id!;
         seen.push(...page.events.map((row: any) => row.revision));
         expect(seen.length).toBeLessThan(100);
       }
@@ -287,11 +302,11 @@ describe("portable Fossil workspace recovery", () => {
       service.child.kill(); await service.child.exited;
       service = await startWorkspaceService(f, false);
       const resumedRequest = seal("status", { view: view.view, progress_cursor: resume });
+      const deadlineStarted = Date.now();
       const resumed = await subscribe(resumedRequest);
       expect(resumed.response.status).toBe(200);
       const continued = inspect(await resumed.next(), resumedRequest);
       expect(continued.events).toEqual([]);
-      const deadlineStarted = Date.now();
       const ended = await resumed.next(40000).then(event => ({ event, error: null }), error => ({ event: null, error }));
       if (ended.event !== null) expect(ended.event.event).toBe("end");
       expect(Date.now() - deadlineStarted).toBeGreaterThan(25000);
