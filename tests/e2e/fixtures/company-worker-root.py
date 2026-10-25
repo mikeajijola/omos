@@ -10,7 +10,7 @@ if spec.get('action') in ('entry','namespaces'):
  marker=root/'.omos-worker-root.json';value=json.load(open(marker))
  assert value['version']=='omos.worker-root/v1' and value['uid']==spec['uid']
  if spec['action']=='entry':
-  assert spec['entry'] in ['/runtime/bin/python3','/runtime/bin/omos']
+  assert spec['entry'] in ['/runtime/bin/python3','/runtime/bin/omos','/bin/bash']
   value['executable']=spec['entry']
   with (root/spec['entry'].lstrip('/')).open('rb') as stream:value['executable_sha256']=hashlib.file_digest(stream,'sha256').hexdigest()
  else:value['namespaces']=spec['namespaces']
@@ -83,6 +83,8 @@ def binary(source,target=None):
 binary(spec['executable'],'/runtime/bin/omos')
 binary(spec['fossil'],'/runtime/bin/fossil')
 binary('/bin/sh','/bin/sh')
+binary('/bin/bash','/bin/bash')
+binary('/usr/bin/env','/usr/bin/env')
 python=sys.executable
 binary(python,'/runtime/bin/python3')
 stdlib=pathlib.Path(sys.base_prefix)/'lib'/('python'+'.'.join(map(str,sys.version_info[:2])))

@@ -173,6 +173,11 @@ test.skipIf(!support?.kernel_supported)("Linux workers isolate host content, cre
     expect(observed).toMatchObject({ uid: spec.uid, cwd: "/workspace", authorized: "authorized input", private_environment: false, inherited_host_file: false, capabilities_cleared: true });
     expect(observed.host_read).not.toBe("unexpected-success"); expect(observed.abstract).not.toBe("unexpected-success");
     expect(observed.tcp).toBe(1); expect(observed.root_restore).toBe(1);
+    expect(image("entry", "/bin/bash").status).toBe(0);
+    const shellProbe = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", launcher, root, "--", "--noprofile", "--norc", "-c", "printf 'verified-bash-runtime\\n'; /usr/bin/env"], { encoding: "utf8", timeout: 20000 });
+    expect(shellProbe.status, shellProbe.stderr + shellProbe.stdout).toBe(0);
+    expect(shellProbe.stdout).toContain("verified-bash-runtime\n"); expect(shellProbe.stdout).toContain("SHELL=/bin/bash");
+    expect(shellProbe.stdout).not.toContain("OMOS_TEST_PRIVATE_TOKEN");
     const selected = image("entry", "/runtime/bin/omos");
     expect(selected.status, selected.stderr).toBe(0);
     broker = await createWorkerBroker({ socket: root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: Date.now() + 120000, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-host-provider" }, company: { endpoint: "http://127.0.0.1:1/company", workspace: "workspace", actor: "actor", grant: "grant", actions: ["status"] } });
@@ -186,7 +191,7 @@ test.skipIf(!support?.kernel_supported)("Linux workers isolate host content, cre
     expect(result.stderr).not.toMatch(/panic:|Isolated worker.*failed/);
     const completed = JSON.parse(result.stdout);
     expect(completed.tool_calls.find((tool: any) => tool.name === "fossil_workspace").status).toBe("success");
-    if (support.private_namespaces) expect(completed.tool_calls.find((tool: any) => tool.name === "shell").status).toBe("success");
+    if (support.private_namespaces) expect(completed.tool_calls.find((tool: any) => tool.name === "shell").status, JSON.stringify(completed.tool_calls)).toBe("success");
     expect(inference.counts().assessments).toBeGreaterThan(0);
     if (!support.private_namespaces) {
       expect(image("namespaces", undefined, true).status).toBe(0);

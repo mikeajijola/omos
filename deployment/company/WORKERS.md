@@ -309,7 +309,8 @@ The template manifest has version `omos.worker-template/v1` and a `files`
 array. Each entry declares `path`, `sha256`, `bytes`, and `executable`. Only
 files beneath `runtime/`, `bin/`, `lib/`, `lib64/`, and `usr/` can be copied.
 The template must include `runtime/bin/omos`, `runtime/bin/fossil`, `bin/sh`,
-and every runtime dependency they require. The preparer verifies all copied
+`bin/bash`, `usr/bin/env`, and every runtime dependency they require. Native
+command execution selects Bash, and shell environment capture invokes `env`. The preparer verifies all copied
 bytes and modes without executing template programs. Limits are 10,000 files,
 512 MiB per file, and 2 GiB per image.
 

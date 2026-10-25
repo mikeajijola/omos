@@ -40,6 +40,8 @@ if spec["action"] == "setup":
     packaged = repository / "zig-out/libexec/fossil"
     binary(packaged if packaged.exists() else shutil.which("fossil"), "/runtime/bin/fossil")
     binary("/bin/sh", "/bin/sh")
+    binary("/bin/bash", "/bin/bash")
+    binary("/usr/bin/env", "/usr/bin/env")
     manifest = base / "template.json"
     manifest.write_text(json.dumps({"version": "omos.worker-template/v1", "files": list(files.values())}))
     manifest.chmod(0o600)

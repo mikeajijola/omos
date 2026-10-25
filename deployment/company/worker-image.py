@@ -120,7 +120,7 @@ def copy_template(config, destination):
                 target.chmod(0o755 if item["executable"] else 0o644)
     finally:
         os.close(template)
-    require("runtime/bin/omos" in seen and "runtime/bin/fossil" in seen and "bin/sh" in seen, "ImageRuntimeMissing")
+    require("runtime/bin/omos" in seen and "runtime/bin/fossil" in seen and "bin/sh" in seen and "bin/bash" in seen and "usr/bin/env" in seen, "ImageRuntimeMissing")
     with (destination / "runtime/bin/omos").open("rb") as source:
         require(hashlib.file_digest(source, "sha256").hexdigest() == config["executable_sha256"], "ImageExecutableChanged")
 
@@ -217,7 +217,7 @@ def main():
                 for name, minor in (("null", 3), ("urandom", 9)):
                     os.mknod(staging / "dev" / name, stat.S_IFCHR | 0o666, os.makedev(1, minor))
                     (staging / "dev" / name).chmod(0o666)
-                (staging / "etc/passwd").write_text(f"worker:x:{uid}:{uid}:Worker:/home/worker:/bin/sh\n")
+                (staging / "etc/passwd").write_text(f"worker:x:{uid}:{uid}:Worker:/home/worker:/bin/bash\n")
                 (staging / "etc/group").write_text(f"worker:x:{uid}:\n")
                 profile = staging / "home/worker/.fx"
                 profile.mkdir(mode=0o700)
