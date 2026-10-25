@@ -17,8 +17,28 @@ const max_file_bytes = 8 * 1024 * 1024;
 const max_view_bytes = 256 * 1024 * 1024;
 const max_files = 10000;
 
+fn projectionRecord(manager: workspace.Manager, root: []const u8) ![]const u8 {
+    return std.Io.Dir.path.join(manager.alloc, &.{ manager.root, "projections", try manager.alloc.print("{s}.json", .{try workspace.hash(manager.alloc, root)}) });
+}
+
+fn present(path: []const u8) !bool {
+    const file = std.Io.Dir.cwd().openFile(io_mod.getIo(), path, .{ .allow_directory = false, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io_mod.getIo());
+    return true;
+}
+
 pub fn directory(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
-    return std.Io.Dir.path.join(manager.alloc, &.{ task.project_root, ".fx", "workspaces", manager.manifest.id, task.id });
+    const parent = try std.Io.Dir.path.join(manager.alloc, &.{ task.project_root, ".fx", "workspaces", manager.manifest.id });
+    const selected = try std.Io.Dir.path.join(manager.alloc, &.{ parent, try manager.alloc.print("{s}-{s}", .{ task.id, try workspace.hash(manager.alloc, manager.repository) }) });
+    // Older runtimes cannot discover the new binding-specific namespace. Keep
+    // an existing owned legacy view in place, including its uncommitted drafts.
+    if (try present(try projectionRecord(manager, selected))) return selected;
+    if (try present(try std.Io.Dir.path.join(manager.alloc, &.{ parent, ".pins", try manager.alloc.print("{s}.lock", .{try workspace.hash(manager.alloc, selected)}) }))) return selected;
+    const legacy = try std.Io.Dir.path.join(manager.alloc, &.{ parent, task.id });
+    return if (try present(try projectionRecord(manager, legacy))) legacy else selected;
 }
 
 pub fn retentionPath(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
@@ -87,7 +107,7 @@ fn verifyRetentionOwner(task: workspace.Task, owner: []const u8, project: []cons
 }
 
 fn baselinePath(manager: workspace.Manager, task: workspace.Task) ![]const u8 {
-    return std.Io.Dir.path.join(manager.alloc, &.{ manager.root, "projections", try manager.alloc.print("{s}.json", .{try workspace.hash(manager.alloc, try directory(manager, task))}) });
+    return projectionRecord(manager, try directory(manager, task));
 }
 
 fn writable(path: []const u8) bool {
@@ -589,7 +609,7 @@ test "resource pin ownership allows descendants and rejects unrelated or company
     try std.testing.expectError(error.WorkspaceAccessDenied, verifyRetentionOwner(child, "root-owner", parent.project_root, Source{ .task = parent }));
 }
 
-test "resource pin follows the physical view across repository bindings" {
+test "resource pin follows the physical view across profile caches" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -599,7 +619,6 @@ test "resource pin follows the physical view across repository bindings" {
     var manager = workspace.Manager{ .alloc = alloc, .repository = "/Users/example/original.fossil", .root = "/Users/example/cache/original", .manifest = .{ .id = "workspace", .format = 2 } };
     const task = workspace.Task{ .id = "task", .workspace_id = "workspace", .session = "owner", .branch = "task/task", .base_revision = "base", .project_root = project, .definition = .{ .id = "contract", .version = 1, .objective = "Retain the view", .obligations = &.{} } };
     const first = try retentionPath(manager, task);
-    manager.repository = "/Users/example/copied.fossil";
     manager.root = "/Users/example/cache/copied";
     const second = try retentionPath(manager, task);
     try std.testing.expectEqualStrings(first, second);
@@ -608,4 +627,25 @@ test "resource pin follows the physical view across repository bindings" {
     pin.close();
     const exclusive = (try @import("../shared/resource_pin.zig").tryExclusive(second)) orelse return error.TestExpectedExclusiveLease;
     exclusive.close();
+}
+
+test "filesystem projection isolates copied bindings and retains owned legacy drafts" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const project = try io_mod.dirRealpathAlloc(alloc, temporary.dir, ".");
+    var manager = workspace.Manager{ .alloc = alloc, .repository = "/Users/example/original.fossil", .root = try std.Io.Dir.path.join(alloc, &.{ project, "cache" }), .manifest = .{ .id = "workspace", .format = 2 } };
+    const task = workspace.Task{ .id = "task", .workspace_id = "workspace", .session = "owner", .branch = "task/task", .base_revision = "base", .project_root = project, .definition = .{ .id = "contract", .version = 1, .objective = "Retain drafts", .obligations = &.{} } };
+    const first = try directory(manager, task);
+    manager.repository = "/Users/example/copied.fossil";
+    try std.testing.expect(!std.mem.eql(u8, first, try directory(manager, task)));
+    const legacy = try std.Io.Dir.path.join(alloc, &.{ project, ".fx", "workspaces", "workspace", "task" });
+    const marker = try projectionRecord(manager, legacy);
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), std.Io.Dir.path.dirname(marker).?, .fromMode(0o700));
+    var record = try std.Io.Dir.cwd().createFile(io_mod.getIo(), marker, .{});
+    record.close(io_mod.getIo());
+    try std.testing.expectEqualStrings(legacy, try directory(manager, task));
+    try std.testing.expect(!std.mem.eql(u8, legacy, first));
 }

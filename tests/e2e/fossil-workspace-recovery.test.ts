@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, rmSync, copyFileSync, chmodSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
@@ -209,6 +209,39 @@ describe("portable Fossil workspace recovery", () => {
       writeFileSync(release, "finish");
       await until(() => available(pin), "Exited terminal retained its filesystem pin");
     } finally { writeFileSync(release, "finish"); await session.kill(); }
+  }, 120000);
+
+  test("resumes an owned legacy filesystem view without discarding its uncommitted draft", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let root = "", resumedRoot = "";
+    model(f, (body, count) => {
+      const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const current = JSON.parse(context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      if (count === 1) {
+        root = current;
+        return { tool_calls: [{ index: 0, id: "legacy-draft", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: join(root, "documents/draft.txt"), content: "Checkpointed original" }) } }] };
+      }
+      resumedRoot = current;
+      expect(readFileSync(join(current, "documents/draft.txt"), "utf8")).toBe("Uncommitted legacy draft");
+      return { content: "Retained the legacy draft and published it." };
+    });
+    const first = await f.run(["ask", "Retain a portable draft", "--json"], { FX_MAX_AGENT_STEPS: "1" });
+    expect(first.code).toBe(1);
+    expect(existsSync(join(root, "documents/draft.txt"))).toBe(true);
+    const status = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout);
+    const task = status.tasks[0];
+    const legacy = join(root, "..", task.id);
+    const manager = join(f.home, ".fx/fossil", createHash("sha256").update(status.repository).digest("hex"));
+    const baseline = (view: string) => join(manager, "projections", createHash("sha256").update(view).digest("hex") + ".json");
+    renameSync(root, legacy);
+    renameSync(baseline(root), baseline(legacy));
+    rmSync(join(root, "..", ".pins", createHash("sha256").update(root).digest("hex") + ".lock"));
+    writeFileSync(join(legacy, "documents/draft.txt"), "Uncommitted legacy draft");
+    const result = await f.run(["ask", "--resume-id", JSON.parse(first.stdout).session_id, "continue", "--json"]);
+    expect(result.code, result.stderr).toBe(0);
+    expect(resumedRoot).toBe(legacy);
+    expect(f.fossil("cat", "documents/draft.txt", "-r", "trunk")).toBe("Uncommitted legacy draft");
   }, 120000);
 
   test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
