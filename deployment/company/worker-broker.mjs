@@ -11,13 +11,19 @@ function endpoint(raw) {
   if (url.username || url.password || url.search || url.hash || (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)))) failure("InvalidBrokerEndpoint");
   return url;
 }
-async function body(request, maximum) {
+async function body(request, maximum, signal) {
   const chunks = []; let bytes = 0;
-  for await (const chunk of request) {
-    bytes += chunk.length;
-    if (bytes > maximum) failure("BrokerRequestTooLarge");
-    chunks.push(chunk);
-  }
+  const aborted = () => request.destroy();
+  signal.throwIfAborted();
+  signal.addEventListener("abort", aborted, { once: true });
+  try {
+    for await (const chunk of request) {
+      signal.throwIfAborted();
+      bytes += chunk.length;
+      if (bytes > maximum) failure("BrokerRequestTooLarge");
+      chunks.push(chunk);
+    }
+  } finally { signal.removeEventListener("abort", aborted); }
   return Buffer.concat(chunks);
 }
 function parsed(bytes) {
@@ -51,12 +57,13 @@ async function isolatedSocketParent(socket) {
   if (!privateBoundary) failure("WorkerBrokerSocketBoundaryRequired");
 }
 
-export async function createWorkerBroker({ socket, model, company, expiresMs, maxRequests = 256, maxConcurrent = 4, socketMode = 0o600 }) {
+export async function createWorkerBroker({ socket, model, company, companyClient, expiresMs, maxRequests = 256, maxConcurrent = 4, socketMode = 0o600 }) {
   if (typeof socket !== "string" || !socket.startsWith("/") || socket.length > 100 || socket.includes("\0") || !Number.isSafeInteger(expiresMs) || expiresMs <= Date.now() || !Number.isInteger(maxRequests) || maxRequests < 1 || maxRequests > 10000 || !Number.isInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 16 || ![0o600, 0o666].includes(socketMode)) failure("InvalidWorkerBroker");
   const modelUrl = endpoint(model.endpoint), companyUrl = endpoint(company.endpoint);
   if (socketMode === 0o666) await isolatedSocketParent(socket);
   if (typeof model.model !== "string" || !model.model || typeof model.handle !== "string" || !model.handle || !Array.isArray(company.actions) || !company.actions.length) failure("InvalidWorkerBroker");
   for (const field of ["workspace", "actor", "grant"]) if (typeof company[field] !== "string" || !company[field]) failure("InvalidWorkerBroker");
+  if (companyClient && (!companyClient.scope || companyClient.scope.view !== company.view || companyClient.scope.expiresMs < expiresMs || !["workspace", "actor", "grant"].every(field => companyClient.identity[field] === company[field]) || companyClient.scope.actions.some(action => !company.actions.includes(action)))) failure("InvalidWorkerCompanyClient");
   let active = 0, requests = 0;
   const controllers = new Set();
   const server = http.createServer(async (request, response) => {
@@ -73,10 +80,31 @@ export async function createWorkerBroker({ socket, model, company, expiresMs, ma
       controller = new AbortController(); controllers.add(controller);
       const timer = setTimeout(() => controller.abort(), Math.min(120000, expiresMs - Date.now()));
       response.once("close", () => { clearTimeout(timer); controller.abort(); });
+      if (request.url === "/company/mcp" && companyClient) {
+        if (request.method !== "POST") { response.setHeader("allow", "POST"); return error(405, "WorkerMcpMethodDenied"); }
+        const rpc = parsed(await body(request, 1024 * 1024, controller.signal));
+        if (!rpc || Array.isArray(rpc) || rpc.jsonrpc !== "2.0" || typeof rpc.method !== "string" || (rpc.params !== undefined && (!rpc.params || typeof rpc.params !== "object" || Array.isArray(rpc.params))) || (rpc.id !== undefined && !(typeof rpc.id === "string" && rpc.id.length <= 128) && !Number.isSafeInteger(rpc.id))) return error(400, "InvalidWorkerMcpRequest");
+        if (rpc.id === undefined) { response.writeHead(202); return response.end(); }
+        let result, rpcError, status = 200;
+        const supported = ["2025-11-25", "2025-06-18"];
+        if (rpc.method === "server/discover") {
+          status = 400;
+          rpcError = { code: -32022, message: "Unsupported protocol version", data: { supported, requested: rpc.params?._meta?.["io.modelcontextprotocol/protocolVersion"] ?? "2026-07-28" } };
+        }
+        else if (rpc.method === "initialize") {
+          if (!supported.includes(rpc.params?.protocolVersion)) { status = 400; rpcError = { code: -32022, message: "Unsupported protocol version", data: { supported, requested: rpc.params?.protocolVersion } }; }
+          else result = { protocolVersion: rpc.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "omos-company-worker", version: "1" } };
+        } else if (rpc.method === "ping") result = {};
+        else if (rpc.method === "tools/list") result = { tools: companyClient.tools() };
+        else if (rpc.method === "tools/call" && typeof rpc.params?.name === "string") result = await companyClient.call(rpc.params.name, rpc.params.arguments ?? {}, controller.signal);
+        else rpcError = { code: -32601, message: "Method not found" };
+        response.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+        return response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, ...(rpcError ? { error: rpcError } : { result }) }));
+      }
       let target, payload;
       const headers = { "content-type": "application/json" };
       if (request.method === "POST" && request.url === "/model/v1/chat/completions") {
-        const input = parsed(await body(request, 8 * 1024 * 1024));
+        const input = parsed(await body(request, 8 * 1024 * 1024, controller.signal));
         if (!input || input.model !== model.handle || !Array.isArray(input.messages)) return error(403, "WorkerModelDenied");
         target = modelUrl;
         payload = JSON.stringify({ ...input, model: model.model });
@@ -85,7 +113,7 @@ export async function createWorkerBroker({ socket, model, company, expiresMs, ma
         response.writeHead(200, { "content-type": "application/json" });
         return response.end(JSON.stringify({ data: [{ id: model.handle }] }));
       } else if (request.method === "POST" && request.url === "/company/v1/company") {
-        const input = parsed(await body(request, 1024 * 1024));
+        const input = parsed(await body(request, 1024 * 1024, controller.signal));
         if (!input || typeof input.payload !== "string" || typeof input.signature !== "string") return error(403, "WorkerCompanyDenied");
         const operation = parsed(Buffer.from(input.payload));
         if (!operation || !["workspace", "actor", "grant"].every(field => operation[field] === company[field]) || !company.actions.includes(operation.action) || (company.view && operation.view && operation.view !== company.view)) return error(403, "WorkerCompanyDenied");

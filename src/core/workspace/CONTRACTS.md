@@ -1077,6 +1077,10 @@ request and final signed receipt. Original request bytes are available through
 bounded base64 pages with a SHA-256 identity, so another authorized client can
 inspect the retained intent without relying on the first client's files.
 Receipts identify the actor, grant, operation, authority epoch, and result.
+When a status or reconciliation request also selects a view, the retained
+operation must belong to that view. This check includes execution operations
+whose recovery journal does not hold a view lock and completed view-creation
+operations. An unresolved creation cannot be associated with an arbitrary view.
 
 An expired envelope remains expired, including when a cached result exists.
 An actor with explicit `reconcile` authority can send a fresh signed request

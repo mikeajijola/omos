@@ -91,3 +91,39 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
 export function writeMemory(content: string) {
   return { tool_calls: [{ index: 0, id: "save-memory", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "memory/preference.md", content }) } }] };
 }
+
+export async function startWorkspaceService(f: ReturnType<typeof fixture>, writable = false, extra: Record<string, string | undefined> = {}) {
+  const token = "isolated-workspace-service-token-for-fixtures";
+  const child = Bun.spawn([join(import.meta.dir, "../../zig-out/bin/fx"), "fossil", "serve", "0", "--json", ...(writable ? ["--write"] : [])], {
+    cwd: f.cwd, env: { ...process.env, ...f.env, ...extra, OMOS_WORKSPACE_TOKEN: token }, stdout: "pipe", stderr: "pipe",
+  });
+  const reader = child.stdout.getReader();
+  let output = "";
+  try {
+    const deadline = Date.now() + 15000;
+    while (!output.includes("\n")) {
+      const chunk = await Promise.race([reader.read(), Bun.sleep(Math.max(1, deadline - Date.now())).then(() => { throw new Error("Workspace service did not become ready"); })]);
+      if (chunk.done) throw new Error(`Service exited: ${await new Response(child.stderr).text()}`);
+      output += new TextDecoder().decode(chunk.value);
+    }
+    const ready = JSON.parse(output.trim().split("\n")[0]);
+    const url = `http://127.0.0.1:${ready.port}`;
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    return { child, ready, url, headers, post: async (body: object) => {
+      try {
+        return await fetch(`${url}/v1/workspace`, { method: "POST", headers, body: JSON.stringify(body) });
+      } catch (error) {
+        const exitCode = child.exitCode;
+        child.kill();
+        await child.exited;
+        throw new Error(`${error instanceof Error ? error.stack : error}\nService exit before cleanup: ${exitCode}\n${await new Response(child.stderr).text()}\n${existsSync(f.env.FX_TRACE_LOG) ? readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-16000) : ""}`);
+      }
+    } };
+  } catch (error) {
+    child.kill();
+    await child.exited;
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}

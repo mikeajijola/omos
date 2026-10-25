@@ -96,6 +96,45 @@ process uses `OMOS_WORKER_BROKER=/run/omos-broker.sock` to route its IP connecti
 requests through that socket. The launcher blocks direct IP sockets; the
 transport adapter itself is not an isolation boundary.
 
+### Connect a worker to its company view
+
+The host can import `createCompanyClient` from `mcp.mjs` and load an operator's
+private company-client configuration. Pass `home` explicitly when the key
+belongs to a separate operator profile. The configuration and key retain the
+same private-file checks as the installed stdio companion.
+
+Create a worker client with a host-selected `binding` containing `view`,
+`execution: { runtime, generation }`, `expiresMs`, and `actions`. The binding
+can expose discovery, reads, checkpoints, typed records, submission, status,
+and reconciliation. It cannot expose grant delegation, view creation, or
+execution ownership changes. The host must claim the execution generation
+through the signed service before starting the worker.
+
+Pass this client as `companyClient` to `createWorkerBroker`, with matching
+company identity, view, actions, and expiry. The private Unix route
+`/company/mcp` exposes `company_context` and `company_workspace`. Configure the
+native MCP client with `http://127.0.0.1:1/company/mcp`; the explicit port
+satisfies its loopback transport policy, while the Unix adapter carries the
+connection. The worker receives neither a signing seed nor an owner token.
+
+The host supplies the view and execution fence on each signed operation.
+Worker-supplied overrides are rejected. Outcome lookup and reconciliation are
+limited to operations issued through that client, and the native service also
+checks that a requested outcome belongs to the selected view. Requests retain
+their original operation IDs and expiry values. An uncertain mutation is not
+automatically retried. A replacement runtime must inspect the retained outcome
+and reconcile it under its current authority before attempting further work.
+
+The HTTP MCP transport is stateless and returns bounded JSON responses. It
+supports the same 2025 protocol versions as the stdio companion and advertises
+them when a client requests a newer version. Closing the broker cancels its
+active requests; closing the company client cancels its active signed calls.
+The client expires with its binding, independently of the execution lease
+that the native company service checks on each operation.
+
+This connection does not yet provide a durable hosted job coordinator or image
+preparation service. The gateway continues to report `hosted_execution: false`.
+
 The broker accepts fixed model and company routes. Model calls map an allowed
 worker model handle to a configured provider model and receive credentials
 only in the host's outgoing request. Company requests retain their signatures;

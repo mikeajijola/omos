@@ -193,6 +193,26 @@ fn loadJournal(manager: workspace.Manager, path: []const u8) !?Journal {
     for (try manager.inventory(revision_id)) |entry| if (std.mem.eql(u8, entry, path)) return try records.decode(Journal, manager.alloc, try manager.contentAt(path, revision_id), .{});
     return null;
 }
+
+fn requireOutcomeView(alloc: std.mem.Allocator, journal: Journal, selected: ?[]const u8) !void {
+    const view = selected orelse return;
+    if (journal.view) |retained| {
+        if (!std.mem.eql(u8, retained, view)) return error.CompanyAccessDenied;
+        return;
+    }
+    const raw = journal.request orelse return error.CompanyAccessDenied;
+    const envelope = try records.decode(authority.Envelope, alloc, raw, .{});
+    const source = try records.decode(struct { action: authority.Action, view: ?[]const u8 = null }, alloc, envelope.payload, .{ .ignore_unknown_fields = true });
+    if (source.view) |retained| {
+        if (!std.mem.eql(u8, retained, view)) return error.CompanyAccessDenied;
+        return;
+    }
+    if (source.action == .create_view and journal.state == .completed) {
+        const result = try records.decode(struct { view: []const u8 }, alloc, journal.result orelse return error.CompanyAccessDenied, .{ .ignore_unknown_fields = true });
+        if (std.mem.eql(u8, result.view, view)) return;
+    }
+    return error.CompanyAccessDenied;
+}
 fn saveJournal(manager: workspace.Manager, path: []const u8, journal: Journal) !void {
     var files: std.ArrayList(workspace.Manager.CompanyFile) = .empty;
     try files.append(manager.alloc, .{ .path = path, .content = try encode(manager.alloc, journal) });
@@ -475,6 +495,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         const path = try operationPath(manager, grant.actor, id);
         var journal = (try loadJournal(manager, path)) orelse return error.CompanyOutcomeNotFound;
         if (!std.mem.eql(u8, journal.grant, grant.id)) return error.CompanyAccessDenied;
+        try requireOutcomeView(alloc, journal, request.view);
         if (journal.state == .failed) return error.CompanyOperationFailed;
         const original_request = try authority.authenticateRetained(alloc, current, journal.request orelse return error.CompanyRequestNotRetained, request, io.milliTimestamp());
         const envelope = try records.decode(authority.Envelope, alloc, journal.request.?, .{});
@@ -553,6 +574,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             if (!authority.safeIdentity(id)) return error.InvalidCompanyIdentity;
             const journal = (try loadJournal(manager, try operationPath(manager, grant.actor, id))) orelse return error.CompanyOutcomeNotFound;
             if (!std.mem.eql(u8, journal.grant, grant.id)) return error.CompanyAccessDenied;
+            try requireOutcomeView(alloc, journal, request.view);
             return encode(alloc, .{ .operation = id, .request_hash = journal.request_hash, .state = @tagName(journal.state), .failure = journal.failure, .reconciled_by = journal.reconciled_by, .request = if (journal.request) |value| try requestPage(manager, value, request.offset, request.limit) else null, .receipt = if (journal.receipt) |value| try parse(alloc, value) else null, .result = if (journal.result) |value| try parse(alloc, value) else null });
         }
         const view = selected orelse return error.CompanyViewRequired;
@@ -743,4 +765,26 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) (if (attributes) "omos.scoped-export/v2" else "omos.scoped-export/v1") else (if (attributes) "omos.scoped-inventory/v2" else "omos.scoped-inventory/v1"), .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = if (export_plan != null) "declared_complete" else "not_evaluated", .package_hash = if (export_plan) |plan| try workspace.hash(alloc, try encode(alloc, plan)) else @as(?[]const u8, null), .authority = "content_only" }), writable);
     }
     return error.UnsupportedCompanyApi;
+}
+
+test "company outcome inspection retains the selected view boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var journal: Journal = .{ .actor = "actor", .grant = "grant", .operation = "operation", .request_hash = "hash", .state = .completed, .view = "first" };
+    try requireOutcomeView(alloc, journal, null);
+    try requireOutcomeView(alloc, journal, "first");
+    try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "other"));
+    journal.view = null;
+    journal.request = try encode(alloc, authority.Envelope{ .payload = "{\"action\":\"execution\",\"view\":\"first\"}", .signature = "signature" });
+    try requireOutcomeView(alloc, journal, "first");
+    try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "other"));
+    journal.request = try encode(alloc, authority.Envelope{ .payload = "{\"action\":\"create_view\"}", .signature = "signature" });
+    journal.result = "{\"view\":\"first\",\"revision\":\"revision\"}";
+    try requireOutcomeView(alloc, journal, "first");
+    try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "other"));
+    journal.state = .pending;
+    try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "first"));
+    journal.request = null;
+    try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "first"));
 }

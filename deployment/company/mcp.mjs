@@ -4,6 +4,7 @@
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 
 const MAX = 1024 * 1024;
@@ -82,7 +83,7 @@ async function privateFile(filename, limit) {
   } finally { await handle.close(); }
 }
 
-async function configuration(filename) {
+async function configuration(filename, home = process.env.HOME) {
   const bytes = await privateFile(filename, 65536);
   let config;
   try { config = JSON.parse(bytes.toString("utf8")); } finally { bytes.fill(0); }
@@ -95,7 +96,7 @@ async function configuration(filename) {
   const declaration = JSON.parse(await fs.readFile(new URL("../../src/core/workspace/standard/omos.json", import.meta.url), "utf8"));
   const schema = declaration.spec.operations.find(item => item.id === "omos_company_operation").input;
   if (!Array.isArray(config.actions) || !config.actions.length || config.actions.some(action => !schema.properties.action.enum.includes(action)) || new Set(config.actions).size !== config.actions.length) fail("InvalidConfiguredActions");
-  const seed = await privateFile(path.join(process.env.HOME ?? fail("HomeUnavailable"), ".fx/company-keys", `${config.key_handle}.seed`), 32);
+  const seed = await privateFile(path.join(home ?? fail("HomeUnavailable"), ".fx/company-keys", `${config.key_handle}.seed`), 32);
   const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
   let key;
   try {
@@ -175,6 +176,85 @@ async function call(state, name, args, signal) {
   }
 }
 
+function tools(state) {
+  return [
+    { name: "company_context", description: "Inspect the configured company's public bootstrap, actor identity, current time, and configured actions. Authority is enforced on signed operations.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true } },
+    { name: "company_workspace", description: "Use the native signed company workspace service within this actor's grant. Supply a unique operation ID and expires_ms within five minutes; preserve them when resolving an uncertain outcome. Read bounded pages; edits require a pinned expected revision. Submission queues independent host review and does not mean acceptance.", inputSchema: structuredClone(state.inputSchema), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
+  ];
+}
+
+function publicFailure(error) {
+  const allowed = ["UnknownTool", "InvalidArguments", "InvalidOperationOrExpiry", "CompanyIdentityChanged", "CompanyRequestTooLarge", "RequestTooComplex", "InvalidRequestKey", "CompanyClientClosed", "CompanyWorkerScopeDenied", "CompanyWorkerExpired", "CompanyWorkerOperationBudgetExceeded"];
+  return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: allowed.includes(error.message) ? error.message : "CompanyRequestNotAttempted" }) }] };
+}
+
+// The host bridge uses the same configuration, signing, authority, receipts,
+// and uncertain-outcome rules as the installed stdio companion. Keys remain
+// inside this closure and are never included in returned tools or results.
+export async function createCompanyClient(filename, { home, binding } = {}) {
+  let state = await configuration(filename, home);
+  let scope;
+  if (binding !== undefined) {
+    const permitted = ["discover", "read", "checkpoint", "submit", "status", "reconcile", "query", "record"];
+    if (!object(binding) || !identity(binding.view) || !object(binding.execution) || !identity(binding.execution.runtime) || !Number.isSafeInteger(binding.execution.generation) || binding.execution.generation < 1 || !Number.isSafeInteger(binding.expiresMs) || binding.expiresMs <= Date.now() || !Array.isArray(binding.actions) || !binding.actions.length || binding.actions.some(action => !permitted.includes(action) || !state.config.actions.includes(action)) || new Set(binding.actions).size !== binding.actions.length || Object.keys(binding).some(key => !["view", "execution", "expiresMs", "actions"].includes(key)) || Object.keys(binding.execution).some(key => !["runtime", "generation"].includes(key))) fail("InvalidWorkerBinding");
+    scope = structuredClone(binding);
+    state.config.actions = scope.actions;
+    state.inputSchema.properties.action.enum = scope.actions;
+  }
+  const publicIdentity = Object.freeze(Object.fromEntries(["workspace", "actor", "grant", "issuer", "epoch"].map(name => [name, state.config[name]])));
+  const active = new Set();
+  const issued = new Set();
+  return Object.freeze({
+    identity: publicIdentity,
+    scope: scope ? Object.freeze({ ...scope, execution: Object.freeze({ ...scope.execution }), actions: Object.freeze([...scope.actions]) }) : null,
+    tools() {
+      if (!state) fail("CompanyClientClosed");
+      const result = tools(state);
+      if (scope) {
+        const schema = result[1].inputSchema;
+        for (const field of ["view", "execution"]) { delete schema.properties[field]; schema.required = schema.required.filter(name => name !== field); }
+        result[1].description += " The host pins the company view and execution generation. Supply neither view nor execution; authority cannot be expanded from this worker.";
+      }
+      return result;
+    },
+    async call(name, args, signal) {
+      if (!state) return publicFailure(new Error("CompanyClientClosed"));
+      const current = state, controller = new AbortController();
+      active.add(controller);
+      const timer = setTimeout(() => controller.abort(), 30000);
+      const bounded = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+      try {
+        if (scope) {
+          if (scope.expiresMs <= Date.now()) fail("CompanyWorkerExpired");
+          if (name === "company_workspace") {
+            if (!object(args) || Object.hasOwn(args, "view") || Object.hasOwn(args, "execution") || !scope.actions.includes(args.action) || (args.outcome !== undefined && !issued.has(args.outcome))) fail("CompanyWorkerScopeDenied");
+            if (issued.size >= 1024 && !issued.has(args.operation)) fail("CompanyWorkerOperationBudgetExceeded");
+            args = { ...structuredClone(args), view: scope.view, execution: scope.execution };
+            if (identity(args.operation)) issued.add(args.operation);
+          }
+          const expiry = setTimeout(() => controller.abort(), Math.max(1, scope.expiresMs - Date.now()));
+          try {
+            const result = await call(current, name, args, bounded);
+            if (name === "company_context" && !result.isError) {
+              const context = JSON.parse(result.content[0].text);
+              context.execution_scope = structuredClone(scope);
+              result.content[0].text = JSON.stringify(context);
+            }
+            return result;
+          } finally { clearTimeout(expiry); }
+        }
+        return await call(current, name, args, bounded);
+      }
+      catch (error) { return publicFailure(error); }
+      finally { clearTimeout(timer); active.delete(controller); }
+    },
+    close() {
+      for (const controller of active) controller.abort();
+      state = null;
+    },
+  });
+}
+
 async function main() {
   if (process.argv.length !== 3) fail("Usage: node deployment/company/mcp.mjs ABSOLUTE_CONFIG.json");
   const state = await configuration(process.argv[2]);
@@ -215,10 +295,7 @@ async function main() {
     if (!initialized) { send(id, null, { code: -32000, message: "Initialize first" }); return; }
     if (method === "ping") { send(id, {}); return; }
     if (method === "tools/list") {
-      send(id, { tools: [
-        { name: "company_context", description: "Inspect the configured company's public bootstrap, actor identity, current time, and configured actions. Authority is enforced on signed operations.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true } },
-        { name: "company_workspace", description: "Use the native signed company workspace service within this actor's grant. Supply a unique operation ID and expires_ms within five minutes; preserve them when resolving an uncertain outcome. Read bounded pages; edits require a pinned expected revision. Submission queues independent host review and does not mean acceptance.", inputSchema: state.inputSchema, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
-      ] });
+      send(id, { tools: tools(state) });
       return;
     }
     if (method !== "tools/call") { send(id, null, { code: -32601, message: "Method not found" }); return; }
@@ -230,8 +307,7 @@ async function main() {
     const timer = setTimeout(() => controller.abort(), 30000);
     try { send(id, await call(state, params.name, params.arguments ?? {}, controller.signal)); }
     catch (error) {
-      const allowed = ["UnknownTool", "InvalidArguments", "InvalidOperationOrExpiry", "CompanyIdentityChanged", "CompanyRequestTooLarge", "RequestTooComplex", "InvalidRequestKey"];
-      send(id, { isError: true, content: [{ type: "text", text: JSON.stringify({ error: allowed.includes(error.message) ? error.message : "CompanyRequestNotAttempted" }) }] });
+      send(id, publicFailure(error));
     } finally { clearTimeout(timer); active.delete(key); }
   };
   process.stdin.on("data", chunk => {
@@ -251,4 +327,7 @@ async function main() {
   process.stdin.on("error", stop);
 }
 
-main().catch(() => { process.stderr.write("Company MCP configuration could not be loaded. Check its private path, permissions, identity pins, and key handle.\n"); process.exitCode = 1; });
+const invoked = process.argv[1] ? await fs.realpath(process.argv[1]).catch(() => null) : null;
+if (invoked && import.meta.url === pathToFileURL(invoked).href) {
+  main().catch(() => { process.stderr.write("Company MCP configuration could not be loaded. Check its private path, permissions, identity pins, and key handle.\n"); process.exitCode = 1; });
+}
