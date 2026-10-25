@@ -18,7 +18,8 @@ pub const ResolvedProviderOptions = struct {
 };
 
 pub const ReasoningEffortOptions = struct {
-    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = undefined,
+    // Keep unused slots valid when complete capability snapshots are inspected.
+    values: [types.ReasoningEffort.max_options]types.ReasoningEffort = @splat(.auto),
     len: usize = 0,
 
     pub fn fromSlice(source: []const types.ReasoningEffort) ReasoningEffortOptions {
