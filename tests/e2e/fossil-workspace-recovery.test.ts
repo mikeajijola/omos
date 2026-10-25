@@ -10,7 +10,8 @@ import { NativeClient } from "./workspace-ui-client.mjs";
 afterEach(cleanupFixtures);
 
 async function progressStream(url: string, envelope: object, controller = new AbortController()) {
-  const response = await fetch(url + "/v1/company", { method: "POST", headers: { "content-type": "application/json", accept: "text/event-stream", connection: "close" }, body: JSON.stringify(envelope), signal: controller.signal });
+  // Bun's keepalive option controls socket reuse during deliberate aborts.
+  const response = await fetch(url + "/v1/company", { method: "POST", keepalive: false, headers: { "content-type": "application/json", accept: "text/event-stream", connection: "close" }, body: JSON.stringify(envelope), signal: controller.signal });
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffered = "";
@@ -156,20 +157,32 @@ describe("portable Fossil workspace recovery", () => {
     await admin({ action: "grant", revision: initialized.revision, grant: { id: "progress-reader", actor: "worker", public_key: key.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex"), paths: ["documents/team/"], actions: ["create_view", "checkpoint", "status"], expires_ms: Date.now() + 3600000 } });
     let service = await startWorkspaceService(f, true);
     const streams: Awaited<ReturnType<typeof progressStream>>[] = [];
-    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const boot = await (await fetch(service.url + "/v1/company", { keepalive: false })).json() as any;
     const issuer = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(boot.issuer, "hex")]), format: "der", type: "spki" });
     const seal = (action: string, params: object) => {
       const payload = JSON.stringify({ version: "omos.company/v1", workspace: boot.workspace, actor: "worker", grant: "progress-reader", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, action, ...params });
       return { payload, signature: sign(null, Buffer.from(payload), key.privateKey).toString("hex") };
     };
     const send = async (action: string, params: object) => {
-      const response = await fetch(service.url + "/v1/company", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(seal(action, params)) });
+      const response = await fetch(service.url + "/v1/company", { method: "POST", keepalive: false, headers: { "content-type": "application/json", connection: "close" }, body: JSON.stringify(seal(action, params)) });
       const receipt = await response.json() as any;
       expect(response.status, JSON.stringify(receipt)).toBe(200);
       return JSON.parse(receipt.payload).result;
     };
     const subscribe = async (envelope: object) => {
-      const stream = await progressStream(service.url, envelope); streams.push(stream); return stream;
+      const stream = await progressStream(service.url, envelope).catch(error => {
+        throw Error(`${error}; native exit: ${service.child.exitCode}\n${readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-8000)}`);
+      }); streams.push(stream); return stream;
+    };
+    const subscribeAvailable = async (envelope: object) => {
+      const deadline = Date.now() + 10000;
+      for (;;) {
+        const stream = await subscribe(envelope);
+        if (stream.response.status !== 429) return stream;
+        await stream.close();
+        if (Date.now() >= deadline) throw Error("Cancelled streams did not release admission");
+        await Bun.sleep(20);
+      }
     };
     const inspect = (event: Awaited<ReturnType<Awaited<ReturnType<typeof progressStream>>["next"]>>, envelope: { payload: string }) => {
       expect(event.event).toBe("workspace");
@@ -231,7 +244,7 @@ describe("portable Fossil workspace recovery", () => {
         await blocker.exited;
         await Promise.all(pending);
       }
-      const occupied = await Promise.all(Array.from({ length: 4 }, () => subscribe(seal("status", { view: view.view, progress_cursor: "" }))));
+      const occupied = await Promise.all(Array.from({ length: 4 }, () => subscribeAvailable(seal("status", { view: view.view, progress_cursor: "" }))));
       for (const stream of occupied) {
         expect(stream.response.status).toBe(200);
         expect(stream.response.headers.get("content-type")).toBe("text/event-stream");
@@ -259,7 +272,7 @@ describe("portable Fossil workspace recovery", () => {
         expected.push(head);
       }
       let request = seal("status", { view: view.view, progress_cursor: "", limit: 1 });
-      let live = await subscribe(request);
+      let live = await subscribeAvailable(request);
       expect(live.response.status).toBe(200);
       let event = await live.next();
       let page = inspect(event, request);
