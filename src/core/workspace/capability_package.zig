@@ -7,13 +7,14 @@ const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 const Value = std.json.Value;
 
-pub const Selection = struct { capability: []const u8, realisation: ?[]const u8 = null };
+pub const Selection = authority.CapabilitySelection;
 const Dependency = struct { kind: enum { runtime, configuration, service, host_implementation }, handle: []const u8, constraint: []const u8 };
 const Portability = struct { version: []const u8, paths: []const []const u8 = &.{}, dependencies: []const Dependency = &.{} };
 const Resource = struct { family: []const u8, definition: Value };
 const Path = struct { resource: []const u8, path: []const u8 };
 const External = struct { resource: []const u8, dependency: Dependency };
 const Problem = struct { subject: []const u8, reason: []const u8 };
+const DependencyEdge = struct { capability: []const u8, dependsOn: []const []const u8 };
 const File = struct { path: []const u8, artifact: []const u8, executable: bool };
 
 pub const Plan = struct {
@@ -29,7 +30,61 @@ pub const Plan = struct {
     external_dependencies: []const External,
     problems: []const Problem,
     files: []const File = &.{},
+    hierarchy: []const DependencyEdge = &.{},
 };
+
+pub fn includes(plan: Plan, path: []const u8) bool {
+    for (plan.paths) |selector| if (std.mem.eql(u8, selector.path, path) or (std.mem.endsWith(u8, selector.path, "/") and std.mem.startsWith(u8, path, selector.path))) return true;
+    return false;
+}
+
+fn mergeRows(alloc: std.mem.Allocator, target: *Value, additions: []const Value) !void {
+    for (additions) |addition| {
+        if (named(target.array.items, model.text(addition, "id"))) |previous| {
+            if (!std.mem.eql(u8, try model.canonical(alloc, previous), try model.canonical(alloc, addition))) return error.CapabilityImportCollision;
+        } else try target.array.append(addition);
+    }
+}
+
+/// Build an additive candidate only. Caller retains this as an artifact until
+/// runtime verification and normal host publication establish activation.
+pub fn importDefinition(alloc: std.mem.Allocator, current: model.Declaration, plan: Plan) !model.Declaration {
+    var value = try std.json.parseFromSliceLeaky(Value, alloc, try model.canonical(alloc, current.value), .{});
+    const root = value.object.getPtr("spec").?;
+    var capabilities: std.ArrayList(Value) = .empty;
+    for (plan.capabilities) |capability| {
+        var selected = try std.json.parseFromSliceLeaky(Value, alloc, try model.canonical(alloc, capability), .{});
+        var realisations: std.ArrayList(Value) = .empty;
+        for (plan.realisations) |realisation| if (std.mem.eql(u8, model.text(realisation, "capability"), model.text(capability, "id"))) try realisations.append(alloc, .{ .string = model.text(realisation, "id") });
+        if (realisations.items.len != 1) return error.InvalidCapabilitySelection;
+        try selected.object.put(alloc, "realisations", .{ .array = .init(alloc) });
+        try selected.object.getPtr("realisations").?.array.appendSlice(realisations.items);
+        try capabilities.append(alloc, selected);
+    }
+    try mergeRows(alloc, root.object.getPtr("capabilities").?, capabilities.items);
+    try mergeRows(alloc, root.object.getPtr("realisations").?, plan.realisations);
+    const resources = root.object.getPtr("resources").?;
+    for (plan.resources) |resource| {
+        const family = resources.object.getPtr(resource.family) orelse return error.UnsupportedResourceFamily;
+        try mergeRows(alloc, family, &.{resource.definition});
+    }
+    if (plan.hierarchy.len > 0) {
+        const semantic = root.object.getPtr("semantic").?;
+        if (semantic.object.getPtr("capabilityHierarchy") == null) try semantic.object.put(alloc, "capabilityHierarchy", .{ .array = .init(alloc) });
+        const hierarchy = semantic.object.getPtr("capabilityHierarchy").?;
+        for (plan.hierarchy) |edge| {
+            const previous = for (hierarchy.array.items) |row| {
+                if (std.mem.eql(u8, model.text(row, "capability"), edge.capability)) break row;
+            } else null;
+            if (previous) |row| {
+                if (!std.mem.eql(u8, try std.json.Stringify.valueAlloc(alloc, model.items(row, "dependsOn"), .{}), try std.json.Stringify.valueAlloc(alloc, edge.dependsOn, .{}))) return error.CapabilityImportCollision;
+            } else try hierarchy.array.append(try std.json.parseFromSliceLeaky(Value, alloc, try std.json.Stringify.valueAlloc(alloc, edge, .{}), .{}));
+        }
+    }
+    const candidate = try model.parse(alloc, try model.canonical(alloc, value));
+    if (!try model.compatible(alloc, current, candidate)) return error.CapabilityImportCollision;
+    return candidate;
+}
 
 fn named(rows: []const Value, id: []const u8) ?Value {
     for (rows) |row| if (std.mem.eql(u8, model.text(row, "id"), id)) return row;
@@ -147,7 +202,11 @@ pub fn describe(alloc: std.mem.Allocator, declaration: model.Declaration, select
     }
     var builder: Builder = .{ .alloc = alloc, .declaration = declaration, .selections = selections };
     for (selections) |selection| try builder.visitCapability(selection.capability, 0);
-    return .{ .definition_hash = declaration.hash, .declaration_complete = builder.problems.items.len == 0, .capabilities = builder.capabilities.items, .realisations = builder.realisations.items, .resources = builder.resources.items, .paths = builder.paths.items, .external_dependencies = builder.external.items, .problems = builder.problems.items };
+    var hierarchy: std.ArrayList(DependencyEdge) = .empty;
+    for (declaration.semantic.capabilityHierarchy) |row| {
+        if (named(builder.capabilities.items, row.capability) != null and row.dependsOn.len > 0) try hierarchy.append(alloc, .{ .capability = row.capability, .dependsOn = row.dependsOn });
+    }
+    return .{ .hierarchy = hierarchy.items, .definition_hash = declaration.hash, .declaration_complete = builder.problems.items.len == 0, .capabilities = builder.capabilities.items, .realisations = builder.realisations.items, .resources = builder.resources.items, .paths = builder.paths.items, .external_dependencies = builder.external.items, .problems = builder.problems.items };
 }
 
 pub fn inspect(manager: workspace.Manager, selections: []const Selection) !Value {
@@ -217,4 +276,20 @@ test "capability packages distinguish copied skills from complete dependency dec
     try std.testing.expectEqual(@as(usize, 5), declared.external_dependencies.len);
     const invalid = try a.print("{s}\"implementation\":\"fossil_skill\",\"portability\":{{\"version\":\"omos.resource-portability/v1\",\"paths\":[\"skills/../outside\"]}}{s}", .{ model.seed[0..index], model.seed[index + original.len ..] });
     try std.testing.expectError(error.InvalidResourcePackagePath, describe(a, try model.parse(a, invalid), &.{.{ .capability = "coding_task" }}));
+}
+
+test "capability package imports preserve the native declaration and reject changed resources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const current = try model.parse(a, model.seed);
+    const plan = try describe(a, current, &.{.{ .capability = "general_task" }});
+    try std.testing.expectEqualStrings(current.hash, (try importDefinition(a, current, plan)).hash);
+    var changed = plan;
+    const resources = try a.dupe(Resource, plan.resources);
+    var value = try std.json.parseFromSliceLeaky(Value, a, try model.canonical(a, resources[0].definition), .{});
+    try value.object.put(a, "name", .{ .string = "Foreign replacement" });
+    resources[0].definition = value;
+    changed.resources = resources;
+    try std.testing.expectError(error.CapabilityImportCollision, importDefinition(a, current, changed));
 }

@@ -246,7 +246,7 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_packages = model.field(properties, "capability_selections") != null and model.hasOperation(declaration, "omos_company_capability"), .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -289,10 +289,14 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
     const schema_discovery = request.action == .discover and request.entity != null;
     const capability_discovery = request.action == .discover and request.capability != null;
-    if ((request.capability != null and (!capability_discovery or request.entity != null or request.path != null)) or (request.realisation != null and (!capability_discovery or std.mem.eql(u8, request.capability.?, "*")))) return error.InvalidCapabilitySelection;
-    if (capability_discovery) {
+    const capability_export = request.action == .export_scope and request.capability != null;
+    const capability_request = capability_discovery or capability_export;
+    if ((request.capability != null and (!capability_request or request.entity != null or request.path != null)) or (request.realisation != null and (!capability_request or std.mem.eql(u8, request.capability.?, "*")))) return error.InvalidCapabilitySelection;
+    if (request.capability_selections != null and (!capability_request or std.mem.eql(u8, request.capability.?, "*"))) return error.InvalidCapabilitySelection;
+    if (capability_export and (!std.mem.eql(u8, request.version, "omos.company/v2") or std.mem.eql(u8, request.capability.?, "*"))) return error.InvalidCapabilitySelection;
+    if (capability_request) {
         if (!model.hasOperation(declaration, "omos_company_capability")) return error.CompanyDefinitionUpdateRequired;
-        try model.validateOperation(manager.alloc, declaration, "omos_company_capability", try parse(manager.alloc, incoming.payload), .input);
+        if (capability_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_capability", try parse(manager.alloc, incoming.payload), .input);
     }
     if (schema_discovery) {
         if (!model.hasOperation(declaration, "omos_company_schema")) return error.CompanyDefinitionUpdateRequired;
@@ -602,7 +606,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             const basis = (if (selected) |view| view.task.model_basis else try manager.modelBasis(pinned)) orelse return error.WorkspaceMigrationRequired;
             const definition = try manager.loadDeclaration(basis.revision);
             if (!std.mem.eql(u8, basis.definition_hash, definition.hash)) return error.StaleWorkspaceDefinition;
-            const result = try @import("company_capabilities.zig").inspect(manager, current, grant, definition, selector, request.realisation, request.offset, request.limit);
+            const result = try @import("company_capabilities.zig").inspect(manager, current, grant, definition, selector, request.realisation, request.capability_selections, request.offset, request.limit);
             return encode(alloc, .{ .version = "omos.company-capability/v1", .workspace = current.workspace, .revision = pinned, .definition_revision = basis.revision, .definition_hash = definition.hash, .semantic_version = definition.semantic.version, .scope_filtered = true, .read_tracking = if (selected != null) "model_basis" else "not_recorded", .capability = result.capability, .package = if (result.body) |body| try requestPage(manager, body, request.offset, request.limit) else null, .capabilities = result.capabilities, .total = result.total, .next_offset = result.next_offset });
         };
         if (request.action == .discover) if (request.entity) |selector| {
@@ -612,6 +616,25 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             const result = try @import("company_schema.zig").inspect(alloc, declaration, grant, selector, request.offset, request.limit);
             return encode(alloc, .{ .version = "omos.company-schema/v1", .workspace = current.workspace, .revision = pinned, .definition_revision = basis.revision, .definition_hash = declaration.hash, .semantic_version = declaration.semantic.version, .scope_filtered = true, .read_tracking = if (selected != null) "model_basis" else "not_recorded", .entity = result.entity, .schema = if (result.body) |body| try requestPage(manager, body, request.offset, request.limit) else null, .entities = result.entities, .total = result.total, .next_offset = result.next_offset });
         };
+        const package = @import("capability_package.zig");
+        const export_plan: ?package.Plan = if (request.action == .export_scope and request.capability != null) selected_plan: {
+            const basis = (if (selected) |view| view.task.model_basis else try manager.modelBasis(pinned)) orelse return error.WorkspaceMigrationRequired;
+            const definition = try manager.loadDeclaration(basis.revision);
+            if (!std.mem.eql(u8, basis.definition_hash, definition.hash)) return error.StaleWorkspaceDefinition;
+            const plan = try @import("company_capabilities.zig").packagePlan(manager, current, grant, definition, request.capability.?, request.realisation, request.capability_selections);
+            if (!plan.declaration_complete) return error.IncompleteCapabilityPackage;
+            const inventory = try manager.inventory(pinned);
+            for (plan.paths) |selector| {
+                // Directory scopes must cover the whole selector. Filtering an
+                // incomplete directory would falsely establish portability.
+                if (!authority.permitsSelector(grant, selector.path)) return error.CompanyAccessDenied;
+                const found = for (inventory) |path| {
+                    if (std.mem.eql(u8, path, selector.path) or (std.mem.endsWith(u8, selector.path, "/") and std.mem.startsWith(u8, path, selector.path))) break true;
+                } else false;
+                if (!found) return error.IncompleteCapabilityPackage;
+            }
+            break :selected_plan plan;
+        } else null;
         var flags = std.StringHashMap(fossil_manifest.File).init(alloc);
         defer flags.deinit();
         if (attributes) for (try manager.fileManifest(pinned)) |file| {
@@ -646,6 +669,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         var count: usize = 0;
         for (try manager.inventory(pinned)) |path| {
             if (!authority.permitsPath(grant, path)) continue;
+            if (export_plan) |plan| if (!package.includes(plan, path)) continue;
             if (count >= request.offset and files.items.len < 32) {
                 const bytes = try manager.contentAt(path, pinned);
                 if (attributes) try fossil_manifest.verifyObject((flags.get(path) orelse return error.WorkspaceVerificationFailed).artifact.?, bytes);
@@ -655,7 +679,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             }
             count += 1;
         }
-        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) (if (attributes) "omos.scoped-export/v2" else "omos.scoped-export/v1") else (if (attributes) "omos.scoped-inventory/v2" else "omos.scoped-inventory/v1"), .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = "not_evaluated", .authority = "content_only" }), writable);
+        return retainRead(manager, grant, request, if (selected) |view| view.view else null, pinned, try encode(alloc, .{ .version = if (request.action == .export_scope) (if (attributes) "omos.scoped-export/v2" else "omos.scoped-export/v1") else (if (attributes) "omos.scoped-inventory/v2" else "omos.scoped-inventory/v1"), .workspace = current.workspace, .revision = pinned, .actor = grant.actor, .grant = grant.id, .files = files.items, .next_offset = if (request.offset + files.items.len < count) @as(?usize, request.offset + files.items.len) else null, .total = count, .content_endpoint = "/v1/company", .dependency_closure = if (export_plan != null) "declared_complete" else "not_evaluated", .package_hash = if (export_plan) |plan| try workspace.hash(alloc, try encode(alloc, plan)) else @as(?[]const u8, null), .authority = "content_only" }), writable);
     }
     return error.UnsupportedCompanyApi;
 }

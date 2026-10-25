@@ -396,6 +396,151 @@ describe("portable Fossil workspace recovery", () => {
     }
   }, 180000);
 
+  test("exports selected capability closure with signed metadata, explicit dependency choices, and offline integrity", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = JSON.parse(f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    declaration.spec.capabilities.push(
+      { id: "portable_cv", name: "Portable CV", requires: [{ id: "cv", primitiveFamily: "skills" }], realisations: ["portable_cv_skill"] },
+      { id: "package_support", name: "Package support", requires: [{ id: "retained_workspace", primitiveFamily: "memory" }], realisations: ["support_primary", "support_alternative"] },
+    );
+    declaration.spec.resources.skills.push({ id: "cv_package", name: "CV package", offers: ["cv"], spec: { documentation: "Declared portable input. ".repeat(900), implementation: "fossil_skill", portability: { version: "omos.resource-portability/v1", paths: ["skills/cv-builder/"], dependencies: [{ kind: "runtime", handle: "node", constraint: ">=22" }] } } });
+    declaration.spec.realisations.push(
+      { id: "portable_cv_skill", name: "Portable CV skill", capability: "portable_cv", participants: [{ resource: "cv_package", supplies: ["cv"] }] },
+      ...["support_primary", "support_alternative"].map(id => ({ id, name: id, capability: "package_support", participants: [{ resource: "fossil_workspace", supplies: ["retained_workspace"] }] })),
+    );
+    declaration.spec.semantic.capabilityHierarchy = [{ capability: "portable_cv", dependsOn: ["general_task", "package_support"] }];
+    const definition = join(f.home, "definition.json"); writeFileSync(definition, JSON.stringify(declaration));
+    const proposed = await f.run(["fossil", "definition", "propose", definition, "--json"]);
+    expect(proposed.code, proposed.stderr).toBe(0);
+    const skill = "# Portable CV fixture\n" + "Use versioned career inputs.\n".repeat(900);
+    model(f, (_body, count) => count === 1 ? { tool_calls: [
+      { path: "skills/cv-builder/SKILL.md", content: skill },
+      { path: "skills/cv-builder/career.mjs", content: "console.log('portable fixture');\n" },
+      { path: "documents/unrelated.txt", content: "Outside the selected capability" },
+    ].map((args, index) => ({ index, id: `closure-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...args }) } })) } : { content: "Saved the portable fixture and unrelated document." });
+    const saved = await f.run(["ask", "Save the declared package inputs", "--json"]);
+    expect(saved.code, saved.stderr).toBe(0);
+    const admin = async (body: object) => {
+      const file = join(f.home, "operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
+      const result = await f.run(["fossil", "company", file, "--json"]);
+      expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+    };
+    const identity = JSON.parse((await f.run(["fossil", "company-key", "reader", "--json"])).stdout);
+    let state = await admin({ action: "initialize" });
+    for (const [id, paths] of [["full-package", ["skills/", "documents/"]], ["partial-package", ["skills/cv-builder/SKILL.md"]]] as const) state = await admin({ action: "grant", revision: state.revision, grant: { id, actor: "reader", public_key: identity.public_key, paths, actions: ["discover", "export_scope"], expires_ms: Date.now() + 3600000 } });
+    state = await admin({ action: "grant_capabilities", revision: state.revision, id: "full-package", capabilities: ["portable_cv", "general_task"] });
+    const service = await startWorkspaceService(f, false);
+    try {
+      const boot = await (await fetch(service.url + "/v1/company", { keepalive: false })).json() as any;
+      expect(boot.features.capability_packages).toBe(true);
+      const config = { version: "omos.scope-export-request/v2", endpoint: service.url, workspace: boot.workspace, actor: "reader", grant: "full-package", key_handle: "reader", issuer: boot.issuer, revision: boot.revision, selections: [{ capability: "portable_cv" }, { capability: "package_support", realisation: "support_alternative" }] };
+      const input = join(f.home, "package-pins.json"), output = join(f.home, "capability.tar");
+      writeFileSync(input, JSON.stringify(config));
+      expect((await f.run(["fossil", "export-scope", input, output, "--json"])).code).toBe(1);
+      expect(existsSync(output)).toBe(false);
+      state = await admin({ action: "grant_capabilities", revision: state.revision, id: "full-package", capabilities: ["portable_cv", "general_task", "package_support"] });
+      state = await admin({ action: "grant_capabilities", revision: state.revision, id: "partial-package", capabilities: ["portable_cv", "general_task", "package_support"] });
+      writeFileSync(input, JSON.stringify({ ...config, selections: [{ capability: "portable_cv" }] }));
+      const ambiguous = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(ambiguous.code).toBe(1); expect(existsSync(output)).toBe(false);
+      writeFileSync(input, JSON.stringify({ ...config, grant: "partial-package" }));
+      expect((await f.run(["fossil", "export-scope", input, output, "--json"])).code).toBe(1);
+      expect(existsSync(output)).toBe(false);
+      writeFileSync(input, JSON.stringify(config));
+      const exported = await f.run(["fossil", "export-scope", input, output, "--json"]);
+      expect(exported.code, exported.stderr + exported.stdout).toBe(0);
+      expect(JSON.parse(exported.stdout)).toMatchObject({ version: "omos.scope-package/v3", files: 2, scope: "selected_capabilities", dependency_closure: "declared_complete" });
+      const archive = readFileSync(output), objects = new Map<string, Buffer>();
+      for (let at = 0; at + 512 <= archive.length && archive[at] !== 0;) {
+        const header = archive.subarray(at, at + 512), name = header.subarray(0, 100).toString().split("\0")[0];
+        const size = parseInt(header.subarray(124, 136).toString().replace(/\0/g, "").trim(), 8);
+        objects.set(name, archive.subarray(at + 512, at + 512 + size)); at += 512 + Math.ceil(size / 512) * 512;
+      }
+      const manifest = JSON.parse(objects.get("manifest.json")!.toString()), plan = JSON.parse(manifest.capability_plan);
+      expect(manifest.capability_receipts.length).toBeGreaterThan(1);
+      expect(plan.capabilities.map((row: any) => row.id).sort()).toEqual(["general_task", "package_support", "portable_cv"]);
+      expect(plan.realisations.map((row: any) => row.id)).toContain("support_alternative");
+      expect(plan.realisations.map((row: any) => row.id)).not.toContain("support_primary");
+      expect(plan.runtime_verification).toBe("required");
+      expect(manifest.files.map((row: any) => row.path).sort()).toEqual(["skills/cv-builder/SKILL.md", "skills/cv-builder/career.mjs"]);
+      expect(objects.get(`objects/${manifest.files.find((row: any) => row.path.endsWith("SKILL.md")).sha256}`)!.toString()).toBe(skill);
+      const offline = fixture(), pins = join(offline.home, "pins.json"), copy = join(offline.home, "package.tar");
+      writeFileSync(pins, JSON.stringify({ ...config, endpoint: "http://127.0.0.1:1" })); writeFileSync(copy, archive);
+      const verified = await offline.run(["fossil", "verify-scope", pins, copy, "--json"]);
+      expect(verified.code, verified.stderr).toBe(0);
+      expect(JSON.parse(verified.stdout)).toMatchObject({ version: "omos.scope-package/v3", files: 2, dependency_closure: "declared_complete" });
+      expect(existsSync(join(offline.home, ".fx/omos-workspace.json"))).toBe(false);
+      expect((await offline.run(["fossil", "init", "--json"])).code).toBe(0);
+      const beforeImport = JSON.parse((await offline.run(["fossil", "status", "--json"])).stdout).trunk_revision;
+      const imported = await offline.run(["fossil", "package", "import", pins, copy, "--json"]);
+      expect(imported.code, imported.stderr + imported.stdout).toBe(0);
+      const staged = JSON.parse(imported.stdout).model_data;
+      expect(staged).toMatchObject({ version: "omos.capability-import/v1", source_workspace: config.workspace, source_revision: config.revision, state: "paused", publication: "pending", runtime_verification: "required", files: 2 });
+      expect(offline.fossil("cat", "skills/cv-builder/SKILL.md", "-r", `task/${staged.task}`)).toBe(skill);
+      const candidate = JSON.parse(offline.fossil("cat", staged.declaration, "-r", `task/${staged.task}`));
+      expect(candidate.spec.capabilities.find((row: any) => row.id === "package_support").realisations).toEqual(["support_alternative"]);
+      expect(candidate.spec.semantic.capabilityHierarchy.find((row: any) => row.capability === "portable_cv").dependsOn).toEqual(["general_task", "package_support"]);
+      expect(JSON.parse(offline.fossil("cat", "omniform/company.json", "-r", "trunk")).spec.capabilities.some((row: any) => row.id === "portable_cv")).toBe(false);
+      const retainedTask = JSON.parse(offline.fossil("cat", `tasks/${staged.task}.json`, "-r", `task/${staged.task}`));
+      expect(retainedTask.definition.obligations.map((row: any) => row.id)).toContain("package_runtime");
+      const replay = await offline.run(["fossil", "package", "import", pins, copy, "--json"]);
+      expect(replay.code, replay.stderr).toBe(0);
+      expect(JSON.parse(replay.stdout).model_data.task).toBe(staged.task);
+      expect(JSON.parse(replay.stdout).model_data.revision).toBe(staged.revision);
+      expect(JSON.parse((await offline.run(["fossil", "status", "--json"])).stdout).trunk_revision).toBe(beforeImport);
+      const verifiedCopy = join(offline.home, "retained-import.fossil");
+      const portable = await offline.run(["fossil", "export", verifiedCopy, "--json"]);
+      expect(portable.code, portable.stderr).toBe(0);
+      expect((await offline.run(["fossil", "verify", "--json"])).code).toBe(0);
+      const restored = fixture();
+      copyFileSync(verifiedCopy, join(restored.cwd, "omos.fossil"));
+      expect((await restored.run(["fossil", "use", join(restored.cwd, "omos.fossil"), "--json"])).code).toBe(0);
+      const restoredImport = await restored.run(["fossil", "package", "import", pins, copy, "--json"]);
+      expect(restoredImport.code, restoredImport.stderr).toBe(0);
+      expect(JSON.parse(restoredImport.stdout).model_data.task).toBe(staged.task);
+      expect(JSON.parse(restoredImport.stdout).model_data.revision).toBe(staged.revision);
+      for (const point of ["capability-import-files", "capability-import-retained"]) {
+        const interrupted = fixture();
+        expect((await interrupted.run(["fossil", "init", "--json"])).code).toBe(0);
+        const stopped = await interrupted.run(["fossil", "package", "import", pins, copy, "--json"], { FX_E2E_FOSSIL_FAULT: point });
+        expect(stopped.code).toBe(1); expect(stopped.stderr).toContain("WorkspaceInjectedFailure");
+        const pending = JSON.parse((await interrupted.run(["fossil", "tasks", "--json"])).stdout).tasks;
+        expect(pending).toHaveLength(1);
+        const resumed = await interrupted.run(["fossil", "package", "import", pins, copy, "--json"]);
+        expect(resumed.code, resumed.stderr).toBe(0);
+        expect(JSON.parse(resumed.stdout).model_data.task).toBe(pending[0].id);
+        const canonical = JSON.parse(interrupted.fossil("cat", `tasks/${pending[0].id}.json`, "-r", `task/${pending[0].id}`));
+        expect(canonical.state).toBe("paused");
+      }
+      const conflicting = fixture();
+      expect((await conflicting.run(["fossil", "init", "--json"])).code).toBe(0);
+      model(conflicting, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "local-skill", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "skills/cv-builder/SKILL.md", content: "Existing local skill" }) } }] } : { content: "Preserved the local skill." });
+      expect((await conflicting.run(["ask", "Retain the existing local skill", "--json"])).code).toBe(0);
+      const conflictBase = JSON.parse((await conflicting.run(["fossil", "status", "--json"])).stdout).trunk_revision;
+      const conflict = await conflicting.run(["fossil", "package", "import", pins, copy, "--json"]);
+      expect(conflict.code).toBe(1); expect(conflict.stderr).toContain("CapabilityImportCollision");
+      expect(JSON.parse((await conflicting.run(["fossil", "status", "--json"])).stdout).trunk_revision).toBe(conflictBase);
+      expect(conflicting.fossil("cat", "skills/cv-builder/SKILL.md", "-r", "trunk")).toBe("Existing local skill");
+      const repack = (changed: any) => {
+        const entries = [...objects].map(([name, bytes]) => [name, (name === "manifest.json" ? Buffer.from(JSON.stringify(changed)) : bytes).toString("base64")]);
+        const result = spawnSync("python3", ["-c", "import base64,io,json,sys,tarfile\nv=json.load(sys.stdin); out=io.BytesIO(); expected=1024\nwith tarfile.open(fileobj=out,mode='w',format=tarfile.USTAR_FORMAT) as a:\n for n,b in v:\n  d=base64.b64decode(b); i=tarfile.TarInfo(n); i.size=len(d); a.addfile(i,io.BytesIO(d)); expected+=512+((len(d)+511)//512)*512\nsys.stdout.buffer.write(out.getvalue()[:expected])\n"], { input: JSON.stringify(entries), maxBuffer: archive.length * 2 });
+        expect(result.status, result.stderr.toString()).toBe(0); writeFileSync(copy, result.stdout);
+      };
+      for (const mutate of [
+        (value: any) => { value.capability_receipts.pop(); },
+        (value: any) => { const altered = JSON.parse(value.capability_plan); altered.external_dependencies = []; value.capability_plan = JSON.stringify(altered); },
+        (value: any) => { value.files.pop(); },
+        (value: any) => { value.inventory_receipts[0].receipt.signature = "00".repeat(64); },
+      ]) {
+        const changed = structuredClone(manifest); mutate(changed); repack(changed);
+        expect((await offline.run(["fossil", "verify-scope", pins, copy, "--json"])).code).toBe(1);
+      }
+      writeFileSync(copy, archive); writeFileSync(pins, JSON.stringify({ ...config, selections: [{ capability: "portable_cv" }, { capability: "package_support", realisation: "support_primary" }] }));
+      expect((await offline.run(["fossil", "verify-scope", pins, copy, "--json"])).code).toBe(1);
+    } finally { service.child.kill(); await service.child.exited; }
+  }, 240000);
+
   test("versions explicit company capability metadata scopes without expanding file grants", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

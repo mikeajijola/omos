@@ -192,7 +192,10 @@ host's encrypted storage and protected backup transport where your deployment
 requires encryption; object-level encryption and portable key-domain recovery
 are not implemented by this service. Current scoped exports can be downloaded as signed, content-addressed file packages with
 `omos fossil export-scope`, then verified offline with `omos fossil verify-scope`.
-They declare a file snapshot scope; capability dependency closure is not inferred.
+Version 1 configurations export file snapshots without inferred capability
+closure. Version 2 configurations explicitly select capabilities and their
+realisations, require authority over the complete declared input paths, and
+retain signed dependency metadata. See [selected capability packages](../../src/core/workspace/CONTRACTS.md#selected-capability-packages).
 
 Before activating a restored instance on another host, stop and fence the old
 host. Bind the verified repository, inspect authority with `company` action

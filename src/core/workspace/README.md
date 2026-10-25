@@ -219,7 +219,8 @@ results are derived from canonical records and are not another editable source.
 
 `omos fossil package plan CAPABILITY --json` follows the selected OmniForm
 realisation and transitive `capabilityHierarchy.dependsOn` requirements. Use
-`--realisation ID` when a capability has multiple choices. The result pins the
+`--realisation ID` when a capability has multiple choices, or `--selections PATH`
+with an array of explicit root and dependency choices. The result pins the
 company revision and declaration hash, lists required files with their Fossil
 object identities and executable flags, and reports missing inputs.
 
@@ -249,6 +250,13 @@ retained files and an executable capability. Owner inspection reports
 `file_verification: "required"` until content has been retrieved and verified.
 See [capability metadata authority](CONTRACTS.md#scoped-company-service) for
 company grant and delegation rules.
+
+Selected company packages can be exported with a version 2 export configuration
+and verified offline. `omos fossil package import CONFIG.json ARCHIVE.tar --json`
+retains a verified package and additive declaration candidate on a paused task
+branch. Runtime verification and independent publication remain outstanding.
+See [selected capability packages](CONTRACTS.md#selected-capability-packages) for
+request fields, authority, integrity checks, and import bounds.
 
 ## Plan and bound an invocation
 

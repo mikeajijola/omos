@@ -11,7 +11,7 @@ pub const Company = struct {
     workspace: []const u8,
     issuer: []const u8,
     epoch: u64,
-    features: ?struct { file_attributes: ?[]const u8 = null, checkpoint_attributes: bool = false } = null,
+    features: ?struct { file_attributes: ?[]const u8 = null, checkpoint_attributes: bool = false, capability_packages: bool = false } = null,
 };
 
 pub const Control = @import("../shared/bounded_operation.zig").Control;

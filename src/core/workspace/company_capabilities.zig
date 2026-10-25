@@ -143,7 +143,21 @@ fn authorizeClosure(alloc: std.mem.Allocator, policy: Policy, state: authority.S
 
 /// This endpoint exposes declared dependencies, not file inventory. Task reads
 /// bind to their model basis; subsequent file reads retain their own evidence.
-pub fn inspect(manager: workspace.Manager, state: authority.State, grant: authority.Grant, declaration: model.Declaration, selector: []const u8, realisation: ?[]const u8, offset: usize, limit: usize) !Selection {
+pub fn packagePlan(manager: workspace.Manager, state: authority.State, grant: authority.Grant, declaration: model.Declaration, selector: []const u8, realisation: ?[]const u8, selections: ?[]const authority.CapabilitySelection) !@import("capability_package.zig").Plan {
+    const policy = try load(manager);
+    const now = @import("../shared/io.zig").milliTimestamp();
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    try authorizeClosure(manager.alloc, policy, state, grant, declaration, selector, &visited, 0, now);
+    const chosen: []const authority.CapabilitySelection = selections orelse &.{.{ .capability = selector, .realisation = realisation }};
+    if (selections != null and (chosen.len == 0 or chosen.len > 256 or !std.mem.eql(u8, chosen[0].capability, selector) or realisation != null)) return error.InvalidCapabilitySelection;
+    for (chosen) |selection| if (!visited.contains(selection.capability)) return error.InvalidCapabilitySelection;
+    return @import("capability_package.zig").describe(manager.alloc, declaration, chosen) catch |err| switch (err) {
+        error.UnknownCapability => return error.CompanyAccessDenied,
+        else => return err,
+    };
+}
+
+pub fn inspect(manager: workspace.Manager, state: authority.State, grant: authority.Grant, declaration: model.Declaration, selector: []const u8, realisation: ?[]const u8, selections: ?[]const authority.CapabilitySelection, offset: usize, limit: usize) !Selection {
     if (limit == 0 or limit > 16384) return error.InvalidEvidenceOffset;
     const policy = try load(manager);
     const now = @import("../shared/io.zig").milliTimestamp();
@@ -159,11 +173,6 @@ pub fn inspect(manager: workspace.Manager, state: authority.State, grant: author
         return .{ .capabilities = visible.items, .total = total, .next_offset = if (offset + visible.items.len < total) offset + visible.items.len else null };
     }
     if (!authority.safeIdentity(selector)) return error.InvalidCompanyIdentity;
-    var visited: std.StringHashMapUnmanaged(void) = .empty;
-    try authorizeClosure(manager.alloc, policy, state, grant, declaration, selector, &visited, 0, now);
-    const plan = @import("capability_package.zig").describe(manager.alloc, declaration, &.{.{ .capability = selector, .realisation = realisation }}) catch |err| switch (err) {
-        error.UnknownCapability => return error.CompanyAccessDenied,
-        else => return err,
-    };
+    const plan = try packagePlan(manager, state, grant, declaration, selector, realisation, selections);
     return .{ .capability = selector, .body = try std.json.Stringify.valueAlloc(manager.alloc, plan, .{}), .total = 1 };
 }

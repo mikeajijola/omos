@@ -33,6 +33,7 @@ pub const State = struct {
 pub const Binding = struct { actor: []const u8, grant: []const u8 };
 pub const Envelope = struct { payload: []const u8, signature: []const u8 };
 pub const Upload = struct { sha256: []const u8, bytes: usize };
+pub const CapabilitySelection = struct { capability: []const u8, realisation: ?[]const u8 = null };
 pub const Request = struct {
     version: []const u8,
     workspace: []const u8,
@@ -61,6 +62,7 @@ pub const Request = struct {
     entity: ?[]const u8 = null,
     capability: ?[]const u8 = null,
     realisation: ?[]const u8 = null,
+    capability_selections: ?[]const CapabilitySelection = null,
     record_id: ?[]const u8 = null,
     progress_cursor: ?[]const u8 = null,
 };
@@ -104,6 +106,12 @@ pub fn validPath(path: []const u8, prefix: bool) bool {
 
 pub fn permitsPath(grant: Grant, path: []const u8) bool {
     if (!validPath(path, false)) return false;
+    return permitsSelector(grant, path);
+}
+
+/// A directory selector requires a grant covering its entire subtree.
+pub fn permitsSelector(grant: Grant, path: []const u8) bool {
+    if (!validPath(path, std.mem.endsWith(u8, path, "/"))) return false;
     for (grant.paths) |scope| {
         if (std.mem.endsWith(u8, scope, "/")) {
             if (std.mem.startsWith(u8, path, scope)) return true;
@@ -204,6 +212,9 @@ test "company authority enforces boundaries, delegation, ancestor revocation and
     var state: State = .{ .workspace = "company", .issuer = &public, .grants = &.{grant} };
     try validateGrant(state, grant, 1);
     try std.testing.expect(permitsPath(grant, "documents/team/report.md"));
+    try std.testing.expect(permitsSelector(grant, "documents/team/"));
+    try std.testing.expect(!permitsSelector(grant, "documents/"));
+    try std.testing.expect(!permitsPath(grant, "documents/team/"));
     try std.testing.expect(!permitsPath(grant, "documents/team-private/report.md"));
     try std.testing.expect(!permitsPath(grant, "documents/team/../secret.md"));
     var child = grant;

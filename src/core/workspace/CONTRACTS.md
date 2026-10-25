@@ -757,6 +757,55 @@ verification. Historical version 1 packages remain readable and report
 `file_attributes: "unavailable"`. Neither format proves that a script can run
 without its declared host dependencies.
 
+### Selected capability packages
+
+A version 2 export configuration adds a nonempty `selections` array. Its first
+entry names the root capability; additional entries choose realisations for
+transitive dependencies with multiple alternatives. For example:
+
+```json
+{
+  "capability": "cv_builder",
+  "realisation": "cv_builder_skill"
+}
+```
+
+Place this entry in `selections` alongside the same endpoint, workspace, actor,
+grant, issuer, revision, and key handle fields shown above, and set `version` to
+`omos.scope-export-request/v2`. The server must advertise
+`features.capability_packages: true`. The grant needs both `discover` and
+`export_scope`, metadata authority for every capability in the closure, and
+path authority covering every required directory or file selector in full.
+A grant covering one file cannot establish completeness for its containing
+directory. Missing files, missing metadata authority, undeclared skill inputs,
+and ambiguous realisations fail before an archive is published.
+
+Version 3 archives declare `scope: "selected_capabilities"` and
+`dependency_closure: "declared_complete"`. They include the exact selected
+capability, resource, and realisation definitions, dependency edges, declared
+external handles, and issuer-signed paginated metadata proofs. Signed inventory
+pages bind the same plan hash and revision. Unrelated authorised files are
+excluded. Offline verification checks the metadata proofs, exact selections,
+complete required-path coverage, file hashes, modes, and inventory proofs.
+Metadata is bounded to 1 MiB and 64 pages. The declared graph still reports
+`runtime_verification: "required"`; the archive carries no executable authority,
+provider credentials, or host configuration secrets.
+
+`omos fossil package import CONFIG.json ARCHIVE.tar --json` verifies a selected
+capability package offline and retains its files, source manifest, and an
+additive declaration candidate on an isolated task branch in the bound local
+workspace. The source signatures and original company revision remain in
+content-addressed artifacts. Existing content or definitions with different
+bytes, flags, or identities cause a conflict. The destination declaration and
+accepted files remain unchanged. Imported content is bounded to 256 MiB and
+the retained manifest to 8 MiB.
+
+The result identifies a paused task with obligations for files, destination
+runtime dependencies, and declaration activation. Import does not execute
+package programs or publish the branch. Resume that task through the normal
+agent and independent-review path. Repeating the same import reuses its retained
+task and checkpoint. A portable Fossil export preserves this pending work.
+
 Exports use at most 32 inventory entries per page and 16 KiB per content
 request. Files are limited to 8 MiB, inventories to 10,000 paths and 8 MiB of
 receipt metadata. `max_bytes` defaults to 1 GiB of logical file content and

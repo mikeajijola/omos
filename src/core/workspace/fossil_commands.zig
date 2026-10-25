@@ -6,6 +6,8 @@ pub const Options = struct {
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
+    selections_path: ?[]const u8 = null,
+    package_action: enum { plan, import } = .plan,
     cache_action: @import("filesystem_projection.zig").CacheMode = .status,
     execution_path: ?[]const u8 = null,
     offset: usize = 0,
@@ -41,6 +43,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingRealisation;
             options.realisation = args[index];
+        } else if (std.mem.eql(u8, arg, "--selections")) {
+            if (options.selections_path != null) return error.UnexpectedArgument;
+            index += 1;
+            if (index >= args.len) return error.MissingPath;
+            options.selections_path = args[index];
         } else if (std.mem.eql(u8, arg, "--execution")) {
             index += 1;
             if (index >= args.len) return error.MissingPath;
@@ -57,12 +64,12 @@ pub fn parse(args: []const [:0]const u8) !Options {
             options.cache_action = std.meta.stringToEnum(@TypeOf(options.cache_action), arg) orelse return error.UnknownAction;
             positional += 1;
         } else if (options.action == .package and positional == 1) {
-            if (!std.mem.eql(u8, arg, "plan")) return error.UnknownAction;
+            options.package_action = std.meta.stringToEnum(@TypeOf(options.package_action), arg) orelse return error.UnknownAction;
             positional += 1;
         } else if (options.path == null) {
             options.path = arg;
             positional += 1;
-        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) {
+        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope" or (options.action == .package and options.package_action == .import)) and options.request_path == null) {
             options.request_path = arg;
         } else return error.UnexpectedArgument;
     }
@@ -72,14 +79,18 @@ pub fn parse(args: []const [:0]const u8) !Options {
             .show => if (options.path != null) return error.UnexpectedArgument,
             .validate, .propose => if (options.path == null) return error.MissingPath,
         },
-        .package => if (options.path == null) return error.MissingCapability,
+        .package => {
+            if (options.path == null) return error.MissingCapability;
+            if (options.package_action == .import and options.request_path == null) return error.MissingPath;
+        },
         .cache => if (options.path != null) return error.UnexpectedArgument,
         .company, .@"company-key" => if (options.path == null) return error.MissingPath,
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
     if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
-    if (options.realisation != null and options.action != .package) return error.UnexpectedArgument;
+    if ((options.realisation != null or options.selections_path != null) and !(options.action == .package and options.package_action == .plan)) return error.UnexpectedArgument;
+    if (options.realisation != null and options.selections_path != null) return error.UnexpectedArgument;
     if (offset_seen and options.action != .query) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
     if (options.upgrade_contracts and options.action != .migrate) return error.UnexpectedArgument;
@@ -109,10 +120,12 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         const declaration = try model.parse(alloc, model.seed);
         const raw = try readDefinition(alloc, options.path.?);
         const input = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
-        try model.validateOperation(alloc, declaration, if (options.action == .@"export-scope") "omos_export_scope" else "omos_verify_scope", input, .input);
+        const selected = std.mem.eql(u8, model.text(input, "version"), "omos.scope-export-request/v2");
+        const operation = if (selected) "omos_export_capabilities" else if (options.action == .@"export-scope") "omos_export_scope" else "omos_verify_scope";
+        try model.validateOperation(alloc, declaration, operation, input, .input);
         const snapshot = if (options.action == .@"export-scope") try @import("scope_export.zig").write(alloc, raw, options.request_path.?) else try @import("scope_export.zig").verify(alloc, raw, options.request_path.?);
         const output = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, snapshot, .{}), .{});
-        try model.validateOperation(alloc, declaration, if (options.action == .@"export-scope") "omos_export_scope" else "omos_verify_scope", output, .output);
+        try model.validateOperation(alloc, declaration, operation, output, .output);
         return .{ .scope = snapshot };
     }
     if (options.action == .remote) {
@@ -169,7 +182,20 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
             .propose => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.proposeDefinition(null, try readDefinition(alloc, options.path.?), if (options.execution_path) |path| try readDefinition(alloc, path) else null), .{})).value,
         },
         .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
-        .package => model_data = try @import("capability_package.zig").inspect(manager, &.{.{ .capability = options.path.?, .realisation = options.realisation }}),
+        .package => {
+            if (options.package_action == .import) {
+                const raw = try readDefinition(alloc, options.path.?);
+                const model = @import("definition.zig");
+                const declaration = try manager.loadDeclaration("trunk");
+                try model.validateOperation(alloc, declaration, "omos_import_capabilities", try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}), .input);
+                model_data = try @import("scope_export.zig").importArchive(manager, raw, options.request_path.?);
+                try model.validateOperation(alloc, declaration, "omos_import_capabilities", model_data.?, .output);
+            } else {
+                const selections: []const @import("capability_package.zig").Selection = if (options.selections_path) |path| try @import("../shared/record_json.zig").decode([]const @import("capability_package.zig").Selection, alloc, try readDefinition(alloc, path), .{}) else &.{.{ .capability = options.path.?, .realisation = options.realisation }};
+                if (selections.len == 0 or !std.mem.eql(u8, selections[0].capability, options.path.?)) return error.InvalidCapabilitySelection;
+                model_data = try @import("capability_package.zig").inspect(manager, selections);
+            }
+        },
         .cache => model_data = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, try @import("filesystem_projection.zig").collect(manager, options.cache_action), .{}), .{}),
         .audit => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.auditContracts(), .{})).value,
         .serve => return error.ServiceRequiresCliHost,

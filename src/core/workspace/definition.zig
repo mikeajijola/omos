@@ -338,7 +338,7 @@ pub fn upgrade(alloc: Allocator, previous: Declaration) !Declaration {
 
 fn extendNativeTransport(alloc: Allocator, operation: *Value, native: Value) !bool {
     const id = text(operation.*, "id");
-    if (!std.mem.eql(u8, id, "omos_company_operation") and !std.mem.eql(u8, id, "omos_export_scope") and !std.mem.eql(u8, id, "omos_verify_scope")) return false;
+    if (!std.mem.eql(u8, id, "omos_company_operation") and !std.mem.eql(u8, id, "omos_company_capability") and !std.mem.eql(u8, id, "omos_export_scope") and !std.mem.eql(u8, id, "omos_verify_scope")) return false;
     var changed = false;
     for ([_][]const u8{ "input", "output" }) |direction| {
         const shape = operation.object.getPtr(direction) orelse continue;
