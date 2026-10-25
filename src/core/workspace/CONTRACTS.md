@@ -396,7 +396,7 @@ metadata is bounded to 8 MiB before atomic publication. Divergent changes stop w
 a known baseline. A view with uncheckpointed edits must not be discarded as
 cache garbage. Views retain the existing limits of 8 MiB per file, 256 MiB of
 materialised content, and 10,000 files. This does not provide a transparent remote
-filesystem, automatic view eviction, or a sandbox for company actors.
+filesystem or a sandbox for company actors.
 
 Managed turns also hold a shared kernel pin for their view. Captured-command
 workers own an additional pin; the foreground supervisor and shell inherit its
@@ -414,8 +414,29 @@ still require an isolated execution backend. A child task can have a different
 project from its parent when the terminal grant authorises that project. Clients
 cannot supply a lock-file path through terminal request parameters.
 The native Darwin spawn adapter preserves these explicit descriptors separately
-from its process-tree witness. Automatic view eviction remains disabled until
-the clean-view collector is implemented.
+from its process-tree witness.
+
+New view directories include the repository binding hash. Copies of a repository
+therefore share immutable canonical objects without sharing mutable drafts. An
+owned legacy baseline keeps its original directory; legacy views remain outside
+automatic collection because older process launchers do not retain lifetime pins.
+
+`fossil cache status`, `prune`, and `trim` report view retention reasons. Pruning
+requires an accepted personal task, exclusive task and lifetime locks, and the
+projection lock. It scans every local entry, including directories deliberately
+omitted from normal checkpoints. Unknown files, execution caches, missing baseline
+files, pending hydration, and mismatched canonical hashes prevent deletion. The
+collector renames a clean view into quarantine and verifies it again before
+removal. Interrupted quarantines remain available for inspection. Baselines and
+Fossil history are retained.
+
+Fresh execution policies bound clean cached views to 256 MiB and 32 views.
+The `projections` field is omitted when absent in legacy policies, preserving
+pinned policy hashes. Saved managed turns, the writable service, and the persistent
+UI host share one kernel-owned background maintenance lease per repository binding.
+The worker runs a cancellable 15-second pass every 30 seconds. Turn shutdown joins
+its worker before releasing borrowed state or execution and resource leases. Standalone cache commands are bounded
+to 30 seconds. Protected drafts and resources do not count as evictable cache.
 
 Task context lists bounded memory and skill inventories independently of body
 previews. Oversized files remain discoverable through `omos_memory` and
@@ -850,9 +871,15 @@ before rebuilding, including when its revision has not changed. Recovery copies
 and earlier cache layouts are retained; they are not silently evicted. These host
 checkouts can still materialize a complete revision. Personal task tools fetch
 their selected files on demand; arbitrary shell commands hydrate the full view.
-Shared caching and safe eviction for these task projections require further
-implementation. Scoped exports
-use the bounded profile object cache described above.
+Clean accepted personal projections use the bounded collector described above.
+Personal projection hydration reuses the profile object cache after selecting
+an object from a verified canonical Fossil manifest. A separate personal scope
+and object-key domain isolate it from signed company export caches. Each lookup
+verifies the full Fossil SHA-1 or SHA-3 identity; cache names never supply
+retrieval authority. Corrupt or missing cache files fall back to Fossil. View
+files are copied and never hard-linked to immutable cache objects. Both cache
+namespaces share the 256 MiB and 4,096-object storage bound. Scoped exports use
+the signed-inventory path described above.
 
 Mutations retain a request hash and pending outcome before effects. Completed
 retries return the saved result after a fresh authority check. Reusing an

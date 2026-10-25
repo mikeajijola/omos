@@ -1354,7 +1354,7 @@ pub const Manager = struct {
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
         try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{}, .server = .{} }));
+        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{}, .server = .{}, .projections = .{} }));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
     }
@@ -3518,7 +3518,7 @@ pub const Manager = struct {
         var manifest = self.manifest;
         manifest.format = 2;
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{}, .server = .{} }));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{}, .server = .{}, .projections = .{} }));
         try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
         _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
         return self.alloc.print("Activated omos.workspace/v1 for future tasks. Verified backup: {s}. Existing tasks retain their original contract and legacy adapter.", .{backup});
@@ -3534,6 +3534,7 @@ pub const Manager = struct {
         const execution_document = (try std.json.parseFromSlice(std.json.Value, self.alloc, old_execution_bytes, .{})).value;
         if (model.field(execution_document, "review") == null) execution.review = .{};
         if (model.field(execution_document, "server") == null) execution.server = .{};
+        if (model.field(execution_document, "projections") == null) execution.projections = .{};
         if (std.mem.eql(u8, previous.hash, next.hash) and std.mem.eql(u8, try json(self.alloc, old_execution), try json(self.alloc, execution))) return "Workspace contracts are current; active task bases remain pinned.";
         const backup = try self.alloc.print("{s}.pre-contracts-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
         try self.exportRepository(backup);
@@ -3581,6 +3582,7 @@ pub const Manager = struct {
             // active review contract when that section was not supplied.
             if (model.field(supplied, "review") == null) execution.review = previous_execution.review;
             if (model.field(supplied, "server") == null) execution.server = previous_execution.server;
+            if (model.field(supplied, "projections") == null) execution.projections = previous_execution.projections;
         }
         const compatible = try model.compatible(self.alloc, old, proposed) and model.compatibleExecution(previous_execution, execution);
         const proposal_id = try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }));

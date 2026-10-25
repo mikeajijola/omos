@@ -195,8 +195,9 @@ Measure repository size, host checkout size, active view count, review duration,
 and storage growth when setting capacity expectations. Scoped export clients
 reuse verified objects through a private 256 MiB cache, bounded to 4,096 objects,
 while checking current grant authority. Their JSON summaries report cache
-activity. Sparse task projections, shared caching for those projections, and
-continuous desired-state reconciliation remain required before treating this
+activity. Personal task projections retrieve files on demand and retain live resources
+during clean-view collection and reuse verified immutable content through the
+bounded profile cache. Continuous desired-state reconciliation remains required before treating this
 deployment as the complete large-company model.
 
 ## Review capacity

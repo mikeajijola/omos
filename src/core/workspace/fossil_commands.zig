@@ -2,9 +2,10 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
+    action: enum { init, ensure, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
+    cache_action: @import("filesystem_projection.zig").CacheMode = .status,
     execution_path: ?[]const u8 = null,
     offset: usize = 0,
     json: bool = false,
@@ -46,6 +47,9 @@ pub fn parse(args: []const [:0]const u8) !Options {
         } else if (options.action == .definition and positional == 1) {
             options.definition_action = std.meta.stringToEnum(@TypeOf(options.definition_action), arg) orelse return error.UnknownAction;
             positional += 1;
+        } else if (options.action == .cache and positional == 1) {
+            options.cache_action = std.meta.stringToEnum(@TypeOf(options.cache_action), arg) orelse return error.UnknownAction;
+            positional += 1;
         } else if (options.path == null) {
             options.path = arg;
             positional += 1;
@@ -59,6 +63,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             .show => if (options.path != null) return error.UnexpectedArgument,
             .validate, .propose => if (options.path == null) return error.MissingPath,
         },
+        .cache => if (options.path != null) return error.UnexpectedArgument,
         .company, .@"company-key" => if (options.path == null) return error.MissingPath,
         .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
@@ -153,6 +158,7 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
             .propose => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.proposeDefinition(null, try readDefinition(alloc, options.path.?), if (options.execution_path) |path| try readDefinition(alloc, path) else null), .{})).value,
         },
         .query => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.queryRecords(null, options.path, options.offset), .{})).value,
+        .cache => model_data = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, try @import("filesystem_projection.zig").collect(manager, options.cache_action), .{}), .{}),
         .audit => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try manager.auditContracts(), .{})).value,
         .serve => return error.ServiceRequiresCliHost,
         .remote, .@"company-key", .@"export-scope", .@"verify-scope" => unreachable,
@@ -221,4 +227,12 @@ test "scoped package commands require separate configuration and archive paths" 
     try std.testing.expectError(error.MissingPath, parse(&.{ "verify-scope", "scope.json" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "export-scope", "scope.json", "package.tar", "extra" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "export-scope", "scope.json", "package.tar", "--write" }));
+}
+
+test "filesystem projection cache command parses bounded host maintenance modes" {
+    try std.testing.expectEqual(.status, (try parse(&.{ "cache", "--json" })).cache_action);
+    try std.testing.expectEqual(.prune, (try parse(&.{ "cache", "prune" })).cache_action);
+    try std.testing.expectEqual(.trim, (try parse(&.{ "cache", "trim" })).cache_action);
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "cache", "prune", "outside" }));
+    try std.testing.expectError(error.UnknownAction, parse(&.{ "cache", "everything" }));
 }

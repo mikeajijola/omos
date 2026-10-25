@@ -24,6 +24,7 @@ pub const Turn = struct {
     assessment_record: ?[]const u8 = null,
     filesystem_view: bool = false,
     execution_lease: ?workspace.ExecutionLease = null,
+    maintenance: ?@import("projection_maintenance.zig").Handle = null,
     projection_pin: ?@import("../shared/resource_pin.zig").Pin = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
@@ -73,6 +74,9 @@ pub const Turn = struct {
         turn.projection_pin = try @import("../shared/resource_pin.zig").acquire(try @import("filesystem_projection.zig").retentionPath(manager, turn.task), manager.operation_control);
         try @import("filesystem_projection.zig").prepare(manager, turn.task);
         turn.filesystem_view = true;
+        if (turn.task.model_basis) |basis| if (basis.execution.projections != null) {
+            turn.maintenance = @import("projection_maintenance.zig").Handle.start(manager) catch null;
+        };
         return turn;
     }
 
@@ -86,6 +90,8 @@ pub const Turn = struct {
     }
 
     pub fn release(self: *Turn) void {
+        if (self.maintenance) |maintenance| maintenance.stop();
+        self.maintenance = null;
         if (self.projection_pin) |pin| pin.close();
         self.projection_pin = null;
         if (self.execution_lease) |lease| lease.release();

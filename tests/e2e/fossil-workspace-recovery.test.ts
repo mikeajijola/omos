@@ -244,6 +244,117 @@ describe("portable Fossil workspace recovery", () => {
     expect(f.fossil("cat", "documents/draft.txt", "-r", "trunk")).toBe("Uncommitted legacy draft");
   }, 120000);
 
+  test("prunes only clean accepted views and preserves drafts, execution caches, and live resources", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const roots: string[] = [];
+    model(f, (body, count) => {
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      if (count % 2 === 1) {
+        const index = roots.push(root) - 1;
+        return { tool_calls: [{ index: 0, id: `cache-view-${index}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: join(root, `documents/item-${index}.txt`), content: `Canonical content ${index}` }) } }] };
+      }
+      return { content: "The document is checkpointed." };
+    });
+    for (let index = 0; index < 3; index++) {
+      const result = await f.run(["ask", `Save document ${index}`, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+    }
+    writeFileSync(join(roots[1], "documents/item-1.txt"), "Uncommitted private draft");
+    mkdirSync(join(roots[2], "node_modules"));
+    writeFileSync(join(roots[2], "node_modules/private.txt"), "Do not silently evict this");
+    const pin = join(roots[0], "..", ".pins", createHash("sha256").update(roots[0]).digest("hex") + ".lock");
+    const holder = Bun.spawn(["python3", "-c", "import fcntl,sys; f=open(sys.argv[1],'r+'); fcntl.flock(f,fcntl.LOCK_SH); print('ready',flush=True); sys.stdin.read()", pin], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    try {
+      const reader = holder.stdout.getReader();
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("ready");
+      reader.releaseLock();
+      const held = await f.run(["fossil", "cache", "prune", "--json"]);
+      expect(held.code, held.stderr).toBe(0);
+      const report = JSON.parse(held.stdout).model_data;
+      expect(report.removed).toBe(0);
+      expect(report.entries.find((entry: any) => entry.path === roots[0]).state).toBe("live_resource");
+      expect(roots.every(existsSync)).toBe(true);
+    } finally { holder.stdin.end(); await holder.exited; }
+    const pruned = await f.run(["fossil", "cache", "prune", "--json"]);
+    expect(pruned.code, pruned.stderr).toBe(0);
+    const report = JSON.parse(pruned.stdout).model_data;
+    expect(report.removed).toBe(1);
+    expect(report.reclaimed_bytes).toBe("Canonical content 0".length);
+    expect(existsSync(roots[0])).toBe(false);
+    expect(readFileSync(join(roots[1], "documents/item-1.txt"), "utf8")).toBe("Uncommitted private draft");
+    expect(readFileSync(join(roots[2], "node_modules/private.txt"), "utf8")).toBe("Do not silently evict this");
+    expect(f.fossil("cat", "documents/item-0.txt", "-r", "trunk")).toBe("Canonical content 0");
+    expect(existsSync(pin)).toBe(true);
+    const declaration = join(f.home, "cache-definition.json"), policy = join(f.home, "cache-policy.json");
+    writeFileSync(declaration, f.fossil("cat", "omniform/company.json", "-r", "trunk"));
+    const execution = JSON.parse(f.fossil("cat", "execution/omos.json", "-r", "trunk"));
+    execution.projections = { max_clean_views: 1, max_clean_bytes: 268435456 };
+    writeFileSync(policy, JSON.stringify(execution));
+    const proposed = await f.run(["fossil", "definition", "propose", declaration, "--execution", policy, "--json"]);
+    expect(proposed.code, proposed.stderr).toBe(0);
+    const fresh = await f.run(["ask", "Save a document for automatic cleanup", "--json"]);
+    expect(fresh.code, fresh.stderr).toBe(0);
+    const newest = await f.run(["ask", "Save the newest clean cached document", "--json"]);
+    expect(newest.code, newest.stderr).toBe(0);
+    expect(roots).toHaveLength(5);
+    const service = await startWorkspaceService(f, true);
+    try {
+      const deadline = Date.now() + 20000;
+      while (existsSync(roots[3])) {
+        if (Date.now() > deadline) throw Error("Background policy did not collect the clean view");
+        await Bun.sleep(50);
+      }
+      expect(readFileSync(join(roots[1], "documents/item-1.txt"), "utf8")).toBe("Uncommitted private draft");
+      expect(existsSync(roots[2])).toBe(true);
+      expect(existsSync(roots[4])).toBe(true);
+    } finally { service.child.kill(); await service.child.exited; }
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  }, 180000);
+
+  test("reuses verified canonical objects across sparse views and rebuilds after corruption or cache loss", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const roots: string[] = [];
+    const content = "Shared immutable projection content";
+    model(f, (body, count) => {
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      const root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      if (count === 1) return { tool_calls: [{ index: 0, id: "seed-shared-content", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/shared.txt", content }) } }] };
+      if (count % 2 === 0) {
+        roots.push(root);
+        return { tool_calls: [{ index: 0, id: `shared-read-${count}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: join(root, "documents/shared.txt") }) } }] };
+      }
+      expect(readFileSync(join(root, "documents/shared.txt"), "utf8")).toBe(content);
+      return { content: "Read verified portable content." };
+    });
+    const read = async () => {
+      const result = await f.run(["ask", "Read the shared portable document", "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+    };
+    await read();
+    const cache = join(f.home, ".fx/cache/company-objects");
+    const objects = () => readdirSync(cache).filter(name => name.length === 129);
+    const first = objects();
+    expect(first).toHaveLength(1);
+    const initialHits = readFileSync(f.env.FX_TRACE_LOG, "utf8").split("projection object cache hit").length;
+    await read();
+    expect(objects()).toEqual(first);
+    expect(readFileSync(f.env.FX_TRACE_LOG, "utf8").split("projection object cache hit").length).toBeGreaterThan(initialHits);
+    expect(roots[0]).not.toBe(roots[1]);
+    expect(statSync(join(roots[0], "documents/shared.txt")).ino).not.toBe(statSync(join(roots[1], "documents/shared.txt")).ino);
+    expect(statSync(join(cache, first[0])).ino).not.toBe(statSync(join(roots[0], "documents/shared.txt")).ino);
+    writeFileSync(join(cache, first[0]), "Corrupt shared cache content");
+    await read();
+    expect(readFileSync(join(cache, first[0]), "utf8")).toBe(content);
+    rmSync(cache, { recursive: true });
+    await read();
+    expect(objects()).toHaveLength(1);
+    expect(roots).toHaveLength(4);
+    expect(f.fossil("cat", "documents/shared.txt", "-r", "trunk")).toBe(content);
+  }, 180000);
+
   test("discovers scoped record schemas from pinned OmniForm definitions without exposing other types", async () => {
     const f = fixture();
     const inference = model(f, () => { throw Error("Schema discovery must not run an actor"); });

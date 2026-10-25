@@ -23,6 +23,34 @@ The baseline tracks only materialised files, so unfetched content cannot become
 a deletion. Parallel hydration and checkpoints share a projection lock. This is
 a tool-driven sparse projection, rather than a transparent filesystem mount.
 
+Hydration reuses a private immutable object cache across personal task views.
+Every lookup follows a verified canonical manifest and verifies the complete
+Fossil object hash. Mutable views receive independent copies. Corruption or cache
+loss fetches the original bytes again. The shared cache remains bounded to
+256 MiB and 4,096 objects; it is excluded from portable exports.
+
+New views use a repository-specific directory, so independently copied repositories
+cannot share editable files. Existing views with an owned baseline retain their
+original directory and private drafts.
+
+Inspect disposable views with `omos fossil cache status --json`. Use
+`omos fossil cache prune --json` to remove verified clean accepted views, or
+`omos fossil cache trim --json` to apply the cache policy. Fresh instances store
+`projections.max_clean_bytes: 268435456` and `projections.max_clean_views: 32`
+in `execution/omos.json`. These limits cover clean disposable views. Drafts,
+paused tasks, unknown files, execution caches, and live process resources remain
+protected even when they exceed the budget. Legacy policies omit `projections`
+and keep automatic cleanup disabled until an explicit contract upgrade.
+
+Managed saved CLI turns, the persistent UI host, and the writable workspace
+service trim through one background worker per repository binding every 30 seconds, with a 15-second pass deadline and cancellation during
+shutdown. Trimming keeps the newest clean views and reclaims older excess views
+as it scans, so a deadline does not postpone every deletion. Standalone inspection and pruning have a 30-second deadline. The
+collector holds task, projection, and process lifetime locks, verifies every
+file against Fossil, then renames and rechecks the view before deletion. A crash
+can leave a quarantined directory for inspection. It does not erase task history,
+canonical content, or uncommitted recovery directories.
+
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
 Its read action returns UTF-8 byte slices of JSON containing the original

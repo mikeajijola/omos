@@ -424,6 +424,12 @@ pub fn run(runner: Runner) !void {
     const binding = try workspace.Manager.ensureBound(setup.allocator());
     workspace.configureHostBinding(.{ .repository = binding.repository, .workspace_id = binding.manifest.id });
     defer workspace.configureHostBinding(null);
+    var maintenance: @import("../workspace/projection_maintenance.zig").Worker = .{ .manager = binding };
+    const maintenance_thread = try std.Thread.spawn(.{}, @import("../workspace/projection_maintenance.zig").Worker.loop, .{&maintenance});
+    defer {
+        maintenance.stopping.store(true, .release);
+        maintenance_thread.join();
+    }
     const home = io.getenv("HOME") orelse return error.HomeUnavailable;
     const directory = try alloc.print("{s}/.fx/ui-host/{s}", .{ home, try workspace.hash(alloc, try io.realpathAlloc(alloc, ".")) });
     defer alloc.free(directory);

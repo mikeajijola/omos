@@ -111,6 +111,52 @@ pub const Cache = struct {
         return bytes;
     }
 
+    fn fossilKey(artifact: []const u8) ![64]u8 {
+        if (!@import("fossil_manifest.zig").validHash(artifact)) return error.InvalidCacheReference;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("omos.fossil-object/v1\x00");
+        hash.update(artifact);
+        return std.fmt.bytesToHex(&hash.finalResult(), .lower);
+    }
+
+    /// The caller must first verify a canonical manifest selecting this object.
+    /// Fossil identities are SHA-1 or SHA-3, independently of cache file names.
+    pub fn loadFossil(self: *Cache, alloc: std.mem.Allocator, artifact: []const u8) !?[]u8 {
+        try self.control.check();
+        const key = try fossilKey(artifact);
+        const name = try self.filename(.{ .sha256 = &key, .bytes = 0 });
+        var file = self.dir.openFile(io.getIo(), &name, .{ .mode = .read_write, .allow_directory = false, .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => {
+                self.stats.misses += 1;
+                return null;
+            },
+            else => return err,
+        };
+        defer file.close(io.getIo());
+        const stat = try file.stat(io.getIo());
+        if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o777 != 0o600 or stat.size > maximum_object_bytes) {
+            self.stats.misses += 1;
+            return null;
+        }
+        const bytes = try io.readFileToEnd(alloc, &file, maximum_object_bytes);
+        errdefer alloc.free(bytes);
+        try self.control.check();
+        @import("fossil_manifest.zig").verifyObject(artifact, bytes) catch {
+            alloc.free(bytes);
+            self.stats.misses += 1;
+            return null;
+        };
+        try file.setTimestamps(io.getIo(), .{ .modify_timestamp = .now });
+        self.stats.hits += 1;
+        return bytes;
+    }
+
+    pub fn saveFossil(self: *Cache, alloc: std.mem.Allocator, artifact: []const u8, bytes: []const u8) !void {
+        const key = try fossilKey(artifact);
+        try @import("fossil_manifest.zig").verifyObject(artifact, bytes);
+        try self.saveNamed(alloc, try self.filename(.{ .sha256 = &key, .bytes = bytes.len }), bytes);
+    }
+
     fn lock(self: Cache) !std.Io.File {
         const file = self.dir.createFile(io.getIo(), "writer.lock", .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
             error.PathAlreadyExists => try self.dir.openFile(io.getIo(), "writer.lock", .{ .mode = .read_write, .allow_directory = false, .follow_symlinks = false }),
@@ -133,6 +179,12 @@ pub const Cache = struct {
         try self.control.check();
         const name = try self.filename(reference);
         if (bytes.len != reference.bytes or !std.mem.eql(u8, reference.sha256, &digest(bytes))) return error.InvalidCacheReference;
+        return self.saveNamed(alloc, name, bytes);
+    }
+
+    fn saveNamed(self: *Cache, alloc: std.mem.Allocator, name: [129]u8, bytes: []const u8) !void {
+        try self.control.check();
+        if (bytes.len > maximum_object_bytes) return error.InvalidCacheReference;
         if (bytes.len > self.limits.bytes) return;
         const writer = try self.lock();
         defer writer.close(io.getIo());
@@ -325,4 +377,39 @@ test "company object cache never follows object symlinks" {
     try std.testing.expectError(error.SymLinkLoop, cache.load(a, reference));
     try std.testing.expectEqual(before.mtime, (try target.stat(io.getIo())).mtime);
     try std.testing.expectEqual(@as(usize, 0), cache.stats.hits);
+}
+
+test "Fossil object cache verifies canonical identities, detects corruption, and preserves scope isolation" {
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try io.dirRealpathAlloc(a, temporary.dir, ".");
+    var cancel = std.atomic.Value(bool).init(false);
+    const control: Control = .{ .cancel = &cancel, .deadline = .fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromSeconds(10) }) };
+    const id: [64]u8 = @splat('a');
+    const issuer: [64]u8 = @splat('b');
+    var cache = try Cache.openAt(path, .{ .workspace = &id, .issuer = &issuer, .epoch = 1 }, control, .{});
+    defer cache.close();
+    const body = "Immutable canonical content";
+    var digest_sha3: [32]u8 = undefined;
+    std.crypto.hash.sha3.Sha3_256.hash(body, &digest_sha3, .{});
+    const artifact = std.fmt.bytesToHex(&digest_sha3, .lower);
+    try std.testing.expect((try cache.loadFossil(a, &artifact)) == null);
+    try cache.saveFossil(a, &artifact, body);
+    try std.testing.expectEqualStrings(body, (try cache.loadFossil(a, &artifact)).?);
+    try std.testing.expectError(error.WorkspaceVerificationFailed, cache.saveFossil(a, &artifact, "Changed"));
+    const key = try Cache.fossilKey(&artifact);
+    const name = try cache.filename(.{ .sha256 = &key, .bytes = 0 });
+    var corrupt = try cache.dir.createFile(io.getIo(), &name, .{ .permissions = .fromMode(0o600) });
+    try corrupt.writeStreamingAll(io.getIo(), "Untrusted cache bytes");
+    corrupt.close(io.getIo());
+    try std.testing.expect((try cache.loadFossil(a, &artifact)) == null);
+    try cache.saveFossil(a, &artifact, body);
+    var isolated = try Cache.openAt(path, .{ .workspace = &id, .issuer = &issuer, .epoch = 2 }, control, .{});
+    defer isolated.close();
+    try std.testing.expect((try isolated.loadFossil(a, &artifact)) == null);
+    try std.testing.expectEqualStrings(body, (try cache.loadFossil(a, &artifact)).?);
 }

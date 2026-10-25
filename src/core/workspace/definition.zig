@@ -69,11 +69,14 @@ pub const ServerPolicy = struct {
     review_workers: usize = 2,
 };
 
+pub const ProjectionPolicy = struct { max_clean_bytes: u64 = 256 * 1024 * 1024, max_clean_views: usize = 32 };
+
 pub const Execution = struct {
     version: []const u8 = "omos.execution/v1",
     defaults: Policy = .{},
     review: ReviewPolicy = ReviewPolicy.legacy,
     server: ?ServerPolicy = null,
+    projections: ?ProjectionPolicy = null,
 
     pub fn reviewWorkers(self: Execution) usize {
         return if (self.server) |server| server.review_workers else 1;
@@ -91,6 +94,10 @@ pub const Execution = struct {
         if (self.server) |server| {
             try writer.objectField("server");
             try writer.write(server);
+        }
+        if (self.projections) |projections| {
+            try writer.objectField("projections");
+            try writer.write(projections);
         }
         try writer.endObject();
     }
@@ -196,6 +203,7 @@ pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
     const p = execution.defaults;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
     if (execution.reviewWorkers() < 1 or execution.reviewWorkers() > 4) return error.InvalidExecutionPolicy;
+    if (execution.projections) |pinned| if (pinned.max_clean_views > 1024 or pinned.max_clean_bytes > 4 * 1024 * 1024 * 1024) return error.InvalidExecutionPolicy;
     try execution.review.validate();
     return execution;
 }
@@ -808,4 +816,18 @@ test "workspace declaration explicit transport upgrades preserve company constra
     try std.testing.expectEqualStrings(try canonical(alloc, field(properties.*, "company_note").?), try canonical(alloc, field(upgraded, "company_note").?));
     try std.testing.expect(!try compatible(alloc, old, next));
     try std.testing.expectEqualStrings(next.hash, (try upgrade(alloc, next)).hash);
+}
+
+test "workspace projection policy preserves legacy hashes and bounds disposable cache budgets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const legacy = try parseExecution(a, "{}");
+    try std.testing.expect(legacy.projections == null);
+    const raw = try std.json.Stringify.valueAlloc(a, legacy, .{});
+    try std.testing.expect(std.mem.find(u8, raw, "projections") == null);
+    const bounded = try parseExecution(a, "{\"projections\":{\"max_clean_views\":0,\"max_clean_bytes\":0}}");
+    try std.testing.expectEqual(@as(usize, 0), bounded.projections.?.max_clean_views);
+    try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(a, "{\"projections\":{\"max_clean_views\":1025}}"));
+    try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(a, "{\"projections\":{\"max_clean_bytes\":4294967297}}"));
 }

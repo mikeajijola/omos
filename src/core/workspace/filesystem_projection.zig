@@ -11,7 +11,7 @@ const Entry = struct { path: []const u8, sha256: []const u8, executable: bool = 
 const Pending = struct { revision: []const u8, entries: []const Entry };
 const Baseline = struct { version: u32 = 3, workspace: []const u8, task: []const u8, revision: []const u8, entries: []const Entry, pending: ?Pending = null };
 const File = struct { path: []const u8, bytes: usize, sha256: []const u8, executable: bool };
-const Desired = struct { path: []const u8, sha256: []const u8, executable: bool };
+const Desired = struct { path: []const u8, sha256: []const u8, artifact: []const u8, executable: bool };
 const roots = [_][]const u8{ "memory/", "skills/", "documents/", "artifacts/", "ui/" };
 const max_file_bytes = 8 * 1024 * 1024;
 const max_view_bytes = 256 * 1024 * 1024;
@@ -175,19 +175,23 @@ fn changedBytes(alloc: std.mem.Allocator, parent: std.Io.Dir, name: []const u8, 
     return bytes;
 }
 
-fn scan(alloc: std.mem.Allocator, parent: std.Io.Dir, prefix: []const u8, files: *std.ArrayList(File), total: *usize) anyerror!void {
+fn scan(alloc: std.mem.Allocator, parent: std.Io.Dir, prefix: []const u8, files: *std.ArrayList(File), total: *usize, collection: bool) anyerror!void {
     var iterator = parent.iterate();
     while (try iterator.next(io_mod.getIo())) |entry| {
         const path = try alloc.print("{s}{s}", .{ prefix, entry.name });
+        if (collection and prefix.len == 0 and !writable(try alloc.print("{s}/", .{path}))) return error.WorkspacePathDenied;
         const kind = if (entry.kind == .unknown) (try parent.statFile(io_mod.getIo(), entry.name, .{ .follow_symlinks = false })).kind else entry.kind;
         if (kind == .directory) {
             // Execution caches are not portable inputs. Required packages must
             // declare reproducible dependencies or store their actual resources.
-            if (std.mem.eql(u8, entry.name, "node_modules") or std.mem.eql(u8, entry.name, "__pycache__") or std.mem.eql(u8, entry.name, ".git") or std.mem.eql(u8, entry.name, ".zig-cache")) continue;
+            if (std.mem.eql(u8, entry.name, "node_modules") or std.mem.eql(u8, entry.name, "__pycache__") or std.mem.eql(u8, entry.name, ".git") or std.mem.eql(u8, entry.name, ".zig-cache")) {
+                if (collection) return error.WorkspacePathDenied;
+                continue;
+            }
             if (entry.name[0] == '.') return error.WorkspacePathDenied;
             var child = try parent.openDir(io_mod.getIo(), entry.name, .{ .iterate = true, .follow_symlinks = false });
             defer child.close(io_mod.getIo());
-            try scan(alloc, child, try alloc.print("{s}/", .{path}), files, total);
+            try scan(alloc, child, try alloc.print("{s}/", .{path}), files, total, collection);
         } else if (kind == .file) {
             if (entry.name[0] == '.') return error.WorkspacePathDenied;
             const file = try readFile(alloc, parent, entry.name, path);
@@ -212,7 +216,7 @@ fn localFiles(manager: workspace.Manager, task: workspace.Task) ![]const File {
             else => return err,
         };
         defer child.close(io_mod.getIo());
-        try scan(manager.alloc, child, prefix, &files, &total);
+        try scan(manager.alloc, child, prefix, &files, &total, false);
     }
     return files.items;
 }
@@ -298,6 +302,34 @@ const Selection = struct {
     }
 };
 
+fn projectionBody(manager: workspace.Manager, path: []const u8, revision: []const u8, artifact: []const u8) ![]const u8 {
+    var cancel = std.atomic.Value(bool).init(false);
+    const control = manager.operation_control orelse @import("../shared/bounded_operation.zig").Control{ .cancel = &cancel, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    const issuer = try workspace.hash(manager.alloc, "omos.personal-projection-cache/v1");
+    var cached = @import("object_cache.zig").Cache.open(.{ .workspace = manager.manifest.id, .issuer = issuer, .epoch = 1 }, control) catch |err| absent: {
+        if (err == error.Cancelled or err == error.Timeout or err == error.OutOfMemory) return err;
+        break :absent null;
+    };
+    defer if (cached) |cache| cache.close();
+    if (cached) |*cache| {
+        const body = cache.loadFossil(manager.alloc, artifact) catch |err| absent: {
+            if (err == error.Cancelled or err == error.Timeout or err == error.OutOfMemory) return err;
+            break :absent null;
+        };
+        if (body) |bytes| {
+            @import("../shared/debug_trace.zig").logf("workspace", "projection object cache hit revision={s} path={s}", .{ revision, path });
+            return bytes;
+        }
+    }
+    try control.check();
+    const bytes = try manager.contentAt(path, revision);
+    try @import("fossil_manifest.zig").verifyObject(artifact, bytes);
+    if (cached) |*cache| cache.saveFossil(manager.alloc, artifact, bytes) catch |err| {
+        if (err == error.Cancelled or err == error.Timeout or err == error.OutOfMemory) return err;
+    };
+    return bytes;
+}
+
 fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Selection) !void {
     if (manager.operation_control) |control| try control.check();
     var previous = try baseline(manager, task);
@@ -331,7 +363,7 @@ fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Sele
         defer page_arena.deinit();
         var page_manager = manager;
         page_manager.alloc = page_arena.allocator();
-        const bytes: ?[]const u8 = if (need_bytes) try page_manager.contentAt(path, revision_id) else null;
+        const bytes: ?[]const u8 = if (need_bytes) try projectionBody(page_manager, path, revision_id, metadata.artifact orelse return error.WorkspaceProjectionConflict) else null;
         if (bytes) |value| if (value.len > max_file_bytes) return error.WorkspaceProjectionTooLarge;
         total = try std.math.add(usize, total, if (bytes) |value| value.len else if (current_file) |value| value.bytes else 0);
         if (total > max_view_bytes or entries.items.len >= max_files) return error.WorkspaceProjectionTooLarge;
@@ -340,7 +372,7 @@ fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Sele
         const current = fileByPath(local, path);
         const observed = if (current) |file| state(file) else null;
         if (!equal(observed, prior) and !equal(observed, expected) and !equal(prior, expected)) return error.WorkspaceProjectionConflict;
-        try desired.append(manager.alloc, .{ .path = path, .sha256 = digest, .executable = executable });
+        try desired.append(manager.alloc, .{ .path = path, .sha256 = digest, .artifact = metadata.artifact orelse return error.WorkspaceProjectionConflict, .executable = executable });
         try entries.append(manager.alloc, expected);
     }
     for (old) |entry| {
@@ -363,7 +395,7 @@ fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Sele
         defer page_arena.deinit();
         var page_manager = manager;
         page_manager.alloc = page_arena.allocator();
-        const body = try page_manager.contentAt(file.path, revision_id);
+        const body = try projectionBody(page_manager, file.path, revision_id, file.artifact);
         if (!std.mem.eql(u8, try workspace.hash(page_manager.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
         try atomicWrite(manager.alloc, parent, std.Io.Dir.path.basename(file.path), body, file.executable);
         if (comptime !@import("build_options").libfx) if (io_mod.getenv("FX_E2E_FOSSIL_FAULT")) |point| {
@@ -423,6 +455,154 @@ pub fn checkpoint(manager: workspace.Manager, task: workspace.Task) !bool {
     const revision_id = try manager.checkpointContent(task, changes.items);
     try saveBaseline(manager, task, revision_id, entries.items);
     return true;
+}
+
+pub const CacheMode = enum { status, prune, trim };
+pub const CacheEntry = struct { task: []const u8, path: []const u8, state: []const u8, bytes: usize = 0 };
+pub const CacheReport = struct {
+    version: []const u8 = "omos.projection-cache/v1",
+    views: usize = 0,
+    retained: usize = 0,
+    removed: usize = 0,
+    reclaimed_bytes: u64 = 0,
+    clean_bytes: u64 = 0,
+    clean_views: usize = 0,
+    entries: []const CacheEntry = &.{},
+};
+
+// Collection scans every entry. The normal checkpoint scan deliberately omits
+// disposable execution caches, which would make it unsafe for deletion checks.
+fn cleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8) !usize {
+    const saved = (try baseline(manager, task)) orelse return error.WorkspaceProjectionMissing;
+    if (saved.version != 3 or saved.pending != null) return error.WorkspaceRecoveryRequired;
+    var dir = try io_mod.openDirAbsoluteNoFollow(root, .{ .iterate = true });
+    defer dir.close(io_mod.getIo());
+    var files: std.ArrayList(File) = .empty;
+    var total: usize = 0;
+    try scan(manager.alloc, dir, "", &files, &total, true);
+    if (files.items.len != saved.entries.len) return error.WorkspaceProjectionConflict;
+    const revision = try manager.currentRevision(task);
+    const manifest = try manager.fileManifest(revision);
+    for (files.items) |file| {
+        if (manager.operation_control) |control| try control.check();
+        if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
+        const canonical = for (manifest) |entry| {
+            if (std.mem.eql(u8, entry.path, file.path)) break entry;
+        } else return error.WorkspaceProjectionConflict;
+        if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+        var page = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer page.deinit();
+        var reader = manager;
+        reader.alloc = page.allocator();
+        const body = try reader.contentAt(file.path, revision);
+        try @import("fossil_manifest.zig").verifyObject(canonical.artifact orelse return error.WorkspaceProjectionConflict, body);
+        if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+    }
+    return total;
+}
+
+fn removeCleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8) !usize {
+    const before = try cleanView(manager, task, root);
+    var parent = try io_mod.openDirAbsoluteNoFollow(std.Io.Dir.path.dirname(root).?, .{ .iterate = true });
+    defer parent.close(io_mod.getIo());
+    var nonce: [16]u8 = undefined;
+    io_mod.getIo().random(&nonce);
+    const name = std.Io.Dir.path.basename(root);
+    const quarantine = try manager.alloc.print(".gc-{s}-{s}", .{ task.id, std.fmt.bytesToHex(&nonce, .lower) });
+    try parent.rename(name, parent, quarantine, io_mod.getIo());
+    errdefer parent.rename(quarantine, parent, name, io_mod.getIo()) catch {};
+    const held = try std.Io.Dir.path.join(manager.alloc, &.{ std.Io.Dir.path.dirname(root).?, quarantine });
+    if (try cleanView(manager, task, held) != before) return error.WorkspaceProjectionConflict;
+    // Task, projection, and lifetime locks remain held through deletion. A crash
+    // before here leaves the quarantine for inspection, never for blind eviction.
+    try parent.deleteTree(io_mod.getIo(), quarantine);
+    return before;
+}
+
+/// Only clean accepted personal views qualify. Canonical history and baseline
+/// metadata remain intact, so a removed view can be reconstructed on demand.
+pub fn collect(source: workspace.Manager, mode: CacheMode) anyerror!CacheReport {
+    var manager = source;
+    var cancel = std.atomic.Value(bool).init(false);
+    if (manager.operation_control == null) manager.operation_control = .{ .cancel = &cancel, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    return collectControlled(manager, mode);
+}
+
+fn collectControlled(manager: workspace.Manager, mode: CacheMode) anyerror!CacheReport {
+    const basis = try manager.modelBasis(try manager.revision("trunk"));
+    const policy = if (basis) |value| value.execution.projections else null;
+    if (mode == .trim and policy == null) return .{};
+    const tasks = try manager.alloc.dupe(workspace.Task, try manager.tasks());
+    std.mem.sort(workspace.Task, tasks, {}, struct {
+        fn less(_: void, a: workspace.Task, b: workspace.Task) bool {
+            return a.created_at_ms > b.created_at_ms;
+        }
+    }.less);
+    var report: CacheReport = .{};
+    var entries: std.ArrayList(CacheEntry) = .empty;
+    for (tasks) |task| {
+        if (manager.operation_control) |control| try control.check();
+        if (task.authority != null) continue;
+        const root = try directory(manager, task);
+        var dir = io_mod.openDirAbsoluteNoFollow(root, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        dir.close(io_mod.getIo());
+        report.views += 1;
+        var entry: CacheEntry = .{ .task = task.id, .path = root, .state = "retained" };
+        if (task.state != .accepted) {
+            entry.state = @tagName(task.state);
+        } else if (std.mem.eql(u8, std.Io.Dir.path.basename(root), task.id)) {
+            entry.state = "legacy_resources";
+        } else if (try manager.tryTaskExecutionLease(task.id)) |execution| {
+            defer execution.release();
+            const current = try manager.loadTask(task.id);
+            if (current.state != .accepted or !std.mem.eql(u8, current.project_root, task.project_root)) {
+                entry.state = "changed_task";
+                report.retained += 1;
+                try entries.append(manager.alloc, entry);
+                continue;
+            }
+            const projection = try manager.projectionLease(current);
+            defer projection.release();
+            if (try @import("../shared/resource_pin.zig").tryExclusive(try retentionPath(manager, task))) |pin| {
+                defer pin.close();
+                const clean = cleanView(manager, task, root) catch |err| switch (err) {
+                    error.Timeout, error.Cancelled, error.OutOfMemory => return err,
+                    else => null,
+                };
+                if (clean) |bytes| {
+                    entry.state = "clean";
+                    entry.bytes = bytes;
+                    report.clean_bytes += bytes;
+                    report.clean_views += 1;
+                    // Keep newest clean views within the allowance. Reclaim
+                    // older excess views during this pass, before a deadline
+                    // can interrupt a later inventory page.
+                    const remove = mode == .prune or (mode == .trim and (report.clean_views > policy.?.max_clean_views or report.clean_bytes > policy.?.max_clean_bytes));
+                    if (remove) {
+                        const removed = removeCleanView(manager, current, root) catch |err| retained: {
+                            if (err == error.Timeout or err == error.Cancelled or err == error.OutOfMemory) return err;
+                            entry.state = "changed_content";
+                            break :retained null;
+                        };
+                        report.clean_views -= 1;
+                        report.clean_bytes -= bytes;
+                        if (removed) |reclaimed| {
+                            entry.state = "removed";
+                            report.removed += 1;
+                            report.reclaimed_bytes += reclaimed;
+                        }
+                    }
+                } else entry.state = "private_or_unknown_content";
+            } else entry.state = "live_resource";
+        } else entry.state = "executing";
+        if (!std.mem.eql(u8, entry.state, "clean") and !std.mem.eql(u8, entry.state, "removed")) report.retained += 1;
+        try entries.append(manager.alloc, entry);
+    }
+    report.entries = entries.items;
+    return report;
 }
 
 /// Only managed saved turns redirect skill installation. Unmanaged SDK callers
@@ -648,4 +828,25 @@ test "filesystem projection isolates copied bindings and retains owned legacy dr
     record.close(io_mod.getIo());
     try std.testing.expectEqualStrings(legacy, try directory(manager, task));
     try std.testing.expect(!std.mem.eql(u8, legacy, first));
+}
+
+test "filesystem projection collection rejects ignored execution caches and unknown root content" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try temporary.dir.createDir(std.testing.io, "documents", .default_dir);
+    var documents = try temporary.dir.openDir(std.testing.io, "documents", .{ .iterate = true });
+    defer documents.close(std.testing.io);
+    try documents.createDir(std.testing.io, "node_modules", .default_dir);
+    var files: std.ArrayList(File) = .empty;
+    var total: usize = 0;
+    try scan(alloc, documents, "documents/", &files, &total, false);
+    try std.testing.expectError(error.WorkspacePathDenied, scan(alloc, documents, "documents/", &files, &total, true));
+    var unknown = try temporary.dir.createFile(std.testing.io, "private.txt", .{});
+    unknown.close(std.testing.io);
+    var root = try temporary.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer root.close(std.testing.io);
+    try std.testing.expectError(error.WorkspacePathDenied, scan(alloc, root, "", &files, &total, true));
 }
