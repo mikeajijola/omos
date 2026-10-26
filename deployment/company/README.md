@@ -252,8 +252,9 @@ reuse verified objects through a private 256 MiB cache, bounded to 4,096 objects
 while checking current grant authority. Their JSON summaries report cache
 activity. Personal task projections retrieve files on demand and retain live resources
 during clean-view collection and reuse verified immutable content through the
-bounded profile cache. Continuous desired-state reconciliation remains required before treating this
-deployment as the complete large-company model.
+bounded profile cache. Enable separately delegated desired-state policies to
+reconcile capability outcomes continuously. See [desired-state reconciliation](DESIRED.md) for
+record contracts, scope, budgets, and recovery.
 
 ## Review capacity
 

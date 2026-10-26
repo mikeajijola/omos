@@ -45,7 +45,7 @@ def main():
         "worker-coordinator.mjs", "worker-snapshot.mjs", "worker-linux.mjs", "worker-validation.mjs", "worker-runtime.mjs", "worker-archive.mjs", "worker-checkpoint.mjs",
         "worker-server.mjs", "worker-launcher.py", "worker-image.py",
         "omos-company.service", "omos-company-workers.service", "Caddyfile",
-        "README.md", "WORKERS.md",
+        "README.md", "WORKERS.md", "DESIRED.md",
     ))
     with tempfile.TemporaryDirectory(prefix="omos-package-") as directory:
         tree = Path(directory) / "omos"

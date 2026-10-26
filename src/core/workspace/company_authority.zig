@@ -30,7 +30,23 @@ pub const State = struct {
     issuer: []const u8,
     grants: []const Grant = &.{},
 };
-pub const Binding = struct { actor: []const u8, grant: []const u8 };
+pub const Binding = struct {
+    actor: []const u8,
+    grant: []const u8,
+    desired: ?[]const u8 = null,
+    pub fn jsonStringify(self: Binding, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("actor");
+        try writer.write(self.actor);
+        try writer.objectField("grant");
+        try writer.write(self.grant);
+        if (self.desired) |reference| {
+            try writer.objectField("desired");
+            try writer.write(reference);
+        }
+        try writer.endObject();
+    }
+};
 pub const Envelope = struct { payload: []const u8, signature: []const u8 };
 pub const Upload = struct { sha256: []const u8, bytes: usize };
 pub const CapabilitySelection = struct { capability: []const u8, realisation: ?[]const u8 = null };
@@ -205,11 +221,13 @@ pub fn authorizePlanning(manager: workspace.Manager, task: workspace.Task) !void
 
 fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publication: bool, planning: bool) !void {
     const binding = task.authority orelse return;
+    if (binding.desired != null) try @import("company_desired.zig").require(manager, task);
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp()));
     const permitted = if (publication or planning) permitsAction(grant, .submit) else permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitted) return error.CompanyAccessDenied;
+    if (publication and binding.desired != null) try @import("company_desired.zig").validateCandidate(manager, task);
     if (publication and grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
     for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
         if (!permittedRoot(path)) continue;

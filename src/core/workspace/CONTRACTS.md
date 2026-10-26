@@ -560,6 +560,23 @@ Successful submission marks the invocation retained as part of the native
 worker outcome. Omitting the optional field preserves legacy request hashes
 and record encoding.
 
+`features.desired_state` requires `omos_company_desired_admin` and
+`omos_company_desired_read`. Accepted `company_desired_capability` records
+express intent. Protected operator policies assign the actor, scope, execution
+capability, and invocation allowance. The host retains an intent before task
+creation and pins the target hash, policy hash, and reconciliation episode in
+the task's authority binding. Publication rechecks these pins and rejects a
+candidate that rewrites its own target. Superseded episodes remain inactive,
+including after restoring an older target document.
+
+The worker supervisor can enable continuous checks with its private
+`reconciliation` flag. Native ticks compare selected immutable file identities
+against the last verified publication. An unchanged result creates no actor
+work. Scoped status pages expose only the current actor and grant's assigned
+policies; membership is pinned while live permission checks remain mandatory.
+See [desired capability reconciliation](../../../deployment/company/DESIRED.md)
+for the record, operator request, budgets, and status protocol.
+
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,
@@ -1200,8 +1217,9 @@ human approval need a new exact decision after integration changes.
 Inspection compares an original proposal with its own recorded base. An
 interruption after committing refreshed state cannot make that retained
 proposal impossible to inspect or approve against the new base. Integration
-receipts preserve the original operation and candidate revision. Hosted company actor execution is rejected until an
-isolated execution backend is supplied; external runtimes can use scoped views.
+receipts preserve the original operation and candidate revision. Hosted company
+actor execution requires a registered live isolated backend and an explicit
+compute grant. External runtimes use the same scoped service operations.
 
 New company publications retain an issuer-signed authorization proof in their
 Fossil acceptance receipt. The proof binds the actor, grant, task, exact source,
@@ -1231,8 +1249,10 @@ incremental VCS import are not used for these writes. Task content, publication,
 and actor filesystem projections keep their existing paths; this change does
 not provide a remote filesystem mount or fully sparse actor views.
 
-This service currently supports path scopes and file or record conflict
-boundaries. Field-level record merges, dependency closure packaging, remote
-filesystem mounting, hosted actor isolation, federated identity enrollment, and
-continuous desired-state reconciliation require further implementation. They are not implied by signed requests or a successful
-checkpoint.
+This service supports path scopes and file or record conflict boundaries.
+Capability packages follow explicitly selected declared dependencies. Hosted
+workers require the separately configured Linux isolation boundary; desired-state
+reconciliation requires separately delegated operator policies. A signed request
+or successful checkpoint does not enable either feature. Field-level record
+merges, remote filesystem mounting, and federated identity enrollment remain
+unsupported.

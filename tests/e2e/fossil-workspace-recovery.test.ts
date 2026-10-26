@@ -5027,10 +5027,20 @@ sys.exit(result.returncode)
     expect(after.definition).toEqual(before.definition);
     const future = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
     expect(future.declaration.spec.operations.some((o: any) => o.id === "omos_record_evidence")).toBe(true);
+    const checkpointOperation = future.declaration.spec.operations.find((o: any) => o.id === "omos_company_worker_checkpoint");
+    expect(checkpointOperation.input.properties.worker.properties.checkpoint).toBeDefined();
+    expect(future.declaration.spec.semantic.entityTypes.find((e: any) => e.id === "omos_company_worker_job").fields.checkpoint).toBe("json");
     expect(future.basis.execution.review.attempt_timeout_ms).toBe(300000);
     const backups = readdirSync(f.cwd).filter(path => path.includes(".pre-contracts-"));
     expect(backups).toHaveLength(1);
-    expect((await f.run(["fossil", "migrate", "--contracts", "--json"])).code).toBe(0);
+    const repeated = await f.run(["fossil", "migrate", "--contracts", "--json"]);
+    expect(repeated.code, repeated.stderr).toBe(0);
+    const repeatedDefinition = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;
+    expect(repeatedDefinition.declaration).toEqual(future.declaration);
+    expect(repeatedDefinition.basis.definition_hash).toBe(future.basis.definition_hash);
+    expect(repeatedDefinition.basis.execution).toEqual(future.basis.execution);
+    expect(repeatedDefinition.basis.execution_hash).toBe(future.basis.execution_hash);
+    expect(repeatedDefinition.basis.revision).toBe(future.basis.revision);
     expect(readdirSync(f.cwd).filter(path => path.includes(".pre-contracts-"))).toEqual(backups);
   }, 120000);
 
@@ -5269,7 +5279,10 @@ sys.exit(result.returncode)
     writeFileSync(path, JSON.stringify(value));
     const added = await f.run(["fossil", "definition", "propose", path, "--json"]);
     expect(added.code, added.stderr).toBe(0);
-    expect(JSON.parse(added.stdout).model_data.state).toBe("activated");
+    const addedProposal = JSON.parse(added.stdout).model_data;
+    expect(addedProposal.state).toBe("activated");
+    expect(addedProposal.declaration).toEqual(value);
+    expect(JSON.parse(f.fossil("cat", `proposals/${addedProposal.id}.json`, "-r", "trunk")).declaration).toEqual(value);
     const pinned = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(pinned.model_basis).toEqual(task.model_basis);
     const after = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data;

@@ -4985,6 +4985,341 @@
           "cli",
           "api"
         ]
+      },
+      {
+        "id": "omos_company_desired_admin",
+        "capability": "general_task",
+        "description": "Enroll separately delegated reconciliation policies and continuously compare pinned desired capability records with accepted company state. Retained intent precedes task creation; unchanged verified outcomes do not dispatch another actor.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "desired"
+            },
+            "desired": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-desired/v1"
+                },
+                "change": {
+                  "type": "string",
+                  "enum": [
+                    "inspect",
+                    "register",
+                    "tick"
+                  ]
+                },
+                "policy": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "const": "omos.company-reconciliation-policy/v1"
+                    },
+                    "workspace": {
+                      "type": "string",
+                      "minLength": 64,
+                      "maxLength": 64
+                    },
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "target_path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 4096
+                    },
+                    "actor": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "grant": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "allowed_paths": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096
+                      },
+                      "minItems": 1,
+                      "maxItems": 32
+                    },
+                    "execution_capability": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "auto_retry": {
+                      "type": "boolean"
+                    },
+                    "max_invocations": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 32
+                    },
+                    "max_runtime_ms": {
+                      "type": "integer",
+                      "minimum": 1000,
+                      "maximum": 240000
+                    }
+                  },
+                  "required": [
+                    "workspace",
+                    "id",
+                    "target_path",
+                    "actor",
+                    "grant",
+                    "allowed_paths",
+                    "execution_capability"
+                  ],
+                  "additionalProperties": false
+                },
+                "id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "expected_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "actor": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "grant": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000000
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 32
+                }
+              },
+              "required": [
+                "version",
+                "change"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "desired"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "sha256": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "policies": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "maxItems": 32
+            },
+            "total": {
+              "type": "integer"
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "api"
+        ]
+      },
+      {
+        "id": "omos_company_desired_read",
+        "capability": "general_task",
+        "description": "Inspect only reconciliation policies assigned to the current actor and grant. Snapshot membership stays pinned while current intent and permission checks govern outcome visibility.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "status"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "entity": {
+              "const": "omos_company_reconciliation"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "view": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "entity"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-desired-status/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "index_revision": {
+              "type": "string"
+            },
+            "policies": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "maxItems": 4
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "index_revision",
+            "policies",
+            "next_offset"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -5601,6 +5936,139 @@
           ],
           "indexed": [
             "sha256"
+          ]
+        },
+        {
+          "id": "company_desired_capability",
+          "fields": {
+            "version": "string",
+            "capability": "string",
+            "objective": "string",
+            "criteria": "json",
+            "paths": "json",
+            "observations": "json",
+            "enabled": "boolean"
+          },
+          "required": [
+            "version",
+            "capability",
+            "objective",
+            "criteria",
+            "paths",
+            "enabled"
+          ],
+          "indexed": [
+            "capability"
+          ]
+        },
+        {
+          "id": "omos_company_reconciliation_policy",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "id": "string",
+            "target_path": "string",
+            "actor": "string",
+            "grant": "string",
+            "allowed_paths": "json",
+            "execution_capability": "string",
+            "enabled": "boolean",
+            "auto_retry": "boolean",
+            "max_invocations": "number",
+            "max_runtime_ms": "number"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "id",
+            "target_path",
+            "actor",
+            "grant",
+            "allowed_paths",
+            "execution_capability",
+            "enabled",
+            "auto_retry",
+            "max_invocations",
+            "max_runtime_ms"
+          ],
+          "indexed": [
+            "id",
+            "actor",
+            "grant"
+          ]
+        },
+        {
+          "id": "omos_company_desired_binding",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "operation": "string",
+            "task": "string",
+            "view": "string",
+            "policy": "string",
+            "policy_sha256": "string",
+            "target_path": "string",
+            "target_sha256": "string",
+            "capability": "string",
+            "execution_capability": "string"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "operation",
+            "task",
+            "view",
+            "policy",
+            "policy_sha256",
+            "target_path",
+            "target_sha256",
+            "capability",
+            "execution_capability"
+          ],
+          "indexed": [
+            "task",
+            "policy"
+          ]
+        },
+        {
+          "id": "omos_company_reconciliation",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "policy": "string",
+            "policy_sha256": "string",
+            "target_sha256": "string",
+            "observed_sha256": "string",
+            "base_revision": "string",
+            "operation": "string",
+            "objective": "string",
+            "phase": "string",
+            "task": "json",
+            "view": "json",
+            "publication_revision": "json",
+            "publication_observed_sha256": "json",
+            "note": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "policy",
+            "policy_sha256",
+            "target_sha256",
+            "observed_sha256",
+            "base_revision",
+            "operation",
+            "objective",
+            "phase",
+            "task",
+            "view",
+            "publication_revision",
+            "publication_observed_sha256",
+            "note"
+          ],
+          "indexed": [
+            "policy",
+            "phase"
           ]
         }
       ],

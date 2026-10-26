@@ -262,7 +262,9 @@ fn context(manager: workspace.Manager, view_id: []const u8) !Context {
     const grant = for (state.grants) |candidate| {
         if (std.mem.eql(u8, candidate.id, view.grant) and std.mem.eql(u8, candidate.actor, view.actor)) break candidate;
     } else return error.CompanyAccessDenied;
-    const live = if (authority.liveGrant(state, view.grant, io.milliTimestamp())) |_| true else |_| false;
+    const grant_live = if (authority.liveGrant(state, view.grant, io.milliTimestamp())) |_| true else |_| false;
+    const desired_live = if (@import("company_desired.zig").require(manager, task)) |_| true else |_| false;
+    const live = grant_live and desired_live;
     const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
     const execution = if (try optionalContent(manager, try ownership.path(manager.alloc, view_id))) |raw| value: {
         const record = try records.decode(ownership.Record, manager.alloc, raw, .{});

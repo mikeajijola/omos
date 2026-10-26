@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
@@ -1535,8 +1535,9 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "answer", "recovery", "archive_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "desired", "answer", "recovery", "archive_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
+  const desiredTask = scenario === "desired";
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
@@ -1563,17 +1564,23 @@ for (const scenario of ["files", "answer", "recovery", "archive_recovery", "proj
   });
   const provider = JSON.parse(readFileSync(join(worker.home, ".fx/settings.json"), "utf8")).providers.local.base_url;
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
-  if (projected) {
+  if (projected || desiredTask) {
     const tree = join(f.home, "projection-source"); mkdirSync(tree);
     const binding = JSON.parse(readFileSync(join(f.home, ".fx/omos-workspace.json"), "utf8"));
     const helper = existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")) ? join(import.meta.dir, "../../zig-out/libexec/fossil") : Bun.which("fossil")!;
     const fossil = (...args: string[]) => { const result = spawnSync(helper, args, { cwd: tree, env: { ...process.env, ...f.env }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); };
     fossil("open", "--nosync", binding.repository, "trunk");
+    if (projected) {
     mkdirSync(join(tree, "documents/team"), { recursive: true }); mkdirSync(join(tree, "documents/private"));
     writeFileSync(join(tree, "documents/team/production.txt"), "Original projected company document\n" + "Unchanged source line.\n".repeat(1000));
     writeFileSync(join(tree, "documents/team/remove.txt"), "Delete only after this file is materialised.");
     writeFileSync(join(tree, "documents/team/keep.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     writeFileSync(join(tree, "documents/private/nope.txt"), "Outside the worker grant.");
+    }
+    if (desiredTask) {
+      mkdirSync(join(tree, "records/company_desired_capability"), { recursive: true });
+      writeFileSync(join(tree, "records/company_desired_capability/production.json"), JSON.stringify({ entity: "company_desired_capability", id: "production", task: "operator-seed", data: { version: "omos.company-desired-capability/v1", capability: "general_task", objective: "Retain documents/team/production.txt with the requested worker checkpoint text.", criteria: ["The document contains Retained by the isolated native worker and collected by its host."], paths: ["documents/team/"], observations: [], enabled: true } }));
+    }
     fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "--user", "omos", "-m", "Retain scoped source projection fixture");
   }
 
@@ -1599,10 +1606,12 @@ for (const scenario of ["files", "answer", "recovery", "archive_recovery", "proj
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
     const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
     client = await createCompanyClient(file, { home: f.home });
-    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: coding ? "Implement add(a, b) in documents/team/calculator.py so that adding 2 and 3 returns 5. Validate the requested behavior before publication." : answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
-    expect(created.isError, JSON.stringify(created)).not.toBe(true);
-    const createdView = JSON.parse(created.content[0].text), view = createdView.view;
-    if (!answerOnly) await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
+    const created = desiredTask ? null : await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: coding ? "Implement add(a, b) in documents/team/calculator.py so that adding 2 and 3 returns 5. Validate the requested behavior before publication." : answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    if (created) expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const createdView = created ? JSON.parse(created.content[0].text) : null;
+    let view = createdView?.view;
+    if (desiredTask) await admin({ action: "desired", desired: { version: "omos.company-desired/v1", change: "register", policy: { version: "omos.company-reconciliation-policy/v1", workspace: boot.workspace, id: "production-target", target_path: "records/company_desired_capability/production.json", actor: "worker", grant: "production-worker", allowed_paths: ["documents/team/"], execution_capability: "general_task", enabled: true } } });
+    if (!answerOnly && !desiredTask) await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
     let recoveredOperation: string | undefined;
     if (recovering) {
       let retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
@@ -1636,12 +1645,13 @@ for (const scenario of ["files", "answer", "recovery", "archive_recovery", "proj
       if (target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
       return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
-    const settings = { ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
     const result = JSON.parse(stdout), outcome = JSON.parse(result.stdout);
+    if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
@@ -1649,6 +1659,7 @@ for (const scenario of ["files", "answer", "recovery", "archive_recovery", "proj
       expect(result.images).toBe(failingChecks ? 1 : 0);
       expect(current.record.checkpoint.phase).toBe("retained");
       if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
+      if (desiredTask) expect(outcome.desired_met).toBe(true);
       if (codingRecovery) { expect(outcome.recovered_coding).toBe(true); expect(current.record.checkpoint.generation).toBe(2); }
       const archives = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_archive", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
       expect(archives.isError, JSON.stringify(archives)).not.toBe(true);
@@ -1684,7 +1695,7 @@ for (const scenario of ["files", "answer", "recovery", "archive_recovery", "proj
       expect(inference.counts().actors).toBe(answerOnly ? 1 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
-      expect(result.images).toBe(0); if (answerOnly) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
+      expect(result.images).toBe(0); if (answerOnly || desiredTask) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
       expect(inference.counts().actors).toBe(0); expect(host.counts().assessments).toBe(0);
     }
     expect(host.counts().actors).toBe(0);
@@ -1962,3 +1973,96 @@ test("company submissions freeze more than one hundred signed read selectors and
     expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
   } finally { client?.close(); service.child.kill(); await service.child.exited; }
 }, 360000);
+
+test("company desired reconciliation pins operator authority, retains one task and detects relevant drift", async () => {
+  const f = fixture();
+  const inference = model(f, () => { throw Error("Reconciliation must not execute an actor directly"); }, undefined, { plan: { capability: "general_task", summary: "Produce the required company report", obligations: [], checks: [] } });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const tree = join(f.home, "desired-owner"); mkdirSync(tree);
+  const helper = existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")) ? join(import.meta.dir, "../../zig-out/libexec/fossil") : Bun.which("fossil")!;
+  const fossil = (...args: string[]) => { const result = spawnSync(helper, args, { cwd: tree, env: { PATH: process.env.PATH, ...f.env, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); return result.stdout; };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+  const targetPath = "records/company_desired_capability/report.json";
+  const target = { version: "omos.company-desired-capability/v1", capability: "general_task", objective: "Retain documents/team/report.txt with the text desired report complete.", criteria: ["The report contains the requested text."], paths: ["documents/team/"], observations: [], enabled: true };
+  const seed = (data: object, filename = targetPath) => {
+    fossil("update", "trunk"); mkdirSync(join(tree, filename.substring(0, filename.lastIndexOf("/"))), { recursive: true });
+    writeFileSync(join(tree, filename), filename === targetPath ? JSON.stringify({ entity: "company_desired_capability", id: "report", task: "operator-seed", data }) : JSON.stringify(data));
+    fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Record accepted operator fixture state");
+  };
+  seed(target);
+  const admin = async (input: object) => {
+    const file = join(f.home, "desired-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initialized = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "desired-worker", "--json"]); expect(keyed.code, keyed.stderr).toBe(0);
+  const key = JSON.parse(keyed.stdout), actions = ["create_view", "discover", "read", "status", "checkpoint", "submit", "execution", "execute_task"];
+  await admin({ action: "grant", revision: initialized.revision, grant: { id: "desired-worker", actor: "reconciler", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client, otherClient, desired;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.desired_state).toBe(true);
+    const config = join(f.home, "desired-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, actor: "reconciler", grant: "desired-worker", key_handle: "desired-worker", issuer: boot.issuer, epoch: boot.epoch, actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    desired = createDesiredHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    const policy = { version: "omos.company-reconciliation-policy/v1", workspace: boot.workspace, id: "daily-report", target_path: targetPath, actor: "reconciler", grant: "desired-worker", allowed_paths: ["documents/team/"], execution_capability: "general_task", enabled: true };
+    const registered = await desired.call({ change: "register", policy }); expect(registered.ok, JSON.stringify(registered)).toBe(true);
+    const denied = await fetch(service.url + "/v1/company/desired", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: "omos.company-desired-api/v1", workspace: boot.workspace, request: { version: "omos.company-desired/v1", change: "tick" } }) }); expect(denied.status).toBe(401);
+    const tick = async () => { const reply = await desired.call({ change: "tick", actor: "reconciler", grant: "desired-worker", limit: 1 }); expect(reply.ok, JSON.stringify(reply)).toBe(true); return reply.policies[0]; };
+    const first = await tick(); expect(first.failure, JSON.stringify(first)).toBeNull(); expect(first.state.phase).toBe("unavailable"); expect(first.state.task).toMatch(/^[a-f0-9]{64}$/);
+    expect((await tick()).state.task).toBe(first.state.task);
+    expect(inference.counts().actors).toBe(0);
+    const readDesired = async (rest: object = {}) => {
+      const result = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_reconciliation", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, limit: 32, ...rest });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text);
+    };
+    const own = await readDesired(); expect(own.policies.map(policy => policy.policy)).toEqual(["daily-report"]); expect(own.policies[0].state).toBe("unavailable");
+    const otherKeyed = await f.run(["fossil", "company-key", "desired-other", "--json"]); expect(otherKeyed.code, otherKeyed.stderr).toBe(0); const otherKey = JSON.parse(otherKeyed.stdout);
+    await admin({ action: "grant", revision: (await admin({ action: "status" })).revision, grant: { id: "desired-other", actor: "other-participant", public_key: (otherKey.model_data ?? otherKey).public_key, paths: ["documents/"], actions: ["status"], expires_ms: Date.now() + 3600000 } });
+    const otherPolicy = await desired.call({ change: "register", policy: { ...policy, id: "private-other-policy", actor: "other-participant", grant: "desired-other", enabled: false } }); expect(otherPolicy.ok, JSON.stringify(otherPolicy)).toBe(true);
+    const otherConfig = join(f.home, "desired-other-client.json"); writeFileSync(otherConfig, JSON.stringify({ ...JSON.parse(readFileSync(config, "utf8")), actor: "other-participant", grant: "desired-other", key_handle: "desired-other", actions: ["status"] }), { mode: 0o600 });
+    otherClient = await createCompanyClient(otherConfig, { home: f.home });
+    const hidden = await otherClient.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_reconciliation", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, limit: 32 }); expect(hidden.isError, JSON.stringify(hidden)).not.toBe(true);
+    expect(JSON.parse(hidden.content[0].text).policies.map(policy => policy.policy)).toEqual(["private-other-policy"]);
+    expect((await readDesired({ revision: own.index_revision })).policies.map(policy => policy.policy)).toEqual(["daily-report"]);
+    expect(JSON.stringify(await readDesired())).not.toContain("private-other-policy");
+    let row = (await admin({ action: "workers", worker: { change: "inspect", view: first.state.view } })).jobs[0];
+    expect(row.grant.paths).toEqual(target.paths); expect(row.record.state).toBe("queued"); expect(row.contract.objective).toContain("desired report complete");
+    row = (await admin({ action: "workers", worker: { change: "plan", operation: crypto.randomUUID(), view: first.state.view, expected_sha256: row.sha256 } })).jobs[0];
+    const planDeadline = Date.now() + 60000;
+    while (row.planning_required && Date.now() < planDeadline) {
+      await Bun.sleep(50); row = (await admin({ action: "workers", worker: { change: "inspect", view: first.state.view } })).jobs[0];
+      if (row.planning_state === "planned") row = (await admin({ action: "workers", worker: { change: "plan", operation: crypto.randomUUID(), view: first.state.view, expected_sha256: row.sha256 } })).jobs[0];
+    }
+    expect(row.planning_required).toBe(false);
+    row = (await admin({ action: "workers", worker: { change: "claim", operation: crypto.randomUUID(), view: first.state.view, expected_sha256: row.sha256, execution: { runtime: "desired-fixture", generation: 0 } } })).jobs[0];
+    const execution = { runtime: row.record.runtime, generation: row.record.generation };
+    const send = async (action: string, rest: object = {}, success = true) => { const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest }); if (success) expect(result.isError, JSON.stringify(result)).not.toBe(true); else expect(result.isError, JSON.stringify(result)).toBe(true); return success ? JSON.parse(result.content[0].text) : result; };
+    const checkpoint = await send("checkpoint", { view: first.state.view, execution, revision: row.view_revision, path: "documents/team/report.txt", content: "desired report complete" });
+    await send("submit", { view: first.state.view, execution, revision: checkpoint.revision, candidate: "Retained the requested company report." });
+    const reviewDeadline = Date.now() + 120000; let status;
+    do { status = await send("status", { view: first.state.view }); if (!["queued", "running"].includes(status.job?.state)) break; await Bun.sleep(50); } while (Date.now() < reviewDeadline);
+    expect(status.publication, JSON.stringify(status)).not.toBeNull();
+    const met = await tick(); expect(met.failure, JSON.stringify(met)).toBeNull(); expect(met.state.phase).toBe("met");
+    expect((await readDesired()).policies[0].state).toBe("met");
+    const stable = (await admin({ action: "status" })).revision;
+    expect((await tick()).state.task).toBe(first.state.task); expect((await admin({ action: "status" })).revision).toBe(stable);
+    seed({ unrelated: true }, "documents/unrelated/change.json");
+    expect((await tick()).state.phase).toBe("met"); expect((await tick()).state.task).toBe(first.state.task);
+    seed({ ...target, objective: "Update the report for the second requested outcome." });
+    const second = await tick(); expect(second.failure, JSON.stringify(second)).toBeNull(); expect(second.state.task).not.toBe(first.state.task);
+    seed({ input: "New accepted input supersedes the pending episode." }, "documents/team/input.json");
+    expect((await admin({ action: "workers", worker: { change: "inspect", view: second.state.view } })).jobs[0].authority_live).toBe(false);
+    const drifted = await tick(); expect(drifted.failure, JSON.stringify(drifted)).toBeNull(); expect(drifted.state.task).not.toBe(second.state.task);
+    seed({ ...target, objective: "A newer desired outcome supersedes the pending task." });
+    const stale = (await admin({ action: "workers", worker: { change: "inspect", view: second.state.view } })).jobs[0]; expect(stale.authority_live).toBe(false);
+    const third = await tick(); expect(third.failure, JSON.stringify(third)).toBeNull(); expect(third.state.task).not.toBe(second.state.task);
+    seed({ ...target, objective: "Update the report for the second requested outcome." });
+    expect((await admin({ action: "workers", worker: { change: "inspect", view: second.state.view } })).jobs[0].authority_live).toBe(false);
+    const restored = await tick(); expect(restored.failure, JSON.stringify(restored)).toBeNull(); expect(restored.state.task).not.toBe(second.state.task); expect(restored.state.task).not.toBe(third.state.task);
+    seed({ ...target, paths: ["ui/"] }); expect((await tick()).failure).toBe("CompanyAccessDenied");
+    expect(inference.counts().actors).toBe(0);
+    const disabled = await desired.call({ change: "register", expected_sha256: registered.sha256, policy: { ...policy, enabled: false } }); expect(disabled.ok, JSON.stringify(disabled)).toBe(true);
+    expect((await tick()).failure).toBe("CompanyDesiredStatePaused");
+    const verified = await f.run(["fossil", "verify", "--json"], {}, 180000); expect(verified.code, verified.stderr).toBe(0);
+  } finally { desired?.close(); otherClient?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 600000);

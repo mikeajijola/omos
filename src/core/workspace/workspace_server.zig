@@ -206,7 +206,8 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
     const evaluation = std.mem.eql(u8, request.head.target, "/v1/company/evaluation");
     const runtimes = std.mem.eql(u8, request.head.target, "/v1/company/runtimes");
     const archives = std.mem.eql(u8, request.head.target, "/v1/company/archives");
-    if (request.head.method != .POST or (!company and !schedules and !workers and !evaluation and !runtimes and !archives and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    const desired = std.mem.eql(u8, request.head.target, "/v1/company/desired");
+    if (request.head.method != .POST or (!company and !schedules and !workers and !evaluation and !runtimes and !archives and !desired and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
@@ -223,7 +224,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         subscription.respond(request) catch return error.HttpConnectionClosing;
         return;
     }
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else if (runtimes) service.executeRuntimes(manager, raw, writable) else if (archives) service.executeArchives(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else if (runtimes) service.executeRuntimes(manager, raw, writable) else if (archives) service.executeArchives(manager, raw, writable) else if (desired) service.executeDesired(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
         return reject(manager, request, keep_alive.*, err);
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
