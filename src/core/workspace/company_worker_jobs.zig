@@ -163,7 +163,7 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
     next.request_hash = request_hash;
     next.request = request;
     next.updated_ms = now;
-    next.note = request.note;
+    if (request.note != null) next.note = request.note;
     try validate(next);
     return next;
 }

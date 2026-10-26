@@ -9,7 +9,7 @@ import { createHash, createPrivateKey, createPublicKey, sign, verify } from "nod
 
 const MAX = 1024 * 1024;
 const versions = ["2025-11-25", "2025-06-18"];
-const mutation = new Set(["create_view", "checkpoint", "submit", "delegate", "reconcile", "record", "execution"]);
+const mutation = new Set(["create_view", "checkpoint", "submit", "delegate", "reconcile", "record", "execution", "execute_task"]);
 const identity = value => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 const hex = (value, size) => typeof value === "string" && new RegExp(`^[0-9a-f]{${size * 2}}$`).test(value);
 const fail = code => { throw new Error(code); };

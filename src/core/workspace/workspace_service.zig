@@ -64,6 +64,18 @@ pub fn executeEvaluation(manager: workspace.Manager, raw: []const u8, writable: 
     return std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .data = try parse(manager.alloc, response) }, .{});
 }
 
+pub fn executeRuntimes(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    if (raw.len > 65536) return error.ServiceRequestTooLarge;
+    const Envelope = struct { version: []const u8, workspace: []const u8, request: @import("company_runtime.zig").Request };
+    const envelope = try records.decode(Envelope, manager.alloc, raw, .{});
+    if (!std.mem.eql(u8, envelope.version, "omos.company-runtime-api/v1")) return error.UnsupportedCompanyApi;
+    if (!std.mem.eql(u8, envelope.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
+    if (envelope.request.change != .inspect and !writable) return error.ServiceReadOnly;
+    const parsed = try parse(manager.alloc, raw);
+    const output = try @import("company_service.zig").administer(manager, try std.json.Stringify.valueAlloc(manager.alloc, .{ .version = "omos.company-admin/v1", .action = "runtimes", .runtime = parsed.object.get("request").? }, .{}));
+    return std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .data = try parse(manager.alloc, output) }, .{});
+}
+
 pub const Request = struct {
     version: []const u8,
     workspace: []const u8,

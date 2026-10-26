@@ -87,6 +87,28 @@ pub fn fingerprint(manager: workspace.Manager, task: workspace.Task) ![]const u8
     return (try source(manager, task, try currentGrant(manager, task), try manager.currentRevision(task))).sha256;
 }
 
+/// The signed view service checks identity and revision ancestry first. Only
+/// one host validation receipt is retrievable, never arbitrary task history.
+pub fn feedback(manager: workspace.Manager, task: workspace.Task, id: []const u8, revision: []const u8, offset: usize, limit: usize) ![]const u8 {
+    _ = try authority.hexBytes(32, id);
+    if (limit == 0 or limit > 16384) return error.InvalidEvidenceOffset;
+    const filename = try manager.alloc.print("history/{s}/{s}.json", .{ task.id, id });
+    const row = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, try manager.historyRecord(task, filename, revision), .{});
+    if (!std.mem.eql(u8, model.text(row, "kind"), "tool_evidence")) return error.CompanyAccessDenied;
+    const values = model.field(row, "value") orelse return error.CompanyAccessDenied;
+    if (values != .array or values.array.items.len != 1) return error.CompanyAccessDenied;
+    const evidence = values.array.items[0];
+    if (!std.mem.eql(u8, model.text(evidence, "tool"), "company_validator")) return error.CompanyAccessDenied;
+    const content = model.text(evidence, "content");
+    const receipt = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, content, .{});
+    if (!std.mem.eql(u8, model.text(receipt, "version"), "omos.company-validation/v1") or !std.mem.eql(u8, model.text(receipt, "task"), task.id) or !std.mem.eql(u8, model.text(receipt, "authority"), "company_host")) return error.CompanyAccessDenied;
+    if (offset > content.len) return error.InvalidEvidenceOffset;
+    const end = offset + @min(limit, content.len - offset);
+    const segment = content[offset..end];
+    const encoded = try manager.alloc.alloc(u8, std.base64.standard.Encoder.calcSize(segment.len));
+    return json(manager.alloc, .{ .version = "omos.company-validation-feedback/v1", .task = task.id, .revision = revision, .record_id = id, .evidence = model.text(evidence, "id"), .sha256 = try workspace.hash(manager.alloc, content), .bytes = content.len, .offset = offset, .content = std.base64.standard.Encoder.encode(encoded, segment), .encoding = "base64", .next_offset = if (end < content.len) @as(?usize, end) else null });
+}
+
 fn context(manager: workspace.Manager, request: Request) !Context {
     if (!authority.safeIdentity(request.view)) return error.InvalidCompanyIdentity;
     const View = struct { id: []const u8, task: []const u8, actor: []const u8, grant: []const u8 };
@@ -164,7 +186,7 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
             if (!std.mem.eql(u8, model.text(value, "operation"), operation)) continue;
             if (!std.mem.eql(u8, model.text(value, "request_sha256"), request_hash)) return error.CompanyOperationConflict;
             if (request.action == .candidate) return json(manager.alloc, .{ .version = "omos.company-candidate-outcome/v1", .task = selected.task.id, .revision = current, .candidate_sha256 = model.text(value, "candidate_sha256"), .authority = "actor_claim", .replayed = true });
-            return json(manager.alloc, .{ .version = "omos.company-evaluation-outcome/v1", .task = selected.task.id, .revision = current, .evidence = model.text(value, "evidence"), .passed = model.field(value, "passed") orelse return error.InvalidCompanyValidation, .replayed = true });
+            return json(manager.alloc, .{ .version = "omos.company-evaluation-outcome/v1", .task = selected.task.id, .revision = current, .evidence = model.text(value, "evidence"), .record_id = model.field(value, "record_id"), .passed = model.field(value, "passed") orelse return error.InvalidCompanyValidation, .replayed = true });
         }
     }
     if (!std.mem.eql(u8, current, request.revision)) return error.WorkspaceRevisionChanged;
@@ -184,11 +206,12 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     const passed = try validateChecks(request.checks);
     const receipt = try json(manager.alloc, .{ .version = "omos.company-validation/v1", .task = selected.task.id, .operation = operation, .source = pinned.sha256, .revision = request.revision, .execution = request.execution, .configuration_handle = request.configuration_handle, .configuration_sha256 = request.configuration_sha256, .environment_sha256 = request.environment_sha256, .checks = request.checks, .status = if (passed) "passed" else "failed", .authority = "company_host" });
     const id = try manager.alloc.print("company-validation:{s}", .{try workspace.hash(manager.alloc, receipt)});
-    try manager.record(selected.task, "tool_evidence", &[_]Evidence{.{ .id = id, .kind = .verification, .tool = "company_validator", .status = if (passed) .success else .failure, .source = pinned.sha256, .action_id = operation, .content = receipt }});
+    const evidence_path = try manager.recordReceipt(selected.task, "tool_evidence", &[_]Evidence{.{ .id = id, .kind = .verification, .tool = "company_validator", .status = if (passed) .success else .failure, .source = pinned.sha256, .content = receipt }});
+    const record_id = std.Io.Dir.path.basename(evidence_path)[0..64];
     if (passed) try manager.record(selected.task, "source_validation", .{ .evidence = id, .source = pinned.sha256 });
-    try manager.record(selected.task, "company_evaluation", .{ .operation = operation, .request_sha256 = request_hash, .evidence = id, .passed = passed });
+    try manager.record(selected.task, "company_evaluation", .{ .operation = operation, .request_sha256 = request_hash, .evidence = id, .record_id = record_id, .passed = passed });
     const retained_revision = try manager.checkpoint(selected.task);
-    return json(manager.alloc, .{ .version = "omos.company-evaluation-outcome/v1", .task = selected.task.id, .revision = retained_revision, .evidence = id, .passed = passed, .replayed = false });
+    return json(manager.alloc, .{ .version = "omos.company-evaluation-outcome/v1", .task = selected.task.id, .revision = retained_revision, .evidence = id, .record_id = record_id, .passed = passed, .replayed = false });
 }
 
 test "company validation requires complete unchanged checks and rejects duplicate or excessive results" {

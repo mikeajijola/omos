@@ -88,7 +88,21 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     await trustedFile(launcher, launcherSha256, 131072);
     return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
   };
+  let identity;
   return Object.freeze({
+    async describe(signal) {
+      const client = await createCompanyClient(companyConfiguration, { home: companyHome });
+      try {
+        const checked = await client.call("company_workspace", { version: "omos.company/v1", action: "status", operation: randomUUID(), expires_ms: Date.now() + 120000 }, signal);
+        if (checked.isError) fail("WorkerCompanyIdentityChanged");
+        identity = structuredClone(client.identity);
+        return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [] };
+      } finally { client.close(); }
+    },
+    supports(row) {
+      const binding = row?.record?.binding;
+      return Boolean(identity && binding?.workspace === identity.workspace && binding.actor === identity.actor && binding.grant === identity.grant);
+    },
     async recover(row, signal) {
       const job = row.record, binding = job.binding;
       if (!row.authority_live || job.state !== "running" || !hex(binding.workspace) || !hex(binding.view) || !job.runtime || job.generation !== row.execution?.generation || row.execution?.runtime !== job.runtime || !/^[A-Za-z0-9_-]{1,128}$/.test(row.pending_operation) || !row.grant.actions.includes("reconcile")) fail("WorkerRecoveryRequired");
@@ -131,7 +145,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         broker = await createWorkerBroker({ socket: prepared.root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: job.expires_ms, model, companyClient: actorClient, company: { endpoint: JSON.parse((await trustedFile(companyConfiguration)).toString("utf8")).endpoint, workspace: binding.workspace, actor: binding.actor, grant: binding.grant, view: binding.view, source_revision: row.view_revision, actions: actorActions } });
         const state = await call("status");
         if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
-        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. ${coding ? "The host runs isolated coding validation after this invocation. Return your final answer without submitting the company proposal; the host owns that step." : ""} Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths })}`;
+        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. ${coding ? "The host runs isolated coding validation after this invocation. Return your final answer without submitting the company proposal; the host owns that step." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
         if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
         const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
         // The launcher joins and kills descendants before returning. Actor
@@ -225,7 +239,12 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           let checked;
           try { checked = await runCompanyValidation({ configuration: validation, configurationSha256: validationSha256, environmentSha256, control, client, row, revision: current.revision, candidate: claim.data.candidate, image, run, signal }); }
           finally { control.close(); }
-          if (!checked.passed) return { outcome: "waiting", note: "The company host retained failed coding checks. Inspect their evidence before revising the task." };
+          if (!checked.passed) {
+            const failed = checked.feedback.checks[0];
+            const reference = `record_id=${checked.record_id}; evidence=${checked.evidence};`;
+            const details = failed ? ` check=${failed.id}; exit=${failed.exit_code}; ${failed.stderr || failed.stdout}` : " Inspect incomplete validation evidence.";
+            return { outcome: "waiting", note: "The company host retained failed coding checks. " + reference + Buffer.from(details).subarray(0, 300).toString("utf8") };
+          }
           current = { ...current, revision: checked.revision };
         }
         await call("submit", { revision: current.revision, candidate: claim.data.candidate });

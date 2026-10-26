@@ -6,7 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createLinuxWorkerBackend } from "./worker-linux.mjs";
 import { createWorkerCoordinator } from "./worker-coordinator.mjs";
-import { createWorkerHttpControl } from "./worker-http-control.mjs";
+import { createWorkerHttpControl, createRuntimeHttpControl } from "./worker-http-control.mjs";
+import { advertiseWorkerRuntime } from "./worker-runtime.mjs";
 
 const fields = (value, expected) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => expected.includes(key));
 function validate(config) {
@@ -19,14 +20,25 @@ export async function runWorkerServer(config, signal, report = () => {}) {
   signal?.throwIfAborted();
   const backend = await createLinuxWorkerBackend({ ...structuredClone(config.backend), evaluation: structuredClone(config.control), concurrency: config.concurrency });
   const control = createWorkerHttpControl(structuredClone(config.control));
+  const runtimeControl = createRuntimeHttpControl(structuredClone(config.control));
   const coordinator = createWorkerCoordinator({ control, backend, concurrency: config.concurrency });
+  let runtime, heartbeat, heartbeatPending = Promise.resolve(), heartbeatError;
   let previous;
   const stop = () => { void coordinator.close().catch(() => {}); };
   signal?.addEventListener("abort", stop, { once: true });
   if (signal?.aborted) stop();
   try {
+    runtime = await advertiseWorkerRuntime({ control: runtimeControl, description: await backend.describe(signal), signal });
+    heartbeat = setInterval(() => {
+      heartbeatPending = heartbeatPending.then(() => runtime.heartbeat()).catch(error => {
+        heartbeatError = error;
+        clearInterval(heartbeat);
+        void coordinator.close().catch(() => {});
+      });
+    }, 10000);
     report({ event: "worker_server_started", workspace: config.control.workspaceId, concurrency: config.concurrency });
     while (!signal?.aborted) {
+      if (heartbeatError) throw heartbeatError;
       let observation;
       try { observation = { event: "worker_server_progress", ...await coordinator.tick() }; }
       catch (error) { observation = { event: "worker_server_inspection_failed", error: /^[A-Z][A-Za-z0-9]{0,95}$/.test(error.message) ? error.message : "WorkerControlUnavailable" }; }
@@ -41,10 +53,17 @@ export async function runWorkerServer(config, signal, report = () => {}) {
       });
     }
   } finally {
+    clearInterval(heartbeat);
+    await heartbeatPending;
     signal?.removeEventListener("abort", stop);
-    await coordinator.close();
-    control.close();
-    report({ event: "worker_server_stopped" });
+    try {
+      await coordinator.close();
+      if (runtime) await runtime.close();
+    } finally {
+      runtimeControl.close();
+      control.close();
+      report({ event: "worker_server_stopped" });
+    }
   }
 }
 

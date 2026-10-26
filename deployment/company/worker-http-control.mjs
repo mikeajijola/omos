@@ -2,10 +2,10 @@
 // service account. The gateway authenticates this endpoint before dispatch.
 import http from "node:http";
 
-function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
+function createOwnerControl({ endpoint, workspaceId, token }, evaluation, runtimes = false) {
   const url = new URL(endpoint);
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash || url.pathname !== "/" || !/^[0-9a-f]{64}$/.test(workspaceId) || typeof token !== "string" || !/^[!-~]{32,1024}$/.test(token)) throw new Error("InvalidWorkerHttpControl");
-  url.pathname = evaluation ? "/v1/company/evaluation" : "/v1/company/workers";
+  url.pathname = evaluation ? "/v1/company/evaluation" : runtimes ? "/v1/company/runtimes" : "/v1/company/workers";
   const active = new Set();
   let closed = false;
   return Object.freeze({
@@ -14,7 +14,7 @@ function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
       if (active.size >= 4) throw new Error("WorkerControlBusy");
       if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("InvalidWorkerControlRequest");
       const mutation = evaluation ? request.action !== "prepare" : request.change !== "inspect";
-      const body = JSON.stringify({ version: evaluation ? "omos.company-evaluation-api/v1" : "omos.company-worker-api/v1", workspace: workspaceId, request: structuredClone(request) });
+      const body = JSON.stringify({ version: evaluation ? "omos.company-evaluation-api/v1" : runtimes ? "omos.company-runtime-api/v1" : "omos.company-worker-api/v1", workspace: workspaceId, request: structuredClone(request) });
       if (Buffer.byteLength(body) > (evaluation ? 256 * 1024 : 65536)) throw new Error("WorkerControlRequestTooLarge");
       const controller = new AbortController();
       active.add(controller);
@@ -41,6 +41,7 @@ function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
         const value = parsed.data;
         if (parsed.workspace !== workspaceId || !value || (evaluation
           ? !["omos.company-validation-input/v1", "omos.company-evaluation-outcome/v1", "omos.company-candidate-outcome/v1"].includes(value.version) || !/^[0-9a-f]{64}$/.test(value.task) || !/^[0-9a-f]{64}$/.test(value.revision)
+          : runtimes ? request.change === "inspect" ? !Array.isArray(value.runtimes) || value.runtimes.length > 32 || value.runtimes.some(row => row.registration?.workspace !== workspaceId) : !/^[0-9a-f]{64}$/.test(value.id) || !/^[0-9a-f]{64}$/.test(value.sha256)
           : !Array.isArray(value.jobs) || value.jobs.length > 32 || value.jobs.some(row => row.record?.binding?.workspace !== workspaceId))) throw new Error("WorkerControlBindingChanged");
         return { ...value, ok: true };
       } catch {
@@ -56,3 +57,4 @@ function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
 
 export const createWorkerHttpControl = config => createOwnerControl(config, false);
 export const createEvaluationHttpControl = config => createOwnerControl(config, true);
+export const createRuntimeHttpControl = config => createOwnerControl(config, false, true);

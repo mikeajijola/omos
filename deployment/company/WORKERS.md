@@ -300,8 +300,8 @@ of verified content per reader. These are collection bounds, not permission to
 publish those files into the company. The host must still enforce the view's
 scope and checkpoint changes through the signed company service.
 
-The coordinator and reader do not yet supply production image preparation,
-execution, or proposal collection. They do not enable `hosted_execution`.
+Use the production image preparer and Linux backend below to connect this
+coordinator to isolated execution and scoped proposal collection.
 
 ### Prepare a production image
 
@@ -549,6 +549,15 @@ does not accept or publish a task. Failed checks retain their evidence and the
 actor's image for inspection; successful submission still passes the normal
 contract, authority, integration and publication gates.
 
+A validation outcome includes `record_id`, the immutable host evidence record
+in that task's history. When bootstrap advertises `validation_feedback`, the
+owning actor can retrieve it with signed `status`, supplying `view`, `revision`,
+`record_id`, `offset`, and a `limit` of at most 16 KiB. Each page identifies the
+full receipt's SHA-256 and byte count. The service checks task ownership and
+revision ancestry before reading it. Another task's record ID grants no access.
+The next hosted invocation receives the previous failed-check note and this
+reference; requeueing preserves the note and its remaining invocation budget.
+
 ### Supervise the coordinator
 
 `worker-server.mjs` runs the optional Linux coordinator with Node.js 22 or newer.
@@ -587,3 +596,46 @@ Stopping the supervisor cancels and joins its current workers. Restarting reads
 those records and does not replay unexpired or paused actor work. The dedicated
 Linux CI job requires private namespaces and exercises the actual production
 adapter; tests on a restricted host verify refusal before claiming a job.
+
+### Discover and request hosted execution
+
+The supervisor registers its verified environment fingerprint, model handle,
+actor/grant bindings, and validation handles through the local owner endpoint
+`/v1/company/runtimes`. These implementation descriptions are versioned in
+Fossil. An authenticated heartbeat renews a 60-second process lease in the
+gateway's memory; it creates no Fossil commit. Another live process cannot take
+that registration's lease. Restarting the gateway clears liveness while
+preserving registrations, task checkpoints, and invocation budgets. The
+supervisor renews its lease every 10 seconds and stops its workers if renewal
+fails.
+
+The public bootstrap advertises `hosted_execution` only while a registered
+implementation is live. This reports service availability, not permission.
+Enroll `execute_task` explicitly in an actor's grant and client configuration
+to permit hosted compute. A signed request uses the same `company_workspace`
+operation as other scoped actions:
+
+```json
+{
+  "version": "omos.company/v1",
+  "action": "execute_task",
+  "operation": "unique-operation-id",
+  "expires_ms": 1900000000000,
+  "view": "OWNED_VIEW_ID",
+  "revision": "CURRENT_VIEW_REVISION"
+}
+```
+
+Set the expiry within five minutes of the current time. The native service
+checks live authority, view ownership, the exact revision, and a live
+implementation for that actor and grant. Coding tasks also require the pinned
+validation handle. A new job allows three invocations of at most four minutes
+each. Repeated requests reuse the job. An explicit request can resume waiting
+or failed work within its remaining budget; it cannot reset that budget or
+restart cancelled work. Queueing runs no actor or model in the request thread.
+
+Signed `status` for the view includes `hosted_execution.available` and a bounded
+job summary with state, invocation count, limits, and the retained note. The
+coordinator checks its configured actor and grant before planning or claiming a
+job. Actor processes receive neither `execute_task` nor operator controls.
+Publication still requires independent review and a verified company receipt.

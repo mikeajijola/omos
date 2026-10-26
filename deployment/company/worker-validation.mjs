@@ -150,7 +150,7 @@ export async function runCompanyValidation({ configuration, configurationSha256,
     const receipt = await control.call(result, signal);
     if (!receipt.ok) fail(receipt.uncertain ? "WorkerValidationOutcomeUnknown" : "WorkerValidationRejected");
     receiptRetained = true;
-    return receipt;
+    return { ...receipt, feedback: { record_id: receipt.record_id, evidence: receipt.evidence, source: result.source_sha256, checks: result.checks.filter(check => check.exit_code !== 0 || !check.output_complete || !check.source_unchanged).map(check => ({ id: check.id, exit_code: check.exit_code, output_complete: check.output_complete, source_unchanged: check.source_unchanged, stdout: check.stdout.slice(0, 256), stderr: check.stderr.slice(0, 256) })) } };
   } finally {
     await image({ ...request, action: "quiesce" });
     if (receiptRetained) await image({ ...request, action: "remove" });

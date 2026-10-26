@@ -1127,7 +1127,8 @@
                 "reconcile",
                 "query",
                 "record",
-                "execution"
+                "execution",
+                "execute_task"
               ]
             },
             "view": {
@@ -3825,6 +3826,314 @@
           "cli",
           "api"
         ]
+      },
+      {
+        "id": "omos_company_runtime_admin",
+        "capability": "general_task",
+        "description": "Register host-selected implementations and maintain disposable liveness through the local operator boundary. Registration and liveness grant no actor authority.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "runtimes"
+            },
+            "runtime": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-runtime/v1"
+                },
+                "change": {
+                  "type": "string",
+                  "enum": [
+                    "inspect",
+                    "register",
+                    "heartbeat",
+                    "stop"
+                  ]
+                },
+                "id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "registration": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "version": {
+                      "const": "omos.company-runtime-registration/v1"
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "workspace": {
+                      "type": "string"
+                    },
+                    "package_sha256": {
+                      "type": "string"
+                    },
+                    "model_handle": {
+                      "type": "string"
+                    },
+                    "isolation": {
+                      "const": "omos.linux-worker/v1"
+                    },
+                    "subjects": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "actor": {
+                            "type": "string"
+                          },
+                          "grant": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "actor",
+                          "grant"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "minItems": 1,
+                      "maxItems": 32
+                    },
+                    "validation_handles": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "maxItems": 16
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "id",
+                    "workspace",
+                    "package_sha256",
+                    "model_handle",
+                    "isolation",
+                    "subjects",
+                    "validation_handles"
+                  ],
+                  "additionalProperties": false
+                },
+                "revision": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "registration_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "instance": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "version",
+                "change"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "runtime"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "api"
+        ]
+      },
+      {
+        "id": "omos_company_hosted_execution",
+        "capability": "general_task",
+        "description": "Request an isolated hosted invocation for the owning view using explicitly delegated compute authority. Queueing is durable; publication requires independent verification.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "execute_task"
+            },
+            "view": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_validation_feedback",
+        "capability": "general_task",
+        "description": "Read a referenced host validation receipt from the owning task at an authorised immutable revision. Content is paged and hashed; another task history is inaccessible.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "status"
+            },
+            "view": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "record_id": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision",
+            "record_id"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -4354,6 +4663,33 @@
             "paths"
           ],
           "indexed": []
+        },
+        {
+          "id": "omos_company_runtime",
+          "fields": {
+            "version": "string",
+            "id": "string",
+            "workspace": "string",
+            "package_sha256": "string",
+            "model_handle": "string",
+            "isolation": "string",
+            "subjects": "json",
+            "validation_handles": "json"
+          },
+          "required": [
+            "version",
+            "id",
+            "workspace",
+            "package_sha256",
+            "model_handle",
+            "isolation",
+            "subjects",
+            "validation_handles"
+          ],
+          "indexed": [
+            "id",
+            "model_handle"
+          ]
         }
       ],
       "relationships": [

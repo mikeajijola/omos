@@ -4,11 +4,11 @@ const std = @import("std");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
-pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record, execution };
+pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record, execution, execute_task };
 
 pub fn isMutation(action: Action) bool {
     return switch (action) {
-        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record, .execution => true,
+        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record, .execution, .execute_task => true,
         .discover, .read, .status, .export_scope, .query => false,
     };
 }
@@ -171,7 +171,7 @@ pub fn authenticateRetained(alloc: std.mem.Allocator, state: State, raw: []const
     if (fresh.action != .reconcile) return error.CompanyAccessDenied;
     const original = try authenticateRequest(alloc, state, raw, now, true);
     if (!std.mem.eql(u8, fresh.actor, original.actor) or !std.mem.eql(u8, fresh.grant, original.grant) or fresh.outcome == null or !std.mem.eql(u8, fresh.outcome.?, original.operation)) return error.CompanyAccessDenied;
-    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate and original.action != .execution) return error.CompanyRecoveryActionDenied;
+    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate and original.action != .execution and original.action != .execute_task) return error.CompanyRecoveryActionDenied;
     return original;
 }
 
@@ -203,7 +203,8 @@ fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publicatio
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp()));
-    if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitsAction(grant, if (publication) .submit else .execution)) return error.CompanyAccessDenied;
+    const permitted = if (publication) permitsAction(grant, .submit) else permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
+    if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitted) return error.CompanyAccessDenied;
     if (publication and grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
     for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
         if (!permittedRoot(path)) continue;

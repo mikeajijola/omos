@@ -6,7 +6,10 @@ const workspace = @import("fossil_workspace.zig");
 const service = @import("workspace_service.zig");
 const bounded = @import("../shared/bounded_operation.zig");
 
-pub fn run(manager: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor, schedule_executor: ?@import("schedule_worker.zig").Executor) !void {
+pub fn run(original: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor, schedule_executor: ?@import("schedule_worker.zig").Executor) !void {
+    var live_hosts: @import("company_runtime.zig").LiveHosts = .{};
+    var manager = original;
+    manager.company_runtime_live = &live_hosts;
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     @import("../shared/debug_trace.zig").configureFromEnv(manager.alloc, std.Io.Dir.path.dirname(manager.repository) orelse ".");
     defer @import("../shared/debug_trace.zig").shutdown();
@@ -201,7 +204,8 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
     const schedules = std.mem.eql(u8, request.head.target, "/v1/schedules");
     const workers = std.mem.eql(u8, request.head.target, "/v1/company/workers");
     const evaluation = std.mem.eql(u8, request.head.target, "/v1/company/evaluation");
-    if (request.head.method != .POST or (!company and !schedules and !workers and !evaluation and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    const runtimes = std.mem.eql(u8, request.head.target, "/v1/company/runtimes");
+    if (request.head.method != .POST or (!company and !schedules and !workers and !evaluation and !runtimes and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
@@ -218,7 +222,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         subscription.respond(request) catch return error.HttpConnectionClosing;
         return;
     }
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else if (runtimes) service.executeRuntimes(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
         return reject(manager, request, keep_alive.*, err);
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });

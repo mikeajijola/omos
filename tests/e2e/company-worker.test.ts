@@ -7,13 +7,14 @@ import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl, createEvaluationHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
 import { validateValidationConfiguration } from "../../deployment/company/worker-validation.mjs";
+import { advertiseWorkerRuntime } from "../../deployment/company/worker-runtime.mjs";
 
 const launcher = join(import.meta.dir, "../../deployment/company/worker-launcher.py");
 const rootFixture = join(import.meta.dir, "fixtures/company-worker-root.py");
@@ -524,6 +525,105 @@ test("server completion preserves a workspace's historical review job schema", a
   } finally { service.child.kill(); await service.child.exited; }
 }, 150000);
 
+test("company implementation registration is portable while heartbeat ownership is disposable and fenced", async () => {
+  const f = fixture();
+  const initial = await f.run(["fossil", "init", "--json"]); expect(initial.code, initial.stderr + initial.stdout).toBe(0);
+  const file = join(f.home, "runtime-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", action: "initialize" }));
+  const initialized = await f.run(["fossil", "company", file, "--json"]); expect(initialized.code, initialized.stderr).toBe(0);
+  let service = await startWorkspaceService(f, true), control;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const connect = () => createRuntimeHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    control = connect();
+    const request = async value => { const result = await control.call({ version: "omos.company-runtime/v1", ...value }); expect(result.ok, JSON.stringify(result)).toBe(true); return result; };
+    const empty = await request({ change: "inspect" }); expect(empty.runtimes).toEqual([]);
+    const registration = { version: "omos.company-runtime-registration/v1", id: "a".repeat(64), workspace: boot.workspace, package_sha256: "b".repeat(64), model_handle: "fixture-model", isolation: "omos.linux-worker/v1", subjects: [{ actor: "actor", grant: "grant" }], validation_handles: ["company-default"] };
+    const registered = await request({ change: "register", id: registration.id, revision: empty.revision, registration });
+    const heartbeat = { change: "heartbeat", id: registration.id, registration_sha256: registered.sha256, instance: "c".repeat(64) };
+    expect((await request(heartbeat)).live).toBe(true);
+    const observed = await request({ change: "inspect", id: registration.id }); expect(observed.revision).toBe(registered.revision); expect(observed.runtimes[0].live).toBe(true);
+    expect((await request(heartbeat)).revision).toBe(registered.revision);
+    const different = await control.call({ version: "omos.company-runtime/v1", ...heartbeat, instance: "d".repeat(64) }); expect(different).toMatchObject({ ok: false, error: "CompanyRuntimeBusy" });
+    const stale = await control.call({ version: "omos.company-runtime/v1", ...heartbeat, registration_sha256: "d".repeat(64) }); expect(stale).toMatchObject({ ok: false, error: "CompanyRuntimeChanged" });
+    const fenced = await control.call({ version: "omos.company-runtime/v1", ...heartbeat, change: "stop", instance: "d".repeat(64) }); expect(fenced).toMatchObject({ ok: false, error: "CompanyRuntimeFenced" });
+    expect((await request({ ...heartbeat, change: "stop" })).live).toBe(false);
+    const same = await request({ change: "register", id: registration.id, revision: registered.revision, registration }); expect(same.revision).toBe(registered.revision);
+    expect((await request(heartbeat)).live).toBe(true);
+    control.close(); service.child.kill(); await service.child.exited;
+    service = await startWorkspaceService(f, true); control = connect();
+    const restored = await request({ change: "inspect", id: registration.id }); expect(restored.runtimes[0].registration).toEqual(registration); expect(restored.runtimes[0].live).toBe(false); expect(restored.revision).toBe(registered.revision);
+    const description = { workspace: boot.workspace, package_sha256: "e".repeat(64), model_handle: "advertised-model", subjects: [{ actor: "actor", grant: "grant" }], validation_handles: [] };
+    const advertised = await advertiseWorkerRuntime({ control, description });
+    const live = await request({ change: "inspect", id: advertised.id }); expect(live.runtimes[0].live).toBe(true);
+    await expect(advertiseWorkerRuntime({ control, description })).rejects.toThrow("WorkerRuntimeAlreadyActive");
+    await advertised.close();
+    expect((await request({ change: "inspect", id: advertised.id })).runtimes[0].live).toBe(false);
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { control?.close(); service.child.kill(); await service.child.exited; }
+}, 180000);
+
+test("signed hosted execution requires compute authority and a live matching implementation while retaining jobs across gateway restarts", async () => {
+  const f = fixture(); const inference = model(f, () => { throw Error("The gateway must never run actor tools"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => {
+    const file = join(f.home, "hosted-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  let revision = (await admin({ action: "initialize" })).revision;
+  const keyed = await f.run(["fossil", "company-key", "hosted", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "discover", "read", "checkpoint", "submit", "status", "reconcile", "execute_task"];
+  for (const id of ["hosted", "manual"]) revision = (await admin({ action: "grant", revision, grant: { id, actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions: id === "manual" ? actions.filter(action => action !== "execute_task") : actions, expires_ms: Date.now() + 3600000 } })).revision;
+  let service = await startWorkspaceService(f, true), client, manual, runtimeControl, advertised, control;
+  const configFile = join(f.home, "hosted-client.json"), manualFile = join(f.home, "manual-client.json");
+  const connect = async () => {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "hosted", key_handle: "hosted", actions };
+    writeFileSync(configFile, JSON.stringify(config), { mode: 0o600 });
+    // A client cannot give itself compute authority by advertising the action.
+    writeFileSync(manualFile, JSON.stringify({ ...config, grant: "manual" }), { mode: 0o600 });
+    client = await createCompanyClient(configFile, { home: f.home }); manual = await createCompanyClient(manualFile, { home: f.home });
+    const owner = { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) };
+    runtimeControl = createRuntimeHttpControl(owner); control = createWorkerHttpControl(owner);
+    return boot;
+  };
+  const args = (action, rest = {}) => ({ version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest });
+  const send = async (input, selected = client) => { const result = await selected.call("company_workspace", input); expect(result.isError, JSON.stringify(result) + (result.isError && existsSync(f.env.FX_TRACE_LOG) ? "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-8000) : "")).not.toBe(true); return JSON.parse(result.content[0].text); };
+  try {
+    let boot = await connect(); expect(boot.features.hosted_execution).toBe(false);
+    expect((await send(args("status"))).actions).toContain("execute_task");
+    const view = await send(args("create_view", { revision: boot.revision, objective: "Answer the team with a short greeting" }));
+    const manualView = await send(args("create_view", { revision: boot.revision, objective: "Keep an independently operated team view" }), manual);
+    const unavailable = await client.call("company_workspace", args("execute_task", { view: view.view, revision: view.revision })); expect(unavailable.isError).toBe(true);
+    expect((await send(args("status", { view: view.view }))).hosted_execution).toMatchObject({ available: false, job: null });
+    const description = { workspace: boot.workspace, package_sha256: "e".repeat(64), model_handle: "company-model", subjects: [{ actor: "participant", grant: "hosted" }], validation_handles: ["company-default"] };
+    advertised = await advertiseWorkerRuntime({ control: runtimeControl, description });
+    boot = await (await fetch(service.url + "/v1/company")).json(); expect(boot.features.hosted_execution).toBe(true);
+    const denied = await manual.call("company_workspace", args("execute_task", { view: manualView.view, revision: manualView.revision })); expect(denied.isError).toBe(true);
+    expect((await client.call("company_workspace", args("execute_task", { view: view.view, revision: "a".repeat(64) }))).isError).toBe(true);
+    const request = args("execute_task", { view: view.view, revision: view.revision });
+    const queued = await send(request); expect(queued).toMatchObject({ available: true, job: { state: "queued", invocations: 0, max_invocations: 3 } });
+    expect(await send(request)).toEqual(queued);
+    expect((await send(args("execute_task", { view: view.view, revision: view.revision }))).job.id).toBe(queued.job.id);
+    expect((await send(args("status", { view: view.view }))).hosted_execution.job).toEqual(queued.job);
+    // A coordinator configured for another actor must not plan or claim this job.
+    const skipped = createWorkerCoordinator({ control, backend: { supports: () => false, async run() { throw Error("Wrong actor dispatched"); } } });
+    expect((await skipped.tick()).started).toBe(0); await skipped.close();
+    expect((await control.call({ change: "inspect", view: view.view })).jobs[0].record.invocations).toBe(0);
+    await advertised.close(); advertised = null;
+    client.close(); manual.close(); control.close(); runtimeControl.close(); service.child.kill(); await service.child.exited;
+    service = await startWorkspaceService(f, true); boot = await connect(); expect(boot.features.hosted_execution).toBe(false);
+    expect((await send(args("status", { view: view.view }))).hosted_execution).toMatchObject({ available: false, job: { id: queued.job.id, invocations: 0 } });
+    advertised = await advertiseWorkerRuntime({ control: runtimeControl, description });
+    let invoked = 0; const coordinator = createWorkerCoordinator({ control, backend: { supports: row => row.record.binding.grant === "hosted", async run() { invoked++; return { outcome: "waiting", note: "Retained the isolated invocation for the next user instruction." }; } } });
+    const deadline = Date.now() + 45000;
+    while (!invoked && Date.now() < deadline) { await advertised.heartbeat(); await coordinator.tick(); await Bun.sleep(50); }
+    await coordinator.drain(); await coordinator.close(); expect(invoked).toBe(1);
+    const waiting = await send(args("status", { view: view.view })); expect(waiting.hosted_execution.job).toMatchObject({ state: "waiting", invocations: 1, max_invocations: 3 });
+    const resumed = await send(args("execute_task", { view: view.view, revision: waiting.revision })); expect(resumed.job).toMatchObject({ id: queued.job.id, state: "queued", invocations: 1, max_invocations: 3, note: waiting.hosted_execution.job.note });
+    expect(inference.counts().actors).toBe(0); const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { if (advertised) await advertised.close(); client?.close(); manual?.close(); runtimeControl?.close(); control?.close(); service.child.kill(); await service.child.exited; }
+}, 180000);
+
 test("company coding publication requires current owner-observed validation and rejects stale checks", async () => {
   const f = fixture();
   const inference = model(f, () => { throw Error("Host evaluation must not run actor tools"); }, undefined, { plan: { capability: "coding_task", summary: "Implement and validate the requested addition function", obligations: [], checks: ["Check add(2, 3) == 5"] } });
@@ -593,7 +693,20 @@ test("company coding publication requires current owner-observed validation and 
     const stale = await evaluator.call({ ...bad, operation: crypto.randomUUID(), source_sha256: "0".repeat(64) }); expect(stale.ok).toBe(false);
     const mismatched = await evaluator.call({ ...bad, operation: crypto.randomUUID(), configuration_handle: "another-configuration" }); expect(mismatched.ok).toBe(false);
     const failed = await evaluator.call(bad); expect(failed.ok, JSON.stringify(failed)).toBe(true); expect(failed.passed).toBe(false);
-    const replay = await evaluator.call(bad); expect(replay.ok, JSON.stringify(replay)).toBe(true); expect(replay).toMatchObject({ replayed: true, passed: false, evidence: failed.evidence, revision: failed.revision });
+    expect(failed.record_id).toMatch(/^[0-9a-f]{64}$/);
+    const feedback: Buffer[] = []; let feedbackOffset = 0, feedbackSha, feedbackBytes;
+    do {
+      const page = await send("status", { view, revision: failed.revision, record_id: failed.record_id, offset: feedbackOffset, limit: 97 });
+      expect(page).toMatchObject({ version: "omos.company-validation-feedback/v1", record_id: failed.record_id, evidence: failed.evidence, offset: feedbackOffset });
+      const content = Buffer.from(page.content, "base64"); expect(content.length).toBeLessThanOrEqual(97); feedback.push(content);
+      feedbackSha ??= page.sha256; feedbackBytes ??= page.bytes; expect(page.sha256).toBe(feedbackSha); expect(page.bytes).toBe(feedbackBytes);
+      if (page.next_offset === null) break; expect(page.next_offset).toBe(feedbackOffset + content.length); feedbackOffset = page.next_offset;
+    } while (feedbackOffset < feedbackBytes);
+    const receipt = Buffer.concat(feedback); expect(receipt.length).toBe(feedbackBytes); expect(createHash("sha256").update(receipt).digest("hex")).toBe(feedbackSha);
+    expect(JSON.parse(receipt.toString())).toMatchObject({ authority: "company_host", status: "failed", checks: [{ exit_code: 1 }] });
+    const other = await send("create_view", { revision: boot.revision, objective: "Keep another task isolated from validation feedback" });
+    const deniedFeedback = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view: other.view, revision: other.revision, record_id: failed.record_id, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }); expect(deniedFeedback.isError).toBe(true);
+    const replay = await evaluator.call(bad); expect(replay.ok, JSON.stringify(replay)).toBe(true); expect(replay).toMatchObject({ replayed: true, passed: false, evidence: failed.evidence, record_id: failed.record_id, revision: failed.revision });
     const different = await evaluator.call({ ...bad, environment_sha256: "c".repeat(64) }); expect(different).toMatchObject({ ok: false, error: "CompanyOperationConflict" });
     const passedInput = await prepare(failed.revision);
     const passed = await evaluator.call(await record(passedInput, await checks(`${code}\nassert add(2, 3) == 5\nprint('addition passed')`)));
@@ -1201,7 +1314,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
   const keyed = await f.run(["fossil", "company-key", "production-worker", "--json"]);
   expect(keyed.code, keyed.stderr).toBe(0);
   const key = JSON.parse(keyed.stdout);
-  const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit", "reconcile", "discover"];
+  const actions = ["create_view", "execution", "execute_task", "status", "read", "checkpoint", "submit", "reconcile", "discover"];
   await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: projected ? ["documents/"] : ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
   let service = await startWorkspaceService(f, true, recovering ? { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" } : {});
   const imageFixture = join(import.meta.dir, "fixtures/company-worker-image.py");
@@ -1217,7 +1330,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
     const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: coding ? "Implement add(a, b) in documents/team/calculator.py so that adding 2 and 3 returns 5. Validate the requested behavior before publication." : answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
     expect(created.isError, JSON.stringify(created)).not.toBe(true);
     const createdView = JSON.parse(created.content[0].text), view = createdView.view;
-    await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
+    if (!answerOnly) await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
     let recoveredOperation: string | undefined;
     if (recovering) {
       let retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
@@ -1243,7 +1356,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
       expect(retained.pending_operation).toBe(recoveredOperation); expect(retained.record.invocations).toBe(1);
     }
 
-    const settings = { company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1284,7 +1397,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
       expect(inference.counts().actors).toBe(answerOnly ? 1 : projected ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
-      expect(result.images).toBe(0); expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0);
+      expect(result.images).toBe(0); if (answerOnly) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
       expect(inference.counts().actors).toBe(0); expect(host.counts().assessments).toBe(0);
     }
     expect(host.counts().actors).toBe(0);

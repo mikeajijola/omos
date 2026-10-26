@@ -80,6 +80,7 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
               if (!sameOwner(row, running.owned) || !row.authority_live || row.record.expires_ms <= Date.now()) running.controller.abort(new Error("WorkerExecutionRevoked"));
               continue;
             }
+            if (typeof backend.supports === "function" && !backend.supports(row)) continue;
             if (row.task_state === "accepted" && row.publication && !["completed", "cancelled"].includes(row.record.state)) {
               await update({ change: "complete", operation: randomUUID(), view, expected_sha256: row.sha256 });
             } else if (row.record.state === "running" && row.record.expires_ms <= Date.now()) {

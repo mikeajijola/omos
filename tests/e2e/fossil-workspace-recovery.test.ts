@@ -508,7 +508,13 @@ describe("portable Fossil workspace recovery", () => {
       expect(JSON.parse(missingRuntime.stdout).model_data.verified).toBe(false);
       const beforeRuntime = JSON.parse((await offline.run(["fossil", "status", "--json"])).stdout).trunk_revision;
       const installedNode = realpathSync(Bun.which("node")!);
-      const node = join(offline.home, "verified-node"); copyFileSync(installedNode, node); chmodSync(node, 0o700);
+      const localNode = (target: ReturnType<typeof fixture>) => {
+        const executable = join(target.home, "verified-node"); copyFileSync(installedNode, executable); chmodSync(executable, 0o700);
+        const probe = spawnSync(executable, ["--version"], { cwd: target.home, env: { PATH: "/usr/bin:/bin", LC_ALL: "C", LANG: "C" }, encoding: "utf8" });
+        expect(probe.status, probe.stderr).toBe(0); expect(probe.stdout).toMatch(/^v(?:2[2-9]|[3-9][0-9])\./);
+        return executable;
+      };
+      const node = localNode(offline);
       const bindings = join(offline.home, "runtime-bindings.json");
       writeFileSync(bindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: node }] }));
       const checked = await offline.run(["fossil", "package", "verify", staged.task, "--bindings", bindings, "--json"], { NODE_OPTIONS: "--this-must-not-reach-the-probe" });
@@ -590,7 +596,7 @@ describe("portable Fossil workspace recovery", () => {
       expect(unverifiedModel.counts().assessments).toBeGreaterThan(1);
       expect(JSON.parse(restored.fossil("cat", "omniform/company.json", "-r", "trunk")).spec.capabilities.some((row: any) => row.id === "portable_cv")).toBe(false);
       const restoredBindings = join(restored.home, "runtime-bindings.json");
-      writeFileSync(restoredBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: installedNode }] }));
+      writeFileSync(restoredBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: localNode(restored) }] }));
       const recoveryProof = await restored.run(["fossil", "package", "verify", staged.task, "--bindings", restoredBindings, "--json"]);
       expect(recoveryProof.code, recoveryProof.stderr).toBe(0);
       const interrupted = await drive(restored, staged.task, JSON.parse(recoveryProof.stdout).model_data.revision, JSON.parse(unverifiedSession.stdout).session_id, false, { FX_E2E_FOSSIL_FAULT: "publication-committed" });
@@ -629,7 +635,7 @@ describe("portable Fossil workspace recovery", () => {
       expect(freshSearch.code, freshSearch.stderr).toBe(0);
       expect(destinationCapabilities.some(value => value.includes("declared_only"))).toBe(true);
       const destinationBindings = join(destination.home, "runtime-bindings.json");
-      writeFileSync(destinationBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: installedNode }] }));
+      writeFileSync(destinationBindings, JSON.stringify({ version: "omos.runtime-handles/v1", handles: [{ handle: "node", kind: "node", executable: localNode(destination) }] }));
       const rechecked = await destination.run(["fossil", "package", "verify", staged.task, "--bindings", destinationBindings, "--json"]);
       expect(rechecked.code, rechecked.stderr).toBe(0);
       const destinationTask = JSON.parse(rechecked.stdout).model_data;
