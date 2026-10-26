@@ -477,8 +477,48 @@ collection retains the bounded image and its private Fossil checkpoint for
 operator inspection. Unconfirmed process cleanup leaves the native job fenced
 until recovery or expiry. A frozen company proposal with additional private
 files also retains its image. The host removes an image only after accounting
-for its proposed files. Runtime availability and compute authority are checked
+for its proposed files and retaining its public Fossil export. Runtime
+availability and compute authority are checked
 again when a user requests dispatch.
+
+### Retain public worker evidence
+
+Hosted actors cannot submit their own company proposal. After the actor and
+its descendants stop, the host exports the private public-history repository
+through the native Fossil command. It retains that export before collecting
+files, running company checks, or submitting the proposal. Provider replay
+files, credentials, and the worker profile are outside this export.
+
+The private owner endpoint `/v1/company/archives` accepts at most 128 KiB of
+archive bytes per chunk. Immutable content objects are shared by SHA-256;
+task records retain scope, source identity, and references to those objects.
+A versioned upload checkpoint carries the byte position and standard SHA-256
+chaining words at complete block boundaries. Inspection resumes from that
+position after a lost acknowledgement. The final request verifies only its
+new chunk and the retained hash state rather than re-reading the whole history.
+There is no accumulated-history size cutoff. Execution deadlines, storage
+capacity, and the wire format's exact-integer range still apply.
+
+The host deletes a successful image only after receiving the complete archive
+acknowledgement. A failed export or unresolved transfer retains the image and
+its public export for inspection and recovery. The retention helper can resume
+the transfer without running the actor. Restarting a worker invocation does
+not yet automatically select an older retained image; inspect that checkpoint
+before dispatching more actor work.
+
+Signed callers inspect only their own view with `status` and
+`entity: "omos_company_archive"`. Pages list complete archives at a pinned
+company control revision. Select an archive using `record_id` and retrieve
+16 KiB byte ranges. Every request checks live authority and coverage of the
+archive's original scope. A raw object hash supplies no access permission.
+An exported company Fossil repository retains these objects and references,
+so completed workers' public records remain available after their images are
+removed.
+
+Archives have authority `actor_public_history_only`. Byte integrity does not
+turn private actor assessments into company assessments, establish external
+effects, or accept a company task. Independent checks and company publication
+receipts continue to own those decisions.
 
 ### Review proposals from external runtimes
 

@@ -5,15 +5,16 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
-import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
 import { validateValidationConfiguration } from "../../deployment/company/worker-validation.mjs";
+import { retainWorkerArchive } from "../../deployment/company/worker-archive.mjs";
 import { advertiseWorkerRuntime } from "../../deployment/company/worker-runtime.mjs";
 
 const launcher = join(import.meta.dir, "../../deployment/company/worker-launcher.py");
@@ -827,6 +828,75 @@ test("external completion planning spends the existing review allowance and reta
   } finally { client?.close(); service.child.kill(); await service.child.exited; }
 }, 120000);
 
+test("company actor archives preserve exact private Fossil history under live scoped authority", async () => {
+  const f = fixture(), privateWorker = fixture();
+  const host = model(f, () => { throw Error("Archival must not run company actors"); });
+  const noise = randomBytes(180 * 1024).toString("base64");
+  const worker = model(privateWorker, (_body, step) => step === 1 ? { tool_calls: [{ index: 0, id: "retain-worker-source", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/private.txt", content: noise }) } }] } : { content: "Retained the original public worker evidence." });
+  expect((await privateWorker.run(["fossil", "init", "--json"])).code).toBe(0);
+  const worked = await privateWorker.run(["ask", "Retain the supplied private worker file and its public evidence.", "--json"], {}, 180000); expect([0, 1]).toContain(worked.code);
+  const privateState = JSON.parse((await privateWorker.run(["fossil", "status", "--json"])).stdout), sourceTask = privateState.tasks[0]; expect(privateState.tasks).toHaveLength(1);
+  const sourceRevision = privateWorker.fossil("timeline", "ancestors", sourceTask.branch, "--type", "ci", "--limit", "1", "--format", "%H").trim().split(/\s+/)[0]; expect(sourceRevision).toMatch(/^[a-f0-9]{64}$/);
+  const filename = join(privateWorker.home, "public-worker.fossil"); expect((await privateWorker.run(["fossil", "export", filename, "--json"])).code).toBe(0);
+  const exported = readFileSync(filename); expect(exported.length).toBeGreaterThan(128 * 1024);
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const file = join(f.home, "archive-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  let revision = (await admin({ action: "initialize" })).revision;
+  const key = await f.run(["fossil", "company-key", "archiver", "--json"]); expect(key.code, key.stderr).toBe(0);
+  const publicKey = (JSON.parse(key.stdout).model_data ?? JSON.parse(key.stdout)).public_key;
+  const actions = ["create_view", "status", "execution"];
+  for (const actor of ["alice", "bob"]) revision = (await admin({ action: "grant", revision, grant: { id: actor, actor, public_key: publicKey, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } })).revision;
+  const service = await startWorkspaceService(f, true); const clients: any[] = []; let control;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.actor_archives).toBe(true);
+    for (const actor of ["alice", "bob"]) { const file = join(f.home, actor + "-archive.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, actor, grant: actor, key_handle: "archiver", issuer: boot.issuer, epoch: boot.epoch, actions }), { mode: 0o600 }); clients.push(await createCompanyClient(file, { home: f.home })); }
+    const call = async (index, input, success = true) => { const response = await clients[index].call("company_workspace", { version: "omos.company/v1", operation: crypto.randomUUID(), expires_ms: Date.now() + 300000, ...input }); if (success) expect(response.isError, JSON.stringify(response)).not.toBe(true); else expect(response.isError).toBe(true); return response.isError ? response : JSON.parse(response.content[0].text); };
+    const view = await call(0, { action: "create_view", revision: boot.revision, objective: "Retain public worker history without claiming company completion" });
+    const claim = await call(0, { action: "execution", view: view.view, revision: view.revision, execution_change: "claim", execution: { runtime: "archive-worker", generation: 0 }, execution_lease_ms: 300000 });
+    const execution = { runtime: "archive-worker", generation: claim.generation }, source = { workspace: privateState.workspace_id, task: sourceTask.id, revision: sourceRevision };
+    control = createArchiveHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    const data = { version: "omos.company-actor-archive-write/v1", view: view.view, execution, source: { ...source, sha256: createHash("sha256").update(exported).digest("hex"), bytes: exported.length }, offset: 0, content: exported.subarray(0, 128 * 1024).toString("base64") };
+    expect((await control.call({ ...data, execution: { ...execution, generation: execution.generation + 1 } })).ok).toBe(false);
+    expect((await control.call({ ...data, source: { ...data.source, bytes: Number.MAX_SAFE_INTEGER + 1 } })).ok).toBe(false);
+    const unauthed = await fetch(service.url + "/v1/company/archives", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); expect(unauthed.status).toBe(401);
+    let loseAck = true;
+    const droppedAck = { async call(request, signal) { const reply = await control.call(request, signal); if (loseAck && request.action !== "inspect" && reply.ok) { loseAck = false; throw Error("The committed archive acknowledgement was lost"); } return reply; } };
+    await expect(retainWorkerArchive({ filename, uid: process.getuid!(), source, view: view.view, execution, control: droppedAck })).rejects.toThrow("WorkerArchiveRetentionPending");
+    expect(existsSync(filename)).toBe(true);
+    const position = await control.call({ ...data, action: "inspect", offset: 0, content: "" }); expect(position.ok).toBe(true); expect(position.resume_offset).toBe(128 * 1024); expect(position.complete).toBe(false);
+    const retained = await retainWorkerArchive({ filename, uid: process.getuid!(), source, view: view.view, execution, control }); expect(retained.complete).toBe(true); expect(retained.sha256).toBe(data.source.sha256);
+    const list = await call(0, { action: "status", entity: "omos_company_archive", view: view.view, limit: 32 }); expect(list.archives).toHaveLength(1); expect(list.archives[0]).toMatchObject({ id: retained.archive_id, authority: "actor_public_history_only", source: data.source });
+    const pieces: Buffer[] = []; let offset = 0;
+    do {
+      const page = await call(0, { action: "status", entity: "omos_company_archive", view: view.view, record_id: retained.archive_id, revision: list.revision, offset, limit: 16384 });
+      expect(page.offset).toBe(offset); expect(page.source.sha256).toBe(retained.sha256); const bytes = Buffer.from(page.content, "base64"); expect(bytes.length).toBeLessThanOrEqual(16384); pieces.push(bytes); offset = page.next_offset;
+    } while (offset !== null);
+    expect(Buffer.concat(pieces).equals(exported)).toBe(true);
+    const end = Math.floor((exported.length - 1) / (128 * 1024)) * (128 * 1024);
+    const before = (await admin({ action: "status" })).revision;
+    expect((await control.call({ ...data, offset: end, content: exported.subarray(end).toString("base64") })).complete).toBe(true);
+    expect((await admin({ action: "status" })).revision).toBe(before);
+    const corrupt = { ...data, source: { ...data.source, sha256: "f".repeat(64), revision: "e".repeat(64) } };
+    for (let position = 0; position < exported.length; position += 128 * 1024) {
+      const result = await control.call({ ...corrupt, offset: position, content: exported.subarray(position, position + 128 * 1024).toString("base64") });
+      expect(result.ok).toBe(position + 128 * 1024 < exported.length);
+      if (!result.ok) expect(result.error).toBe("CompanyArchiveHashMismatch");
+    }
+    expect((await call(0, { action: "status", entity: "omos_company_archive", view: view.view })).archives).toHaveLength(1);
+    const objects = () => f.fossil("ls", "-r", "omos-company").split("\n").filter(path => path.startsWith("company/archives/objects/")).sort();
+    const originalObjects = objects(); expect(originalObjects.length).toBeGreaterThan(0);
+    const reusedView = await call(0, { action: "create_view", revision: boot.revision, objective: "Reference the retained worker history from another isolated task" });
+    const reusedClaim = await call(0, { action: "execution", view: reusedView.view, revision: reusedView.revision, execution_change: "claim", execution: { runtime: "archive-worker", generation: 0 }, execution_lease_ms: 300000 });
+    const reused = await retainWorkerArchive({ filename, uid: process.getuid!(), source, view: reusedView.view, execution: { runtime: "archive-worker", generation: reusedClaim.generation }, control });
+    expect(reused.complete).toBe(true); expect(objects()).toEqual(originalObjects);
+    expect((await call(0, { action: "status", entity: "omos_company_archive", view: reusedView.view })).archives[0].source.sha256).toBe(retained.sha256);
+    await call(1, { action: "status", entity: "omos_company_archive", view: view.view }, false);
+    const state = await call(0, { action: "status", view: view.view }); expect(state.publication).toBeNull(); expect(state.state).toBe("active"); expect(host.counts()).toEqual({ actors: 0, assessments: 0 }); expect(worker.counts().actors).toBe(2);
+    revision = (await admin({ action: "status" })).revision; await admin({ action: "revoke", revision, id: "alice" }); await call(0, { action: "status", entity: "omos_company_archive", view: view.view, record_id: retained.archive_id }, false);
+    const verified = await f.run(["fossil", "verify", "--json"], {}, 180000); expect(verified.code, verified.stderr).toBe(0);
+  } finally { control?.close(); clients.forEach(client => client.close()); service.child.kill(); await service.child.exited; }
+}, 300000);
+
 test("company view discovery isolates actor and grant and pins membership while new chats arrive", async () => {
   const f = fixture(), inference = model(f, () => { throw Error("Task discovery must never invoke an actor"); });
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
@@ -1529,6 +1599,10 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
       expect(outcome).toMatchObject({ ok: true, started: 1, state: failingChecks ? "waiting" : "completed", invocations: recovering ? 2 : 1, generation: recovering ? 2 : 1, published: !failingChecks });
       expect(result.images).toBe(failingChecks ? 1 : 0);
+      const archives = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_archive", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+      expect(archives.isError, JSON.stringify(archives)).not.toBe(true);
+      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
+
       if (failingChecks) {
         expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
         expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/calculator.py");

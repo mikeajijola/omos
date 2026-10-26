@@ -8,7 +8,8 @@ import { spawn } from "node:child_process";
 import { createCompanyClient } from "./mcp.mjs";
 import { createWorkerBroker } from "./worker-broker.mjs";
 import { createWorkerSnapshot } from "./worker-snapshot.mjs";
-import { createEvaluationHttpControl } from "./worker-http-control.mjs";
+import { retainWorkerArchive } from "./worker-archive.mjs";
+import { createArchiveHttpControl, createEvaluationHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
 
 const fail = code => { throw new Error(code); };
@@ -77,6 +78,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
   const probe = await command("/usr/bin/python3", ["-I", launcher, "--probe"], { timeout: 10000, maxBytes: 8192 });
   const support = probe.code === 0 ? JSON.parse(probe.stdout) : null;
   if (!support?.kernel_supported || !support.private_namespaces) fail("WorkerPrivateNamespacesRequired");
+  if (!evaluation) fail("WorkerArchiveControlRequired");
   const image = async (request, signal) => {
     await trustedFile(imageTool, imageToolSha256, 131072);
     if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
@@ -95,6 +97,8 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       try {
         const checked = await client.call("company_workspace", { version: "omos.company/v1", action: "status", operation: randomUUID(), expires_ms: Date.now() + 120000 }, signal);
         if (checked.isError) fail("WorkerCompanyIdentityChanged");
+        const context = await client.call("company_context", {}, signal);
+        if (context.isError || !JSON.parse(context.content[0].text).company.features.actor_archives) fail("WorkerArchiveContractRequired");
         identity = structuredClone(client.identity);
         return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [] };
       } finally { client.close(); }
@@ -130,7 +134,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       const request = { version: "omos.worker-image-request/v1", action: "prepare", id: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), workspace: binding.workspace, view: binding.view, generation: job.generation, max_runtime_ms: job.max_runtime_ms, model: model.handle, source_revision: row.view_revision };
       const prepared = await image(request, signal);
       if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== job.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
-      let client, actorClient, broker, complete = false;
+      let client, actorClient, broker, complete = false, archiveRetained = false;
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: randomUUID(), expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
@@ -140,12 +144,12 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       try {
         client = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions } });
         if (client.identity.workspace !== binding.workspace || client.identity.actor !== binding.actor || client.identity.grant !== binding.grant) fail("WorkerCompanyIdentityChanged");
-        const actorActions = coding ? actions.filter(action => action !== "submit") : actions;
-        actorClient = coding ? await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions: actorActions } }) : client;
+        const actorActions = actions.filter(action => action !== "submit");
+        actorClient = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions: actorActions } });
         broker = await createWorkerBroker({ socket: prepared.root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: job.expires_ms, model, companyClient: actorClient, company: { endpoint: JSON.parse((await trustedFile(companyConfiguration)).toString("utf8")).endpoint, workspace: binding.workspace, actor: binding.actor, grant: binding.grant, view: binding.view, source_revision: row.view_revision, actions: actorActions } });
         const state = await call("status");
         if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
-        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. ${coding ? "The host runs isolated coding validation after this invocation. Return your final answer without submitting the company proposal; the host owns that step." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
+        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
         if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
         const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
         // The launcher joins and kills descendants before returning. Actor
@@ -176,6 +180,18 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         const head = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id });
         const claim = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: head.data.definition_hash, revision: head.data.revision, action: "candidate", task: selected.id });
         if (claim.revision !== head.data.revision || claim.data.task !== selected.id || claim.data.authority !== "actor_claim") fail("WorkerCandidateChanged");
+        const exportDirectory = await fs.mkdtemp(path.join(prepared.root, "workspace", ".omos-host-archive-"));
+        await fs.chown(exportDirectory, prepared.uid, prepared.uid);
+        const exportPath = path.join(exportDirectory, "actor.fossil");
+        const exported = await run(prepared.root, ["fossil", "export", "/workspace/" + path.basename(exportDirectory) + "/actor.fossil", "--json"], signal);
+        await image({ ...request, action: "quiesce" });
+        if (exported.code !== 0) fail("WorkerArchiveExportFailed");
+        await fs.chown(exportDirectory, 0, 0);
+        const archive = createArchiveHttpControl(evaluation);
+        try {
+          const retained = await retainWorkerArchive({ filename: exportPath, uid: prepared.uid, source: { workspace: local.workspace_id, task: selected.id, revision: head.data.revision }, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, control: archive, signal });
+          archiveRetained = retained.complete === true;
+        } finally { archive.close(); }
         const reader = createWorkerSnapshot({ workspace: local.workspace_id, definitionHash: head.data.definition_hash, revision: head.data.revision, request: input => requestNative({ ...input, task: selected.id }), maxFileBytes: 8 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
         const inventory = await reader.inventory(signal);
         const provenance = createWorkerSnapshot({ workspace: local.workspace_id, definitionHash: head.data.definition_hash, revision: head.data.revision, request: input => requestNative({ ...input, task: selected.id }), roots: ["records/omos_worker_projection/"], maxFiles: 1, maxFileBytes: 8 * 1024 * 1024, maxBytes: 8 * 1024 * 1024 });
@@ -258,6 +274,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         // for operator recovery. It consumes the bounded pool until resolved.
         try {
           await image({ ...request, action: "quiesce" });
+          if (complete && !archiveRetained) fail("WorkerArchiveRetentionPending");
           if (complete) await image({ ...request, action: "remove" });
         } catch {
           const error = new Error("WorkerCleanupPending"); error.executionUncertain = true;

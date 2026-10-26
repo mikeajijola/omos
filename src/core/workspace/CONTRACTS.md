@@ -537,6 +537,18 @@ Presentation clients use this operation and file exports to render an interface;
 actor tools retain their normal tracked reads. A grant for presentation does
 not grant task mutation or hosted execution.
 
+`features.actor_archives` advertises public worker-history retention. The owner
+uses `omos_company_archive_admin` through the private archive endpoint. It
+requires a live execution generation and stores immutable content objects plus
+the owning task's scope and upload checkpoint. `omos_company_archive_read`
+projects complete archives through signed `status` with
+`entity: "omos_company_archive"`, an owned `view`, and optional `record_id`.
+List pages contain at most 32 entries. Content requests return at most 16 KiB
+with the original file SHA-256 and immutable control revision. Revocation and
+the original path scope are checked again for every request. Archive contents
+are labelled `actor_public_history_only`; they cannot replace company checks,
+assessments, or publication receipts.
+
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,
