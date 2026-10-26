@@ -2,6 +2,15 @@
 // Transport, execution ownership and company publication belong to the host.
 import { createHash } from "node:crypto";
 
+// Portable task records contain a fingerprint, not a private session ID. Only
+// the owning runtime may resolve it against its local native session catalog.
+export function selectWorkerSession(sessions, fingerprint) {
+  if (!Array.isArray(sessions) || sessions.length > 10000 || !/^[0-9a-f]{64}$/.test(fingerprint)) throw new Error("WorkerSessionAmbiguous");
+  const selected = sessions.filter(session => typeof session?.id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(session.id) && createHash("sha256").update(session.id).digest("hex") === fingerprint);
+  if (selected.length !== 1) throw new Error("WorkerSessionAmbiguous");
+  return selected[0].id;
+}
+
 // A delegated task shares its root's private repository. Independent roots and
 // malformed ancestry remain ambiguous; a child does not hide its parent's work.
 export function selectWorkerRoot(tasks) {

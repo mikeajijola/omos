@@ -98,7 +98,7 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
               await update({ change: "complete", operation: randomUUID(), view, expected_sha256: row.sha256 });
             } else if (row.record.state === "running" && row.record.expires_ms <= Date.now()) {
               await update({ change: "expire", operation: randomUUID(), view, expected_sha256: row.sha256 });
-            } else if (!closed && row.record.state === "queued" && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function")) {
+            } else if (!closed && row.record.state === "queued" && !row.pending_amendment && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function")) {
               if (["queued", "running"].includes(row.review_state)) continue;
               let prepared = row;
               if (row.planning_required && !row.pending_operation) {

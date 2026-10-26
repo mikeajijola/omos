@@ -528,7 +528,10 @@ archives its public history, then resumes its exact native session in the same
 image. The host-owned `omos_company_worker_continuation` contract binds that
 transition to the new invocation count and completed archive receipt. It cannot
 restart the actor twice within one invocation, change the original image, or
-reset the job budget. The resumed native runtime retains completed tool history
+reset the job budget. The portable task stores a session fingerprint. The host
+resolves it against the private native session catalog and requires one exact
+match before resuming; raw session IDs remain local to that runtime. The resumed
+native runtime retains completed tool history
 and handles its interrupted turn. A later public export retains both the
 pre-continuation and completed histories. Older declarations keep the image
 pending until they adopt the continuation operation.

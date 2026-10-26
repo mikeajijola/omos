@@ -61,7 +61,8 @@ fn planUnderLease(original: workspace.Manager, job: jobs.Job, provider: anytype)
     const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
     if (!std.mem.eql(u8, basis.definition_hash, job.definition_hash)) return error.StaleWorkspaceDefinition;
     // A crash after the atomic plan/job commit needs no second model call.
-    if (basis.capability != null) {
+    const revising = task.revision_pending and basis.capability != null;
+    if (basis.capability != null and !revising) {
         return task;
     }
     const policy = basis.execution.review;
@@ -73,11 +74,11 @@ fn planUnderLease(original: workspace.Manager, job: jobs.Job, provider: anytype)
     const authority = @import("company_authority.zig");
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try authority.liveGrant(state, task.authority.?.grant, io.milliTimestamp()));
-    const packet = try std.json.Stringify.valueAlloc(manager.alloc, .{ .originalRequest = try manager.originalRequest(task), .amendments = task.amendments, .contract = task.definition, .model = try manager.definitionSnapshot(task), .step = @as(usize, 0), .authority = .{ .scope = "company_task", .paths = grant.paths, .actor_execution = if (job.kind == .completion) "external_proposal_retained" else "not_started" } }, .{});
+    const packet = try std.json.Stringify.valueAlloc(manager.alloc, .{ .originalRequest = try manager.originalRequest(task), .amendments = task.amendments, .pendingAmendments = task.amendments[@min(task.planned_amendments, task.amendments.len)..], .contract = task.definition, .model = try manager.definitionSnapshot(task), .step = @as(usize, 0), .authority = .{ .scope = "company_task", .paths = grant.paths, .actor_execution = if (job.kind == .completion) "external_proposal_retained" else "not_started" } }, .{});
     var delivery: streams.DeliveryCertainty = .init();
     var evidence: streams.AttemptEvidence = .{};
     var event_context: u8 = 0;
-    const reply = try governance.plan(manager.alloc, provider.provider, .{
+    const request: streams.ModelRequest = .{
         .credential = provider.credential,
         .model = provider.model,
         .retry_count = 1,
@@ -91,14 +92,24 @@ fn planUnderLease(original: workspace.Manager, job: jobs.Job, provider: anytype)
         .events = .{ .context = &event_context, .emit_fn = discard },
         .cancel_flag = provider.cancel,
         .content_capture_limit = 64 * 1024,
-    }, provider.provider_id, packet, turn.journal());
+    };
+    const reply = if (revising)
+        try governance.revise(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal())
+    else
+        try governance.plan(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal());
     const reported = job.reported_tokens +| (reply.usage.input_tokens orelse 0) +| (reply.usage.output_tokens orelse 0);
     try turn.journal().record("review_usage", try std.json.Stringify.valueAlloc(manager.alloc, .{ .reported_tokens = reported }, .{}));
     if (policy.max_tokens) |limit| if (reported > limit) return error.TaskGovernancePending;
-    const plan = try records.decode(governance.Plan, manager.alloc, reply.raw, .{});
+
     try manager.validateTaskBasis(task);
     try authorize(manager, task, job.kind);
-    task = try manager.setPlan(task, plan.capability, plan.summary, plan.obligations, plan.checks);
+    if (revising) {
+        const revision = try records.decode(governance.Revision, manager.alloc, reply.raw, .{});
+        task = try manager.revisePlan(task, revision.capability, revision.summary, revision.obligations, revision.checks, revision.superseded);
+    } else {
+        const plan = try records.decode(governance.Plan, manager.alloc, reply.raw, .{});
+        task = try manager.setPlan(task, plan.capability, plan.summary, plan.obligations, plan.checks);
+    }
     turn.task = task;
     _ = try manager.checkpoint(task);
     return task;

@@ -17,7 +17,7 @@ const standard_schema = compactJson(@embedFile("standard/omniform.schema.json"))
 // Keep the pinned source files readable while embedding only JSON token bytes.
 fn compactJson(comptime source: []const u8) []const u8 {
     const compact = comptime blk: {
-        @setEvalBranchQuota(200000);
+        @setEvalBranchQuota(@max(200000, source.len * 2));
         var bytes: [source.len]u8 = undefined;
         var length: usize = 0;
         var quoted = false;
@@ -675,7 +675,7 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     defer arena.deinit();
     const declaration = try parse(arena.allocator(), seed);
     try std.testing.expectEqual(@as(usize, 2), items(spec(declaration.value), "capabilities").len);
-    try std.testing.expectEqual(@as(usize, 39), declaration.semantic.entityTypes.len);
+    try std.testing.expectEqual(@as(usize, 40), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }
 

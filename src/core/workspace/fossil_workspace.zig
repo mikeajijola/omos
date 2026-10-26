@@ -590,7 +590,7 @@ pub const Manager = struct {
         const declaration = try self.loadDeclaration(basis.revision);
         for (files, 0..) |file, index| {
             if (!allowedPath(file.path) or (!std.mem.startsWith(u8, file.path, "authority/") and !std.mem.startsWith(u8, file.path, "company/"))) return error.WorkspacePathDenied;
-            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, file.path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, file.path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, file.path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, file.path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, file.path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, file.path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
+            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, file.path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, file.path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, file.path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, file.path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, file.path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, file.path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, file.path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
             try model.validateRecord(declaration.semantic, entity, try parse(self.alloc, std.json.Value, file.content), true);
             if (std.mem.eql(u8, entity, "omos_company_reconciliation_policy") or std.mem.eql(u8, entity, "omos_company_desired_binding") or std.mem.eql(u8, entity, "omos_company_reconciliation")) {
                 try @import("company_desired.zig").validateControl(self.alloc, file.path, file.content, self.manifest.id);
@@ -602,6 +602,14 @@ pub const Manager = struct {
                 const registered = try record_json.decode(@import("company_runtime.zig").Registration, self.alloc, file.content, .{});
                 try @import("company_runtime.zig").validate(registered, file.path, self.alloc);
                 if (!std.mem.eql(u8, registered.workspace, self.manifest.id)) return error.WorkspaceIdentityMismatch;
+            }
+            if (std.mem.eql(u8, entity, "omos_company_task_amendment")) {
+                const update = try record_json.decode(@import("company_amendment.zig").Record, self.alloc, file.content, .{});
+                try @import("company_amendment.zig").validateStored(self.alloc, update, file.path);
+                if (!std.mem.eql(u8, update.workspace, self.manifest.id)) return error.WorkspaceIdentityMismatch;
+                if (current) |pinned| if (try self.companyRecordExists(file.path, pinned)) {
+                    if (!std.mem.eql(u8, file.content, try self.contentAt(file.path, pinned))) return error.CompanyOperationConflict;
+                };
             }
             if (std.mem.eql(u8, entity, "omos_company_task_input")) {
                 const input = try record_json.decode(@import("company_control.zig").Record, self.alloc, file.content, .{});
@@ -1062,6 +1070,7 @@ pub const Manager = struct {
         }
         if (!std.mem.eql(u8, value.version, "omos.review-job/v1")) return error.UnsupportedReviewJobVersion;
         if (!std.mem.eql(u8, value.id, id) or !std.mem.eql(u8, value.task, task.id) or value.generation > std.math.maxInt(i64)) return error.InvalidReviewJob;
+        if (value.planning_amendments) |count| if (value.kind != .planning or count == 0 or count > 32) return error.InvalidReviewJob;
         if (value.kind == .planning) {
             const original = value.planning_definition orelse return error.InvalidReviewJob;
             if (!std.mem.eql(u8, original.id, task.id) or original.version > value.contract_version) return error.InvalidReviewJob;
@@ -1072,6 +1081,7 @@ pub const Manager = struct {
 
     fn reviewJobBytes(self: Manager, job: @import("review_job.zig").Job) ![]const u8 {
         var value = try parse(self.alloc, std.json.Value, try json(self.alloc, job));
+        if (job.planning_amendments == null) _ = value.object.swapRemove("planning_amendments");
         if (job.workspace_definition_revision.len > 0) {
             const declaration = try self.loadDeclaration(job.workspace_definition_revision);
             if (!std.mem.eql(u8, declaration.hash, job.workspace_definition_hash)) return error.StaleWorkspaceDefinition;
@@ -1101,6 +1111,7 @@ pub const Manager = struct {
 
     pub fn planningJobId(self: Manager, task: Task) ![]const u8 {
         const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
+        if (task.amendments.len > 0) return hash(self.alloc, try json(self.alloc, .{ "company-planning", task.id, basis.definition_hash, task.amendments.len }));
         return hash(self.alloc, try json(self.alloc, .{ "company-planning", task.id, basis.definition_hash }));
     }
 
@@ -1121,11 +1132,11 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
-        if (task.authority == null or task.revision_pending or task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
+        if (task.authority == null or task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
         const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
         const transport = (try self.modelBasis(try self.revision("trunk"))) orelse return error.WorkspaceMigrationRequired;
         if (!@import("company_planning.zig").supported(try self.loadDeclaration(transport.revision))) return error.CompanyDefinitionUpdateRequired;
-        var job: @import("review_job.zig").Job = .{ .id = try self.planningJobId(task), .task = task.id, .kind = .planning, .contract_version = task.definition.version, .definition_hash = basis.definition_hash, .candidate_hash = try hash(self.alloc, ""), .planning_contract_sha256 = previous_contract, .planning_definition = task.definition, .workspace_definition_hash = transport.definition_hash, .workspace_definition_revision = transport.revision };
+        var job: @import("review_job.zig").Job = .{ .id = try self.planningJobId(task), .task = task.id, .kind = .planning, .contract_version = task.definition.version, .definition_hash = basis.definition_hash, .candidate_hash = try hash(self.alloc, ""), .planning_contract_sha256 = previous_contract, .planning_definition = task.definition, .planning_amendments = if (task.revision_pending) task.amendments.len else null, .workspace_definition_hash = transport.definition_hash, .workspace_definition_revision = transport.revision };
         if (task.review_job) |selected| if (!std.mem.eql(u8, selected, job.id)) {
             const retained = try self.loadReviewJob(task, selected);
             if (retained.state == .queued or retained.state == .running) return error.TaskReviewInProgress;
@@ -1143,8 +1154,8 @@ pub const Manager = struct {
             job.reported_tokens = 0;
             job.budget_epoch = std.math.add(u64, job.generation, 1) catch return error.InvalidReviewJob;
         } else {
-            if (basis.capability != null) return error.StaleCompanyWorkerContract;
-            if (!std.mem.eql(u8, previous_contract, try hash(self.alloc, try json(self.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })))) return error.StaleCompanyWorkerContract;
+            if (basis.capability != null and !task.revision_pending) return error.StaleCompanyWorkerContract;
+            if (!task.revision_pending and !std.mem.eql(u8, previous_contract, try hash(self.alloc, try json(self.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })))) return error.StaleCompanyWorkerContract;
         }
         task.review_job = job.id;
         task.state = .active;
@@ -1164,7 +1175,9 @@ pub const Manager = struct {
         if (job.kind != .planning or (task.model_basis orelse return error.WorkspaceMigrationRequired).capability == null) return error.InvalidReviewJob;
         const original = job.planning_definition orelse return error.InvalidReviewJob;
         if (!std.mem.eql(u8, original.objective, task.definition.objective)) return error.WeakenedParentContract;
-        for (original.obligations) |required| {
+        if (job.planning_amendments) |count| {
+            if (task.revision_pending or task.planned_amendments != count or task.amendments.len != count) return error.InvalidReviewJob;
+        } else for (original.obligations) |required| {
             const preserved = for (task.definition.obligations) |actual| {
                 if (std.mem.eql(u8, required.id, actual.id) and std.mem.eql(u8, required.description, actual.description)) break true;
             } else false;
@@ -1385,7 +1398,9 @@ pub const Manager = struct {
     fn checkReviewFence(self: Manager, task: Task) !void {
         if (self.review_fence) |fence| {
             const job = try self.loadReviewJob(task, fence.job);
-            if (task.revision_pending or job.contract_version != task.definition.version) return error.StaleWorkContract;
+            const revising = job.kind == .planning and job.planning_amendments != null and
+                job.planning_amendments.? == task.amendments.len and task.amendments.len > task.planned_amendments;
+            if ((task.revision_pending and !revising) or job.contract_version != task.definition.version) return error.StaleWorkContract;
             if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
         }
     }
@@ -3207,10 +3222,15 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
         if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
-            const entity: ?[]const u8 = if (std.mem.startsWith(u8, path, "records/omos_worker_projection/")) "omos_worker_projection" else if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
+            const entity: ?[]const u8 = if (std.mem.startsWith(u8, path, "records/omos_worker_projection/")) "omos_worker_projection" else if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
             if (entity) |kind| {
                 try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
                 if (std.mem.eql(u8, kind, "omos_company_reconciliation_policy") or std.mem.eql(u8, kind, "omos_company_desired_binding") or std.mem.eql(u8, kind, "omos_company_reconciliation")) try @import("company_desired.zig").validateControl(self.alloc, path, bytes, self.manifest.id);
+                if (std.mem.eql(u8, kind, "omos_company_task_amendment")) {
+                    const update = try record_json.decode(@import("company_amendment.zig").Record, self.alloc, bytes, .{});
+                    try @import("company_amendment.zig").validateStored(self.alloc, update, path);
+                    if (!std.mem.eql(u8, update.workspace, self.manifest.id)) return error.WorkspaceIdentityMismatch;
+                }
                 if (std.mem.eql(u8, kind, "omos_company_task_input")) {
                     const input = try record_json.decode(@import("company_control.zig").Record, self.alloc, bytes, .{});
                     try @import("company_control.zig").validateStored(self.alloc, input, path);
@@ -3327,7 +3347,7 @@ pub const Manager = struct {
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
                 const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
-                const needs_body = std.mem.startsWith(u8, path, "records/omos_worker_projection/") or std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix) or std.mem.startsWith(u8, path, "company/desired/") or std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix) or std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix) or std.mem.startsWith(u8, path, @import("company_archive.zig").prefix) or std.mem.startsWith(u8, path, @import("company_control.zig").prefix) or std.mem.startsWith(u8, path, @import("company_activity.zig").prefix) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
+                const needs_body = std.mem.startsWith(u8, path, "records/omos_worker_projection/") or std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix) or std.mem.startsWith(u8, path, "company/desired/") or std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix) or std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix) or std.mem.startsWith(u8, path, @import("company_archive.zig").prefix) or std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix) or std.mem.startsWith(u8, path, @import("company_control.zig").prefix) or std.mem.startsWith(u8, path, @import("company_activity.zig").prefix) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
                 if (!needs_body) continue;
                 var digest = std.crypto.hash.sha2.Sha256.init(.{});
                 digest.update(if (company) "company" else "content");
