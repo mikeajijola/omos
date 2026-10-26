@@ -3,10 +3,10 @@
 import http from "node:http";
 
 function createOwnerControl({ endpoint, workspaceId, token }, kind) {
-  const endpoints = { workers: ["/v1/company/workers", "omos.company-worker-api/v1"], evaluation: ["/v1/company/evaluation", "omos.company-evaluation-api/v1"], runtimes: ["/v1/company/runtimes", "omos.company-runtime-api/v1"], archives: ["/v1/company/archives", "omos.company-archive-api/v1"], desired: ["/v1/company/desired", "omos.company-desired-api/v1"], activity: ["/v1/company/activity", "omos.company-activity-api/v1"] };
+  const endpoints = { inputs: ["/v1/company/controls", "omos.company-input-api/v1"], workers: ["/v1/company/workers", "omos.company-worker-api/v1"], evaluation: ["/v1/company/evaluation", "omos.company-evaluation-api/v1"], runtimes: ["/v1/company/runtimes", "omos.company-runtime-api/v1"], archives: ["/v1/company/archives", "omos.company-archive-api/v1"], desired: ["/v1/company/desired", "omos.company-desired-api/v1"], activity: ["/v1/company/activity", "omos.company-activity-api/v1"] };
   const selected = endpoints[kind];
   if (!selected) throw new Error("InvalidWorkerHttpControl");
-  const evaluation = kind === "evaluation", runtimes = kind === "runtimes", archive = kind === "archives", desired = kind === "desired", activity = kind === "activity";
+  const evaluation = kind === "evaluation", runtimes = kind === "runtimes", archive = kind === "archives", desired = kind === "desired", activity = kind === "activity", inputs = kind === "inputs";
   const url = new URL(endpoint);
   if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.search || url.hash || url.pathname !== "/" || !/^[0-9a-f]{64}$/.test(workspaceId) || typeof token !== "string" || !/^[!-~]{32,1024}$/.test(token)) throw new Error("InvalidWorkerHttpControl");
   url.pathname = selected[0];
@@ -17,7 +17,7 @@ function createOwnerControl({ endpoint, workspaceId, token }, kind) {
       if (closed) throw new Error("WorkerControlClosed");
       if (active.size >= 4) throw new Error("WorkerControlBusy");
       if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("InvalidWorkerControlRequest");
-      const mutation = archive || activity ? request.action !== "inspect" : evaluation ? request.action !== "prepare" : request.change !== "inspect";
+      const mutation = archive || activity || inputs ? request.action !== "inspect" : evaluation ? request.action !== "prepare" : request.change !== "inspect";
       const body = JSON.stringify({ version: selected[1], workspace: workspaceId, request: structuredClone(request) });
       if (Buffer.byteLength(body) > ((evaluation || archive || activity) ? 256 * 1024 : 65536)) throw new Error("WorkerControlRequestTooLarge");
       const controller = new AbortController();
@@ -43,7 +43,9 @@ function createOwnerControl({ endpoint, workspaceId, token }, kind) {
         const parsed = JSON.parse(response.body);
         if (response.status !== 200) return { ok: false, error: typeof parsed.error === "string" && /^[A-Z][A-Za-z0-9]{0,95}$/.test(parsed.error) ? parsed.error : "WorkerControlRejected", uncertain: mutation, operation: request.operation ?? null };
         const value = parsed.data;
-        if (parsed.workspace !== workspaceId || !value || (activity
+        if (parsed.workspace !== workspaceId || !value || (inputs
+          ? value.version !== "omos.company-input-owner-outcome/v1" || value.view !== request.view || value.generation !== request.execution.generation || !Array.isArray(value.commands) || value.commands.length > 8 || value.commands.some(command => command.workspace !== workspaceId || command.view !== request.view || command.execution?.generation !== request.execution.generation || command.execution?.runtime !== request.execution.runtime)
+          : activity
           ? value.version !== "omos.company-activity-outcome/v1" || value.workspace !== workspaceId || value.view !== request.view || value.generation !== request.execution.generation || !/^[0-9a-f]{64}$/.test(value.task) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.revision) || !Number.isSafeInteger(value.next_offset) || value.next_offset < 0 || typeof value.ended !== "boolean"
           : archive
           ? value.version !== "omos.company-actor-archive-outcome/v1" || value.view !== request.view || value.sha256 !== request.source.sha256 || value.bytes !== request.source.bytes || value.offset !== request.offset || !/^[0-9a-f]{64}$/.test(value.task) || !/^[0-9a-f]{64}$/.test(value.archive_id) || typeof value.complete !== "boolean"
@@ -78,4 +80,9 @@ export const createDesiredHttpControl = config => {
 export const createActivityHttpControl = config => {
   const control = createOwnerControl(config, "activity");
   return Object.freeze({ call: (request, signal) => control.call({ version: "omos.company-activity-write/v1", ...request }, signal), close: () => control.close() });
+};
+
+export const createInputHttpControl = config => {
+  const control = createOwnerControl(config, "inputs");
+  return Object.freeze({ call: (request, signal) => control.call({ version: "omos.company-input-owner/v1", ...request }, signal), close: () => control.close() });
 };

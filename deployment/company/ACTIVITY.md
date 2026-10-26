@@ -37,6 +37,7 @@ Initial display loads at most the latest 512 events per generation; older
 activity remains available through the paged service. A paused snapshot retains
 the visible text and tool cards. Only company publication emits completion.
 
-The current bridge displays pending native input as a waiting state. Answering
-questions, steering, cancellation, and contract amendments require separately
-authorized control operations; activity records cannot authorize those actions.
+The bridge displays pending native input through the trusted host controls.
+[Company task input and cancellation](INPUT.md) describes the separately signed
+decisions, delivery acknowledgements, and cancellation fences. Activity records
+cannot authorize these actions or change a task's acceptance obligations.

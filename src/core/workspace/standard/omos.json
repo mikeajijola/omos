@@ -5780,6 +5780,300 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_task_control",
+        "capability": "general_task",
+        "description": "Accept authenticated user input or cancel the owning current task; actor tool brokers cannot invoke compute controls.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "execute_task"
+            },
+            "view": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 24576
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision",
+            "content"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_input_admin",
+        "capability": "general_task",
+        "description": "Claim and acknowledge a retained authenticated task input under the current execution fence. Interrupted dispatch remains uncertain and cannot replay automatically.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "controls"
+            },
+            "controls": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-input-owner/v1"
+                },
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "inspect",
+                    "claim",
+                    "acknowledge"
+                  ]
+                },
+                "view": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "execution": {
+                  "type": "object",
+                  "properties": {
+                    "runtime": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "generation": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "generation"
+                  ],
+                  "additionalProperties": false
+                },
+                "event_offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "delivery": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "outcome": {
+                  "type": "string",
+                  "enum": [
+                    "applied",
+                    "failed"
+                  ]
+                }
+              },
+              "required": [
+                "version",
+                "action",
+                "view",
+                "execution"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "controls"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "api"
+        ]
+      },
+      {
+        "id": "omos_company_input_read",
+        "capability": "general_task",
+        "description": "Read the owning task input delivery outcome under current signed retrieval authority.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "status"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "entity": {
+              "const": "omos_company_task_input"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "view": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "record_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "entity",
+            "view",
+            "record_id",
+            "offset"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -6571,6 +6865,46 @@
             "task",
             "view",
             "generation"
+          ]
+        },
+        {
+          "id": "omos_company_task_input",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "view": "string",
+            "actor": "string",
+            "grant": "string",
+            "contract_sha256": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "state": "string",
+            "execution": "json",
+            "command": "json",
+            "delivery": "json",
+            "expires_ms": "number"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "view",
+            "actor",
+            "grant",
+            "contract_sha256",
+            "operation",
+            "request_hash",
+            "state",
+            "execution",
+            "command",
+            "delivery",
+            "expires_ms"
+          ],
+          "indexed": [
+            "task",
+            "view",
+            "state"
           ]
         }
       ],

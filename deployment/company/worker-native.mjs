@@ -43,7 +43,7 @@ export function publicWorkerEvents(data) {
   return [];
 }
 
-export async function runWorkerNative({ launch, control, view, execution, prompt, session, signal, timeout = 240000 }) {
+export async function runWorkerNative({ launch, control, view, execution, prompt, session, inputControl, signal, timeout = 240000 }) {
   if (typeof launch !== "function" || typeof control?.call !== "function" || typeof prompt !== "string" || Buffer.byteLength(prompt) > 131072 || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 300000) fail("InvalidWorkerNativeInvocation");
   signal?.throwIfAborted();
   const before = await control.call({ action: "inspect", view, execution }, signal);
@@ -54,10 +54,13 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
   const errors = [], pending = new Map(), queue = [];
   const turn = randomUUID();
   let uploads = Promise.resolve();
+  let inputTimer, inputPoll = Promise.resolve(), waitingInput = false, ending = false;
   const stop = () => {
     if (killed) return;
-    killed = true; child.kill("SIGTERM");
-    force = setTimeout(() => child.kill("SIGKILL"), 10000);
+    killed = true;
+    child.stdin.destroy();
+    child.kill("SIGTERM");
+    force = setTimeout(() => { child.kill("SIGKILL"); child.stdout.destroy(); child.stderr.destroy(); }, 10000);
   };
   const rejectPending = () => {
     for (const waiting of pending.values()) waiting.reject(new Error("WorkerNativeInvocationStopped"));
@@ -65,6 +68,14 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
   };
   const closed = new Promise((resolve, reject) => {
     child.once("error", error => { rejectPending(); reject(error); });
+    child.once("exit", (code, stoppedBy) => {
+      if (!killed) return;
+      // On failure, wait for the owned process, rather than an open writable
+      // stream in the Node/Bun compatibility layer. No successful result can
+      // be accepted after stop(), and the private task remains retained.
+      child.stdout.destroy(); child.stderr.destroy(); rejectPending();
+      resolve({ code, stoppedBy });
+    });
     child.once("close", (code, stoppedBy) => { rejectPending(); resolve({ code, stoppedBy }); });
   });
   closed.catch(() => {});
@@ -100,6 +111,36 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     if (queue.length >= 4) await flush();
     else if (!flushTimer) flushTimer = setTimeout(() => { void flush(); }, 100);
   };
+  const pollInput = () => {
+    clearTimeout(inputTimer);
+    if (!inputControl || ending || killed || !waitingInput) return;
+    inputPoll = (async () => {
+      const found = await inputControl.call({ action: "inspect", view, execution }, signal);
+      if (!found.ok) fail("WorkerInputControlUnavailable");
+      for (const command of found.commands) {
+        if (command.state !== "pending") fail("WorkerInputOutcomeUncertain");
+        const delivery = randomUUID();
+        const claim = { action: "claim", view, execution, event_offset: command.command.event_offset, delivery };
+        let owned = await inputControl.call(claim, signal);
+        if (!owned.ok) owned = await inputControl.call(claim, signal);
+        if (!owned.ok || owned.commands.length !== 1 || owned.commands[0].delivery !== delivery || owned.commands[0].state !== "dispatching") fail("WorkerInputOutcomeUncertain");
+        let outcome = "applied";
+        try {
+          await request("input", { turn, request_id: command.command.request_id, ...(command.command.approved !== null ? { approved: command.command.approved } : { answers: command.command.answers }) });
+        } catch (error) {
+          if (error.message !== "WorkerNativeRequestRejected" || !["NoActiveInput", "InvalidQuestionAnswers", "StaleInputRequest", "StaleTurn", "NoActiveTurn"].includes(error.nativeCode)) fail("WorkerInputOutcomeUncertain");
+          outcome = "failed";
+        }
+        const acknowledge = { action: "acknowledge", view, execution, event_offset: command.command.event_offset, delivery, outcome };
+        let saved = await inputControl.call(acknowledge, signal);
+        if (!saved.ok) saved = await inputControl.call(acknowledge, signal);
+        if (!saved.ok || saved.commands[0]?.state !== outcome) fail("WorkerInputOutcomeUncertain");
+        if (outcome === "failed") fail("WorkerInputRejected");
+        waitingInput = false;
+      }
+    })();
+    inputPoll.then(() => { if (!ending && !killed && waitingInput) inputTimer = setTimeout(pollInput, 1000); }, error => { failure ??= error; stop(); });
+  };
   try {
     const initialized = request("initialize", {});
     let started;
@@ -120,7 +161,7 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
             const waiting = pending.get(event.id);
             if (!waiting) fail("InvalidWorkerNativeResponse");
             pending.delete(event.id);
-            if (event.err) waiting.reject(new Error("WorkerNativeRequestRejected")); else waiting.resolve(event.result);
+            if (event.err) waiting.reject(Object.assign(new Error("WorkerNativeRequestRejected"), { nativeCode: typeof event.err === "string" && /^[A-Z][A-Za-z0-9]{0,95}$/.test(event.err) ? event.err : "UnknownNativeFailure" })); else waiting.resolve(event.result);
             continue;
           }
           if (event.type !== "event" || event.turn !== turn || event.cursor !== nativeCursor + 1) fail("InvalidWorkerNativeEvent");
@@ -137,7 +178,14 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
           }
           if (data.type === "validate_ui") await emit({ type: "notice", text: "The retained private task is waiting for a configured UI validator." });
           for (const selected of publicWorkerEvents(data)) await emit(selected);
+          if (data.type === "input_required" && inputControl) {
+            await flush(); await uploads;
+            waitingInput = true;
+            pollInput();
+          }
           if (data.type === "turn_end") {
+            ending = true;
+            clearTimeout(inputTimer);
             exitCode = data.exit_code;
             await flush(); await uploads;
             child.stdin.end();
@@ -152,6 +200,8 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     await started;
     const result = await closed;
     await consume;
+    ending = true; clearTimeout(inputTimer);
+    await inputPoll;
     await flush(); await uploads;
     if (failure) throw failure;
     if (buffered.trim() || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255 || result.code !== 0 || result.stoppedBy) fail("WorkerNativeInvocationStopped");
@@ -161,7 +211,9 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     await closed.catch(() => {});
     throw error;
   } finally {
-    clearTimeout(timer); clearTimeout(force); clearTimeout(flushTimer);
+    ending = true;
+    clearTimeout(timer); clearTimeout(force); clearTimeout(flushTimer); clearTimeout(inputTimer);
+    await inputPoll.catch(() => {});
     signal?.removeEventListener("abort", stop);
     rejectPending();
   }

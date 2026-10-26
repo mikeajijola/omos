@@ -10,7 +10,7 @@ import { createWorkerBroker } from "./worker-broker.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "./worker-snapshot.mjs";
 import { retainWorkerArchive } from "./worker-archive.mjs";
 import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
-import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl } from "./worker-http-control.mjs";
+import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl, createInputHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
 import { runWorkerNative } from "./worker-native.mjs";
 
@@ -92,7 +92,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     await trustedFile(launcher, launcherSha256, 131072);
     return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
   };
-  let identity, continuationSupported = false, activitySupported = false;
+  let identity, continuationSupported = false, activitySupported = false, inputSupported = false;
   return Object.freeze({
     async describe(signal) {
       const client = await createCompanyClient(companyConfiguration, { home: companyHome });
@@ -104,6 +104,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         identity = structuredClone(client.identity);
         continuationSupported = JSON.parse(context.content[0].text).company.features.worker_continuation === true;
         activitySupported = JSON.parse(context.content[0].text).company.features.actor_activity === true;
+        inputSupported = JSON.parse(context.content[0].text).company.features.task_input === true;
         return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [], desired_state: Boolean(JSON.parse(context.content[0].text).company.features.desired_state) };
       } finally { client.close(); }
     },
@@ -166,6 +167,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (!activitySupported) return run(prepared.root, ["ask", ...(session ? ["--resume-id", session] : []), "--json"], signal, text);
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const control = createActivityHttpControl(evaluation);
+        const inputControl = inputSupported ? createInputHttpControl(evaluation) : null;
         try {
           return await runWorkerNative({
             launch: async () => {
@@ -173,9 +175,9 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
               if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
               return spawn("/usr/bin/python3", ["-I", launcher, prepared.root, "--", "ui-host", "--stdio"], { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] });
             },
-            control, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, prompt: text, session, signal, timeout: Math.max(1, Math.min(240000, deadline - Date.now())),
+            control, inputControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, prompt: text, session, signal, timeout: Math.max(1, Math.min(240000, deadline - Date.now())),
           });
-        } finally { control.close(); }
+        } finally { control.close(); inputControl?.close(); }
       };
       const startBroker = async () => {
         if (broker) return;

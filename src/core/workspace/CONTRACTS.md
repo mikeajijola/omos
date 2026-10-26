@@ -1264,3 +1264,12 @@ branch. The host checks live execution ownership before append and live scoped
 retrieval authority on each read. Activity cannot establish execution or task
 completion. See [Public worker activity](../../../deployment/company/ACTIVITY.md)
 for the transport and cursor contracts.
+
+## Company user controls
+
+The separately declared `omos_company_task_control` operation accepts signed
+user decisions and cancellation under explicit compute authority. Hosted actor
+brokers omit these actions. `omos_company_task_input` retains the request,
+execution fence, contract hash, and delivery state on the control branch.
+Owner delivery claims cannot replay an uncertain input on a replacement worker.
+See [Company task input and cancellation](../../../deployment/company/INPUT.md).

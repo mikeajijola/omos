@@ -7,7 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl, createActivityHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl, createActivityHttpControl, createInputHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
@@ -1539,9 +1539,9 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "desired", "answer", "recovery", "archive_recovery", "partial_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
-  const desiredTask = scenario === "desired";
+  const desiredTask = scenario === "desired", inputTask = scenario === "input";
   const partialRecovery = scenario === "partial_recovery" && support.private_namespaces;
   let resumedNativeHistory = false;
   const codingRecovery = scenario === "coding_recovery";
@@ -1554,8 +1554,14 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
   const host = model(f, () => { throw Error("The company host must never execute the actor"); }, undefined, { plan: { capability: coding ? "coding_task" : "general_task", summary: "Retain the requested company outcome", obligations: [], checks: coding ? ["Run the operator-configured isolated behavior check"] : [] } });
   const inference = model(worker, (body, count) => {
     const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
-    // PID 1 is the native runtime inside the mandatory private PID namespace.
-    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "kill -TERM 1", timeout_ms: 10000 } });
+    if (inputTask && count === 1) return tool("ask_user_question", { questions: [{ question: "Which presentation should the retained report use?", options: [{ label: "Brief" }, { label: "Detailed" }] }] });
+    if (inputTask && count === 2) {
+      expect(body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Brief"))).toBe(true);
+      return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
+    }
+    // The native UI host is PID 1 only inside the mandatory private namespace.
+    // PID 1 ignores default TERM; KILL creates the required abrupt interruption.
+    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "kill -KILL 1", timeout_ms: 10000 } });
     if (partialRecovery && count === 3) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("production.txt"));
     if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
@@ -1654,7 +1660,7 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
       if (target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
       return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
-    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1669,6 +1675,7 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
       expect(current.record.checkpoint.phase).toBe("retained");
       if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
       if (desiredTask) expect(outcome.desired_met).toBe(true);
+      if (inputTask) expect(outcome.input_answered).toBe(true);
       if (partialRecovery) {
         expect(outcome.recovered_partial).toBe(true); expect(resumedNativeHistory).toBe(true);
         expect(current.record.checkpoint.generation).toBe(1);
@@ -1730,7 +1737,7 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
         const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
       }
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : partialRecovery ? 3 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : partialRecovery || inputTask ? 3 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); if (answerOnly || desiredTask) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
@@ -2116,19 +2123,24 @@ test("public worker activity filters private fields and preserves Unicode text c
   expect(publicWorkerEvents({ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", arguments: { credential: "private" } })).toEqual([{ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", action: null }]);
 });
 
-test("company public activity streams the native runtime without publishing its claims and resumes exact acknowledged pages", async () => {
+for (const interactive of [false, true]) test(`company public activity streams the native runtime without publishing its claims and resumes exact acknowledged pages${interactive ? " with authenticated human input" : ""}`, async () => {
   const f = fixture(), privateWorker = fixture();
-  const inference = model(privateWorker, (_body, count) => count === 1 ? { content: "Preparing the portable document.\n", tool_calls: [
+  let answered = false;
+  const inference = model(privateWorker, (body, count) => {
+    if (interactive && count === 2) return { tool_calls: [{ index: 0, id: "public-question", type: "function", function: { name: "ask_user_question", arguments: JSON.stringify({ questions: [{ question: "Which presentation should the retained report use?", options: [{ label: "Brief" }, { label: "Detailed" }] }] }) } }] };
+    if (interactive && count === 3) answered = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Brief"));
+    return count === 1 ? { content: "Preparing the portable document.\n", tool_calls: [
     { index: 0, id: "write-visible", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/progress.txt", content: "Retained privately before company review." }) } },
     { index: 1, id: "print-visible", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "printf 'native-visible-output λ 漢字\\n'", timeout_ms: 10000 } }) } },
-  ] } : { content: "Fixture complete.\n\n- Retained **portable** document. λ 漢字" });
+  ] } : { content: "Fixture complete.\n\n- Retained **portable** document. λ 漢字" };
+  });
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   const admin = async (input: object) => { const file = join(f.home, "activity-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
   const initial = await admin({ action: "initialize" });
   const keyed = await f.run(["fossil", "company-key", "activity-owner", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
-  const actions = ["create_view", "read", "status", "execution", "checkpoint", "submit"];
+  const actions = ["create_view", "read", "status", "execution", "execute_task", "checkpoint", "submit"];
   await admin({ action: "grant", revision: initial.revision, grant: { id: "activity-owner", actor: "activity-user", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
-  const service = await startWorkspaceService(f, true); let client, otherClient, control;
+  const service = await startWorkspaceService(f, true); let client, otherClient, control, inputControl;
   try {
     const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.actor_activity).toBe(true);
     const config = join(f.home, "activity-owner.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "activity-user", grant: "activity-owner", key_handle: "activity-owner", actions }), { mode: 0o600 });
@@ -2138,11 +2150,63 @@ test("company public activity streams the native runtime without publishing its 
     const notStarted = await send("status", { view: view.view, entity: "omos_company_activity", limit: 2 }); expect(notStarted.events).toEqual([]); expect(notStarted.ended).toBe(false);
     const claimed = await send("execution", { view: view.view, revision: view.revision, execution_change: "claim", execution: { runtime: "activity-runtime", generation: 0 }, execution_lease_ms: 300000 });
     const execution = { runtime: "activity-runtime", generation: claimed.generation };
+    if (interactive) {
+      const actor = await createCompanyClient(config, { home: f.home, binding: { view: view.view, execution, expiresMs: Date.now() + 120000, actions: ["status", "checkpoint"] } });
+      try {
+        expect(actor.tools()[1].inputSchema.properties.action.enum).not.toContain("execute_task");
+        const selfDecision = await actor.call("company_workspace", { version: "omos.company/v1", action: "execute_task", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, content: "{}" });
+        expect(selfDecision.isError).toBe(true); expect(JSON.parse(selfDecision.content[0].text).error).toBe("CompanyWorkerScopeDenied");
+      } finally { actor.close(); }
+    }
     control = createActivityHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
-    let lost = false, appendCalls = 0;
-    const sink = { async call(request, signal) { const reply = await control.call(request, signal); if (request.action === "append") { appendCalls++; if (!lost && reply.ok) { lost = true; return { ok: false, uncertain: true }; } } return reply; } };
-    const result = await runWorkerNative({ launch: () => spawn(join(import.meta.dir, "../../zig-out/bin/fx"), ["ui-host", "--stdio"], { cwd: privateWorker.cwd, env: { PATH: process.env.PATH, ...privateWorker.env, USER: "fixture", LOGNAME: "fixture", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] }), control: sink, view: view.view, execution, prompt: "Retain documents/team/progress.txt and print the requested visible output. Return the short Markdown response.", timeout: 240000 });
-    expect(result.code, result.stderr).toBe(0); expect(result.killed).toBe(false); expect(inference.counts().actors).toBe(2); expect(lost).toBe(true); expect(appendCalls).toBeGreaterThan(1);
+    inputControl = interactive ? createInputHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }) : null;
+    let lost = false, appendCalls = 0, inputOffset;
+    const inputTransport = inputControl;
+    let claimLost = false, inputAckLost = false;
+    if (inputControl) inputControl = { close: () => inputTransport.close(), async call(request, signal) {
+      const reply = await inputTransport.call(request, signal);
+      if (reply.ok && request.action === "claim" && !claimLost) { claimLost = true; return { ok: false, uncertain: true }; }
+      if (reply.ok && request.action === "acknowledge" && !inputAckLost) { inputAckLost = true; return { ok: false, uncertain: true }; }
+      return reply;
+    } };
+    const sink = { async call(request, signal) {
+      const reply = await control.call(request, signal);
+      if (request.action === "append") {
+        appendCalls++;
+        const index = request.events.findIndex(raw => JSON.parse(raw).type === "input_required");
+        if (interactive && reply.ok && index !== -1 && inputOffset === undefined) {
+          inputOffset = request.offset + index;
+          const question = JSON.parse(request.events[index]);
+          await send("execute_task", { view: view.view, revision: view.revision, execution, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: inputOffset, request_id: question.request_id, answers: ["Brief"] }) });
+        }
+        if (!lost && reply.ok) { lost = true; return { ok: false, uncertain: true }; }
+      }
+      return reply;
+    } };
+    const result = await runWorkerNative({ launch: () => spawn(join(import.meta.dir, "../../zig-out/bin/fx"), ["ui-host", "--stdio"], { cwd: privateWorker.cwd, env: { PATH: process.env.PATH, ...privateWorker.env, USER: "fixture", LOGNAME: "fixture", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] }), control: sink, inputControl, view: view.view, execution, prompt: "Retain documents/team/progress.txt and print the requested visible output. Return the short Markdown response.", timeout: 240000 });
+    expect(result.code, result.stderr).toBe(0); expect(result.killed).toBe(false); expect(inference.counts().actors).toBe(interactive ? 3 : 2); expect(lost).toBe(true); expect(appendCalls).toBeGreaterThan(1);
+    if (interactive) {
+      expect(answered).toBe(true);
+      const delivered = await send("status", { view: view.view, entity: "omos_company_task_input", record_id: "1", offset: inputOffset });
+      expect(delivered.state).toBe("applied");
+      expect(claimLost).toBe(true); expect(inputAckLost).toBe(true);
+      for (const rejected of [
+        { execution: { ...execution, generation: execution.generation + 1 }, request_id: 1 },
+        { execution, request_id: 999 },
+      ]) {
+        const result = await client.call("company_workspace", { version: "omos.company/v1", action: "execute_task", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, view: view.view, revision: view.revision, execution: rejected.execution, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: inputOffset, request_id: rejected.request_id, answers: ["Brief"] }) });
+        expect(result.isError).toBe(true);
+      }
+
+      const changedDelivery = await inputTransport.call({ action: "claim", view: view.view, execution, event_offset: inputOffset, delivery: crypto.randomUUID() });
+      expect(changedDelivery.ok).toBe(false); expect(changedDelivery.error).toBe("CompanyInputOutcomeUncertain");
+      const queuedView = await send("create_view", { revision: boot.revision, objective: "Cancel a queued company invocation before an actor starts." });
+      await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view: queuedView.view } });
+      const cancelled = await send("execute_task", { view: queuedView.view, revision: queuedView.revision, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "cancel" }) });
+      expect(cancelled.state).toBe("cancelled");
+      const cancelledStatus = await send("status", { view: queuedView.view });
+      expect(cancelledStatus.hosted_execution.job.state).toBe("cancelled"); expect(cancelledStatus.publication).toBeNull();
+    }
     const collected: any[] = []; let offset = 0, revision, final;
     do { final = await send("status", { view: view.view, entity: "omos_company_activity", record_id: "1", limit: 2, offset, ...(revision ? { revision } : {}) }); revision ??= final.index_revision; expect(final.index_revision).toBe(revision); expect(final.events.length).toBeLessThanOrEqual(2); collected.push(...final.events); offset = final.resume_offset; } while (final.next_offset !== null);
     expect(collected.map(event => event.offset)).toEqual(Array.from({ length: collected.length }, (_, index) => index)); expect(final.ended).toBe(true); expect(final.authority).toBe("actor_public_activity_only");
@@ -2156,5 +2220,61 @@ test("company public activity streams the native runtime without publishing its 
     await admin({ action: "revoke", revision: (await admin({ action: "status" })).revision, id: "activity-owner" });
     const revoked = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view: view.view, entity: "omos_company_activity", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, limit: 2 }); expect(revoked.isError).toBe(true);
     const verified = await f.run(["fossil", "verify", "--json"], {}, 180000); expect(verified.code, verified.stderr).toBe(0);
-  } finally { control?.close(); otherClient?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+  } finally { inputControl?.close(); control?.close(); otherClient?.close(); client?.close(); service.child.kill(); await service.child.exited; }
 }, 600000);
+
+
+test("company clients recover a closed bootstrap read without replaying a lost mutation acknowledgement", async () => {
+  const f = fixture(), workspace = "a".repeat(64);
+  const keys = generateKeyPairSync("ed25519");
+  const issuer = keys.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+  mkdirSync(join(f.home, ".fx/company-keys"), { recursive: true });
+  writeFileSync(join(f.home, ".fx/company-keys/bootstrap.seed"), randomBytes(32), { mode: 0o600 });
+  let reads = 0, mutations = 0, epoch = 1;
+  const server = http.createServer((request, response) => {
+    if (request.method === "GET") {
+      if (++reads === 1) { request.socket.destroy(); return; }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ version: "omos.company/v1", workspace, issuer, epoch: 1 }));
+    } else {
+      let body = ""; request.setEncoding("utf8"); request.on("data", chunk => { body += chunk; });
+      request.on("end", () => {
+        const input = JSON.parse(body), payload = JSON.parse(input.payload);
+        if (payload.action !== "status") { mutations++; request.socket.destroy(); return; }
+        const receipt = JSON.stringify({ version: "omos.company-receipt/v1", workspace, actor: "user", grant: "user", operation: payload.operation, request_hash: createHash("sha256").update(input.payload).digest("hex"), action: "status", epoch, result: { state: "ready" } });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ issuer, payload: receipt, signature: sign(null, Buffer.from(receipt), keys.privateKey).toString("hex") }));
+      });
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const config = join(f.home, "bootstrap-client.json");
+  writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: `http://127.0.0.1:${(server.address() as any).port}`, workspace, issuer, epoch: 1, actor: "user", grant: "user", key_handle: "bootstrap", actions: ["create_view", "status"] }), { mode: 0o600 });
+  const client = await createCompanyClient(config, { home: f.home });
+  try {
+    const context = await client.call("company_context", {});
+    expect(context.isError, JSON.stringify(context)).not.toBe(true); expect(reads).toBe(2);
+    const inspect = () => client.call("company_workspace", { version: "omos.company/v1", action: "status", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+    const read = await inspect(); expect(read.isError, JSON.stringify(read)).not.toBe(true); expect(reads).toBe(2);
+    epoch = 2; const drift = await inspect(); expect(drift.isError).toBe(true); expect(JSON.parse(drift.content[0].text).error).toBe("CompanyOutcomeUnverified"); expect(reads).toBe(2); epoch = 1;
+    const changed = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", objective: "Retain an uncertain acknowledgement", revision: "b".repeat(64), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+    expect(changed.isError).toBe(true); expect(JSON.parse(changed.content[0].text).error).toBe("CompanyOutcomeUnknown");
+    expect(mutations).toBe(1); expect(reads).toBe(3);
+  } finally { client.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test("worker native delivery stops and joins its process when activity retention fails", async () => {
+  const source = String.raw`import readline from 'node:readline';
+const input = readline.createInterface({input:process.stdin});
+const send = value => process.stdout.write(JSON.stringify({version:'omos.ui-host/v1',...value})+'\n');
+input.on('line',line=>{const request=JSON.parse(line);send({type:'response',id:request.id,result:{},err:null});if(request.method==='prompt'){send({type:'event',turn:request.id,cursor:1,data:{type:'turn_start'}});send({type:'event',turn:request.id,cursor:2,data:{type:'input_required',kind:'question',request_id:1,questions:[{question:'Retain this request?',options:[{label:'Yes'}]}]}});}});`;
+  let child, appends = 0;
+  const started = Date.now();
+  await expect(runWorkerNative({
+    launch: () => child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] }),
+    control: { async call(request) { if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false }; appends++; return { ok: false, uncertain: true }; } },
+    view: "view", execution: { runtime: "runtime", generation: 1 }, prompt: "Retain the pending request", timeout: 2000,
+  })).rejects.toThrow("WorkerActivityRetentionPending");
+  expect(appends).toBe(2); expect(Date.now() - started).toBeLessThan(5000);
+  expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+}, 10000);

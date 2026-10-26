@@ -135,7 +135,16 @@ async function http(state, body, signal) {
 }
 
 async function bootstrap(state, signal) {
-  const boot = await http(state, undefined, signal);
+  let boot;
+  try { boot = await http(state, undefined, signal); }
+  catch (error) {
+    // A bootstrap GET has no effects. Recover one closed transport inside the
+    // existing deadline; signed POST operations are never retried here.
+    signal?.throwIfAborted();
+    const code = error.cause?.code ?? error.code;
+    if (!["ECONNRESET", "EPIPE", "UND_ERR_SOCKET"].includes(code)) throw error;
+    boot = await http(state, undefined, signal);
+  }
   if (boot.version !== "omos.company/v1" || boot.workspace !== state.config.workspace || boot.issuer !== state.config.issuer || boot.epoch !== state.config.epoch) fail("CompanyIdentityChanged");
   return boot;
 }
@@ -154,7 +163,11 @@ async function call(state, name, args, signal) {
   const payload = canonical(request);
   const body = JSON.stringify({ payload, signature: sign(null, Buffer.from(payload), state.key).toString("hex") });
   if (Buffer.byteLength(body) > MAX) fail("CompanyRequestTooLarge");
-  await bootstrap(state, signal);
+  // Read results already carry a verified issuer, epoch, request hash and
+  // scope receipt. A second public GET would take the same native writer
+  // boundary and compete with reviews while polling. Mutations retain the
+  // preflight before dispatch; no signed POST is replayed on failure.
+  if (mutation.has(args.action)) await bootstrap(state, signal);
   const request_hash = createHash("sha256").update(payload).digest("hex");
   let envelope;
   try { envelope = await http(state, body, signal); }
@@ -183,9 +196,11 @@ function tools(state) {
   ];
 }
 
-function publicFailure(error) {
+function publicFailure(error, aborted = false) {
   const allowed = ["UnknownTool", "InvalidArguments", "InvalidOperationOrExpiry", "CompanyIdentityChanged", "CompanyRequestTooLarge", "RequestTooComplex", "InvalidRequestKey", "CompanyClientClosed", "CompanyWorkerScopeDenied", "CompanyWorkerExpired", "CompanyWorkerOperationBudgetExceeded"];
-  return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: allowed.includes(error.message) ? error.message : "CompanyRequestNotAttempted" }) }] };
+  const known = allowed.includes(error.message);
+  const cause = aborted ? "RequestDeadline" : /^CompanyHttp[0-9]{3}$/.test(error.message) ? error.message : typeof error.cause?.code === "string" && /^[A-Z_0-9]{1,48}$/.test(error.cause.code) ? error.cause.code : ["SyntaxError", "TypeError", "AbortError"].includes(error.name) ? error.name : "RequestPreparationFailed";
+  return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: known ? error.message : "CompanyRequestNotAttempted", ...(!known ? { failure_stage: "before_signed_dispatch", failure_code: cause } : {}) }) }] };
 }
 
 // The host bridge uses the same configuration, signing, authority, receipts,
@@ -245,7 +260,7 @@ export async function createCompanyClient(filename, { home, binding } = {}) {
         }
         return await call(current, name, args, bounded);
       }
-      catch (error) { return publicFailure(error); }
+      catch (error) { return publicFailure(error, bounded.aborted); }
       finally { clearTimeout(timer); active.delete(controller); }
     },
     close() {

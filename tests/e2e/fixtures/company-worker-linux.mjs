@@ -16,7 +16,7 @@ try {
   const deadline = Date.now() + 360000;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
-  let selected, desiredMetAt = 0;
+  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false;
   for (;;) {
     if (serverError) throw serverError;
     if (!requested) {
@@ -40,6 +40,21 @@ try {
     }
     if (result.jobs.length !== 1) throw new Error("FixtureJobInspectionFailed");
     selected = result.jobs[0];
+    if (settings.inputResponse && !inputAnswered && selected.record.state === "running") {
+      actor ??= await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
+      const invoke = async input => {
+        const result = await actor.call("company_workspace", { version: "omos.company/v1", operation: randomUUID(), expires_ms: Date.now() + 120000, ...input });
+        if (result.isError) throw new Error("FixtureInputRequestFailed");
+        return JSON.parse(result.content[0].text);
+      };
+      const page = await invoke({ action: "status", view: settings.view, entity: "omos_company_activity", record_id: String(selected.record.generation), offset: inputOffset, limit: 2 });
+      inputOffset = page.resume_offset;
+      const question = page.events.find(event => event.data.type === "input_required");
+      if (question) {
+        await invoke({ action: "execute_task", view: settings.view, revision: selected.view_revision, execution: { runtime: selected.record.runtime, generation: selected.record.generation }, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: question.offset, request_id: question.data.request_id, answers: ["Brief"] }) });
+        inputAnswered = true;
+      }
+    }
     if (settings.desiredPolicy) {
       if (!settings.view) settings.view = selected.record.binding.view;
       if (selected.record.state === "completed") {
@@ -88,7 +103,7 @@ try {
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0 }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed" }));
   process.exitCode = 1;
