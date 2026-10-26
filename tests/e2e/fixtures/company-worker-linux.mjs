@@ -65,8 +65,9 @@ try {
       stopping = new AbortController(); supervisor = start();
       continue;
     }
-    if (settings.partialRecovery && !recoveredPartial && selected.record.state === "failed") {
-      if (selected.record.checkpoint?.phase !== "running" || selected.record.checkpoint.generation !== 1) throw new Error("FixturePartialCheckpointMissing");
+    if (settings.partialRecovery && !recoveredPartial && ["failed", "waiting"].includes(selected.record.state)) {
+      const checkpoint = selected.record.checkpoint;
+      if (!checkpoint || !["running", "stopped"].includes(checkpoint.phase) || checkpoint.generation !== 1 || checkpoint.continuation || (selected.record.state === "waiting" && !selected.record.note?.includes("no bounded recorded answer"))) throw new Error("FixturePartialCheckpointMissing");
       stopping.abort(); await supervisor;
       const resumed = await control.call({ change: "requeue", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
       if (!resumed.ok) throw new Error("FixturePartialRequeueFailed");

@@ -3,11 +3,11 @@ import http from "node:http";
 import net from "node:net";
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomBytes } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl, createActivityHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
@@ -17,6 +17,7 @@ import { validateValidationConfiguration } from "../../deployment/company/worker
 import { createWorkerCheckpointer } from "../../deployment/company/worker-checkpoint.mjs";
 import { retainWorkerArchive } from "../../deployment/company/worker-archive.mjs";
 import { advertiseWorkerRuntime } from "../../deployment/company/worker-runtime.mjs";
+import { runWorkerNative, publicWorkerEvents } from "../../deployment/company/worker-native.mjs";
 
 const launcher = join(import.meta.dir, "../../deployment/company/worker-launcher.py");
 const rootFixture = join(import.meta.dir, "fixtures/company-worker-root.py");
@@ -1679,6 +1680,29 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
       const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery || partialRecovery ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
       if (partialRecovery) expect(new Set(archived.map(entry => entry.source.task)).size).toBe(1);
 
+      // Public native progress survives worker cleanup and never establishes
+      // company publication by itself. Read through the signed scoped API.
+      if (!recovering && !archiveRecovery) {
+      let activityOffset = 0, activityRevision, activityEnded = false;
+      const activityEvents = [];
+      do {
+        const activityResult = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_activity", view, record_id: String(current.record.generation), offset: activityOffset, limit: 2, ...(activityRevision ? { revision: activityRevision } : {}), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+        expect(activityResult.isError, JSON.stringify(activityResult)).not.toBe(true);
+        const page = JSON.parse(activityResult.content[0].text);
+        expect(page.authority).toBe("actor_public_activity_only");
+        expect(page.events.length).toBeLessThanOrEqual(2);
+        for (const event of page.events) { expect(event.offset).toBe(activityOffset++); activityEvents.push(event.data); }
+        activityRevision = page.index_revision; activityEnded = page.ended;
+        if (page.next_offset === null) break;
+        expect(page.next_offset).toBe(activityOffset);
+        expect(activityOffset).toBeLessThan(512);
+      } while (true);
+      expect(activityEnded).toBe(true);
+      expect(activityEvents.some(event => event.type === "text_delta")).toBe(true);
+      expect(activityEvents.at(-1)?.type).toBe("turn_end");
+      if (!answerOnly && !partialRecovery) expect(activityEvents.some(event => event.type === "tool_start")).toBe(true);
+      }
+
       if (failingChecks) {
         expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
         expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/calculator.py");
@@ -2079,4 +2103,58 @@ test("company desired reconciliation pins operator authority, retains one task a
     expect((await tick()).failure).toBe("CompanyDesiredStatePaused");
     const verified = await f.run(["fossil", "verify", "--json"], {}, 180000); expect(verified.code, verified.stderr).toBe(0);
   } finally { desired?.close(); otherClient?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 600000);
+
+
+test("public worker activity filters private fields and preserves Unicode text chunks", () => {
+  const text = "A portable workspace λ 漢字\n".repeat(700);
+  const selected = publicWorkerEvents({ type: "text_delta", text, reasoning: "Do not copy", provider_state: { opaque: true } });
+  expect(selected.map(event => event.text).join("")).toBe(text);
+  expect(selected.every(event => Buffer.byteLength(event.text) <= 2048)).toBe(true);
+  expect(selected.every(event => Object.keys(event).sort().join(",") === "text,type")).toBe(true);
+  expect(publicWorkerEvents({ type: "reasoning", text: "private" })).toEqual([]);
+  expect(publicWorkerEvents({ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", arguments: { credential: "private" } })).toEqual([{ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", action: null }]);
+});
+
+test("company public activity streams the native runtime without publishing its claims and resumes exact acknowledged pages", async () => {
+  const f = fixture(), privateWorker = fixture();
+  const inference = model(privateWorker, (_body, count) => count === 1 ? { content: "Preparing the portable document.\n", tool_calls: [
+    { index: 0, id: "write-visible", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/progress.txt", content: "Retained privately before company review." }) } },
+    { index: 1, id: "print-visible", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "printf 'native-visible-output λ 漢字\\n'", timeout_ms: 10000 } }) } },
+  ] } : { content: "Fixture complete.\n\n- Retained **portable** document. λ 漢字" });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => { const file = join(f.home, "activity-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "activity-owner", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "read", "status", "execution", "checkpoint", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "activity-owner", actor: "activity-user", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client, otherClient, control;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.actor_activity).toBe(true);
+    const config = join(f.home, "activity-owner.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "activity-user", grant: "activity-owner", key_handle: "activity-owner", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const send = async (action: string, rest: object = {}) => { const result = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest }); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const view = await send("create_view", { revision: boot.revision, objective: "Retain a company proposal separately from its actor activity." });
+    const notStarted = await send("status", { view: view.view, entity: "omos_company_activity", limit: 2 }); expect(notStarted.events).toEqual([]); expect(notStarted.ended).toBe(false);
+    const claimed = await send("execution", { view: view.view, revision: view.revision, execution_change: "claim", execution: { runtime: "activity-runtime", generation: 0 }, execution_lease_ms: 300000 });
+    const execution = { runtime: "activity-runtime", generation: claimed.generation };
+    control = createActivityHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    let lost = false, appendCalls = 0;
+    const sink = { async call(request, signal) { const reply = await control.call(request, signal); if (request.action === "append") { appendCalls++; if (!lost && reply.ok) { lost = true; return { ok: false, uncertain: true }; } } return reply; } };
+    const result = await runWorkerNative({ launch: () => spawn(join(import.meta.dir, "../../zig-out/bin/fx"), ["ui-host", "--stdio"], { cwd: privateWorker.cwd, env: { PATH: process.env.PATH, ...privateWorker.env, USER: "fixture", LOGNAME: "fixture", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] }), control: sink, view: view.view, execution, prompt: "Retain documents/team/progress.txt and print the requested visible output. Return the short Markdown response.", timeout: 240000 });
+    expect(result.code, result.stderr).toBe(0); expect(result.killed).toBe(false); expect(inference.counts().actors).toBe(2); expect(lost).toBe(true); expect(appendCalls).toBeGreaterThan(1);
+    const collected: any[] = []; let offset = 0, revision, final;
+    do { final = await send("status", { view: view.view, entity: "omos_company_activity", record_id: "1", limit: 2, offset, ...(revision ? { revision } : {}) }); revision ??= final.index_revision; expect(final.index_revision).toBe(revision); expect(final.events.length).toBeLessThanOrEqual(2); collected.push(...final.events); offset = final.resume_offset; } while (final.next_offset !== null);
+    expect(collected.map(event => event.offset)).toEqual(Array.from({ length: collected.length }, (_, index) => index)); expect(final.ended).toBe(true); expect(final.authority).toBe("actor_public_activity_only");
+    expect(collected.some(event => event.data.type === "text_delta" && event.data.text.includes("portable"))).toBe(true);
+    expect(collected.some(event => event.data.type === "tool_start" && event.data.name === "fossil_workspace")).toBe(true);
+    expect(collected.some(event => event.data.type === "tool_end")).toBe(true);
+    expect(collected.some(event => event.data.type === "command_output" && event.data.text.includes("native-visible-output"))).toBe(true);
+    const unchanged = await send("status", { view: view.view }); expect(unchanged.revision).toBe(view.revision); expect(unchanged.publication).toBeNull();
+    const conflict = await control.call({ action: "append", view: view.view, execution, offset: 0, events: [JSON.stringify({ type: "text_delta", text: "Replace retained history" })] }); expect(conflict.ok).toBe(false); expect(conflict.error).toBe("CompanyActivityConflict");
+    const stale = await control.call({ action: "inspect", view: view.view, execution: { ...execution, generation: execution.generation + 1 } }); expect(stale.ok).toBe(false);
+    await admin({ action: "revoke", revision: (await admin({ action: "status" })).revision, id: "activity-owner" });
+    const revoked = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view: view.view, entity: "omos_company_activity", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, limit: 2 }); expect(revoked.isError).toBe(true);
+    const verified = await f.run(["fossil", "verify", "--json"], {}, 180000); expect(verified.code, verified.stderr).toBe(0);
+  } finally { control?.close(); otherClient?.close(); client?.close(); service.child.kill(); await service.child.exited; }
 }, 600000);

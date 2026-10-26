@@ -4899,6 +4899,8 @@ test {
     _ = @import("core/workspace/company_capabilities.zig");
     _ = @import("core/workspace/company_execution.zig");
     _ = @import("core/workspace/company_worker_jobs.zig");
+    _ = @import("core/workspace/company_desired.zig");
+    _ = @import("core/workspace/company_activity.zig");
     _ = @import("core/workspace/company_task_scope.zig");
     _ = @import("core/shared/worker_broker_io.zig");
     _ = @import("core/shared/directory_path.zig");

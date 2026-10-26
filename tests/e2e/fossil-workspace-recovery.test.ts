@@ -1020,11 +1020,11 @@ describe("portable Fossil workspace recovery", () => {
       expect(second.entities).toEqual(["large_note"]);
       expect(second.next_offset).toBeNull();
       const broad = await send("broad", "discover", { entity: "*" });
-      expect(broad.total).toBe(35);
+      expect(broad.total).toBe(36);
       expect(broad.entities).toHaveLength(32);
       expect(broad.entities.some((id: string) => id.startsWith("omos_"))).toBe(false);
       expect(broad.next_offset).toBe(32);
-      expect((await send("broad", "discover", { entity: "*", revision: broad.revision, offset: 32 })).entities).toHaveLength(3);
+      expect((await send("broad", "discover", { entity: "*", revision: broad.revision, offset: 32 })).entities).toHaveLength(4);
       expect((await send("outside", "discover", { entity: "*" })).total).toBe(0);
       for (const entity of ["team_note", "missing_note", "omos_assessment"]) expect((await post("outside", "discover", { entity })).status).toBe(403);
       expect((await post("scoped", "discover", { entity: "hidden_note" })).status).toBe(403);

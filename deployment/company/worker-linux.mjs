@@ -10,8 +10,9 @@ import { createWorkerBroker } from "./worker-broker.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "./worker-snapshot.mjs";
 import { retainWorkerArchive } from "./worker-archive.mjs";
 import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
-import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl } from "./worker-http-control.mjs";
+import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
+import { runWorkerNative } from "./worker-native.mjs";
 
 const fail = code => { throw new Error(code); };
 const hex = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -91,7 +92,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     await trustedFile(launcher, launcherSha256, 131072);
     return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
   };
-  let identity, continuationSupported = false;
+  let identity, continuationSupported = false, activitySupported = false;
   return Object.freeze({
     async describe(signal) {
       const client = await createCompanyClient(companyConfiguration, { home: companyHome });
@@ -102,6 +103,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (context.isError || !JSON.parse(context.content[0].text).company.features.actor_archives || !JSON.parse(context.content[0].text).company.features.worker_checkpoints) fail("WorkerArchiveContractRequired");
         identity = structuredClone(client.identity);
         continuationSupported = JSON.parse(context.content[0].text).company.features.worker_continuation === true;
+        activitySupported = JSON.parse(context.content[0].text).company.features.actor_activity === true;
         return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [], desired_state: Boolean(JSON.parse(context.content[0].text).company.features.desired_state) };
       } finally { client.close(); }
     },
@@ -160,6 +162,21 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (result.isError) fail("WorkerCompanyOutcomeUnresolved");
         return JSON.parse(result.content[0].text);
       };
+      const invoke = async (text, session) => {
+        if (!activitySupported) return run(prepared.root, ["ask", ...(session ? ["--resume-id", session] : []), "--json"], signal, text);
+        if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
+        const control = createActivityHttpControl(evaluation);
+        try {
+          return await runWorkerNative({
+            launch: async () => {
+              await trustedFile(launcher, launcherSha256, 131072);
+              if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
+              return spawn("/usr/bin/python3", ["-I", launcher, prepared.root, "--", "ui-host", "--stdio"], { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] });
+            },
+            control, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, prompt: text, session, signal, timeout: Math.max(1, Math.min(240000, deadline - Date.now())),
+          });
+        } finally { control.close(); }
+      };
       const startBroker = async () => {
         if (broker) return;
         const actorActions = actions.filter(action => action !== "submit");
@@ -177,7 +194,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Preserve completed effects and already satisfied criteria. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
           if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
           await mark("running");
-          const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
+          const actor = await invoke(prompt);
           // The launcher joins and kills descendants before returning. Actor
           // answers and private assessments never establish company acceptance.
           await image({ ...request, action: "quiesce" });
@@ -238,7 +255,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
             archiveRetained = false;
             const continuationPrompt = "Continue the retained company task from its recorded history and checkpoint. Inspect prior effects and preserve completed work. Do not repeat uncertain external actions. Reconcile the retained work with the current company contract and scope below; return the retained task's final answer without submitting the company proposal.\n" + JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: current.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } });
             if (Buffer.byteLength(continuationPrompt) > 131072) fail("WorkerInvocationContextTooLarge");
-            const resumed = await run(prepared.root, ["ask", "--resume-id", selected.session, "--json"], signal, continuationPrompt);
+            const resumed = await invoke(continuationPrompt, selected.session);
             await image({ ...request, action: "quiesce" });
             signal?.throwIfAborted();
             if (resumed.killed || ![0, 1].includes(resumed.code)) fail("WorkerInvocationFailed");

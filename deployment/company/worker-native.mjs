@@ -1,0 +1,168 @@
+// Drive the existing native UI protocol inside a worker. Public activity is
+// retained in bounded batches; provider replay and reasoning never leave it.
+import { createHash, randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
+
+const fail = code => { throw new Error(code); };
+const maximumLine = 12 * 1024 * 1024;
+function bounded(text, limit = 8192) {
+  if (typeof text !== "string") return "";
+  let result = "", bytes = 0;
+  for (const point of text) {
+    const size = Buffer.byteLength(point);
+    if (bytes + size > limit) break;
+    result += point; bytes += size;
+  }
+  return result;
+}
+function* textParts(text) {
+  let part = "", bytes = 0;
+  for (const point of text) {
+    const size = Buffer.byteLength(point);
+    if (bytes + size > 2048) { yield part; part = ""; bytes = 0; }
+    part += point; bytes += size;
+  }
+  if (part) yield part;
+}
+export function publicWorkerEvents(data) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) fail("InvalidWorkerNativeEvent");
+  const type = data.type;
+  if (["assistant_started", "assistant_restarted", "turn_start"].includes(type)) return [{ type }];
+  if (["text_delta", "command_output"].includes(type)) {
+    if (typeof data.text !== "string") fail("InvalidWorkerNativeEvent");
+    return Array.from(textParts(data.text), text => type === "text_delta" ? { type, text } : { type, call_id: data.call_id ?? null, stream: data.stream, text });
+  }
+  if (["notice", "tool_progress"].includes(type)) return [{ type, ...(type === "tool_progress" ? { call_id: data.call_id } : {}), text: bounded(data.text) }];
+  if (type === "tool_start") return [{ type, call_id: data.call_id, name: data.name, path: data.path ?? null, action: data.action ?? null }];
+  if (type === "tool_end") return [{ type, call_id: data.call_id, outcome: typeof data.outcome === "string" ? data.outcome : data.outcome?.kind ?? "completed", text: bounded(data.outcome?.summary) }];
+  if (type === "input_required") return [{ type, kind: data.kind, request_id: data.request_id, ...(data.kind === "approval" ? { prompt: data.prompt } : { questions: (data.questions ?? []).map(question => ({ question: question.question, options: (question.options ?? []).map(option => ({ label: option.label, ...(option.description ? { description: option.description } : {}) })) })) }) }];
+  if (type === "error") return [{ type, code: /^[A-Z][A-Za-z0-9]{0,95}$/.test(data.code) ? data.code : "WorkerNativeInvocationFailed" }];
+  if (type === "turn_end") return [{ type, exit_code: data.exit_code }];
+  // Session identities, result metadata, private provider data and unsupported
+  // events are not copied into company activity. Final text is handled below.
+  return [];
+}
+
+export async function runWorkerNative({ launch, control, view, execution, prompt, session, signal, timeout = 240000 }) {
+  if (typeof launch !== "function" || typeof control?.call !== "function" || typeof prompt !== "string" || Buffer.byteLength(prompt) > 131072 || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 300000) fail("InvalidWorkerNativeInvocation");
+  signal?.throwIfAborted();
+  const before = await control.call({ action: "inspect", view, execution }, signal);
+  if (!before.ok || before.next_offset !== 0 || before.ended) fail("WorkerNativeActivityAlreadyStarted");
+  const child = await launch();
+  let offset = 0, nativeCursor = 0, nextId = 0, failure, exitCode, killed = false, force, timer, flushTimer;
+  let textHash = createHash("sha256"), textBytes = 0, buffered = "", errorBytes = 0;
+  const errors = [], pending = new Map(), queue = [];
+  const turn = randomUUID();
+  let uploads = Promise.resolve();
+  const stop = () => {
+    if (killed) return;
+    killed = true; child.kill("SIGTERM");
+    force = setTimeout(() => child.kill("SIGKILL"), 10000);
+  };
+  const rejectPending = () => {
+    for (const waiting of pending.values()) waiting.reject(new Error("WorkerNativeInvocationStopped"));
+    pending.clear();
+  };
+  const closed = new Promise((resolve, reject) => {
+    child.once("error", error => { rejectPending(); reject(error); });
+    child.once("close", (code, stoppedBy) => { rejectPending(); resolve({ code, stoppedBy }); });
+  });
+  closed.catch(() => {});
+  child.stdin.on("error", () => {});
+  child.stderr.on("data", chunk => { errorBytes += chunk.length; if (errorBytes <= 65536) errors.push(chunk); });
+  signal?.addEventListener("abort", stop, { once: true });
+  if (signal?.aborted) stop();
+  timer = setTimeout(stop, timeout);
+  const request = (method, params, id = "command-" + (++nextId)) => new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    child.stdin.write(JSON.stringify({ version: "omos.ui-host/v1", id, method, params }) + "\n");
+  });
+  const flush = () => {
+    clearTimeout(flushTimer); flushTimer = undefined;
+    if (!queue.length) return uploads;
+    const events = queue.splice(0, 4);
+    uploads = uploads.then(async () => {
+      const mutation = { action: "append", view, execution, offset, events };
+      let saved = await control.call(mutation, signal);
+      // Native offsets and exact immutable payloads make this one explicit
+      // metadata retry safe. It cannot restart an actor or execute a tool.
+      if (!saved.ok) saved = await control.call(mutation, signal);
+      if (!saved.ok || saved.next_offset !== offset + events.length) fail("WorkerActivityRetentionPending");
+      offset = saved.next_offset;
+    });
+    uploads.catch(error => { failure ??= error; stop(); });
+    return uploads;
+  };
+  const emit = async data => {
+    const raw = JSON.stringify(data);
+    if (Buffer.byteLength(raw) > 16384) fail("WorkerNativeActivityEventTooLarge");
+    queue.push(raw);
+    if (queue.length >= 4) await flush();
+    else if (!flushTimer) flushTimer = setTimeout(() => { void flush(); }, 100);
+  };
+  try {
+    const initialized = request("initialize", {});
+    let started;
+    // Keep stdin open through turn_end. EOF deliberately cancels a native UI
+    // job and would otherwise turn every request into an interrupted turn.
+    const consume = (async () => {
+      const decoder = new StringDecoder("utf8");
+      for await (const chunk of child.stdout) {
+        buffered += decoder.write(chunk);
+        if (Buffer.byteLength(buffered) > maximumLine) fail("WorkerNativeLineTooLarge");
+        let end;
+        while ((end = buffered.indexOf("\n")) >= 0) {
+          const line = buffered.slice(0, end); buffered = buffered.slice(end + 1);
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (event.version !== "omos.ui-host/v1") fail("InvalidWorkerNativeEvent");
+          if (event.type === "response") {
+            const waiting = pending.get(event.id);
+            if (!waiting) fail("InvalidWorkerNativeResponse");
+            pending.delete(event.id);
+            if (event.err) waiting.reject(new Error("WorkerNativeRequestRejected")); else waiting.resolve(event.result);
+            continue;
+          }
+          if (event.type !== "event" || event.turn !== turn || event.cursor !== nativeCursor + 1) fail("InvalidWorkerNativeEvent");
+          nativeCursor = event.cursor;
+          const data = event.data;
+          if (["assistant_started", "assistant_restarted"].includes(data.type)) { textHash = createHash("sha256"); textBytes = 0; }
+          if (data.type === "text_delta") { textHash.update(data.text); textBytes += Buffer.byteLength(data.text); }
+          if (data.type === "result") {
+            const text = data.data?.final_output;
+            if (typeof text === "string" && text.length && (Buffer.byteLength(text) !== textBytes || createHash("sha256").update(text).digest("hex") !== textHash.copy().digest("hex"))) {
+              await emit({ type: "assistant_restarted" });
+              for (const part of textParts(text)) await emit({ type: "text_delta", text: part });
+            }
+          }
+          if (data.type === "validate_ui") await emit({ type: "notice", text: "The retained private task is waiting for a configured UI validator." });
+          for (const selected of publicWorkerEvents(data)) await emit(selected);
+          if (data.type === "turn_end") {
+            exitCode = data.exit_code;
+            await flush(); await uploads;
+            child.stdin.end();
+          }
+        }
+      }
+      buffered += decoder.end();
+    })();
+    consume.catch(error => { failure ??= error; stop(); });
+    await initialized;
+    started = request("prompt", { text: prompt, ...(session ? { session } : {}) }, turn);
+    await started;
+    const result = await closed;
+    await consume;
+    await flush(); await uploads;
+    if (failure) throw failure;
+    if (buffered.trim() || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255 || result.code !== 0 || result.stoppedBy) fail("WorkerNativeInvocationStopped");
+    return { code: exitCode, killed, stdout: "", stderr: Buffer.concat(errors).toString("utf8"), output_complete: errorBytes <= 65536 };
+  } catch (error) {
+    stop();
+    await closed.catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(timer); clearTimeout(force); clearTimeout(flushTimer);
+    signal?.removeEventListener("abort", stop);
+    rejectPending();
+  }
+}

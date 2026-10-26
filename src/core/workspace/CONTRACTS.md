@@ -1256,3 +1256,11 @@ reconciliation requires separately delegated operator policies. A signed request
 or successful checkpoint does not enable either feature. Field-level record
 merges, remote filesystem mounting, and federated identity enrollment remain
 unsupported.
+
+## Company activity
+
+`omos_company_activity` retains bounded public worker events on the control
+branch. The host checks live execution ownership before append and live scoped
+retrieval authority on each read. Activity cannot establish execution or task
+completion. See [Public worker activity](../../../deployment/company/ACTIVITY.md)
+for the transport and cursor contracts.

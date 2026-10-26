@@ -725,3 +725,9 @@ job summary with state, invocation count, limits, and the retained note. The
 coordinator checks its configured actor and grant before planning or claiming a
 job. Actor processes receive neither `execute_task` nor operator controls.
 Publication still requires independent review and a verified company receipt.
+
+## Live activity
+
+Workers stream the native public UI protocol through the protected company
+activity service. See [Public worker activity](ACTIVITY.md) for limits, replay,
+and the distinction between progress and verified publication.
