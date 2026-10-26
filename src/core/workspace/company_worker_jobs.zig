@@ -202,6 +202,7 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
                 if (!publication_verified or request.execution != null or request.outcome != null) return error.WorkspaceVerificationFailed;
                 next.state = .completed;
                 next.expires_ms = 0;
+                if (next.checkpoint) |*saved| saved.phase = .retained;
             },
             .cancel => {
                 if (request.execution != null or request.outcome != null or next.state == .completed or next.state == .cancelled) return error.InvalidCompanyWorkerJob;
@@ -554,6 +555,9 @@ test "company worker checkpoint phases retain unfinished images across owners" {
     job = try transition(job, .{ .change = .checkpoint, .operation = "replace-collected", .execution = second, .checkpoint = replacement }, binding, digest, digest, live, 109, false, false);
     try std.testing.expectEqualStrings(other, job.checkpoint.?.image);
     try std.testing.expectError(error.CompanyExecutionFenced, transition(job, .{ .change = .checkpoint, .operation = "stale", .execution = first, .checkpoint = replacement }, binding, digest, digest, live, 110, false, false));
+    const completed = try transition(job, .{ .change = .complete, .operation = "publication-recovered" }, binding, digest, digest, live, 111, true, true);
+    try std.testing.expectEqual(State.completed, completed.state);
+    try std.testing.expectEqual(@TypeOf(completed.checkpoint.?.phase).retained, completed.checkpoint.?.phase);
 }
 
 test "company worker checkpoint extension preserves legacy request hashes" {
