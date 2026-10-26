@@ -25,7 +25,7 @@ export async function advertiseWorkerRuntime({ control, description, signal }) {
     } else if (result.sha256 !== expected) fail("WorkerRuntimeRegistrationChanged");
   }
   const instance = randomBytes(32).toString("hex");
-  let stopped = false, last = 0;
+  let stopped = false, released = false, last = 0;
   const heartbeat = async force => {
     if (stopped) fail("WorkerRuntimeClosed");
     if (!force && Date.now() - last < 10000) return;
@@ -42,9 +42,15 @@ export async function advertiseWorkerRuntime({ control, description, signal }) {
     id,
     async heartbeat() { await heartbeat(false); },
     async close() {
-      if (stopped) return;
+      if (released) return;
       stopped = true;
-      await control.call({ version: "omos.company-runtime/v1", change: "stop", id, registration_sha256: expected, instance });
+      const request = { version: "omos.company-runtime/v1", change: "stop", id, registration_sha256: expected, instance };
+      let result = await control.call(request);
+      // Stopping this exact nonce is idempotent. Confirm a lost stop response
+      // before another coordinator tries to advertise the same implementation.
+      if (!result.ok && result.error === "WorkerControlOutcomeUnknown") result = await control.call(request);
+      if (!result.ok || result.live !== false || result.sha256 !== expected) throw Object.assign(new Error("WorkerRuntimeReleasePending"), { nativeCode: result.error });
+      released = true;
     },
   });
 }

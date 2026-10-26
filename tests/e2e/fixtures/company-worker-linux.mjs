@@ -14,7 +14,8 @@ try {
   let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false;
   const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
   supervisor = start();
-  const deadline = Date.now() + 360000;
+  if (![360000, 600000].includes(settings.timeoutMs)) throw new Error("FixtureInvocationBudgetInvalid");
+  const deadline = Date.now() + settings.timeoutMs;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
   let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false, amendedTask = false;
@@ -147,6 +148,17 @@ try {
       recoveredCoding = true;
       stopping = new AbortController(); supervisor = start();
       continue;
+    }
+    if (selected.record.state === "completed" && selected.publication) {
+      // Native publication can finish before the worker reads its submit ACK
+      // and joins cleanup. Observe the pool before aborting the supervisor.
+      const configuration = JSON.parse(await fs.readFile(settings.backend.imageConfiguration, "utf8"));
+      const images = (await fs.readdir(configuration.root)).filter(name => /^[0-9a-f]{24}$/.test(name));
+      if (images.length) {
+        if (Date.now() >= deadline) throw new Error("FixturePublishedCleanupPending");
+        await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
+        continue;
+      }
     }
     if (!["queued", "running", "submitted"].includes(selected.record.state) || selected.review_state === "failed" || Date.now() >= deadline) break;
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);

@@ -34,7 +34,7 @@ pub const Request = struct {
 /// Rebuilt by authenticated coordinator heartbeats after every gateway restart.
 /// Accepted state, implementation descriptions and jobs remain in Fossil.
 pub const LiveHosts = struct {
-    const Entry = struct { id: [64]u8 = @splat(0), digest: [64]u8 = @splat(0), instance: [64]u8 = @splat(0), expires_ms: i64 = 0 };
+    const Entry = struct { id: [64]u8 = @splat(0), digest: [64]u8 = @splat(0), instance: [64]u8 = @splat(0), expires_ms: i64 = 0, stopped: bool = false };
     mutex: std.Io.Mutex = .init,
     entries: [64]Entry = @splat(.{}),
 
@@ -47,7 +47,8 @@ pub const LiveHosts = struct {
         var free_entry: ?*Entry = null;
         for (&self.entries) |*entry| {
             if (std.mem.eql(u8, &entry.id, id)) {
-                if (entry.expires_ms > now and !std.mem.eql(u8, &entry.instance, instance)) return error.CompanyRuntimeBusy;
+                if (entry.stopped and std.mem.eql(u8, &entry.instance, instance)) return error.CompanyRuntimeFenced;
+                if (!entry.stopped and entry.expires_ms > now and !std.mem.eql(u8, &entry.instance, instance)) return error.CompanyRuntimeBusy;
                 free_entry = entry;
                 break;
             }
@@ -58,21 +59,25 @@ pub const LiveHosts = struct {
         @memcpy(&selected.digest, digest);
         @memcpy(&selected.instance, instance);
         selected.expires_ms = now + 60000;
+        selected.stopped = false;
     }
 
     pub fn contains(self: *LiveHosts, id: []const u8, digest: []const u8, now: i64) bool {
         self.mutex.lockUncancelable(io.getIo());
         defer self.mutex.unlock(io.getIo());
-        for (self.entries) |entry| if (entry.expires_ms > now and std.mem.eql(u8, &entry.id, id) and std.mem.eql(u8, &entry.digest, digest)) return true;
+        for (self.entries) |entry| if (!entry.stopped and entry.expires_ms > now and std.mem.eql(u8, &entry.id, id) and std.mem.eql(u8, &entry.digest, digest)) return true;
         return false;
     }
 
-    pub fn stop(self: *LiveHosts, id: []const u8, instance: []const u8) !void {
+    pub fn stop(self: *LiveHosts, id: []const u8, instance: []const u8, now: i64) !void {
         self.mutex.lockUncancelable(io.getIo());
         defer self.mutex.unlock(io.getIo());
         for (&self.entries) |*entry| if (std.mem.eql(u8, &entry.id, id)) {
             if (!std.mem.eql(u8, &entry.instance, instance)) return error.CompanyRuntimeFenced;
-            entry.expires_ms = 0;
+            // Keep the stopped nonce through an in-flight request window, so
+            // a heartbeat whose acknowledgement was lost cannot resurrect it.
+            entry.stopped = true;
+            entry.expires_ms = @max(entry.expires_ms, now + 60000);
             return;
         };
     }
@@ -163,7 +168,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     const instance = request.instance orelse return error.InvalidCompanyRuntime;
     _ = try authority.hexBytes(32, instance);
     const live = manager.company_runtime_live orelse return error.CompanyRuntimeServiceRequired;
-    if (request.change == .heartbeat) try live.renew(id, digest, instance, io.milliTimestamp()) else try live.stop(id, instance);
+    if (request.change == .heartbeat) try live.renew(id, digest, instance, io.milliTimestamp()) else try live.stop(id, instance, io.milliTimestamp());
     return json(manager.alloc, .{ .revision = current, .id = id, .sha256 = digest, .live = live.contains(id, digest, io.milliTimestamp()) });
 }
 
@@ -259,10 +264,14 @@ test "company runtime liveness is disposable, bounded, and fenced by process ins
     try std.testing.expect(cache.contains(&id, &digest, 101));
     try std.testing.expect(!cache.contains(&id, &first, 101));
     try std.testing.expectError(error.CompanyRuntimeBusy, cache.renew(&id, &digest, &second, 200));
-    try std.testing.expectError(error.CompanyRuntimeFenced, cache.stop(&id, &second));
+    try std.testing.expectError(error.CompanyRuntimeFenced, cache.stop(&id, &second, 200));
     try std.testing.expect(!cache.contains(&id, &digest, 60100));
     try cache.renew(&id, &digest, &second, 60100);
-    try std.testing.expectError(error.CompanyRuntimeFenced, cache.stop(&id, &first));
-    try cache.stop(&id, &second);
+    try std.testing.expectError(error.CompanyRuntimeFenced, cache.stop(&id, &first, 60100));
+    try cache.stop(&id, &second, 60100);
     try std.testing.expect(!cache.contains(&id, &digest, 60101));
+    try std.testing.expectError(error.CompanyRuntimeFenced, cache.renew(&id, &digest, &second, 60102));
+    try cache.renew(&id, &digest, &first, 60103);
+    try std.testing.expect(cache.contains(&id, &digest, 60104));
+    try std.testing.expectError(error.CompanyRuntimeBusy, cache.renew(&id, &digest, &second, 60105));
 }

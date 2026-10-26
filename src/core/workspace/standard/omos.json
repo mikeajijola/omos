@@ -6918,6 +6918,108 @@
           "cli",
           "api"
         ]
+      },
+      {
+        "id": "omos_company_resume_verification",
+        "capability": "general_task",
+        "description": "Resume independent verification of the retained exact candidate without actor dispatch or an invocation allowance reset. Immutable admission makes interrupted retries identifiable.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "execute_task"
+            },
+            "view": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "job": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "verification": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "state": {
+                  "type": "string"
+                },
+                "generation": {
+                  "type": "integer"
+                },
+                "budget_epoch": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "state",
+                "generation",
+                "budget_epoch"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "available",
+            "job",
+            "verification"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -7783,6 +7885,36 @@
             "amendment_count",
             "text",
             "worker_sha256"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_company_review_resume",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "view": "string",
+            "actor": "string",
+            "grant": "string",
+            "operation": "string",
+            "request_hash": "string",
+            "revision": "string",
+            "contract_sha256": "string",
+            "review": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "view",
+            "actor",
+            "grant",
+            "operation",
+            "request_hash",
+            "revision",
+            "contract_sha256",
+            "review"
           ],
           "indexed": []
         }

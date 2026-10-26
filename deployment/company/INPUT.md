@@ -93,3 +93,21 @@ so an amendment preserves unaffected work. The old answer is not submitted.
 
 Owner configuration and browser delegation retain their separate authority
 requirements. Input decisions and task updates cannot grant permissions.
+
+## Continue independent verification
+
+When `verification_resume` is advertised, a plain `execute_task` request can
+resume the retained completion review. It requires compute and submission
+authority, but no live hosted actor implementation. The host pins the retained
+candidate, contract, review generation, and review budget before allocating a
+new bounded review attempt. It preserves the worker invocation count.
+
+A review that is already queued or running returns its recorded progress.
+An interrupted admission exposes `pending_verification`; signed reconciliation
+can finish that exact internal operation after execution ownership has ended.
+Retrying its operation ID cannot allocate another review allowance. A verdict
+requiring changes or human approval retains its existing resolution path.
+
+Existing company workspaces adopt this additive operation with
+`omos fossil migrate --contracts`. Active tasks keep their pinned definitions
+and execution policies.

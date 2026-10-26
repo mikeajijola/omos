@@ -1992,6 +1992,9 @@ sys.exit(result.returncode)
     expect(readFileSync(join(cache, "sessions", selectedSession), "utf8")).toBe(pending.id);
     const events = JSON.parse((await f.run(["fossil", "query", "omos_event", "--json"])).stdout).model_data;
     expect(events.records.some((row: any) => row.data.kind === "session_binding" && row.data.payload.session === selectedSession && row.data.task === pending.id)).toBe(true);
+    if (missingCheckout) {
+      for (const filename of [".fslckout", "_FOSSIL_"]) rmSync(join(tree, filename), { force: true });
+    }
     const calls = inference.counts().actors;
     permit = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
@@ -2925,7 +2928,7 @@ sys.exit(result.returncode)
     }
   }, 240000);
 
-  test("preserves dirty same-revision host scratch before rebuilding it without replaying actor work", async () => {
+  for (const missingCheckout of [false, true]) test(`preserves ${missingCheckout ? "interrupted unopened" : "dirty same-revision"} host scratch before rebuilding it without replaying actor work`, async () => {
     const f = fixture();
     let permit = false;
     const inference = model(f, (_body, count) => count === 1 ? writeMemory("Canonical retained information") : { content: "The canonical information is saved." }, packet => permit ? "met" : {

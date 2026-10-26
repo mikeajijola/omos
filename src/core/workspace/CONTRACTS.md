@@ -1301,3 +1301,18 @@ amendments it applied; unaffected obligations retain their canonical ownership.
 to a private invocation. These additive operations require a declaration update
 before an existing company enables task amendments. See
 [Update a task from chat](../../../deployment/company/INPUT.md#update-a-task-from-chat).
+
+## Company verification continuation
+
+`omos_company_resume_verification` resumes independent review of a retained
+candidate through a plain signed `execute_task` request. Its protected
+`omos_company_review_resume` record pins the candidate, contract, previous
+review generation and budget epoch, original operation, and request hash.
+Admission precedes scheduling. Recovery observes an already allocated review
+allowance instead of allocating it again. A queued or running review receives
+no additional allowance.
+
+This transition dispatches no actor and does not reset a worker invocation
+budget. It requires current scoped submission and compute authority. Only its
+admitted immutable intent permits internal reconciliation without an execution
+fence; publication retains independent verification and current-base checks.
