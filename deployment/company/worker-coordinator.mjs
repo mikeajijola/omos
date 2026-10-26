@@ -77,7 +77,20 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
             const view = row.record.binding.view;
             const running = active.get(view);
             if (running) {
-              if (!sameOwner(row, running.owned) || !row.authority_live || row.record.expires_ms <= Date.now()) running.controller.abort(new Error("WorkerExecutionRevoked"));
+              if (!running.retention && (!sameOwner(row, running.owned) || !row.authority_live || row.record.expires_ms <= Date.now())) running.controller.abort(new Error("WorkerExecutionRevoked"));
+              continue;
+            }
+            if (typeof backend.retire === "function" && row.record.checkpoint && (!row.authority_live || ["cancelled", "completed", "exhausted"].includes(row.record.state)) && (typeof backend.canRetire !== "function" || await backend.canRetire(structuredClone(row)))) {
+              if (!closed && active.size < concurrency) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(new Error("WorkerRetentionDeadline")), 300000);
+                const entry = { retention: true, controller, promise: null };
+                active.set(view, entry);
+                entry.promise = Promise.resolve().then(() => backend.retire(structuredClone(row), controller.signal)).catch(() => {
+                  // The durable retirement and acknowledged chunks survive.
+                  // Failed maintenance keeps its private image for another pass.
+                }).finally(() => { clearTimeout(timer); active.delete(view); });
+              }
               continue;
             }
             if (typeof backend.supports === "function" && !backend.supports(row)) continue;

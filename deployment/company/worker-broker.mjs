@@ -120,6 +120,12 @@ export async function createWorkerBroker({ socket, model, company, companyClient
       if (request.method === "POST" && request.url === "/model/v1/chat/completions") {
         const input = parsed(await body(request, 8 * 1024 * 1024, controller.signal));
         if (!input || input.model !== model.handle || !Array.isArray(input.messages)) return error(403, "WorkerModelDenied");
+        if (companyClient) {
+          const checked = await companyClient.call("company_workspace", { version: "omos.company/v1", action: "status", operation: randomUUID(), expires_ms: Math.min(expiresMs, Date.now() + 120000) }, controller.signal);
+          const current = checked.isError ? null : parsed(Buffer.from(checked.content[0].text));
+          const fence = companyClient.scope.execution;
+          if (current?.view !== company.view || current.execution?.runtime !== fence.runtime || current.execution?.generation !== fence.generation || current.execution?.expires_ms <= Date.now()) return error(403, "WorkerInvocationRevoked");
+        }
         target = modelUrl;
         payload = JSON.stringify({ ...input, model: model.model });
         if (model.credential) headers.authorization = `Bearer ${model.credential}`;

@@ -624,9 +624,20 @@ jobs:
         run: |
           selected=()
           selection_file="$RUNNER_TEMP/fx-e2e-shard-${SHARD_INDEX}.txt"
+          shared_files="$RUNNER_TEMP/fx-e2e-shared-files.json"
+          # Company worker contracts and execution have dedicated required jobs.
+          # Remove that file before balancing the remaining shared shards.
+          bun -e '
+            import { readdirSync } from "node:fs";
+            const files = readdirSync(".", { withFileTypes: true })
+              .filter(entry => entry.isFile() && entry.name.endsWith(".test.ts") && entry.name !== "company-worker.test.ts")
+              .map(entry => entry.name);
+            process.stdout.write(JSON.stringify(files));
+          ' > "$shared_files"
           bun ci-shards.ts \
             --shard-count "$SHARD_COUNT" \
-            --shard-index "$SHARD_INDEX" > "$selection_file"
+            --shard-index "$SHARD_INDEX" \
+            --only "$shared_files" > "$selection_file"
           while IFS= read -r test_file; do
             selected+=("$test_file")
           done < "$selection_file"

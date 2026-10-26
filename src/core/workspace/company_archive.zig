@@ -33,6 +33,22 @@ pub const Record = struct {
     complete: bool = false,
     hash_state: [8]u32 = @splat(0),
     authority: []const u8 = "actor_public_history_only",
+    retirement: ?[]const u8 = null,
+    pub fn jsonStringify(self: Record, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "retirement")) {
+                if (self.retirement) |reference| {
+                    try writer.objectField(name);
+                    try writer.write(reference);
+                }
+            } else {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 fn json(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -79,6 +95,7 @@ fn decode(alloc: std.mem.Allocator, source: Source, offset: usize, content: []co
 }
 pub fn validateStored(alloc: std.mem.Allocator, record: Record, filename: []const u8) !void {
     try validateSource(record.source);
+    if (record.retirement) |reference| _ = try authority.hexBytes(32, reference);
     for ([_][]const u8{ record.workspace, record.task, record.id }) |id| _ = try authority.hexBytes(32, id);
     for ([_][]const u8{ record.view, record.actor, record.grant }) |id| if (!authority.safeIdentity(id)) return error.InvalidCompanyArchive;
     if (!std.mem.eql(u8, record.version, "omos.company-actor-archive/v1") or !std.mem.eql(u8, record.authority, "actor_public_history_only") or !std.mem.eql(u8, record.id, try identifier(alloc, record.source)) or record.paths.len == 0 or record.paths.len > 32) return error.InvalidCompanyArchive;
@@ -110,7 +127,8 @@ fn permits(grant: authority.Grant, record: Record) !void {
 /// retention, including after publication; it cannot change task source.
 pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
-    if (!std.mem.eql(u8, request.version, "omos.company-actor-archive-write/v1") or !authority.safeIdentity(request.view)) return error.InvalidCompanyArchive;
+    const retired = std.mem.eql(u8, request.version, "omos.company-retired-archive-write/v1");
+    if ((!retired and !std.mem.eql(u8, request.version, "omos.company-actor-archive-write/v1")) or !authority.safeIdentity(request.view)) return error.InvalidCompanyArchive;
     try validateSource(request.source);
     if (request.action == .inspect and (request.offset != 0 or request.content.len != 0)) return error.InvalidCompanyArchive;
     const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8 };
@@ -119,13 +137,24 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     const task = try manager.refreshTaskContext(try manager.loadTask(view.task));
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
-    const live = try authority.liveGrant(state, binding.grant, io.milliTimestamp());
+    const live = if (retired) original: {
+        for (state.grants) |candidate| if (std.mem.eql(u8, candidate.id, binding.grant) and std.mem.eql(u8, candidate.actor, binding.actor)) break :original candidate;
+        return error.CompanyAccessDenied;
+    } else try authority.liveGrant(state, binding.grant, io.milliTimestamp());
     const grant = try scope.forTask(manager, task, live);
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !std.mem.eql(u8, view.actor, grant.actor) or !std.mem.eql(u8, view.grant, grant.id)) return error.CompanyAccessDenied;
-    try authority.authorizeExecution(manager, task);
-    const execution = try records.decode(ownership.Record, manager.alloc, try manager.companyContent(try ownership.path(manager.alloc, request.view)), .{});
-    try ownership.validate(execution, request.view, task.id, grant);
-    try ownership.require(execution, request.execution, io.milliTimestamp());
+    var retirement_reference: ?[]const u8 = null;
+    if (retired) {
+        const stopped = (try @import("company_worker_jobs.zig").retirement(manager, task.id)) orelse return error.CompanyWorkerNotRetired;
+        const saved = stopped.checkpoint orelse return error.InvalidCompanyWorkerCheckpoint;
+        if (!std.mem.eql(u8, stopped.binding.view, view.id) or !std.mem.eql(u8, stopped.binding.actor, grant.actor) or !std.mem.eql(u8, stopped.binding.grant, grant.id) or !std.mem.eql(u8, saved.runtime, request.execution.runtime) or saved.generation != request.execution.generation) return error.CompanyAccessDenied;
+        retirement_reference = try workspace.hash(manager.alloc, try manager.companyContent(try @import("company_worker_jobs.zig").retirementPath(manager.alloc, task.id)));
+    } else {
+        try authority.authorizeExecution(manager, task);
+        const execution = try records.decode(ownership.Record, manager.alloc, try manager.companyContent(try ownership.path(manager.alloc, request.view)), .{});
+        try ownership.validate(execution, request.view, task.id, grant);
+        try ownership.require(execution, request.execution, io.milliTimestamp());
+    }
     const lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy;
     defer lease.release();
     const id = try identifier(manager.alloc, request.source);
@@ -148,7 +177,7 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     }
     digest.update(bytes);
     const paths = if (progress) |head| head.paths else grant.paths;
-    const record: Record = .{ .workspace = manager.manifest.id, .task = task.id, .view = request.view, .actor = grant.actor, .grant = grant.id, .paths = paths, .id = id, .source = request.source, .offset = request.offset, .content = "", .chunk_sha256 = try workspace.hash(manager.alloc, bytes), .hash_state = digest.s };
+    const record: Record = .{ .workspace = manager.manifest.id, .task = task.id, .view = request.view, .actor = grant.actor, .grant = grant.id, .paths = paths, .id = id, .source = request.source, .offset = request.offset, .content = "", .chunk_sha256 = try workspace.hash(manager.alloc, bytes), .hash_state = digest.s, .retirement = if (progress) |head| head.retirement else if (receipt) |saved| saved.retirement else retirement_reference };
     var files: std.ArrayList(workspace.Manager.CompanyFile) = .empty;
     if (try load(manager, filename)) |existing| {
         if (!std.mem.eql(u8, try json(manager.alloc, existing), try json(manager.alloc, record))) return error.CompanyArchiveConflict;
@@ -168,6 +197,7 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
             accepted.content = "";
             accepted.chunk_sha256 = "";
             accepted.complete = true;
+            if (retirement_reference) |reference| accepted.retirement = reference;
             try files.append(manager.alloc, .{ .path = completed, .content = try json(manager.alloc, accepted) });
         }
     }
@@ -253,6 +283,14 @@ test "company actor archives bound bytes and never confer company acceptance" {
     try std.testing.expectError(error.InvalidCompanyArchive, validateSource(oversized));
     var row: Record = .{ .workspace = &id, .task = &id, .view = "view", .actor = "actor", .grant = "grant", .paths = &.{"documents/team/"}, .id = try identifier(alloc, source), .source = source, .offset = 0, .content = "", .chunk_sha256 = source.sha256 };
     const filename = try chunkPath(alloc, row.task, row.id, 0);
+    const historical = try json(alloc, row);
+    try std.testing.expect(std.mem.find(u8, historical, "retirement") == null);
+    const restored = try records.decode(Record, alloc, historical, .{});
+    try std.testing.expectEqualStrings(historical, try json(alloc, restored));
+    row.retirement = &id;
+    const retained = try records.decode(Record, alloc, try json(alloc, row), .{});
+    try std.testing.expectEqualStrings(&id, retained.retirement.?);
+    row.retirement = null;
     try validateStored(alloc, row, filename);
     row.authority = "company_host";
     try std.testing.expectError(error.InvalidCompanyArchive, validateStored(alloc, row, filename));

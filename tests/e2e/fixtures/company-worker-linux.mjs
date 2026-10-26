@@ -17,7 +17,7 @@ try {
   const deadline = Date.now() + 360000;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
-  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, partialOffset = 0;
+  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false;
   for (;;) {
     if (serverError) throw serverError;
     if (!requested) {
@@ -57,12 +57,8 @@ try {
       }
     }
     if (settings.partialRecovery && !interrupted && selected.record.checkpoint?.phase === "running") {
-      actor ??= await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
-      const result = await actor.call("company_workspace", { version: "omos.company/v1", action: "status", view: settings.view, entity: "omos_company_activity", record_id: String(selected.record.generation), offset: partialOffset, limit: 2, operation: randomUUID(), expires_ms: Date.now() + 120000 });
-      if (result.isError) throw new Error("FixturePartialActivityUnavailable");
-      const page = JSON.parse(result.content[0].text);
-      partialOffset = page.resume_offset;
-      if (page.events.some(event => event.data.type === "tool_start" && event.data.name === "shell")) {
+      const ready = await (await fetch(settings.actorWaitUrl, { signal: AbortSignal.timeout(5000) })).json();
+      if (ready.ready === true) {
         const saved = selected.record.checkpoint;
         const request = { version: "omos.worker-image-request/v1", action: "quiesce", id: saved.image, workspace: selected.record.binding.workspace, view: settings.view, generation: saved.generation, max_runtime_ms: selected.record.max_runtime_ms, model: saved.model, source_revision: saved.source_revision };
         const killed = await new Promise((resolve, reject) => {
@@ -72,6 +68,26 @@ try {
         if (killed !== 0) throw new Error("FixturePartialInterruptionFailed");
         interrupted = true;
       }
+    }
+    if (settings.retirement) {
+      if (!cancelledForRetention && selected.record.checkpoint?.phase === "running") {
+        const ready = await (await fetch(settings.actorWaitUrl, { signal: AbortSignal.timeout(5000) })).json();
+        if (ready.ready === true) {
+          const cancelled = await control.call({ change: "cancel", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
+          if (!cancelled.ok) throw new Error("FixtureRetentionCancelFailed");
+          cancelledForRetention = true;
+        }
+      }
+      if (selected.record.request.change === "retire") {
+        const configuration = JSON.parse(await fs.readFile(settings.backend.imageConfiguration, "utf8"));
+        let exists = true;
+        try { await fs.lstat(configuration.root + "/" + selected.record.checkpoint.image.slice(0, 24)); }
+        catch (error) { if (error.code === "ENOENT") exists = false; else throw error; }
+        if (!exists) { retiredHistory = true; break; }
+      }
+      if (Date.now() >= deadline) throw new Error("FixtureRetainedHistoryUnavailable");
+      await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
+      continue;
     }
     if (settings.desiredPolicy) {
       if (!settings.view) settings.view = selected.record.binding.view;
@@ -121,9 +137,10 @@ try {
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory }));
 } catch (error) {
-  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof error.controlCode === "string" && /^[A-Z][A-Za-z0-9]+$/.test(error.controlCode) ? { control_error: error.controlCode } : {}) }));
+  const code = error.nativeCode ?? error.controlCode;
+  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}) }));
   process.exitCode = 1;
 } finally {
   stopping.abort();

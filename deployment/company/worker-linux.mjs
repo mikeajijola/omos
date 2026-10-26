@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { createCompanyClient } from "./mcp.mjs";
 import { createWorkerBroker } from "./worker-broker.mjs";
 import { createWorkerSnapshot, selectWorkerRoot } from "./worker-snapshot.mjs";
-import { retainWorkerArchive } from "./worker-archive.mjs";
+import { retainWorkerArchive, prepareWorkerExport } from "./worker-archive.mjs";
 import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
 import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl, createInputHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
@@ -92,8 +92,118 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     await trustedFile(launcher, launcherSha256, 131072);
     return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
   };
+  const subjectBytes = await trustedFile(companyConfiguration);
+  const subject = JSON.parse(subjectBytes.toString("utf8"));
+  if (!hex(subject.workspace) || subject.workspace !== evaluation.workspaceId || !/^[A-Za-z0-9_-]{1,128}$/.test(subject.actor) || !/^[A-Za-z0-9_-]{1,128}$/.test(subject.grant)) fail("WorkerCompanyIdentityChanged");
+  const removeBrokerSocket = async root => {
+    const socket = path.join(root, "run", "omos-broker.sock");
+    try {
+      const info = await fs.lstat(socket);
+      if (!info.isSocket() || info.uid !== 0) fail("UnsafeWorkerBrokerSocket");
+      await fs.unlink(socket);
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+  };
+  const retirementAttempts = new Map();
   let identity, continuationSupported = false, activitySupported = false, inputSupported = false;
   return Object.freeze({
+    async canRetire(row) {
+      const job = row?.record, binding = job?.binding, saved = job?.checkpoint;
+      if (!saved || binding?.workspace !== subject.workspace || binding.actor !== subject.actor || binding.grant !== subject.grant || (row.authority_live && (!["cancelled", "completed", "exhausted"].includes(job.state) || (job.state === "exhausted" && row.review_job_id))) || !hex(saved.image)) return false;
+      if ((retirementAttempts.get(saved.image)?.next ?? 0) > Date.now()) return false;
+      try { return (await fs.lstat(path.join(configuration.root, saved.image.slice(0, 24)))).isDirectory(); }
+      catch (error) { if (error.code === "ENOENT") { retirementAttempts.delete(saved.image); return false; } throw error; }
+    },
+    async retire(row, signal) {
+      const job = row?.record, binding = job?.binding, saved = job?.checkpoint;
+      if (!saved || binding?.workspace !== subject.workspace || binding.actor !== subject.actor || binding.grant !== subject.grant || (row.authority_live && (!["cancelled", "completed", "exhausted"].includes(job.state) || (job.state === "exhausted" && row.review_job_id)))) return false;
+      if (!(await trustedFile(companyConfiguration)).equals(subjectBytes)) fail("WorkerHostFileChanged");
+      if (!hex(saved.image) || !hex(binding.view)) fail("InvalidWorkerInvocation");
+      try { await fs.lstat(path.join(configuration.root, saved.image.slice(0, 24))); }
+      catch (error) { if (error.code === "ENOENT") return false; throw error; }
+      const attempt = Math.min(10, (retirementAttempts.get(saved.image)?.attempt ?? 0) + 1);
+      retirementAttempts.set(saved.image, { attempt, next: Date.now() + Math.min(300000, 1000 * 2 ** (attempt - 1)) });
+      try {
+        const owner = createWorkerHttpControl(evaluation);
+        let retired;
+        try {
+          let result = await owner.call({ change: "retire", operation: randomUUID(), view: binding.view, expected_sha256: row.sha256 }, signal);
+          if (!result.ok) result = await owner.call({ change: "inspect", view: binding.view }, signal);
+          retired = result.ok && result.jobs.length === 1 ? result.jobs[0] : null;
+          if (retired?.record?.request?.change !== "retire" || retired.record.binding.task !== binding.task || retired.record.checkpoint?.image !== saved.image) return false;
+        } finally { owner.close(); }
+        // Native retirement is irreversible: no replacement actor can enter this
+        // image while passive commands retain its public repository. These calls
+        // neither start a model broker nor restore a compute grant.
+        const request = { version: "omos.worker-image-request/v1", action: "prepare", id: saved.image, workspace: binding.workspace, view: binding.view, generation: saved.generation, max_runtime_ms: job.max_runtime_ms, model: saved.model, source_revision: saved.source_revision };
+        const prepared = await image(request, signal);
+        if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== saved.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root) fail("WorkerImageIdentityChanged");
+        await image({ ...request, action: "quiesce" });
+        await removeBrokerSocket(prepared.root);
+        let retained = saved.phase === "prepared";
+        try {
+          if (!retained) {
+            const snapshot = await run(prepared.root, ["fossil", "status", "--json"], signal);
+            if (snapshot.code !== 0) fail("WorkerSnapshotUnavailable");
+            const local = JSON.parse(snapshot.stdout), selected = selectWorkerRoot(local.tasks);
+            if (!hex(local.workspace_id) || !hex(selected.id) || !hex(selected.model_basis?.definition_hash)) fail("WorkerSnapshotAmbiguous");
+            const name = ".omos-host-read-" + randomUUID() + ".json";
+            const file = path.join(prepared.root, "workspace", name);
+            let head;
+            try {
+              await fs.writeFile(file, JSON.stringify({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id }), { flag: "wx", mode: 0o400 });
+              await fs.chown(file, prepared.uid, prepared.uid);
+              const result = await run(prepared.root, ["workspace", "--request-file", "/workspace/" + name, "--json"], signal);
+              if (result.code !== 0) fail("WorkerSnapshotUnavailable");
+              head = JSON.parse(result.stdout);
+            } finally { await fs.rm(file, { force: true }); }
+            if (!hex(head.data?.revision)) fail("WorkerSnapshotAmbiguous");
+            const directory = path.join(prepared.root, "workspace", saved.export_directory ?? ".omos-host-archive-retired-" + saved.image);
+            if (!saved.export_directory) {
+              try { await fs.mkdir(directory, { mode: 0o700 }); }
+              catch (error) { if (error.code !== "EEXIST") throw error; }
+            }
+            const info = await fs.lstat(directory);
+            if (!info.isDirectory() || info.isSymbolicLink() || ![0, prepared.uid].includes(info.uid)) fail("UnsafeWorkerArchiveDirectory");
+            if (!saved.export_directory) {
+              const marker = path.join(directory, ".omos-retirement.json");
+              const expected = Buffer.from(JSON.stringify({ retirement: retired.sha256, image: saved.image }));
+              if (info.uid === 0) {
+                try { await fs.writeFile(marker, expected, { flag: "wx", mode: 0o600 }); }
+                catch (error) { if (error.code !== "EEXIST") throw error; }
+              }
+              const file = await fs.open(marker, constants.O_RDONLY | constants.O_NOFOLLOW);
+              try {
+                const info = await file.stat();
+                if (!info.isFile() || info.uid !== 0 || info.nlink !== 1 || (info.mode & 0o777) !== 0o600 || info.size !== expected.length || !(await file.readFile()).equals(expected)) fail("UnsafeWorkerArchiveDirectory");
+              } finally { await file.close(); }
+            }
+            await fs.chown(directory, prepared.uid, prepared.uid);
+            const filename = path.join(directory, "actor.fossil");
+            let exists = false;
+            try { await fs.lstat(filename); exists = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
+            if (!exists) {
+              await prepareWorkerExport(filename, prepared.uid);
+              const exported = await run(prepared.root, ["fossil", "export", "/workspace/" + path.basename(directory) + "/actor.fossil", "--json"], signal);
+              if (exported.code !== 0) fail("WorkerArchiveExportFailed");
+            }
+            await fs.chown(directory, 0, 0);
+            const archive = createArchiveHttpControl(evaluation);
+            try {
+              const receipt = await retainWorkerArchive({ filename, uid: prepared.uid, source: { workspace: local.workspace_id, task: selected.id, revision: head.data.revision }, view: binding.view, execution: { runtime: saved.runtime, generation: saved.generation }, control: { call: (request, signal) => archive.call({ ...request, version: "omos.company-retired-archive-write/v1" }, signal) }, signal });
+              retained = receipt.complete === true;
+            } finally { archive.close(); }
+          }
+        } finally {
+          await image({ ...request, action: "quiesce" });
+          if (retained) await image({ ...request, action: "remove" });
+        }
+        if (retained) retirementAttempts.delete(saved.image);
+        return retained;
+      } finally {
+        const pending = retirementAttempts.get(saved.image);
+        if (pending) pending.next = Date.now() + Math.min(300000, 1000 * 2 ** (attempt - 1));
+      }
+    },
     async describe(signal) {
       const client = await createCompanyClient(companyConfiguration, { home: companyHome });
       try {
@@ -239,6 +349,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           const exportPath = path.join(exportDirectory, "actor.fossil");
           let exists = false;
           try { await fs.lstat(exportPath); exists = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
+          if (!exists) await prepareWorkerExport(exportPath, prepared.uid);
           const exported = exists ? { code: 0 } : await run(prepared.root, ["fossil", "export", "/workspace/" + path.basename(exportDirectory) + "/actor.fossil", "--json"], signal);
           await image({ ...request, action: "quiesce" });
           if (exported.code !== 0) fail("WorkerArchiveExportFailed");

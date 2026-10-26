@@ -5,7 +5,7 @@ const authority = @import("company_authority.zig");
 const ownership = @import("company_execution.zig");
 
 pub const State = enum { queued, running, waiting, submitted, failed, cancelled, completed, exhausted };
-pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire, checkpoint };
+pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire, checkpoint, retire };
 pub const Outcome = enum { waiting, submitted, failed, completed };
 pub const Checkpoint = struct {
     version: []const u8 = "omos.company-worker-checkpoint/v1",
@@ -164,6 +164,7 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
     } else {
         if (previous == null or request.max_invocations != null or request.max_runtime_ms != null) return error.InvalidCompanyWorkerJob;
         switch (request.change) {
+            .retire => return error.InvalidCompanyWorkerJob,
             .claim => {
                 if (request.outcome != null or (next.state != .queued and !(next.state == .running and next.expires_ms <= now))) return error.CompanyWorkerNotQueued;
                 if (next.invocations >= next.max_invocations) return error.CompanyWorkerInvocationBudget;
@@ -264,11 +265,30 @@ fn encode(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(alloc, value, .{});
 }
 
+pub fn retirementPath(alloc: std.mem.Allocator, task: []const u8) ![]const u8 {
+    if (!authority.safeIdentity(task)) return error.InvalidCompanyWorkerJob;
+    return alloc.print("company/workers/retirements/{s}.json", .{task});
+}
+
+pub fn retirement(manager: workspace.Manager, task: []const u8) !?Record {
+    const selected = try retirementPath(manager.alloc, task);
+    const revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
+    const raw = if (manager.company_operation_held) found: {
+        if (!try manager.companyRecordExists(selected, revision)) return null;
+        break :found try manager.contentAt(selected, revision);
+    } else (try optionalContent(manager, selected)) orelse return null;
+    const saved = try records.decode(Record, manager.alloc, raw, .{});
+    try validateStored(manager.alloc, saved, selected);
+    if (!std.mem.eql(u8, saved.binding.workspace, manager.manifest.id) or !std.mem.eql(u8, saved.binding.task, task)) return error.CompanyAccessDenied;
+    return saved;
+}
+
 pub fn validateStored(alloc: std.mem.Allocator, record: Record, record_path: []const u8) !void {
     try validate(record);
     const operation = record.request.operation orelse return error.InvalidCompanyWorkerJob;
     const view = record.request.view orelse return error.InvalidCompanyWorkerJob;
     if (record.request.change == .inspect or !std.mem.eql(u8, operation, record.operation) or !std.mem.eql(u8, view, record.binding.view) or !std.mem.eql(u8, record.request_hash, try workspace.hash(alloc, try encode(alloc, record.request)))) return error.InvalidCompanyWorkerJob;
+    if (record.request.change == .retire and record.checkpoint != null and (record.state == .cancelled or record.state == .completed or record.state == .exhausted) and std.mem.eql(u8, record_path, try retirementPath(alloc, record.binding.task))) return;
     if (std.mem.eql(u8, record_path, try path(alloc, record.id))) return;
     if (std.mem.eql(u8, record_path, try alloc.print("company/workers/history/{s}/{s}.json", .{ record.id, record.request_hash }))) return;
     if (std.mem.eql(u8, record_path, try alloc.print("company/workers/operations/{s}/{s}.json", .{ record.id, try workspace.hash(alloc, record.operation) }))) return;
@@ -389,6 +409,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     }
     const view_id = request.view orelse return error.CompanyViewRequired;
     const selected = try context(manager, view_id);
+    if (request.change != .retire and try retirement(manager, selected.task.id) != null) return error.CompanyWorkerRetired;
     const task_lease = (try manager.tryTaskExecutionLease(selected.task.id)) orelse return error.WorkspaceExecutionBusy;
     defer task_lease.release();
     const id = try workspace.hash(manager.alloc, view_id);
@@ -463,12 +484,27 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
             transition_binding = retained.binding;
         }
     };
-    var record = if (request.change == .plan)
+    var record = if (request.change == .retire) retired: {
+        const retained = previous orelse return error.CompanyWorkerNotQueued;
+        if (request.execution != null or request.outcome != null or request.max_invocations != null or request.max_runtime_ms != null or request.checkpoint != null or retained.checkpoint == null) return error.InvalidCompanyWorkerJob;
+        if (selected.live and retained.state != .cancelled and retained.state != .completed and retained.state != .exhausted) return error.CompanyWorkerStillResumable;
+        if (selected.live and retained.state == .exhausted and selected.task.review_job != null) return error.CompanyWorkerStillResumable;
+        var stopped = retained;
+        stopped.state = if (retained.state == .completed) .completed else if (retained.state == .exhausted) .exhausted else .cancelled;
+        stopped.expires_ms = 0;
+        stopped.operation = operation;
+        stopped.request_hash = request_hash;
+        stopped.request = request;
+        stopped.updated_ms = now;
+        stopped.note = "Execution permanently retired; the host may retain its public history without restoring actor authority.";
+        try validate(stopped);
+        break :retired stopped;
+    } else if (request.change == .plan)
         try planRecord(manager, previous orelse return error.CompanyWorkerNotQueued, request, selected, operation, request_hash)
     else
         try transition(previous, normalized, transition_binding, id, request_hash, live, now, publication_verified, selected.task.review_job != null);
     record.request = request;
-    if (request.change == .finish or request.change == .cancel or request.change == .complete or request.change == .expire) {
+    if (request.change == .finish or request.change == .cancel or request.change == .complete or request.change == .expire or request.change == .retire) {
         if (live) |current| if (record.runtime != null and current.runtime != null and record.generation == current.generation and std.mem.eql(u8, record.runtime.?, current.runtime.?)) {
             var released = current;
             released.runtime = null;
@@ -487,6 +523,15 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         }
     }
     const raw = try encode(manager.alloc, record);
+    if (request.change == .retire) {
+        const retired_path = try retirementPath(manager.alloc, record.binding.task);
+        if (try optionalContent(manager, retired_path)) |existing| {
+            const saved = try records.decode(Record, manager.alloc, existing, .{});
+            try validateStored(manager.alloc, saved, retired_path);
+            return encode(manager.alloc, .{ .revision = revision, .jobs = .{try row(manager, saved, existing, true)}, .next_offset = @as(?usize, null), .replayed = true });
+        }
+        try files.append(manager.alloc, .{ .path = retired_path, .content = raw });
+    }
     try files.append(manager.alloc, .{ .path = record_path, .content = raw });
     try files.append(manager.alloc, .{ .path = operation_path, .content = raw });
     try files.append(manager.alloc, .{ .path = try manager.alloc.print("company/workers/history/{s}/{s}.json", .{ id, request_hash }), .content = raw });

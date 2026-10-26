@@ -29,8 +29,12 @@ export async function advertiseWorkerRuntime({ control, description, signal }) {
   const heartbeat = async force => {
     if (stopped) fail("WorkerRuntimeClosed");
     if (!force && Date.now() - last < 10000) return;
-    const result = await control.call({ version: "omos.company-runtime/v1", change: "heartbeat", id, registration_sha256: expected, instance }, signal);
-    if (!result.ok || !result.live || result.sha256 !== expected) fail(result.error === "CompanyRuntimeBusy" ? "WorkerRuntimeAlreadyActive" : "WorkerRuntimeHeartbeatFailed");
+    const request = { version: "omos.company-runtime/v1", change: "heartbeat", id, registration_sha256: expected, instance };
+    let result = await control.call(request, signal);
+    // This exact process nonce can renew only its own disposable lease. A lost
+    // acknowledgement does not justify cancelling its already fenced actor.
+    if (!result.ok && result.error === "WorkerControlOutcomeUnknown") result = await control.call(request, signal);
+    if (!result.ok || !result.live || result.sha256 !== expected) throw Object.assign(new Error(result.error === "CompanyRuntimeBusy" ? "WorkerRuntimeAlreadyActive" : "WorkerRuntimeHeartbeatFailed"), { nativeCode: result.error });
     last = Date.now();
   };
   await heartbeat(true);

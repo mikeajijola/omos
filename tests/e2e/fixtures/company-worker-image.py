@@ -103,7 +103,7 @@ if spec["action"] == "backend":
         validation_file.chmod(0o600)
         backend["validationConfiguration"] = str(validation_file)
     configuration = base / "backend.json"
-    configuration.write_text(json.dumps({"backend": backend, "control": settings["control"], "view": settings.get("view"), "desiredPolicy": settings.get("desiredPolicy"), "reconciliation": settings.get("reconciliation", False), "hostedRequest": settings.get("hostedRequest"), "archiveRecovery": settings.get("archiveRecovery", False), "codingRecovery": settings.get("codingRecovery", False), "partialRecovery": settings.get("partialRecovery", False), "inputResponse": settings.get("inputResponse", False)}))
+    configuration.write_text(json.dumps({"backend": backend, "control": settings["control"], "view": settings.get("view"), "desiredPolicy": settings.get("desiredPolicy"), "reconciliation": settings.get("reconciliation", False), "hostedRequest": settings.get("hostedRequest"), "archiveRecovery": settings.get("archiveRecovery", False), "codingRecovery": settings.get("codingRecovery", False), "partialRecovery": settings.get("partialRecovery", False), "retirement": settings.get("retirement", False), "actorWaitUrl": settings.get("actorWaitUrl"), "inputResponse": settings.get("inputResponse", False)}))
     configuration.chmod(0o600)
     assert pathlib.Path(spec["node"]).is_absolute() and pathlib.Path(spec["node"]).name in ("node", "bun")
     result = subprocess.run([spec["node"], str(repository / "tests/e2e/fixtures/company-worker-linux.mjs"), str(configuration)], capture_output=True, text=True, timeout=360, env={"PATH": "/usr/bin:/bin", "HOME": str(profile)})

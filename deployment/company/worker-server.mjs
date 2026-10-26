@@ -30,6 +30,10 @@ export async function runWorkerServer(config, signal, report = () => {}) {
   signal?.addEventListener("abort", stop, { once: true });
   if (signal?.aborted) stop();
   try {
+    // Owner-only passive retention also works after this actor's grant expires.
+    // supports() remains false until describe(), so this pass cannot dispatch.
+    await coordinator.tick();
+    await coordinator.drain();
     const description = await backend.describe(signal);
     if (desiredControl && !description.desired_state) throw new Error("CompanyDesiredDefinitionRequired");
     runtime = await advertiseWorkerRuntime({ control: runtimeControl, description, signal });

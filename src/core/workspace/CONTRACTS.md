@@ -1273,3 +1273,17 @@ brokers omit these actions. `omos_company_task_input` retains the request,
 execution fence, contract hash, and delivery state on the control branch.
 Owner delivery claims cannot replay an uncertain input on a replacement worker.
 See [Company task input and cancellation](../../../deployment/company/INPUT.md).
+
+## Retired worker history
+
+The owner-only `omos_company_worker_retirement` operation permanently ends a
+worker task's execution authority and retains its original checkpoint. A retired
+task cannot be requeued or acquire another execution lease. Authorized history
+reads remain available.
+
+`omos_company_retired_archive_admin` permits the host to retain that checkpoint's
+public history after the actor's grant expires or is revoked. The archive receipt
+references the immutable retirement record. This operation grants no actor or
+publication authority. The host removes the private image only after receiving a
+complete archive acknowledgement. See
+[Retain history after execution authority ends](../../../deployment/company/WORKERS.md#retain-history-after-execution-authority-ends).

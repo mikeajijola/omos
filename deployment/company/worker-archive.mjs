@@ -9,8 +9,57 @@ const chunkBytes = 128 * 1024;
 const hash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const fail = code => { throw Error(code); };
 
+// Native export publishes a verified repository with an exclusive hard link,
+// then removes its staging alias. A crash between those steps leaves two
+// names for the verified inode. Repair only that exact staging relationship.
+async function finishExportLink(filename, uid) {
+  const before = await fs.lstat(filename);
+  if (before.nlink !== 2 || !before.isFile() || before.uid !== uid) return;
+  const parent = path.dirname(filename), prefix = path.basename(filename) + ".pending-";
+  for (const name of await fs.readdir(parent)) {
+    if (!name.startsWith(prefix) || !/^[0-9a-f]{32}$/.test(name.slice(prefix.length))) continue;
+    const directory = path.join(parent, name), info = await fs.lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink() || ![0, uid].includes(info.uid)) continue;
+    const entries = await fs.readdir(directory);
+    if (entries.length !== 1 || entries[0] !== "workspace.fossil") continue;
+    const temporary = path.join(directory, "workspace.fossil");
+    const file = await fs.open(temporary, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let matches;
+    try {
+      const info = await file.stat();
+      matches = info.isFile() && info.uid === uid && info.dev === before.dev && info.ino === before.ino && info.size === before.size && info.nlink === 2;
+    } finally { await file.close(); }
+    if (!matches) continue;
+    const current = await fs.lstat(filename);
+    if (!current.isFile() || current.dev !== before.dev || current.ino !== before.ino || current.uid !== uid || current.nlink !== 2) fail("WorkerArchiveChanged");
+    await fs.unlink(temporary);
+    await fs.rmdir(directory);
+    return;
+  }
+}
+
+export async function prepareWorkerExport(filename, uid) {
+  try { await fs.lstat(filename); return; }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  const parent = path.dirname(filename), prefix = path.basename(filename) + ".pending-";
+  for (const name of await fs.readdir(parent)) {
+    if (!name.startsWith(prefix) || !/^[0-9a-f]{32}$/.test(name.slice(prefix.length))) continue;
+    const directory = path.join(parent, name), info = await fs.lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== uid) continue;
+    const names = await fs.readdir(directory);
+    if (names.some(name => !["workspace.fossil", "workspace.fossil-journal", "workspace.fossil-wal", "workspace.fossil-shm"].includes(name))) continue;
+    const files = await Promise.all(names.map(name => fs.lstat(path.join(directory, name))));
+    if (files.some(info => !info.isFile() || info.uid !== uid || info.nlink !== 1)) continue;
+    // No destination was published. These are disposable clone files, not the
+    // original repository, and actor processes have already joined.
+    for (const name of names) await fs.unlink(path.join(directory, name));
+    await fs.rmdir(directory);
+  }
+}
+
 export async function retainWorkerArchive({ filename, uid, source, view, execution, control, signal }) {
   if (!path.isAbsolute(filename) || !Number.isSafeInteger(uid) || uid < 0 || !hash(source?.workspace) || !hash(source?.task) || !hash(source?.revision) || !hash(view) || !control || typeof control.call !== "function") fail("InvalidWorkerArchive");
+  await finishExportLink(filename, uid);
   const before = await fs.lstat(filename);
   const file = await fs.open(filename, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {

@@ -139,7 +139,10 @@ each actor still needs an explicit `execute_task` grant to request dispatch.
 
 The broker accepts fixed model and company routes. Model calls map an allowed
 worker model handle to a configured provider model and receive credentials
-only in the host's outgoing request. Company requests retain their signatures;
+only in the host's outgoing request. Before each model dispatch, a company-bound
+broker checks signed native status against its view, execution generation, and
+unexpired execution lease. Revoked or replaced workers cannot send another model
+request through that broker. Company requests retain their signatures;
 the broker checks the pinned identity, allowed actions, and any specified view
 before the gateway applies its current authority rules. Arbitrary destinations,
 redirects, caller credentials, and cookies are not forwarded. Provider error
@@ -731,3 +734,45 @@ Publication still requires independent review and a verified company receipt.
 Workers stream the native public UI protocol through the protected company
 activity service. See [Public worker activity](ACTIVITY.md) for limits, replay,
 and the distinction between progress and verified publication.
+
+## Retain history after execution authority ends
+
+The public bootstrap advertises `retired_archives` when the workspace declares
+both retirement operations. The coordinator can then retain an inactive worker
+image after cancellation, invocation exhaustion, grant expiry or revocation, or
+supersession of its desired-state task. A live, resumable invocation is refused. Exhausted actor work with a retained
+review job keeps its independent verification path.
+
+The native owner first records an immutable retirement under
+`company/workers/retirements/<task>.json`. This record preserves the admitted
+checkpoint, contract binding, image identity, and operation hash, and releases
+its matching execution ownership. New compute claims, requeues, and publication
+cannot revive that retired task. Request further work through a new task.
+Authorized history reads remain available under the original scope.
+
+After the running process has joined, maintenance runs only the native status,
+bounded workspace-read, and public-export commands. It starts no model broker,
+actor turn, or application tool. The owner archive route accepts
+`omos.company-retired-archive-write/v1` only after checking the retirement and
+original checkpoint. Its complete receipt links the retirement hash and keeps
+`actor_public_history_only` authority. Archival cannot establish company
+acceptance.
+
+Maintenance uses the existing concurrency limit and a five-minute attempt
+ceiling. A deterministic export directory and a protected marker preserve the
+same bytes across lost acknowledgements. Uploads resume from the native offset;
+failed attempts retain the image. An interrupted native export can leave its
+verified file linked to its staging name. Recovery removes only an alias with
+the exact expected name, owner, inode, and directory contents. Unrelated hard
+links remain rejected.
+
+Retries remove only recognized, unpublished native-export staging files. A
+published export or an unrecognized file remains intact. Failed maintenance
+attempts back off from one second to five minutes without claiming an actor
+invocation or reserving capacity for images that no longer exist.
+
+The image is removed after a complete archive acknowledgement. A prepared image
+that never admitted an actor has no actor history to export. Waiting work with
+live authority remains available for ordinary requeue and continuation. Startup
+performs passive maintenance before advertising an implementation, so an expired
+actor grant does not prevent retention of its existing image.

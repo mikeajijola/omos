@@ -56,7 +56,10 @@ cannot be cancelled through this interface.
 
 Interrupted images remain retained when their history has not been acknowledged.
 Cancellation does not erase recorded activity, contracts, prior checkpoints, or
-company history. Retained images require recovery before removal.
+company history. Where `retired_archives` is declared, the host permanently
+retires the cancelled execution and archives its public history before removing
+its image. Failed archival remains pending and preserves the image. Further work
+after retirement requires a new task.
 
 Task amendments, steering, owner configuration, and browser delegation have
 separate authority and contract requirements. Input decisions cannot change

@@ -37,7 +37,7 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -70,7 +70,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         } }] };
         reason = "tool_calls";
       } else {
-        delta = actor(body, ++actors);
+        delta = await actor(body, ++actors, request.signal);
         if ((delta as any).tool_calls) reason = "tool_calls";
       }
       const chunks: object[] = [

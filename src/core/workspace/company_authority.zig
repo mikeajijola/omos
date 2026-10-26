@@ -221,6 +221,7 @@ pub fn authorizePlanning(manager: workspace.Manager, task: workspace.Task) !void
 
 fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publication: bool, planning: bool) !void {
     const binding = task.authority orelse return;
+    if (try @import("company_worker_jobs.zig").retirement(manager, task.id) != null) return error.CompanyWorkerRetired;
     if (binding.desired != null) try @import("company_desired.zig").require(manager, task);
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);

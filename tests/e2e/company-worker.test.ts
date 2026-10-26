@@ -15,7 +15,7 @@ import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
 import { validateValidationConfiguration } from "../../deployment/company/worker-validation.mjs";
 import { createWorkerCheckpointer } from "../../deployment/company/worker-checkpoint.mjs";
-import { retainWorkerArchive } from "../../deployment/company/worker-archive.mjs";
+import { retainWorkerArchive, prepareWorkerExport } from "../../deployment/company/worker-archive.mjs";
 import { advertiseWorkerRuntime } from "../../deployment/company/worker-runtime.mjs";
 import { runWorkerNative, publicWorkerEvents } from "../../deployment/company/worker-native.mjs";
 
@@ -1539,10 +1539,11 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "retirement", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "retirement" ? "passive public history retention after cancellation" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
   const desiredTask = scenario === "desired", inputTask = scenario === "input";
   const partialRecovery = scenario === "partial_recovery" && support.private_namespaces;
+  const retiring = scenario === "retirement" && support.private_namespaces;
   let resumedNativeHistory = false;
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
@@ -1552,16 +1553,25 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
   const answer = coding ? "Implemented add(a, b) in documents/team/calculator.py." : answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
   const f = fixture(), worker = fixture();
   const host = model(f, () => { throw Error("The company host must never execute the actor"); }, undefined, { plan: { capability: coding ? "coding_task" : "general_task", summary: "Retain the requested company outcome", obligations: [], checks: coding ? ["Run the operator-configured isolated behavior check"] : [] } });
-  const inference = model(worker, (body, count) => {
+  const inference = model(worker, async (body, count, signal) => {
     const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
     if (inputTask && count === 1) return tool("ask_user_question", { questions: [{ question: "Which presentation should the retained report use?", options: [{ label: "Brief" }, { label: "Detailed" }] }] });
     if (inputTask && count === 2) {
       expect(body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Brief"))).toBe(true);
       return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
     }
-    // The fixture stops namespace PID 1 from its host after observing this
-    // tool start. Descendants cannot reliably signal namespace init itself.
-    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "sleep 120", timeout_ms: 180000 } });
+    // Hold a provider response after the first durable tool completed. The
+    // host fixture can interrupt the process without relying on shell tools
+    // or optional executables inside the deliberately sparse worker image.
+    if ((partialRecovery || retiring) && count === 2) {
+      await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+        const timer = setTimeout(done, 120000);
+        signal?.addEventListener("abort", done, { once: true });
+        if (signal?.aborted) done();
+      });
+      return { content: answer };
+    }
     if (partialRecovery && count === 3) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("production.txt"));
     if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
@@ -1653,14 +1663,16 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     }
 
     let archiveAcknowledgementLost = false;
-    if (archiveRecovery) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
-      const body = await request.text(), target = new URL(request.url).pathname;
+    if (archiveRecovery || retiring || partialRecovery) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const target = new URL(request.url).pathname;
+      if (request.method === "GET" && target === "/fixture/actor-ready") return Response.json({ ready: inference.counts().actors >= 2 });
+      const body = await request.text();
       const reply = await fetch(service.url + target, { method: request.method, headers: { authorization: request.headers.get("authorization")!, "content-type": "application/json" }, body });
       const content = await reply.text();
       if (target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
       return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
-    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, retirement: retiring, actorWaitUrl: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}/fixture/actor-ready` : null, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1670,9 +1682,9 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, state: failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, published: !failingChecks });
+      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, state: retiring ? "cancelled" : failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, published: !failingChecks && !retiring });
       expect(result.images).toBe(failingChecks ? 1 : 0);
-      expect(current.record.checkpoint.phase).toBe("retained");
+      expect(current.record.checkpoint.phase).toBe(retiring ? "running" : "retained");
       if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
       if (desiredTask) expect(outcome.desired_met).toBe(true);
       if (inputTask) expect(outcome.input_answered).toBe(true);
@@ -1689,7 +1701,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
 
       // Public native progress survives worker cleanup and never establishes
       // company publication by itself. Read through the signed scoped API.
-      if (!recovering && !archiveRecovery) {
+      if (!recovering && !archiveRecovery && !retiring) {
       let activityOffset = 0, activityRevision, activityEnded = false;
       const activityEvents = [];
       do {
@@ -1710,6 +1722,27 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
       if (!answerOnly && !partialRecovery) expect(activityEvents.some(event => event.type === "tool_start")).toBe(true);
       }
 
+      if (retiring) {
+        expect(outcome.retired_history).toBe(true); expect(current.publication).toBeNull(); expect(archiveAcknowledgementLost).toBe(true);
+        const archived = JSON.parse(archives.content[0].text).archives[0];
+        const directory = `company/archives/${current.record.binding.task}/${archived.id}`;
+        const receipt = JSON.parse(f.fossil("cat", directory + "/receipt.json", "-r", "omos-company"));
+        expect(receipt.retirement).toBe(current.sha256);
+        const chunks: Buffer[] = [];
+        for (let offset = 0; offset < archived.source.bytes; offset += 128 * 1024) {
+          const part = JSON.parse(f.fossil("cat", `${directory}/${offset}.json`, "-r", "omos-company"));
+          const object = JSON.parse(f.fossil("cat", `company/archives/objects/${part.chunk_sha256}.json`, "-r", "omos-company"));
+          chunks.push(Buffer.from(object.content, "base64"));
+        }
+        const bytes = Buffer.concat(chunks); expect(createHash("sha256").update(bytes).digest("hex")).toBe(archived.source.sha256);
+        const exported = join(f.home, "cancelled-worker.fossil"); writeFileSync(exported, bytes);
+        const content = spawnSync("fossil", ["cat", "documents/team/production.txt", "-r", "task/" + archived.source.task, "-R", exported], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, XDG_CONFIG_HOME: f.home } });
+        expect(content.status, content.stderr).toBe(0); expect(content.stdout).toBe("Retained by the isolated native worker and collected by its host.");
+        expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
+        expect(host.counts()).toEqual({ actors: 0, assessments: 0 }); expect(inference.counts().actors).toBe(2);
+        expect((await f.run(["fossil", "verify", "--json"], {}, 180000)).code).toBe(0);
+        return;
+      }
       if (failingChecks) {
         expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
         expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/calculator.py");
@@ -2284,3 +2317,191 @@ input.on('line',line=>{const request=JSON.parse(line);send({type:'response',id:r
   expect(appends).toBe(2); expect(Date.now() - started).toBeLessThan(5000);
   expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 }, 10000);
+
+for (const cancelled of [false, true]) test(`company retirement archives public history after revocation without restoring execution${cancelled ? " after live cancellation" : ""}`, async () => {
+  const f = fixture(), sourceWorker = fixture();
+  const host = model(f, () => { throw Error("Passive retention must not start company actors"); });
+  model(sourceWorker, () => ({ content: "Retained public history for passive archival." }));
+  expect((await sourceWorker.run(["fossil", "init", "--json"])).code).toBe(0);
+  expect((await sourceWorker.run(["ask", "Retain this public history.", "--json"], {}, 180000)).code).toBe(0);
+  const state = JSON.parse((await sourceWorker.run(["fossil", "status", "--json"])).stdout), sourceTask = state.tasks[0];
+  const revision = sourceWorker.fossil("timeline", "ancestors", sourceTask.branch, "--type", "ci", "--limit", "1", "--format", "%H").trim().split(/\s+/)[0];
+  const filename = join(sourceWorker.home, "retired-public.fossil");
+  expect((await sourceWorker.run(["fossil", "export", filename, "--json"])).code).toBe(0);
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const adminResult = async input => { const file = join(f.home, "retirement-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); return f.run(["fossil", "company", file, "--json"]); };
+  const admin = async input => { const result = await adminResult(input); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const key = await f.run(["fossil", "company-key", "retired-worker", "--json"]); expect(key.code).toBe(0);
+  const actions = ["create_view", "status", "read", "execution", "checkpoint", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "retired-worker", actor: "worker", public_key: (JSON.parse(key.stdout).model_data ?? JSON.parse(key.stdout)).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client, archive;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    expect(boot.features.retired_archives).toBe(true);
+    const config = join(f.home, "retired-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "retired-worker", key_handle: "retired-worker", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const send = async input => { const result = await client.call("company_workspace", { version: "omos.company/v1", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input }); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const view = await send({ action: "create_view", revision: boot.revision, objective: "Preserve the revoked worker's history without publishing its claims." });
+    const workers = async worker => (await admin({ action: "workers", worker })).jobs[0];
+    let row = await workers({ change: "queue", operation: crypto.randomUUID(), view: view.view });
+    row = await workers({ change: "claim", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256, execution: { runtime: "retired-runtime", generation: 0 } });
+    const execution = { runtime: "retired-runtime", generation: 1 };
+    const checkpoint = { version: "omos.company-worker-checkpoint/v1", runtime: execution.runtime, generation: 1, image: createHash("sha256").update(JSON.stringify([boot.workspace, view.view, execution.runtime, 1])).digest("hex"), source_revision: row.view_revision, model: "fixture-model", phase: "prepared", export_directory: null };
+    row = await workers({ change: "checkpoint", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256, execution, checkpoint });
+    row = await workers({ change: "checkpoint", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256, execution, checkpoint: { ...checkpoint, phase: "running" } });
+    const active = await adminResult({ action: "workers", worker: { change: "retire", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256 } });
+    expect(active.code).not.toBe(0); expect(active.stderr).toContain("CompanyWorkerStillResumable");
+    if (cancelled) row = await workers({ change: "cancel", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256 });
+    else await admin({ action: "revoke", revision: (await admin({ action: "status" })).revision, id: "retired-worker" });
+    const request = { change: "retire", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256 };
+    row = await workers(request);
+    expect(row.record.state).toBe("cancelled"); expect(row.execution.runtime).toBeNull(); expect(row.record.checkpoint.image).toBe(checkpoint.image);
+    expect((await workers(request)).sha256).toBe(row.sha256);
+    if (cancelled) {
+      const revival = await client.call("company_workspace", { version: "omos.company/v1", action: "execution", view: view.view, revision: row.view_revision, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, execution: { runtime: "resurrected", generation: 1 }, execution_change: "claim", execution_lease_ms: 300000 });
+      expect(revival.isError).toBe(true); expect((await workers({ change: "inspect", view: view.view })).execution.runtime).toBeNull();
+      const missing = await send({ action: "read", view: view.view, revision: row.view_revision, path: "documents/team/absent.txt" });
+      expect(missing.exists).toBe(false);
+      await admin({ action: "revoke", revision: (await admin({ action: "status" })).revision, id: "retired-worker" });
+    }
+    const requeue = await adminResult({ action: "workers", worker: { change: "requeue", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256 } });
+    expect(requeue.code).not.toBe(0); expect(requeue.stderr).toContain("CompanyWorkerRetired");
+    const owner = { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) };
+    archive = createArchiveHttpControl(owner);
+    const source = { workspace: state.workspace_id, task: sourceTask.id, revision };
+    await expect(retainWorkerArchive({ filename, uid: process.getuid!(), source, view: view.view, execution, control: archive })).rejects.toThrow("WorkerArchiveRetentionPending");
+    const passive = { call: (request, signal) => archive.call({ ...request, version: "omos.company-retired-archive-write/v1" }, signal) };
+    const retained = await retainWorkerArchive({ filename, uid: process.getuid!(), source, view: view.view, execution, control: passive });
+    expect(retained.complete).toBe(true);
+    const receipt = JSON.parse(f.fossil("cat", `company/archives/${row.record.binding.task}/${retained.archive_id}/receipt.json`, "-r", "omos-company"));
+    expect(receipt.retirement).toBe(row.sha256); expect(receipt.authority).toBe("actor_public_history_only"); expect(receipt.source.sha256).toBe(createHash("sha256").update(readFileSync(filename)).digest("hex"));
+    const denied = await client.call("company_workspace", { version: "omos.company/v1", action: "execution", view: view.view, revision: view.revision, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, execution: { runtime: "resurrected", generation: 1 }, execution_change: "claim", execution_lease_ms: 300000 });
+    expect(denied.isError).toBe(true); expect(host.counts()).toEqual({ actors: 0, assessments: 0 });
+    expect((await f.run(["fossil", "verify", "--json"], {}, 180000)).code).toBe(0);
+  } finally { archive?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 600000);
+
+test("worker coordinator retains inactive images without starving unrelated work or claiming compute", async () => {
+  const common = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Retain a document", basis: {}, grant: {}, execution: null, task_state: "active", review_job_id: null, pending_operation: null, publication: null };
+  const absent: any = { ...structuredClone(common), record: { binding: { view: "absent" }, state: "completed", checkpoint: {}, generation: 1 } };
+  const retained: any = { ...structuredClone(common), authority_live: false, record: { binding: { view: "retained" }, state: "cancelled", checkpoint: {}, generation: 1 } };
+  const actor: any = { ...structuredClone(common), record: { binding: { view: "live" }, state: "queued", generation: 0, max_runtime_ms: 60000, expires_ms: 0 } };
+  const calls: any[] = [], rows = [absent, retained, actor];
+  let stopped = false, ran = 0, retirements = 0;
+  const control = { async call(input) {
+    calls.push(input);
+    if (input.change === "inspect") return { ok: true, jobs: structuredClone(input.view ? rows.filter(row => row.record.binding.view === input.view) : rows), next_offset: null };
+    expect(input.view).toBe("live");
+    if (input.change === "claim") { actor.record = { ...actor.record, state: "running", runtime: input.execution.runtime, generation: 1, operation: input.operation, expires_ms: Date.now() + 120000 }; actor.execution = { runtime: input.execution.runtime, generation: 1 }; }
+    else if (input.change === "finish") { actor.record.state = input.outcome; actor.record.operation = input.operation; }
+    return { ok: true, jobs: [structuredClone(actor)], next_offset: null };
+  } };
+  const coordinator = createWorkerCoordinator({ control, concurrency: 2, backend: {
+    async canRetire(row) { return row.record.binding.view === "retained"; },
+    async retire(_row, signal) { retirements++; await new Promise<void>(resolve => signal.addEventListener("abort", () => { stopped = true; resolve(); }, { once: true })); },
+    async run() { ran++; return { outcome: "waiting" }; },
+  } });
+  expect((await coordinator.tick()).started).toBe(1);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await coordinator.tick();
+  expect(ran).toBe(1); expect(retirements).toBe(1); expect(stopped).toBe(false);
+  expect(calls.filter(call => call.change === "claim").map(call => call.view)).toEqual(["live"]);
+  await coordinator.close(); expect(stopped).toBe(true);
+});
+
+test("worker archive resumes an interrupted exclusive export link and preserves unrelated aliases", async () => {
+  const fs = await import("node:fs/promises");
+  const f = fixture(), filename = join(f.home, "actor.fossil");
+  const pending = filename + ".pending-" + "a".repeat(32);
+  await fs.mkdir(pending);
+  const bytes = Buffer.alloc(512); bytes.write("SQLite format 3\0");
+  await fs.writeFile(join(pending, "workspace.fossil"), bytes, { mode: 0o600 });
+  await fs.link(join(pending, "workspace.fossil"), filename);
+  let calls = 0;
+  const control = { async call(request) {
+    calls++;
+    return { ok: true, view: request.view, sha256: request.source.sha256, bytes: request.source.bytes, archive_id: "d".repeat(64), revision: "e".repeat(64), offset: request.offset, resume_offset: request.action === "inspect" ? 0 : bytes.length, next_offset: request.action === "inspect" ? 0 : null, complete: request.action !== "inspect" };
+  } };
+  const parameters = { filename, uid: process.getuid!(), source: { workspace: "a".repeat(64), task: "b".repeat(64), revision: "c".repeat(64) }, view: "f".repeat(64), execution: { runtime: "fixture", generation: 1 }, control };
+  const receipt = await retainWorkerArchive(parameters);
+  expect(receipt.sha256).toBe(createHash("sha256").update(bytes).digest("hex")); expect(receipt.complete).toBe(true);
+  expect((await fs.stat(filename)).nlink).toBe(1); expect(existsSync(pending)).toBe(false); expect(calls).toBe(2);
+  const unrelated = join(f.home, "unrelated-copy");
+  await fs.link(filename, unrelated);
+  calls = 0;
+  await expect(retainWorkerArchive(parameters)).rejects.toThrow("InvalidWorkerArchiveFile");
+  expect(calls).toBe(0); expect(existsSync(unrelated)).toBe(true); expect((await fs.stat(filename)).nlink).toBe(2);
+  await fs.mkdir(pending);
+  await fs.writeFile(join(pending, "workspace.fossil"), bytes);
+  await expect(retainWorkerArchive(parameters)).rejects.toThrow("InvalidWorkerArchiveFile");
+  expect(existsSync(join(pending, "workspace.fossil"))).toBe(true); expect(existsSync(unrelated)).toBe(true); expect(calls).toBe(0);
+});
+
+test("worker heartbeat resolves one lost acknowledgement with its original process nonce", async () => {
+  const description = { workspace: "a".repeat(64), package_sha256: "b".repeat(64), model_handle: "fixture-model", subjects: [{ actor: "user", grant: "user" }], validation_handles: [] };
+  const id = createHash("sha256").update(JSON.stringify([description.workspace, description.model_handle, description.subjects])).digest("hex");
+  const registration = { version: "omos.company-runtime-registration/v1", id, workspace: description.workspace, package_sha256: description.package_sha256, model_handle: description.model_handle, isolation: "omos.linux-worker/v1", subjects: description.subjects, validation_handles: [] };
+  const sha256 = createHash("sha256").update(JSON.stringify(registration)).digest("hex");
+  const calls: any[] = [];
+  const runtime = await advertiseWorkerRuntime({ description, control: { async call(request) {
+    calls.push(structuredClone(request));
+    if (request.change === "inspect") return { ok: true, runtimes: [{ sha256 }] };
+    if (request.change === "heartbeat" && calls.filter(call => call.change === "heartbeat").length === 1) return { ok: false, error: "WorkerControlOutcomeUnknown", uncertain: true };
+    return { ok: true, live: true, sha256 };
+  } } });
+  const heartbeat = calls.filter(call => call.change === "heartbeat");
+  expect(heartbeat).toHaveLength(2); expect(heartbeat[0]).toEqual(heartbeat[1]); expect(heartbeat[0].instance).toMatch(/^[0-9a-f]{64}$/);
+  await runtime.close();
+  let busy = 0;
+  await expect(advertiseWorkerRuntime({ description, control: { async call(request) {
+    if (request.change === "inspect") return { ok: true, runtimes: [{ sha256 }] };
+    busy++; return { ok: false, error: "CompanyRuntimeBusy" };
+  } } })).rejects.toThrow("WorkerRuntimeAlreadyActive");
+  expect(busy).toBe(1);
+});
+
+test("worker export discards only unpublished clone staging files before retrying", async () => {
+  const fs = await import("node:fs/promises");
+  const f = fixture(), filename = join(f.home, "actor.fossil"), pending = filename + ".pending-" + "a".repeat(32);
+  await fs.mkdir(pending);
+  await fs.writeFile(join(pending, "workspace.fossil"), "An interrupted clone.");
+  await fs.writeFile(join(pending, "workspace.fossil-journal"), "Its temporary journal.");
+  const original = join(f.home, "original.fossil"); await fs.writeFile(original, "Original canonical repository.");
+  await prepareWorkerExport(filename, process.getuid!());
+  expect(existsSync(pending)).toBe(false); expect(await fs.readFile(original, "utf8")).toBe("Original canonical repository.");
+  await fs.mkdir(pending);
+  await fs.writeFile(join(pending, "workspace.fossil"), "A clone.");
+  await fs.writeFile(join(pending, "document.txt"), "An unrelated file.");
+  await prepareWorkerExport(filename, process.getuid!());
+  expect(existsSync(join(pending, "document.txt"))).toBe(true); expect(existsSync(join(pending, "workspace.fossil"))).toBe(true);
+  await fs.unlink(join(pending, "document.txt"));
+  await fs.link(original, join(pending, "workspace.fossil-wal"));
+  await prepareWorkerExport(filename, process.getuid!());
+  expect(existsSync(join(pending, "workspace.fossil"))).toBe(true); expect((await fs.stat(original)).nlink).toBe(2);
+  await fs.writeFile(filename, "A published destination.");
+  await fs.unlink(join(pending, "workspace.fossil-wal"));
+  await prepareWorkerExport(filename, process.getuid!());
+  expect(existsSync(join(pending, "workspace.fossil"))).toBe(true); expect(await fs.readFile(filename, "utf8")).toBe("A published destination.");
+});
+
+test("worker model broker checks current signed execution before dispatching provider requests", async () => {
+  const f = fixture(), socket = join(f.home, "model-fence.sock"), expiresMs = Date.now() + 120000;
+  let providerCalls = 0, allowed = true, generation = 1;
+  const provider = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { providerCalls++; return Response.json({ ok: true }); } });
+  const company = { endpoint: "http://127.0.0.1:1/company", workspace: "a".repeat(64), actor: "worker", grant: "grant", view: "b".repeat(64), actions: ["status"] };
+  const companyClient = { identity: { workspace: company.workspace, actor: company.actor, grant: company.grant }, scope: { view: company.view, expiresMs, execution: { runtime: "owner", generation: 1 }, actions: ["status"] }, async call(name, request) {
+    expect(name).toBe("company_workspace"); expect(request.action).toBe("status"); expect(request.view).toBeUndefined();
+    return allowed ? { content: [{ type: "text", text: JSON.stringify({ view: company.view, execution: { runtime: "owner", generation, expires_ms: expiresMs } }) }] } : { isError: true };
+  } };
+  const broker = await createWorkerBroker({ socket, company, companyClient, expiresMs, model: { endpoint: `http://127.0.0.1:${provider.port}/v1`, model: "provider-model", handle: "fixture-model", credential: "host-only-fixture-key" } });
+  try {
+    const request = { model: "fixture-model", messages: [{ role: "user", content: "Retain this public report." }] };
+    expect((await local(socket, "/model/v1/chat/completions", request)).status).toBe(200); expect(providerCalls).toBe(1);
+    generation = 2;
+    const stale = await local(socket, "/model/v1/chat/completions", request);
+    expect(stale.status).toBe(403); expect(stale.text).toContain("WorkerInvocationRevoked"); expect(providerCalls).toBe(1);
+    generation = 1; allowed = false;
+    expect((await local(socket, "/model/v1/chat/completions", request)).status).toBe(403); expect(providerCalls).toBe(1);
+  } finally { await broker.close(); provider.stop(true); }
+});
