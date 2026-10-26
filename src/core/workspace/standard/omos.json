@@ -4170,6 +4170,76 @@
         "interfaces": [
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_views",
+        "capability": "general_task",
+        "description": "Discover the caller's own company task views through a bounded, immutable membership snapshot. Task contracts and publication remain canonical.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "status"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "entity": {
+              "const": "omos_workspace_view"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "entity"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {
@@ -4420,7 +4490,8 @@
             "base": "string",
             "pending": "json",
             "reads": "json",
-            "scope": "json"
+            "scope": "json",
+            "created_at_ms": "number"
           },
           "required": [
             "id",

@@ -1614,6 +1614,25 @@ pub const Manager = struct {
         return self.fullRevision(tree, "current");
     }
 
+    /// Host-generated, read-only projection. Actor and grant identifiers are
+    /// validated before interpolation; no caller can supply SQL or file paths.
+    pub fn companyViewHeaders(self: Manager, grant: @import("company_authority.zig").Grant, revision_id: []const u8, offset: usize, limit: usize) ![]const u8 {
+        const authority = @import("company_authority.zig");
+        if (!self.company_operation_held or !authority.safeIdentity(grant.actor) or !authority.safeIdentity(grant.id) or !fossil_manifest.validHash(revision_id) or offset > 1000000 or limit == 0 or limit > 33) return error.InvalidCompanyViewIndex;
+        const query = try self.alloc.print(
+            \\SELECT json_object('filename',filename,'id',json_extract(content(uuid),'$.id'),
+            \\'actor',json_extract(content(uuid),'$.actor'),'grant',json_extract(content(uuid),'$.grant'),
+            \\'task',json_extract(content(uuid),'$.task'),'base',json_extract(content(uuid),'$.base'),
+            \\'scope',json_extract(content(uuid),'$.scope'),'created_at_ms',json_extract(content(uuid),'$.created_at_ms')) AS entry
+            \\FROM files_of_checkin('{s}') WHERE filename GLOB 'company/views/*.json'
+            \\AND json_extract(content(uuid),'$.actor')='{s}' AND json_extract(content(uuid),'$.grant')='{s}'
+            \\ORDER BY coalesce(json_extract(content(uuid),'$.created_at_ms'),0) DESC,filename LIMIT {d} OFFSET {d};
+        , .{ revision_id, grant.actor, grant.id, limit, offset });
+        // Ignore ambient sqlite startup files. The native statement is the
+        // only input and the repository is opened read-only.
+        return self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query });
+    }
+
     fn taskPath(self: Manager, id: []const u8) ![]const u8 {
         if (!safeId(id)) return error.InvalidTaskId;
         return self.alloc.print("tasks/{s}.json", .{id});

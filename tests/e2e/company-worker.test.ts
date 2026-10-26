@@ -827,6 +827,50 @@ test("external completion planning spends the existing review allowance and reta
   } finally { client?.close(); service.child.kill(); await service.child.exited; }
 }, 120000);
 
+test("company view discovery isolates actor and grant and pins membership while new chats arrive", async () => {
+  const f = fixture(), inference = model(f, () => { throw Error("Task discovery must never invoke an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const file = join(f.home, "views-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  let revision = (await admin({ action: "initialize" })).revision;
+  const actions = ["create_view", "status"];
+  const subjects = [{ actor: "alice", grant: "own", key: "own" }, { actor: "alice", grant: "other-grant", key: "own" }, { actor: "bob", grant: "other-actor", key: "bob" }];
+  const keys = new Map();
+  for (const handle of ["own", "bob"]) { const keyed = await f.run(["fossil", "company-key", handle, "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const parsed = JSON.parse(keyed.stdout); keys.set(handle, (parsed.model_data ?? parsed).public_key); }
+  for (const subject of subjects) revision = (await admin({ action: "grant", revision, grant: { id: subject.grant, actor: subject.actor, public_key: keys.get(subject.key), paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } })).revision;
+  const service = await startWorkspaceService(f, true), clients: any[] = []; let bound;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.owned_views).toBe(true);
+    const configs: string[] = [];
+    for (const subject of subjects) {
+      const config = join(f.home, `${subject.grant}-views.json`); configs.push(config);
+      writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: subject.actor, grant: subject.grant, key_handle: subject.key, actions }), { mode: 0o600 }); clients.push(await createCompanyClient(config, { home: f.home }));
+    }
+    const call = async (index, input, success = true) => {
+      const result = await clients[index].call("company_workspace", { version: "omos.company/v1", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input });
+      const detail = JSON.stringify(result) + (result.isError && success && existsSync(f.env.FX_TRACE_LOG) ? "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-8000) : "");
+      if (success) expect(result.isError, detail).not.toBe(true); else expect(result.isError, detail).toBe(true);
+      return success ? JSON.parse(result.content[0].text) : result;
+    };
+    const create = (index, objective) => call(index, { action: "create_view", revision: boot.revision, objective });
+    const first = await create(0, "First own chat"), second = await create(0, "Second own chat"), otherGrant = await create(1, "A private task under another grant"), otherActor = await create(2, "An unrelated participant's confidential goal");
+    const marker = join(f.home, "ambient-sql-startup-ran"); writeFileSync(join(f.home, ".sqliterc"), `.shell touch ${JSON.stringify(marker)}\n`);
+    const request = { action: "status", entity: "omos_workspace_view", limit: 1 };
+    const page = await call(0, request); expect(page.version).toBe("omos.company-views/v1"); expect(page.views.map(row => row.view)).toEqual([second.view]); expect(page.next_offset).toBe(1);
+    expect(page.views[0]).toMatchObject({ task: second.contract.id, objective: "Second own chat", state: "active", published: false }); expect(page.views[0].created_at_ms).toBeGreaterThan(0);
+    expect(JSON.stringify(page)).not.toContain("private task"); expect(JSON.stringify(page)).not.toContain("confidential goal"); expect(existsSync(marker)).toBe(false);
+    const third = await create(0, "A new chat after the membership snapshot");
+    const continuation = await call(0, { ...request, revision: page.index_revision, offset: page.next_offset }); expect(continuation.views.map(row => row.view)).toEqual([first.view]); expect(continuation.next_offset).toBeNull(); expect(continuation.index_revision).toBe(page.index_revision);
+    expect((await call(0, { ...request, limit: 32 })).views.map(row => row.view)).toEqual([third.view, second.view, first.view]);
+    expect((await call(1, request)).views.map(row => row.view)).toEqual([otherGrant.view]); expect((await call(2, request)).views.map(row => row.view)).toEqual([otherActor.view]);
+    await call(0, { ...request, limit: 33 }, false); await call(0, { ...request, entity: "omos_task" }, false); await call(0, { ...request, revision: otherActor.revision }, false);
+    bound = await createCompanyClient(configs[0], { home: f.home, binding: { view: first.view, execution: { runtime: "bound", generation: 1 }, expiresMs: Date.now() + 120000, actions: ["status"] } });
+    expect((await bound.call("company_workspace", { version: "omos.company/v1", ...request, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 })).isError).toBe(true);
+    revision = (await admin({ action: "status" })).revision; await admin({ action: "revoke", revision, id: "own" }); await call(0, request, false);
+    expect((await call(1, request)).views.map(row => row.view)).toEqual([otherGrant.view]); expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { bound?.close(); clients.forEach(client => client.close()); service.child.kill(); await service.child.exited; }
+}, 240000);
+
 test("company worker jobs checkpoint dispatch, fence replacement owners and survive portable recovery", async () => {
   const f = fixture();
   let reviews = 0;

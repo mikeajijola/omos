@@ -503,6 +503,17 @@ current declaration; existing installations must update their contracts first.
 
 ## Scoped company service
 
+Signed `status` with `entity: "omos_workspace_view"` lists only views owned by
+the authenticated actor and grant. Check `features.owned_views` before using
+this operation. Pages contain at most 32 bounded task headers, including the
+current task revision, contract version, review state, and verified publication
+status. They omit evidence bodies and other actors' objectives. Carry the
+returned `index_revision` and `next_offset` into the next request to preserve
+page membership while new views are created. Task status can advance between
+pages. Every request rechecks live authority; a saved page position does not
+preserve access after revocation. The index is derived from Fossil manifests
+and does not introduce another task database.
+
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,
