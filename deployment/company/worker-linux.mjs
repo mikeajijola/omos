@@ -152,7 +152,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
             try {
               await fs.writeFile(file, JSON.stringify({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id }), { flag: "wx", mode: 0o400 });
               await fs.chown(file, prepared.uid, prepared.uid);
-              const result = await run(prepared.root, ["workspace", "--request-file", "/workspace/" + name, "--json"], signal);
+              const result = await run(prepared.root, ["fossil", "request", "/workspace/" + name, "--json"], signal);
               if (result.code !== 0) fail("WorkerSnapshotUnavailable");
               head = JSON.parse(result.stdout);
             } finally { await fs.rm(file, { force: true }); }
