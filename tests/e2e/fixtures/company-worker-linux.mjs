@@ -3,6 +3,7 @@ import { runWorkerServer } from "../../../deployment/company/worker-server.mjs";
 import { createWorkerHttpControl, createDesiredHttpControl } from "../../../deployment/company/worker-http-control.mjs";
 import { createCompanyClient } from "../../../deployment/company/mcp.mjs";
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 
 let control, desired, supervisor, actor;
 let stopping = new AbortController();
@@ -16,7 +17,7 @@ try {
   const deadline = Date.now() + 360000;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
-  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false;
+  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, partialOffset = 0;
   for (;;) {
     if (serverError) throw serverError;
     if (!requested) {
@@ -32,7 +33,7 @@ try {
       requested = true;
     }
     const result = await control.call({ change: "inspect", view: settings.view });
-    if (!result.ok || result.jobs.length > 1) throw new Error("FixtureJobInspectionFailed");
+    if (!result.ok || result.jobs.length > 1) throw Object.assign(new Error("FixtureJobInspectionFailed"), { controlCode: result.error });
     if (settings.desiredPolicy && result.jobs.length === 0) {
       if (Date.now() >= deadline) throw new Error("FixtureDesiredTaskUnavailable");
       await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
@@ -53,6 +54,23 @@ try {
       if (question) {
         await invoke({ action: "execute_task", view: settings.view, revision: selected.view_revision, execution: { runtime: selected.record.runtime, generation: selected.record.generation }, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: question.offset, request_id: question.data.request_id, answers: ["Brief"] }) });
         inputAnswered = true;
+      }
+    }
+    if (settings.partialRecovery && !interrupted && selected.record.checkpoint?.phase === "running") {
+      actor ??= await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
+      const result = await actor.call("company_workspace", { version: "omos.company/v1", action: "status", view: settings.view, entity: "omos_company_activity", record_id: String(selected.record.generation), offset: partialOffset, limit: 2, operation: randomUUID(), expires_ms: Date.now() + 120000 });
+      if (result.isError) throw new Error("FixturePartialActivityUnavailable");
+      const page = JSON.parse(result.content[0].text);
+      partialOffset = page.resume_offset;
+      if (page.events.some(event => event.data.type === "tool_start" && event.data.name === "shell")) {
+        const saved = selected.record.checkpoint;
+        const request = { version: "omos.worker-image-request/v1", action: "quiesce", id: saved.image, workspace: selected.record.binding.workspace, view: settings.view, generation: saved.generation, max_runtime_ms: selected.record.max_runtime_ms, model: saved.model, source_revision: saved.source_revision };
+        const killed = await new Promise((resolve, reject) => {
+          const child = spawn("/usr/bin/python3", ["-I", settings.backend.imageTool, settings.backend.imageConfiguration], { stdio: ["pipe", "ignore", "ignore"] });
+          child.once("error", reject); child.once("close", resolve); child.stdin.end(JSON.stringify(request));
+        });
+        if (killed !== 0) throw new Error("FixturePartialInterruptionFailed");
+        interrupted = true;
       }
     }
     if (settings.desiredPolicy) {
@@ -105,7 +123,7 @@ try {
   if (serverError) throw serverError;
   process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered }));
 } catch (error) {
-  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed" }));
+  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof error.controlCode === "string" && /^[A-Z][A-Za-z0-9]+$/.test(error.controlCode) ? { control_error: error.controlCode } : {}) }));
   process.exitCode = 1;
 } finally {
   stopping.abort();

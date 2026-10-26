@@ -180,7 +180,10 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     const hash = try contractHash(manager, task);
     if (request.action == .inspect) {
         if (request.event_offset != null or request.delivery != null or request.outcome != null) return error.InvalidCompanyTaskControl;
-        const paths = try records.decode([]const struct { filename: []const u8 }, manager.alloc, try manager.companyInputPaths(task.id, request.execution.generation, revision), .{});
+        const raw = try manager.companyInputPaths(task.id, request.execution.generation, revision);
+        // Fossil's JSON shell emits no bytes for zero rows. An unanswered
+        // question is a valid empty queue, not a malformed control response.
+        const paths = if (std.mem.trim(u8, raw, " \t\r\n").len == 0) &.{} else try records.decode([]const struct { filename: []const u8 }, manager.alloc, raw, .{});
         var rows: std.ArrayList(Record) = .empty;
         for (paths) |item| {
             const row = try records.decode(Record, manager.alloc, try manager.contentAt(item.filename, revision), .{});

@@ -156,7 +156,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       if (!recovering) await mark("prepared");
       const prepared = await image(request, signal);
       if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== checkpoint.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
-      let client, actorClient, broker, complete = false, archiveRetained = false;
+      let client, actorClient, broker, complete = false, archiveRetained = false, unused = false;
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: randomUUID(), expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
@@ -192,7 +192,10 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (checkpoint.phase === "prepared") {
           await startBroker();
           const state = await call("status");
-          if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
+          if (state.publication) {
+            unused = true;
+            return { outcome: "completed", note: "The company task was already published before actor dispatch; the unused prepared image has no actor history." };
+          }
           const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Preserve completed effects and already satisfied criteria. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
           if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
           await mark("running");
@@ -344,13 +347,25 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (broker) await broker.close();
         if (actorClient && actorClient !== client) actorClient.close();
         if (client) client.close();
+        // Publication can finish while the signed submit acknowledgement is
+        // still being read. Cleanup may use the owner's canonical receipt,
+        // but only after this exact image's public archive was acknowledged.
+        if (!complete && archiveRetained) {
+          try {
+            const current = await ownerControl.call({ change: "inspect", view: binding.view });
+            const row = current.ok && current.jobs.length === 1 ? current.jobs[0] : null;
+            complete = row?.record?.binding?.task === binding.task && row.task_state === "accepted" && Boolean(row.publication);
+          } catch {
+            // An unavailable receipt retains the image. Quiescence still runs.
+          }
+        }
         ownerControl.close();
         // Retain an unsuccessful image, including its private Fossil checkpoint,
         // for operator recovery. It consumes the bounded pool until resolved.
         try {
           await image({ ...request, action: "quiesce" });
           if (complete && !archiveRetained) fail("WorkerArchiveRetentionPending");
-          if (complete) await image({ ...request, action: "remove" });
+          if (complete || unused) await image({ ...request, action: "remove" });
         } catch {
           const error = new Error("WorkerCleanupPending"); error.executionUncertain = true;
           throw error;

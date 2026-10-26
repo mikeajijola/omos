@@ -1559,9 +1559,9 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
       expect(body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Brief"))).toBe(true);
       return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
     }
-    // The native UI host is PID 1 only inside the mandatory private namespace.
-    // PID 1 ignores default TERM; KILL creates the required abrupt interruption.
-    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "kill -KILL 1", timeout_ms: 10000 } });
+    // The fixture stops namespace PID 1 from its host after observing this
+    // tool start. Descendants cannot reliably signal namespace init itself.
+    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "sleep 120", timeout_ms: 180000 } });
     if (partialRecovery && count === 3) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("production.txt"));
     if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
@@ -2145,7 +2145,7 @@ for (const interactive of [false, true]) test(`company public activity streams t
     const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.actor_activity).toBe(true);
     const config = join(f.home, "activity-owner.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "activity-user", grant: "activity-owner", key_handle: "activity-owner", actions }), { mode: 0o600 });
     client = await createCompanyClient(config, { home: f.home });
-    const send = async (action: string, rest: object = {}) => { const result = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest }); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const send = async (action: string, rest: object = {}) => { const result = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest }); expect(result.isError, JSON.stringify({ request: { action, ...rest }, response: result })).not.toBe(true); return JSON.parse(result.content[0].text); };
     const view = await send("create_view", { revision: boot.revision, objective: "Retain a company proposal separately from its actor activity." });
     const notStarted = await send("status", { view: view.view, entity: "omos_company_activity", limit: 2 }); expect(notStarted.events).toEqual([]); expect(notStarted.ended).toBe(false);
     const claimed = await send("execution", { view: view.view, revision: view.revision, execution_change: "claim", execution: { runtime: "activity-runtime", generation: 0 }, execution_lease_ms: 300000 });
@@ -2160,11 +2160,15 @@ for (const interactive of [false, true]) test(`company public activity streams t
     }
     control = createActivityHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
     inputControl = interactive ? createInputHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }) : null;
-    let lost = false, appendCalls = 0, inputOffset;
+    let lost = false, appendCalls = 0, inputOffset, inputRequestId, emptyInputObserved = false;
     const inputTransport = inputControl;
     let claimLost = false, inputAckLost = false;
     if (inputControl) inputControl = { close: () => inputTransport.close(), async call(request, signal) {
       const reply = await inputTransport.call(request, signal);
+      if (reply.ok && request.action === "inspect" && reply.commands.length === 0 && !emptyInputObserved) {
+        emptyInputObserved = true;
+        await send("execute_task", { view: view.view, revision: view.revision, execution, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: inputOffset, request_id: inputRequestId, answers: ["Brief"] }) });
+      }
       if (reply.ok && request.action === "claim" && !claimLost) { claimLost = true; return { ok: false, uncertain: true }; }
       if (reply.ok && request.action === "acknowledge" && !inputAckLost) { inputAckLost = true; return { ok: false, uncertain: true }; }
       return reply;
@@ -2176,8 +2180,7 @@ for (const interactive of [false, true]) test(`company public activity streams t
         const index = request.events.findIndex(raw => JSON.parse(raw).type === "input_required");
         if (interactive && reply.ok && index !== -1 && inputOffset === undefined) {
           inputOffset = request.offset + index;
-          const question = JSON.parse(request.events[index]);
-          await send("execute_task", { view: view.view, revision: view.revision, execution, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: inputOffset, request_id: question.request_id, answers: ["Brief"] }) });
+          inputRequestId = JSON.parse(request.events[index]).request_id;
         }
         if (!lost && reply.ok) { lost = true; return { ok: false, uncertain: true }; }
       }
@@ -2189,7 +2192,7 @@ for (const interactive of [false, true]) test(`company public activity streams t
       expect(answered).toBe(true);
       const delivered = await send("status", { view: view.view, entity: "omos_company_task_input", record_id: "1", offset: inputOffset });
       expect(delivered.state).toBe("applied");
-      expect(claimLost).toBe(true); expect(inputAckLost).toBe(true);
+      expect(emptyInputObserved).toBe(true); expect(claimLost).toBe(true); expect(inputAckLost).toBe(true);
       for (const rejected of [
         { execution: { ...execution, generation: execution.generation + 1 }, request_id: 1 },
         { execution, request_id: 999 },
@@ -2258,7 +2261,10 @@ test("company clients recover a closed bootstrap read without replaying a lost m
     const read = await inspect(); expect(read.isError, JSON.stringify(read)).not.toBe(true); expect(reads).toBe(2);
     epoch = 2; const drift = await inspect(); expect(drift.isError).toBe(true); expect(JSON.parse(drift.content[0].text).error).toBe("CompanyOutcomeUnverified"); expect(reads).toBe(2); epoch = 1;
     const changed = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", objective: "Retain an uncertain acknowledgement", revision: "b".repeat(64), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
-    expect(changed.isError).toBe(true); expect(JSON.parse(changed.content[0].text).error).toBe("CompanyOutcomeUnknown");
+    expect(changed.isError).toBe(true);
+    const failure = JSON.parse(changed.content[0].text);
+    expect(failure.error).toBe("CompanyOutcomeUnknown"); expect(failure.failure_stage).toBe("signed_dispatch"); expect(failure.failure_code).toMatch(/^[A-Za-z0-9_]{1,48}$/);
+    expect(changed.content[0].text).not.toContain(config);
     expect(mutations).toBe(1); expect(reads).toBe(3);
   } finally { client.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });

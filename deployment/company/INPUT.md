@@ -30,6 +30,9 @@ identity, execution generation, expiry, and request hash. The owner-only
 `POST /v1/company/controls` endpoint inspects at most eight pending decisions,
 claims a decision with a unique delivery ID, and acknowledges its outcome.
 The worker sends the answer through the existing native `ui-host` input method.
+An unanswered question has an empty decision queue. The worker keeps waiting
+until an authenticated answer arrives, its authority changes, or its deadline
+expires.
 
 Exact claim and acknowledgement retries preserve that delivery ID. A replacement
 process cannot replay a command already marked `dispatching`. A missing native

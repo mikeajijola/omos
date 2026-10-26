@@ -171,8 +171,8 @@ async function call(state, name, args, signal) {
   const request_hash = createHash("sha256").update(payload).digest("hex");
   let envelope;
   try { envelope = await http(state, body, signal); }
-  catch {
-    return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: mutation.has(args.action) ? "CompanyOutcomeUnknown" : "CompanyRequestFailed", operation: args.operation, request_hash, advice: "Inspect status or reconcile this operation before repeating a mutation. No retry was sent." }) }] };
+  catch (error) {
+    return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: mutation.has(args.action) ? "CompanyOutcomeUnknown" : "CompanyRequestFailed", operation: args.operation, request_hash, failure_stage: "signed_dispatch", failure_code: failureCode(error, signal?.aborted, "RequestTransportFailed"), advice: "Inspect status or reconcile this operation before repeating a mutation. No retry was sent." }) }] };
   }
   try {
     if (envelope.issuer !== state.config.issuer || typeof envelope.payload !== "string" || !hex(envelope.signature, 64) || !verify(null, Buffer.from(envelope.payload), state.issuer, Buffer.from(envelope.signature, "hex"))) fail("InvalidCompanyReceipt");
@@ -196,10 +196,15 @@ function tools(state) {
   ];
 }
 
+function failureCode(error, aborted, fallback) {
+  const code = error.cause?.code ?? error.code;
+  return aborted ? "RequestDeadline" : /^CompanyHttp[0-9]{3}$/.test(error.message) ? error.message : typeof code === "string" && /^[A-Z_0-9]{1,48}$/.test(code) ? code : ["SyntaxError", "TypeError", "AbortError"].includes(error.name) ? error.name : fallback;
+}
+
 function publicFailure(error, aborted = false) {
   const allowed = ["UnknownTool", "InvalidArguments", "InvalidOperationOrExpiry", "CompanyIdentityChanged", "CompanyRequestTooLarge", "RequestTooComplex", "InvalidRequestKey", "CompanyClientClosed", "CompanyWorkerScopeDenied", "CompanyWorkerExpired", "CompanyWorkerOperationBudgetExceeded"];
   const known = allowed.includes(error.message);
-  const cause = aborted ? "RequestDeadline" : /^CompanyHttp[0-9]{3}$/.test(error.message) ? error.message : typeof error.cause?.code === "string" && /^[A-Z_0-9]{1,48}$/.test(error.cause.code) ? error.cause.code : ["SyntaxError", "TypeError", "AbortError"].includes(error.name) ? error.name : "RequestPreparationFailed";
+  const cause = failureCode(error, aborted, "RequestPreparationFailed");
   return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: known ? error.message : "CompanyRequestNotAttempted", ...(!known ? { failure_stage: "before_signed_dispatch", failure_code: cause } : {}) }) }] };
 }
 

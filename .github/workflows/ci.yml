@@ -644,10 +644,18 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   e2e_company_workers:
-    name: E2E (company workers)
+    name: E2E (company workers, ${{ matrix.suite }})
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: contracts
+            pattern: '^(?!.*the production company coordinator)'
+          - suite: isolated execution
+            pattern: 'the production company coordinator'
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""
@@ -686,7 +694,9 @@ jobs:
         working-directory: tests/e2e
 
       - name: Require private namespaces and exercise production dispatch
-        run: bun test company-worker.test.ts
+        run: bun test company-worker.test.ts --test-name-pattern "$WORKER_TEST_PATTERN"
+        env:
+          WORKER_TEST_PATTERN: ${{ matrix.pattern }}
         working-directory: tests/e2e
 
   e2e_conformance:
