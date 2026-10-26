@@ -4240,6 +4240,282 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_conversation",
+        "capability": "general_task",
+        "description": "Read the original request, amendments and retained actor answer for an owned company view through hash-verified byte pages at an immutable revision. Actor claims do not establish acceptance.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "status"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "entity": {
+              "const": "omos_company_conversation"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 16777216
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "view": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "entity",
+            "view"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_inventory",
+        "capability": "general_task",
+        "description": "Discover bounded file metadata within an explicitly authorised directory or file selector at an immutable company revision.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.company/v1",
+                "omos.company/v2"
+              ]
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "discover"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "view": {
+              "type": "string"
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_company_inventory_export",
+        "capability": "general_task",
+        "description": "Inspect bounded directory metadata for presentation or export without recording it as actor task input. Requires explicit export_scope authority and full selector coverage.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "enum": [
+                "omos.company/v1",
+                "omos.company/v2"
+              ]
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "export_scope"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            },
+            "view": {
+              "type": "string"
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "path"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
       }
     ],
     "semantic": {

@@ -832,7 +832,7 @@ test("company view discovery isolates actor and grant and pins membership while 
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   const admin = async input => { const file = join(f.home, "views-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
   let revision = (await admin({ action: "initialize" })).revision;
-  const actions = ["create_view", "status"];
+  const actions = ["create_view", "status", "checkpoint", "discover", "read", "export_scope"];
   const subjects = [{ actor: "alice", grant: "own", key: "own" }, { actor: "alice", grant: "other-grant", key: "own" }, { actor: "bob", grant: "other-actor", key: "bob" }];
   const keys = new Map();
   for (const handle of ["own", "bob"]) { const keyed = await f.run(["fossil", "company-key", handle, "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const parsed = JSON.parse(keyed.stdout); keys.set(handle, (parsed.model_data ?? parsed).public_key); }
@@ -861,6 +861,28 @@ test("company view discovery isolates actor and grant and pins membership while 
     const third = await create(0, "A new chat after the membership snapshot");
     const continuation = await call(0, { ...request, revision: page.index_revision, offset: page.next_offset }); expect(continuation.views.map(row => row.view)).toEqual([first.view]); expect(continuation.next_offset).toBeNull(); expect(continuation.index_revision).toBe(page.index_revision);
     expect((await call(0, { ...request, limit: 32 })).views.map(row => row.view)).toEqual([third.view, second.view, first.view]);
+    const transcript = { action: "status", entity: "omos_company_conversation", view: first.view, limit: 32 };
+    const opening = await call(0, transcript), chunks = [Buffer.from(opening.conversation.content, "base64")];
+    const changed = await call(0, { action: "checkpoint", view: first.view, revision: first.revision, path: "documents/team/chat.txt", content: "A later checkpoint", previous_hash: null });
+    expect(changed.revision).not.toBe(opening.revision);
+    const selectedFiles = await call(0, { version: "omos.company/v2", action: "discover", view: first.view, revision: changed.revision, path: "documents/team/chat.txt" });
+    expect(selectedFiles.files.map(file => file.path)).toEqual(["documents/team/chat.txt"]); expect(selectedFiles.total).toBe(1);
+    const beforeInspection = (await admin({ action: "status" })).revision;
+    const inspected = await call(0, { version: "omos.company/v2", action: "export_scope", view: first.view, revision: changed.revision, path: "documents/team/" });
+    expect(inspected.files.map(file => file.path)).toEqual(["documents/team/chat.txt"]); expect(inspected.observation).toBeUndefined();
+    expect((await admin({ action: "status" })).revision).toBe(beforeInspection);
+    const emptyFiles = await call(0, { action: "discover", view: first.view, revision: changed.revision, path: "documents/team/empty/" }); expect(emptyFiles.files).toEqual([]); expect(emptyFiles.total).toBe(0);
+    await call(0, { action: "discover", path: "documents/" }, false); await call(0, { action: "discover", path: "documents/team/../private/" }, false);
+
+    let offset = opening.conversation.next_offset;
+    while (offset !== null) {
+      const page = await call(0, { ...transcript, revision: opening.revision, offset });
+      expect(page.revision).toBe(opening.revision); expect(page.conversation.sha256).toBe(opening.conversation.sha256); expect(page.conversation.offset).toBe(offset);
+      chunks.push(Buffer.from(page.conversation.content, "base64")); offset = page.conversation.next_offset;
+    }
+    const bytes = Buffer.concat(chunks); expect(createHash("sha256").update(bytes).digest("hex")).toBe(opening.conversation.sha256);
+    expect(JSON.parse(bytes.toString("utf8"))).toMatchObject({ version: "omos.company-conversation/v1", original_request: "First own chat", candidate: null, candidate_authority: "actor_claim" });
+    await call(0, { ...transcript, view: otherActor.view }, false); await call(0, { ...transcript, revision: otherActor.revision }, false);
     expect((await call(1, request)).views.map(row => row.view)).toEqual([otherGrant.view]); expect((await call(2, request)).views.map(row => row.view)).toEqual([otherActor.view]);
     await call(0, { ...request, limit: 33 }, false); await call(0, { ...request, entity: "omos_task" }, false); await call(0, { ...request, revision: otherActor.revision }, false);
     bound = await createCompanyClient(configs[0], { home: f.home, binding: { view: first.view, execution: { runtime: "bound", generation: 1 }, expiresMs: Date.now() + 120000, actions: ["status"] } });

@@ -514,6 +514,29 @@ pages. Every request rechecks live authority; a saved page position does not
 preserve access after revocation. The index is derived from Fossil manifests
 and does not introduce another task database.
 
+`features.conversation` advertises a read-only conversation projection. Use
+signed `status` with `entity: "omos_company_conversation"` and an owned `view`
+to retrieve the original request, amendments, and retained answer. The
+`conversation` object contains SHA-256, size, encoding, byte offset, and a next
+position. Requests read at most 16 KiB. Continue with the returned immutable
+`revision`; concurrent checkpoints do not alter those bytes. The answer remains
+an `actor_claim`. Acceptance requires the separate verified publication receipt.
+Other actors' views and unrelated private revisions are rejected.
+
+When `features.scoped_inventory` is true, `discover` accepts a `path` selecting
+one file or an entire directory. The current grant must cover the selector.
+Pagination and metadata inspection budgets apply within that selector, so
+retrieving `ui/` does not hash unrelated company document bodies. The selected
+revision remains pinned and no additional authority is granted.
+
+`features.inventory_export` additionally permits `export_scope` with a directory
+`path`. It returns the same bounded inventory within that directory. This
+requires an explicit export grant covering the entire selector. As with file
+exports, inspection creates no task input dependency or company control commit.
+Presentation clients use this operation and file exports to render an interface;
+actor tools retain their normal tracked reads. A grant for presentation does
+not grant task mutation or hosted execution.
+
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,

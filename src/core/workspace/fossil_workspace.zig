@@ -1650,6 +1650,10 @@ pub const Manager = struct {
         return self.decodeTask(id, try read(self.alloc, try self.localTaskPath(id)));
     }
 
+    pub fn taskAtRevision(self: Manager, id: []const u8, revision_id: []const u8) !Task {
+        return self.decodeTask(id, try self.contentAt(try self.taskPath(id), revision_id));
+    }
+
     fn decodeTask(self: Manager, id: []const u8, bytes: []const u8) !Task {
         const task = try parse(self.alloc, Task, bytes);
         if (!std.mem.eql(u8, task.workspace_id, self.manifest.id) or !std.mem.eql(u8, task.id, id)) return error.WorkspaceBindingMismatch;

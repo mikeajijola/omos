@@ -2,8 +2,8 @@
 
 The worker launcher and Unix broker provide an execution boundary for the
 company coordinator. They do not enroll actors, create grants, or publish
-company state. The gateway still reports `hosted_execution: false` until its
-coordinator is connected to a verified backend. External actors continue to use
+company state. The gateway advertises hosted execution only while a matching
+registered runtime has a live heartbeat. External actors continue to use
 the signed company service.
 
 ## Check the Linux host
@@ -134,8 +134,8 @@ The client expires with its binding, independently of the execution lease
 that the native company service checks on each operation.
 
 The durable job coordinator and image preparer described below use this
-connection. The gateway continues to report `hosted_execution: false` pending
-qualification and gateway integration of the complete backend.
+connection. The runtime registration and heartbeat determine availability;
+each actor still needs an explicit `execute_task` grant to request dispatch.
 
 The broker accepts fixed model and company routes. Model calls map an allowed
 worker model handle to a configured provider model and receive credentials
@@ -477,8 +477,8 @@ collection retains the bounded image and its private Fossil checkpoint for
 operator inspection. Unconfirmed process cleanup leaves the native job fenced
 until recovery or expiry. A frozen company proposal with additional private
 files also retains its image. The host removes an image only after accounting
-for its proposed files. Native `hosted_execution` remains disabled pending
-qualification and gateway integration of the complete backend.
+for its proposed files. Runtime availability and compute authority are checked
+again when a user requests dispatch.
 
 ### Review proposals from external runtimes
 
