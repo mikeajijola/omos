@@ -375,6 +375,21 @@ resumes, or publishes the task.
 
 ### Connect the Linux execution backend
 
+When creating a company view, supply optional `scope` paths to narrow the
+participant's grant for that task. Paths must be exact files or directory
+prefixes already covered by the live grant. The native host commits an
+immutable `omos_company_task_scope` record with the view. Status and worker
+inspection expose the effective paths. Retrieval, discovery, record writes,
+checkpoints, delegated file authority and publication enforce that boundary.
+Starting another task is required to choose a wider scope. Definitions and
+worker arguments cannot widen it. Older views without a task scope keep their
+existing live-grant behavior.
+
+Creation retries recover the existing view instead of recreating it. Later
+input observations, private checkpoints, the original base and the task scope
+remain retained when a creation acknowledgement is lost. New task branches
+also check their requested base while holding the source writer boundary.
+
 `worker-linux.mjs` provides `createLinuxWorkerBackend` for a separate privileged
 operator process. It requires root-owned, hash-pinned launcher and image tools,
 a private image configuration, a private company-client configuration and key

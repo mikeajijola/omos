@@ -179,7 +179,7 @@ async function call(state, name, args, signal) {
 function tools(state) {
   return [
     { name: "company_context", description: "Inspect the configured company's public bootstrap, actor identity, current time, and configured actions. Authority is enforced on signed operations.", inputSchema: { type: "object", properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true } },
-    { name: "company_workspace", description: "Use the native signed company workspace service within this actor's grant. Supply a unique operation ID and expires_ms within five minutes; preserve them when resolving an uncertain outcome. Read bounded pages; edits require a pinned expected revision. Submission queues independent host review and does not mean acceptance.", inputSchema: structuredClone(state.inputSchema), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
+    { name: "company_workspace", description: "Use the native signed company workspace service within this actor's grant. Supply a unique operation ID and expires_ms within five minutes; preserve them when resolving an uncertain outcome. Read bounded pages; edits require a pinned expected revision. When bootstrap advertises task_scopes, create_view can narrow its immutable scope to selected permitted file paths. Submission queues independent host review and does not mean acceptance.", inputSchema: structuredClone(state.inputSchema), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } },
   ];
 }
 
@@ -212,7 +212,7 @@ export async function createCompanyClient(filename, { home, binding } = {}) {
       const result = tools(state);
       if (scope) {
         const schema = result[1].inputSchema;
-        for (const field of ["view", "execution"]) { delete schema.properties[field]; schema.required = schema.required.filter(name => name !== field); }
+        for (const field of ["view", "execution", "scope"]) { delete schema.properties[field]; schema.required = schema.required.filter(name => name !== field); }
         result[1].description += " The host pins the company view and execution generation. Supply neither view nor execution; authority cannot be expanded from this worker.";
       }
       return result;
@@ -227,7 +227,7 @@ export async function createCompanyClient(filename, { home, binding } = {}) {
         if (scope) {
           if (scope.expiresMs <= Date.now()) fail("CompanyWorkerExpired");
           if (name === "company_workspace") {
-            if (!object(args) || Object.hasOwn(args, "view") || Object.hasOwn(args, "execution") || !scope.actions.includes(args.action) || (args.outcome !== undefined && !issued.has(args.outcome))) fail("CompanyWorkerScopeDenied");
+            if (!object(args) || Object.hasOwn(args, "view") || Object.hasOwn(args, "execution") || Object.hasOwn(args, "scope") || !scope.actions.includes(args.action) || (args.outcome !== undefined && !issued.has(args.outcome))) fail("CompanyWorkerScopeDenied");
             if (mutation.has(args.action) && issued.size >= 1024 && !issued.has(args.operation)) fail("CompanyWorkerOperationBudgetExceeded");
             args = { ...structuredClone(args), view: scope.view, execution: scope.execution };
             if (mutation.has(args.action) && identity(args.operation)) issued.add(args.operation);

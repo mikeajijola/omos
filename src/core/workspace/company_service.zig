@@ -11,6 +11,7 @@ const fossil_manifest = @import("fossil_manifest.zig");
 const read_dependencies = @import("company_reads.zig");
 const uploads = @import("company_upload.zig");
 const ownership = @import("company_execution.zig");
+const task_scope = @import("company_task_scope.zig");
 
 pub const progress_stream_limit = 4;
 pub const progress_stream_seconds = 30;
@@ -29,7 +30,7 @@ const Journal = struct {
     receipt: ?[]const u8 = null,
     reconciled_by: ?[]const u8 = null,
 };
-const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, base: []const u8, pending: ?[]const u8 = null, reads: []const read_dependencies.Reference = &.{} };
+const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, base: []const u8, pending: ?[]const u8 = null, reads: []const read_dependencies.Reference = &.{}, scope: ?[]const u8 = null };
 const Submission = struct {
     version: []const u8 = "omos.company-submission/v1",
     task: []const u8,
@@ -74,6 +75,7 @@ fn viewBytes(manager: workspace.Manager, view: View) ![]const u8 {
         if (view.reads.len > 0) return error.CompanyDefinitionUpdateRequired;
         _ = value.object.swapRemove("reads");
     }
+    if (view.scope == null) _ = value.object.swapRemove("scope");
     return encode(manager.alloc, value);
 }
 
@@ -306,7 +308,7 @@ pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_packages = model.field(properties, "capability_selections") != null and model.hasOperation(declaration, "omos_company_capability"), .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .execution_ownership = executionDeclared(declaration), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_packages = model.field(properties, "capability_selections") != null and model.hasOperation(declaration, "omos_company_capability"), .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .task_scopes = task_scope.supported(declaration), .execution_ownership = executionDeclared(declaration), .hosted_execution = false, .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -345,6 +347,9 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
         try model.validateOperation(manager.alloc, declaration, "omos_company_subscription", try parse(manager.alloc, raw), .input);
     }
     var request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
+    if (request.scope != null and request.action != .create_view) return error.UnsupportedCompanyApi;
+    if (request.scope != null and !task_scope.supported(declaration)) return error.CompanyDefinitionUpdateRequired;
+    if (request.action == .create_view and request.view != null) return error.UnsupportedCompanyApi;
     try model.validateOperation(manager.alloc, declaration, "omos_company_operation", try parse(manager.alloc, incoming.payload), .input);
     const grant = try authority.liveGrant(current, request.grant, io.milliTimestamp());
     if (request.action == .execution) {
@@ -402,7 +407,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     if (mutation and retained == null) try saveJournal(manager, path, journal);
     const result = perform(manager, current, grant, request, request_hash, writable) catch |err| {
         if (mutation) {
-            journal.state = if (err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
+            journal.state = if (err == error.InvalidCompanyTaskScope or err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
             journal.failure = @errorName(err);
             journal.receipt = try signed(manager, current, request, request_hash, try encode(manager.alloc, .{ .operation = request.operation, .state = @tagName(journal.state), .failure = journal.failure }));
             try saveJournal(manager, path, journal);
@@ -427,6 +432,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
 fn loadView(manager: workspace.Manager, grant: authority.Grant, id: []const u8) !struct { view: View, task: workspace.Task } {
     if (!authority.safeIdentity(id)) return error.InvalidCompanyIdentity;
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{id})), .{});
+    if (!std.mem.eql(u8, view.id, id)) return error.WorkspaceIdentityMismatch;
     if (!std.mem.eql(u8, view.actor, grant.actor) or !std.mem.eql(u8, view.grant, grant.id)) return error.CompanyAccessDenied;
     return .{ .view = view, .task = try manager.refreshTaskContext(try manager.loadTask(view.task)) };
 }
@@ -493,10 +499,11 @@ fn prepareSubmission(manager: workspace.Manager, view: View, task: workspace.Tas
     return submission;
 }
 
-fn perform(original: workspace.Manager, current: authority.State, grant: authority.Grant, request: authority.Request, operation_hash: []const u8, writable: bool) anyerror![]const u8 {
+fn perform(original: workspace.Manager, current: authority.State, original_grant: authority.Grant, request: authority.Request, operation_hash: []const u8, writable: bool) anyerror![]const u8 {
     var manager = original;
     const alloc = manager.alloc;
-    const selected = if (request.view) |id| try loadView(manager, grant, id) else null;
+    const selected = if (request.view) |id| try loadView(manager, original_grant, id) else null;
+    const grant = if (selected) |view| try task_scope.forView(manager, view.task, original_grant, view.view.id, view.view.scope) else original_grant;
     const revision_id = if (selected) |view| try manager.currentRevision(view.task) else try manager.revision("trunk");
     if (request.action == .reconcile) {
         const id = request.outcome orelse return error.CompanyOutcomeRequired;
@@ -535,23 +542,41 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         return encode(alloc, .{ .operation = id, .request_hash = journal.request_hash, .state = @tagName(journal.state), .result = if (journal.result) |value| try parse(alloc, value) else null });
     }
     if (request.action == .create_view) {
+        if (request.scope) |paths| try task_scope.validatePaths(grant, paths);
         const objective = request.objective orelse return error.MissingCompanyObjective;
         if (objective.len == 0 or objective.len > 16384) return error.InvalidCompanyObjective;
         const id = try workspace.hash(alloc, try encode(alloc, .{ request.actor, request.operation }));
+        const view_path = try alloc.print("company/views/{s}.json", .{id});
+        for (try manager.inventory((try manager.companyRevision()) orelse return error.CompanyNotInitialized)) |entry| if (std.mem.eql(u8, entry, view_path)) {
+            // Lost creation acknowledgements never reset read observations,
+            // execution recovery, the original base, or an accepted task.
+            const retained = try loadView(manager, grant, id);
+            const reference = if (request.scope != null) try task_scope.path(alloc, retained.task.id) else null;
+            if (!equal(retained.view.scope, reference)) return error.CompanyOperationConflict;
+            const effective = try task_scope.forView(manager, retained.task, grant, id, reference);
+            return encode(alloc, .{ .view = id, .revision = try manager.currentRevision(retained.task), .base = retained.view.base, .contract = retained.task.definition, .basis = retained.task.model_basis, .paths = effective.paths });
+        };
         const session = try alloc.print("company-{s}", .{id});
         const project = try std.Io.Dir.path.join(alloc, &.{ manager.root, "company-workers", id });
         const previous = try manager.active(session);
         if (previous == null and (request.revision == null or !std.mem.eql(u8, request.revision.?, revision_id))) return error.WorkspaceRevisionChanged;
         const binding: authority.Binding = .{ .actor = grant.actor, .grant = grant.id };
-        const task = if (previous) |value| try manager.bindCompanyTask(value, binding) else try manager.startCompany(session, project, objective, binding);
-        const view: View = .{ .id = id, .actor = grant.actor, .grant = grant.id, .task = task.id, .base = task.base_revision };
-        _ = try manager.companyWrite(try manager.companyRevision(), &.{.{ .path = try alloc.print("company/views/{s}.json", .{id}), .content = try viewBytes(manager, view) }});
-        return encode(alloc, .{ .view = id, .revision = try manager.currentRevision(task), .base = task.base_revision, .contract = task.definition, .basis = task.model_basis });
+        var starter = manager;
+        starter.expected_revision = request.revision;
+        const task = if (previous) |value| try manager.bindCompanyTask(value, binding) else try starter.startCompany(session, project, objective, binding);
+        const scope_path = if (request.scope != null) try task_scope.path(alloc, task.id) else null;
+        const view: View = .{ .id = id, .actor = grant.actor, .grant = grant.id, .task = task.id, .base = task.base_revision, .scope = scope_path };
+        var files: std.ArrayList(workspace.Manager.CompanyFile) = .empty;
+        try files.append(alloc, .{ .path = view_path, .content = try viewBytes(manager, view) });
+        if (request.scope) |paths| try files.append(alloc, .{ .path = scope_path.?, .content = try encode(alloc, task_scope.Record{ .workspace = manager.manifest.id, .task = task.id, .view = id, .actor = grant.actor, .grant = grant.id, .paths = paths }) });
+        _ = try manager.companyWrite(try manager.companyRevision(), files.items);
+        return encode(alloc, .{ .view = id, .revision = try manager.currentRevision(task), .base = task.base_revision, .contract = task.definition, .basis = task.model_basis, .paths = request.scope orelse grant.paths });
     }
     if (request.action == .delegate) {
         const delegated = request.delegated_grant orelse return error.InvalidCompanyGrant;
         if (delegated.parent == null or !std.mem.eql(u8, delegated.parent.?, grant.id)) return error.CompanyDelegationDenied;
         try authority.validateGrant(current, delegated, io.milliTimestamp());
+        for (delegated.paths) |path| if (!authority.permitsSelector(grant, path)) return error.CompanyDelegationDenied;
         for (current.grants) |existing| if (std.mem.eql(u8, existing.id, delegated.id)) {
             if (!std.mem.eql(u8, try encode(alloc, existing), try encode(alloc, delegated))) return error.CompanyGrantAlreadyExists;
             if (request.delegated_capabilities) |capabilities| {
@@ -588,7 +613,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         }
         const view = selected orelse return error.CompanyViewRequired;
         const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else null;
-        var result = try parse(alloc, try encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .base = view.task.base_revision, .contract = view.task.definition, .basis = view.task.model_basis, .job = job, .execution = try executionRecord(manager, view.view, grant), .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null }));
+        var result = try parse(alloc, try encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .base = view.task.base_revision, .contract = view.task.definition, .basis = view.task.model_basis, .paths = grant.paths, .job = job, .execution = try executionRecord(manager, view.view, grant), .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null }));
         if (request.progress_cursor) |cursor| try result.object.put(alloc, "progress", try @import("company_progress.zig").page(manager, current, grant, view.task, view.view.id, view.view.base, revision_id, cursor, request.limit));
         return encode(alloc, result);
     }
@@ -698,7 +723,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             const basis = (if (selected) |view| view.task.model_basis else try manager.modelBasis(pinned)) orelse return error.WorkspaceMigrationRequired;
             const definition = try manager.loadDeclaration(basis.revision);
             if (!std.mem.eql(u8, basis.definition_hash, definition.hash)) return error.StaleWorkspaceDefinition;
-            const result = try @import("company_capabilities.zig").inspect(manager, current, grant, definition, selector, request.realisation, request.capability_selections, request.offset, request.limit);
+            const result = try @import("company_capabilities.zig").inspect(manager, current, original_grant, definition, selector, request.realisation, request.capability_selections, request.offset, request.limit);
             return encode(alloc, .{ .version = "omos.company-capability/v1", .workspace = current.workspace, .revision = pinned, .definition_revision = basis.revision, .definition_hash = definition.hash, .semantic_version = definition.semantic.version, .scope_filtered = true, .read_tracking = if (selected != null) "model_basis" else "not_recorded", .capability = result.capability, .package = if (result.body) |body| try requestPage(manager, body, request.offset, request.limit) else null, .capabilities = result.capabilities, .total = result.total, .next_offset = result.next_offset });
         };
         if (request.action == .discover) if (request.entity) |selector| {
@@ -713,7 +738,7 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
             const basis = (if (selected) |view| view.task.model_basis else try manager.modelBasis(pinned)) orelse return error.WorkspaceMigrationRequired;
             const definition = try manager.loadDeclaration(basis.revision);
             if (!std.mem.eql(u8, basis.definition_hash, definition.hash)) return error.StaleWorkspaceDefinition;
-            const plan = try @import("company_capabilities.zig").packagePlan(manager, current, grant, definition, request.capability.?, request.realisation, request.capability_selections);
+            const plan = try @import("company_capabilities.zig").packagePlan(manager, current, original_grant, definition, request.capability.?, request.realisation, request.capability_selections);
             if (!plan.declaration_complete) return error.IncompleteCapabilityPackage;
             const inventory = try manager.inventory(pinned);
             for (plan.paths) |selector| {

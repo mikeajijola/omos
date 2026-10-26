@@ -193,7 +193,7 @@ fn optionalContent(manager: workspace.Manager, record_path: []const u8) !?[]cons
     return null;
 }
 
-const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, pending: ?[]const u8 = null };
+const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, pending: ?[]const u8 = null, scope: ?[]const u8 = null };
 const Context = struct { view: View, task: workspace.Task, grant: authority.Grant, binding: Binding, execution: ?ownership.Record, live: bool };
 
 fn context(manager: workspace.Manager, view_id: []const u8) !Context {
@@ -214,7 +214,7 @@ fn context(manager: workspace.Manager, view_id: []const u8) !Context {
         try ownership.validate(record, view_id, task.id, grant);
         break :value record;
     } else null;
-    return .{ .view = view, .task = task, .grant = grant, .live = live, .execution = execution, .binding = .{ .workspace = manager.manifest.id, .view = view_id, .task = task.id, .actor = view.actor, .grant = view.grant, .contract_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })), .definition_sha256 = basis.definition_hash, .policy_sha256 = basis.execution_hash orelse try workspace.hash(manager.alloc, try encode(manager.alloc, basis.execution)) } };
+    return .{ .view = view, .task = task, .grant = try @import("company_task_scope.zig").forView(manager, task, grant, view.id, view.scope), .live = live, .execution = execution, .binding = .{ .workspace = manager.manifest.id, .view = view_id, .task = task.id, .actor = view.actor, .grant = view.grant, .contract_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })), .definition_sha256 = basis.definition_hash, .policy_sha256 = basis.execution_hash orelse try workspace.hash(manager.alloc, try encode(manager.alloc, basis.execution)) } };
 }
 
 fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bool) !std.json.Value {

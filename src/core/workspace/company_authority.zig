@@ -63,6 +63,7 @@ pub const Request = struct {
     capability: ?[]const u8 = null,
     realisation: ?[]const u8 = null,
     capability_selections: ?[]const CapabilitySelection = null,
+    scope: ?[]const []const u8 = null,
     record_id: ?[]const u8 = null,
     progress_cursor: ?[]const u8 = null,
     execution: ?@import("company_execution.zig").Fence = null,
@@ -201,7 +202,7 @@ fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publicatio
     const binding = task.authority orelse return;
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
-    const grant = try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp());
+    const grant = try @import("company_task_scope.zig").forTask(manager, task, try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp()));
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitsAction(grant, if (publication) .submit else .execution)) return error.CompanyAccessDenied;
     if (publication and grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
     for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {

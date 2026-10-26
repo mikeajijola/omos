@@ -930,7 +930,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
         expect(body.messages.some(message => message.role === "tool" && typeof message.content === "string" && message.content.includes("Original projected company document"))).toBe(true);
         return tool("write_file", { path: join(directory, "documents/team/production.txt"), content: "Retained by the isolated native worker and collected by its host." });
       }
-      return tool("shell", { request: { action: "run", command: `rm '${directory}/documents/team/remove.txt'`, timeout_ms: 10000 } });
+      return tool("shell", { request: { action: "run", command: `test ! -e '${directory}/documents/private/nope.txt' && rm '${directory}/documents/team/remove.txt'`, timeout_ms: 10000 } });
     }
     return !answerOnly && !projected && count === 1 ? tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." }) : { content: answer };
   });
@@ -960,7 +960,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
   expect(keyed.code, keyed.stderr).toBe(0);
   const key = JSON.parse(keyed.stdout);
   const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit", "reconcile", "discover"];
-  await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: projected ? ["documents/"] : ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
   let service = await startWorkspaceService(f, true, recovering ? { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" } : {});
   const imageFixture = join(import.meta.dir, "fixtures/company-worker-image.py");
   const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0 }), encoding: "utf8", timeout: 120000 });
@@ -972,7 +972,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
     const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
     client = await createCompanyClient(file, { home: f.home });
-    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
     expect(created.isError, JSON.stringify(created)).not.toBe(true);
     const createdView = JSON.parse(created.content[0].text), view = createdView.view;
     await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
@@ -1120,6 +1120,119 @@ test("portable scope verification accepts every signed short inventory page beyo
     expect(existsSync(join(offline.home, ".fx/omos-workspace.json"))).toBe(false);
   } finally { source.stop(true); }
 }, 180000);
+
+test("company views keep a narrower immutable task scope through discovery, worker dispatch and publication", async () => {
+  const f = fixture(); model(f, () => { throw Error("Task scope checks must never execute an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const file = join(f.home, "scope-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "scope-reader", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "discover", "read", "checkpoint", "submit", "status", "reconcile", "execution", "query", "record", "export_scope", "delegate"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "scope-reader", actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/", "ui/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client, bound;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any; expect(boot.features.task_scopes).toBe(true);
+    const config = join(f.home, "scope-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "scope-reader", key_handle: "scope-reader", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const args = (action: string, rest: object = {}) => ({ version: ["read", "discover", "export_scope"].includes(action) ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest });
+    const send = async (input: object, success = true) => {
+      const result = await client.call("company_workspace", input);
+      if (success) expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      else expect(result.isError, JSON.stringify(result)).toBe(true);
+      return success ? JSON.parse(result.content[0].text) : result;
+    };
+    for (const scope of [["skills/"], ["documents/team/", "documents/team/"]]) await send(args("create_view", { revision: boot.revision, objective: "Reject an invalid task scope", scope }), false);
+    expect(JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks).toHaveLength(0);
+    const creation = args("create_view", { revision: boot.revision, objective: "Retain documents/team/input.txt within this task's selected scope", scope: ["documents/team/"] });
+    const view = await send(creation); expect(view.paths).toEqual(["documents/team/"]); expect((await send(creation)).view).toBe(view.view);
+    const child = { id: "outside-child", actor: "child", public_key: (key.model_data ?? key).public_key, parent: "scope-reader", paths: ["ui/"], actions: ["read"], expires_ms: Date.now() + 180000 };
+    await send(args("delegate", { view: view.view, delegated_grant: child }), false);
+    expect((await send(args("delegate", { view: view.view, delegated_grant: { ...child, id: "inside-child", paths: ["documents/team/input.txt"] } }))).state).toBe("delegated");
+    const queued = (await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view: view.view } })).jobs[0];
+    expect(queued.grant.paths).toEqual(["documents/team/"]);
+    await admin({ action: "workers", worker: { change: "cancel", operation: crypto.randomUUID(), view: view.view, expected_sha256: queued.sha256 } });
+    const execution = { runtime: "scope-client", generation: 1 };
+    await send(args("execution", { view: view.view, revision: view.revision, execution: { ...execution, generation: 0 }, execution_change: "claim", execution_lease_ms: 240000 }));
+    bound = await createCompanyClient(config, { home: f.home, binding: { view: view.view, execution, expiresMs: Date.now() + 210000, actions: ["read", "status", "checkpoint"] } });
+    expect(bound.tools()[1].inputSchema.properties.scope).toBeUndefined();
+    expect(JSON.parse((await bound.call("company_workspace", args("read", { path: "documents/team/input.txt", scope: ["documents/"] }))).content[0].text).error).toBe("CompanyWorkerScopeDenied");
+    const checkpoint = await send(args("checkpoint", { view: view.view, execution, revision: view.revision, path: "documents/team/input.txt", content: "Scoped input." }));
+    for (const path of ["documents/other/input.txt", "ui/outside.css"]) {
+      await send(args("read", { view: view.view, execution, revision: checkpoint.revision, path }), false);
+      await send(args("checkpoint", { view: view.view, execution, revision: checkpoint.revision, path, content: "Do not retain this outside the task scope." }), false);
+      expect((await send(args("read", { revision: boot.revision, path }))).exists).toBe(false);
+    }
+    const discovered = await send(args("discover", { view: view.view, execution, revision: checkpoint.revision }));
+    expect(discovered.files.map(file => file.path)).toEqual(["documents/team/input.txt"]);
+    await send(args("status", { view: view.view, scope: ["documents/"] }), false);
+    expect((await send(args("status", { view: view.view }))).paths).toEqual(["documents/team/"]);
+    const submitted = await send(args("submit", { view: view.view, execution, revision: checkpoint.revision, candidate: "Retained the scoped input document." }));
+    expect(submitted.state).toBe("verification_pending");
+    let accepted;
+    const deadline = Date.now() + 60000;
+    do { accepted = await send(args("status", { view: view.view })); if (!["queued", "running"].includes(accepted.job?.state)) break; await Bun.sleep(30); } while (Date.now() < deadline);
+    expect(accepted.job.state, JSON.stringify(accepted)).toBe("published"); expect(accepted.paths).toEqual(["documents/team/"]);
+    expect(f.fossil("cat", "documents/team/input.txt", "-r", "trunk")).toBe("Scoped input.");
+    const rejected = await send(args("create_view", { revision: accepted.publication.revision, objective: "Keep mutations within documents/team only", scope: ["documents/team/"] }));
+    const tree = join(f.home, "scope-adversarial"); mkdirSync(tree);
+    const fossil = (...args: string[]) => { const result = spawnSync(existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")) ? join(import.meta.dir, "../../zig-out/libexec/fossil") : Bun.which("fossil")!, args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), `task/${rejected.contract.id}`); mkdirSync(join(tree, "ui"), { recursive: true });
+    writeFileSync(join(tree, "ui/forged.css"), "body { color: red; }"); fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Inject an out-of-scope proposal for publication rejection");
+    const changed = await send(args("status", { view: rejected.view }));
+    const refused = await client.call("company_workspace", args("submit", { view: rejected.view, revision: changed.revision, candidate: "Do not accept the forged out-of-scope file." }));
+    if (!refused.isError) {
+      let current; const deadline = Date.now() + 60000;
+      do { current = await send(args("status", { view: rejected.view })); if (!["queued", "running"].includes(current.job?.state)) break; await Bun.sleep(30); } while (Date.now() < deadline);
+      expect(current.publication).toBeNull(); expect(current.job.state).not.toBe("published");
+    }
+    expect(f.fossil("ls", "-r", "trunk")).not.toContain("ui/forged.css"); expect(f.fossil("ls", "-r", `task/${rejected.contract.id}`)).toContain("ui/forged.css");
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally { bound?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 360000);
+
+test("lost scoped view creation acknowledgements preserve later reads, private edits and the original task", async () => {
+  const f = fixture(); expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const file = join(f.home, "scope-recovery-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "scope-recovery", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "read", "checkpoint", "status", "reconcile"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "scope-recovery", actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-view-scoped-committed" }); let client;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "scope-recovery-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "scope-recovery", key_handle: "scope-recovery", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const args = (action: string, rest: object = {}) => ({ version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 240000, ...rest });
+    const send = async (input: object) => { const result = await client.call("company_workspace", input); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const creation = args("create_view", { revision: boot.revision, objective: "Retain the same private task and observations after its creation acknowledgement is lost", scope: ["documents/team/"] });
+    const lost = await client.call("company_workspace", creation); expect(lost.isError).toBe(true);
+    const matched = f.fossil("ls", "-r", "omos-company").match(/^company\/views\/([0-9a-f]+)\.json$/m); expect(matched).not.toBeNull();
+    const id = matched![1], viewPath = `company/views/${id}.json`;
+    const original = JSON.parse(f.fossil("cat", viewPath, "-r", "omos-company"));
+    expect(original.scope).toBe(`authority/task-scopes/${original.task}.json`);
+    const scopeBytes = f.fossil("cat", original.scope, "-r", "omos-company");
+    const state = await send(args("status", { view: id }));
+    expect((await send(args("read", { view: id, revision: state.revision, path: "documents/team/input.txt" }))).read_tracking).toBe("recorded");
+    const changed = await send(args("checkpoint", { view: id, revision: state.revision, path: "documents/team/input.txt", content: "Retained before the creation outcome was reconciled." }));
+    expect((await send(args("read", { view: id, revision: changed.revision, path: "documents/team/input.txt" }))).read_tracking).toBe("recorded");
+    const before = f.fossil("cat", viewPath, "-r", "omos-company"), observed = JSON.parse(before);
+    expect(observed.reads).toHaveLength(1); expect(observed.base).toBe(original.base);
+    const recovered = await send(args("reconcile", { outcome: creation.operation }));
+    expect(recovered.state).toBe("completed"); expect(recovered.result).toMatchObject({ view: id, revision: changed.revision, base: original.base, paths: ["documents/team/"] });
+    expect(f.fossil("cat", viewPath, "-r", "omos-company")).toBe(before);
+    expect(f.fossil("cat", original.scope, "-r", "omos-company")).toBe(scopeBytes);
+    expect(f.fossil("cat", "documents/team/input.txt", "-r", `task/${original.task}`)).toBe("Retained before the creation outcome was reconciled.");
+    const repeated = await send(creation); expect(repeated.view).toBe(id); expect(repeated.contract.id).toBe(original.task);
+    expect(JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).tasks).toHaveLength(1);
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally { client?.close(); service.child.kill(); await service.child.exited; }
+}, 240000);
 
 test("personal tasks retain more than one hundred distinct read dependencies without discarding earlier observations", async () => {
   const f = fixture();
