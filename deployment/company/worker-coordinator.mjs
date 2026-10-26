@@ -3,6 +3,14 @@
 import { randomUUID } from "node:crypto";
 
 const fail = code => { throw new Error(code); };
+const diagnosticCode = value => typeof value === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(value) ? value : "Unknown";
+function failureNote(error) {
+  const cause = typeof error?.message === "string" && /^[A-Z][A-Za-z0-9]{0,95}$/.test(error.message) ? error.message : "IsolatedInvocationFailed";
+  const operation = error?.companyOperation;
+  const details = operation && ["status", "read", "checkpoint", "submit"].includes(operation.action) && typeof operation.operation === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(operation.operation)
+    ? ` action=${operation.action}; operation=${operation.operation}; error=${diagnosticCode(operation.error)}; transport=${diagnosticCode(operation.transport)}.` : "";
+  return `${cause}.${details} Inspect the retained isolated checkpoint before resuming.`;
+}
 const sameOwner = (row, owned) => row?.record?.state === "running" && row.record.runtime === owned.runtime && row.record.generation === owned.generation && row.execution?.runtime === owned.runtime && row.execution.generation === owned.generation;
 
 export function createWorkerCoordinator({ control, backend, concurrency = 1, runtime = randomUUID() }) {
@@ -44,7 +52,7 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
         else if (invocation.planning_required) result = { outcome: "waiting", note: "The retained internal operation was reconciled. Requeue for host planning before starting actor work." };
         else result = await backend.run(structuredClone(invocation), controller.signal);
       }
-      catch (error) { if (error?.executionUncertain) return; const cause = /^[A-Z][A-Za-z0-9]{0,95}$/.test(error?.message) ? error.message : "IsolatedInvocationFailed"; result = { outcome: "failed", note: `${cause}. Inspect the retained isolated checkpoint before resuming.` }; }
+      catch (error) { if (error?.executionUncertain) return; result = { outcome: "failed", note: failureNote(error) }; }
       finally { clearTimeout(timer); }
       // run() must have joined cleanup here. A revoked/cancelled/fenced worker
       // cannot release a newer execution owner or overwrite its job outcome.

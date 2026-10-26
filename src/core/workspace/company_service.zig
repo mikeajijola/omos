@@ -737,11 +737,13 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
             return encode(alloc, .{ .operation = id, .request_hash = journal.request_hash, .state = @tagName(journal.state), .failure = journal.failure, .reconciled_by = journal.reconciled_by, .request = if (journal.request) |value| try requestPage(manager, value, request.offset, request.limit) else null, .receipt = if (journal.receipt) |value| try parse(alloc, value) else null, .result = if (journal.result) |value| try parse(alloc, value) else null });
         }
         if (selected == null) return encode(alloc, .{ .workspace = manager.manifest.id, .actor = grant.actor, .grant = grant.id, .actions = grant.actions, .paths = grant.paths, .expires_ms = grant.expires_ms });
-        const view = selected.?;
-        const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else null;
-        var result = try parse(alloc, try encode(alloc, .{ .view = view.view.id, .revision = revision_id, .state = @tagName(view.task.state), .base = view.task.base_revision, .contract = view.task.definition, .basis = view.task.model_basis, .paths = grant.paths, .job = job, .execution = try executionRecord(manager, view.view, grant), .pending_operation = view.view.pending, .pending_amendment = if (view.view.pending) |pending_operation| try @import("company_amendment.zig").pending(manager, view.task, view.view.id, pending_operation) else false, .pending_verification = if (view.view.pending) |pending_operation| try @import("company_review_resume.zig").pending(manager, view.task, view.view.id, pending_operation) else false, .publication = if (view.task.state == .accepted) try manager.publicationSummary(view.task) else null }));
+        var view = selected.?;
+        const snapshot = try manager.taskStatusSnapshot(view.task.id);
+        view.task = snapshot.task;
+        const job = snapshot.job;
+        var result = try parse(alloc, try encode(alloc, .{ .view = view.view.id, .revision = snapshot.revision, .state = @tagName(view.task.state), .base = view.task.base_revision, .contract = view.task.definition, .basis = view.task.model_basis, .paths = grant.paths, .job = job, .execution = try executionRecord(manager, view.view, grant), .pending_operation = view.view.pending, .pending_amendment = if (view.view.pending) |pending_operation| try @import("company_amendment.zig").pending(manager, view.task, view.view.id, pending_operation) else false, .pending_verification = if (view.view.pending) |pending_operation| try @import("company_review_resume.zig").pending(manager, view.task, view.view.id, pending_operation) else false, .publication = snapshot.publication }));
         try result.object.put(alloc, "hosted_execution", try parse(alloc, try runtimes.taskStatus(manager, grant, view.task, view.view.id)));
-        if (request.progress_cursor) |cursor| try result.object.put(alloc, "progress", try @import("company_progress.zig").page(manager, current, grant, view.task, view.view.id, view.view.base, revision_id, cursor, request.limit));
+        if (request.progress_cursor) |cursor| try result.object.put(alloc, "progress", try @import("company_progress.zig").page(manager, current, grant, view.task, view.view.id, view.view.base, snapshot.revision, cursor, request.limit));
         return encode(alloc, result);
     }
     if (request.action == .execute_task) {

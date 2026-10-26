@@ -93,9 +93,12 @@ pub fn submit(manager: workspace.Manager, original: workspace.Task, grant: autho
     const lease: ?workspace.ExecutionLease = if (saved.review.allocate_budget) (try manager.tryTaskExecutionLease(original.id)) orelse return error.WorkspaceExecutionBusy else null;
     defer if (lease) |held| held.release();
     const task = try manager.refreshTaskContext(try manager.loadTask(original.id));
-    if (!std.mem.eql(u8, saved.contract_sha256, try contractHash(manager, task))) return error.StaleWorkContract;
-    var review = try manager.loadReviewJob(task, task.review_job orelse saved.review.id);
-    if (review.kind != .completion or !std.mem.eql(u8, review.candidate_hash, saved.review.candidate_hash) or review.contract_version != task.definition.version) return error.InvalidCompanyReviewResume;
+    if (saved.review.allocate_budget and !std.mem.eql(u8, saved.contract_sha256, try contractHash(manager, task))) return error.StaleWorkContract;
+    // An observation pins its original review. Completion planning can fill the
+    // task's model basis while it runs; observing that job allocates no budget.
+    const review_id = if (saved.review.allocate_budget) task.review_job orelse saved.review.id else saved.review.id;
+    var review = try manager.loadReviewJob(task, review_id);
+    if (review.kind != .completion or !std.mem.eql(u8, review.candidate_hash, saved.review.candidate_hash) or (saved.review.allocate_budget and review.contract_version != task.definition.version)) return error.InvalidCompanyReviewResume;
     const advanced = !std.mem.eql(u8, review.id, saved.review.id) or review.generation > saved.review.generation or review.budget_epoch > saved.review.budget_epoch;
     if (saved.review.allocate_budget and !advanced and task.state != .accepted and task.state != .publication_pending and task.state != .conflict and review.state != .published) {
         if (review.state != .pending and review.state != .failed) return error.InvalidCompanyReviewResume;

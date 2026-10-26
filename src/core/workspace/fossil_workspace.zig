@@ -1070,6 +1070,20 @@ pub const Manager = struct {
         return self.alloc.print("jobs/{s}.json", .{id});
     }
 
+    pub fn taskStatusSnapshot(self: Manager, id: []const u8) !struct { task: Task, revision: []const u8, job: ?@import("review_job.zig").Job, publication: std.json.Value } {
+        const lease = try self.writerLease();
+        defer lease.release();
+        // Completion planning commits the contract and matching review fence
+        // together. Readers must not combine the previous task with that job.
+        const task = try self.refreshTaskContextLocked(try self.loadTask(id));
+        return .{
+            .task = task,
+            .revision = try self.currentRevision(task),
+            .job = if (task.review_job) |job| try self.loadReviewJob(task, job) else null,
+            .publication = if (task.state == .accepted) try self.publicationSummary(task) else .null,
+        };
+    }
+
     pub fn loadReviewJob(self: Manager, task: Task, id: []const u8) !@import("review_job.zig").Job {
         var value = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(try self.jobPath(id), try self.revision(task.branch)), .{});
         if (task.state == .accepted) {

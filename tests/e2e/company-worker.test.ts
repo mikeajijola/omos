@@ -838,7 +838,7 @@ for (const scenario of ["normal", "interrupted", "reported usage"]) test(`extern
     await send("execution", { view, revision: created.revision, execution: { ...execution, generation: 0 }, execution_change: "claim", execution_lease_ms: 240000 });
     const code = "def add(a, b):\n    return a + b\n";
     const checkpoint = await send("checkpoint", { view, execution, revision: created.revision, path: "documents/team/calculator.py", content: code });
-    const review = async () => { let state; const deadline = Date.now() + 60000; do { state = await send("status", { view }); if (!["queued", "running"].includes(state.job?.state)) return state; await Bun.sleep(50); } while (Date.now() < deadline); throw Error("ExternalProposalReviewDidNotFinish"); };
+    const review = async () => { let state; const deadline = Date.now() + 60000; do { state = await send("status", { view }); if (state.job) expect(state.job.contract_version, JSON.stringify({ revision: state.revision, contract: state.contract.version, review: state.job.contract_version, state: state.job.state })).toBe(state.contract.version); if (!["queued", "running"].includes(state.job?.state)) return state; await Bun.sleep(50); } while (Date.now() < deadline); throw Error("ExternalProposalReviewDidNotFinish"); };
     await send("submit", { view, execution, revision: checkpoint.revision, candidate });
     let held = await review();
     expect(held.basis.capability, JSON.stringify(held)).toBe("coding_task");
@@ -1761,10 +1761,11 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
     if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
-      if (outcome.state === "waiting" && !failingChecks) {
+      if ((outcome.state === "waiting" && !failingChecks) || outcome.state === "failed") {
         const activity = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_activity", view, record_id: String(current.record.generation), offset: 0, limit: 32, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         const page = activity.isError ? null : JSON.parse(activity.content[0].text);
-        throw Error(JSON.stringify({ outcome, checkpoint: current.record.checkpoint, actors: inference.counts().actors, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
+        const operation = current.pending_operation ? await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, outcome: current.pending_operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }) : null;
+        throw Error(JSON.stringify({ outcome, checkpoint: current.record.checkpoint, execution: current.execution, pending_operation: current.pending_operation, operation, actors: inference.counts().actors, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
       }
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
       expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, state: retiring ? "cancelled" : failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, published: !failingChecks && !retiring });
@@ -2777,5 +2778,76 @@ test("worker runtime release confirms a lost stop acknowledgement before replace
     if (unresolved) await expect(runtime.close()).rejects.toThrow("WorkerRuntimeReleasePending");
     else { await runtime.close(); await runtime.close(); }
     expect(stops).toHaveLength(2); expect(stops[0]).toEqual(stops[1]);
+  }
+});
+
+test("company verification observation survives completion planning without allocating another review budget", async () => {
+  const f = fixture();
+  let planning = false, permit = false, releasePlan;
+  const gate = new Promise<void>(resolve => { releasePlan = resolve; });
+  const inference = model(f, () => { throw Error("Observing verification must not dispatch an actor"); }, packet => permit ? "met" : { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map(obligation => ({ id: obligation.id, status: "met", evidence: ["unseen-reference"], note: "This reference must be rejected" })) } }, { plan: async () => { planning = true; await gate; return { capability: "general_task", summary: "Verify the retained report", obligations: [], checks: [] }; } });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const filename = join(f.home, "observation-owner.json"); writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", filename, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "observation-user", "--json"]); expect(keyed.code, keyed.stderr).toBe(0);
+  const key = JSON.parse(keyed.stdout), actions = ["create_view", "execution", "read", "status", "checkpoint", "submit", "execute_task", "reconcile"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "observation-user", actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-review-resume-intent" }), client;
+  const connect = async () => {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "observation-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "observation-user", key_handle: "observation-user", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home }); return boot;
+  };
+  const send = async (action, input = {}) => { const reply = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input }); expect(reply.isError, JSON.stringify(reply)).not.toBe(true); return JSON.parse(reply.content[0].text); };
+  const settle = async view => { const deadline = Date.now() + 180000; do { const state = await send("status", { view }); if (!["queued", "running"].includes(state.job?.state)) return state; await Bun.sleep(100); } while (Date.now() < deadline); throw Error("Observed verification did not settle"); };
+  try {
+    const boot = await connect(); expect(boot.features.hosted_execution).toBe(false);
+    const created = await send("create_view", { revision: boot.revision, objective: "Retain and independently verify the report." });
+    expect(created.basis.capability).toBeNull();
+    const view = created.view, execution = { runtime: "external-observer", generation: 1 };
+    await send("execution", { view, revision: created.revision, execution: { ...execution, generation: 0 }, execution_change: "claim", execution_lease_ms: 300000 });
+    const checkpoint = await send("checkpoint", { view, execution, revision: created.revision, path: "documents/team/report.txt", content: "A retained report observed while completion planning runs." });
+    await send("submit", { view, execution, revision: checkpoint.revision, candidate: "Retained the report for independent verification." });
+    const planningDeadline = Date.now() + 120000;
+    while (!planning && Date.now() < planningDeadline) await Bun.sleep(50);
+    expect(planning).toBe(true);
+    const before = await send("status", { view }); expect(["queued", "running"]).toContain(before.job.state);
+    const operation = crypto.randomUUID();
+    const interrupted = await client.call("company_workspace", { version: "omos.company/v1", action: "execute_task", view, revision: before.revision, operation, expires_ms: Date.now() + 300000 });
+    expect(interrupted.isError).toBe(true);
+    const retained = await send("status", { view }); expect(retained.pending_verification).toBe(true);
+    releasePlan();
+    const planned = await settle(view); expect(planned.basis.capability).toBe("general_task"); expect(planned.basis).not.toEqual(before.basis); expect(["pending", "failed"]).toContain(planned.job.state);
+    await send("execution", { view, revision: planned.revision, execution, execution_change: "release" });
+    client.close(); client = null; service.child.kill(); await service.child.exited;
+    service = await startWorkspaceService(f, true); await connect();
+    const reply = await client.call("company_workspace", { version: "omos.company/v1", action: "reconcile", view, outcome: operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+    const diagnostic = reply.isError ? await send("status", { view, outcome: operation }) : null;
+    expect(reply.isError, JSON.stringify({ reply, diagnostic })).not.toBe(true);
+    const recovered = JSON.parse(reply.content[0].text); expect(recovered.state).toBe("completed");
+    expect(recovered.result.verification.id).toBe(before.job.id); expect(recovered.result.verification.budget_epoch).toBe(before.job.budget_epoch);
+    expect((await send("reconcile", { view, outcome: operation })).result).toEqual(recovered.result);
+    const observed = await send("status", { view }); expect(observed.job.budget_epoch).toBe(before.job.budget_epoch); expect(observed.publication).toBeNull();
+    permit = true;
+    await send("execute_task", { view, revision: observed.revision });
+    const accepted = await settle(view); expect(accepted.state).toBe("accepted"); expect(accepted.publication).not.toBeNull(); expect(accepted.job.candidate_hash).toBe(before.job.candidate_hash);
+    expect(inference.counts().actors).toBe(0); expect(accepted.hosted_execution.job).toBeNull();
+    expect(f.fossil("cat", "documents/team/report.txt", "-r", "trunk")).toBe("A retained report observed while completion planning runs.");
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally { releasePlan(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 600000);
+
+
+test("worker failure notes retain bounded operation diagnostics without replaying requests", async () => {
+  for (const unsafe of [false, true]) {
+    let runs = 0, note;
+    const row = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Retain work", basis: {}, grant: {}, execution: null, record: { state: "queued", binding: { view: "view" }, generation: 0, max_runtime_ms: 10000, expires_ms: 0 } };
+    const control = { async call(request) {
+      if (request.change === "claim") { row.record = { ...row.record, state: "running", runtime: request.execution.runtime, generation: 1, expires_ms: Date.now() + 20000 }; row.execution = { runtime: request.execution.runtime, generation: 1 }; }
+      if (request.change === "finish") { note = request.note; row.record.state = request.outcome; }
+      return { ok: true, jobs: [structuredClone(row)], next_offset: null };
+    } };
+    const coordinator = createWorkerCoordinator({ control, backend: { async run() { runs++; throw Object.assign(Error("WorkerCompanyOutcomeUnresolved"), { companyOperation: { action: "submit", operation: "retained-operation", error: unsafe ? "private secret\n" : "CompanyOutcomeUnknown", transport: unsafe ? "/private/credential" : "CompanyHttp409" } }); } } });
+    try { await coordinator.tick(); await coordinator.drain(); expect(runs).toBe(1); expect(note).toContain("action=submit; operation=retained-operation"); expect(note).toContain(unsafe ? "error=Unknown; transport=Unknown" : "error=CompanyOutcomeUnknown; transport=CompanyHttp409"); expect(note).not.toContain("private"); expect(note.length).toBeLessThanOrEqual(512); } finally { await coordinator.close(); }
   }
 });

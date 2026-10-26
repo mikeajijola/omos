@@ -270,8 +270,13 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       let client, actorClient, broker, complete = false, archiveRetained = false, unused = false;
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
-        const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: randomUUID(), expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
-        if (result.isError) fail("WorkerCompanyOutcomeUnresolved");
+        const operation = randomUUID();
+        const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation, expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
+        if (result.isError) {
+          let failure;
+          try { failure = JSON.parse(result.content?.[0]?.text); } catch { failure = {}; }
+          throw Object.assign(new Error("WorkerCompanyOutcomeUnresolved"), { companyOperation: { action, operation, error: failure?.error, transport: failure?.failure_code } });
+        }
         return JSON.parse(result.content[0].text);
       };
       const invoke = async (text, session) => {
