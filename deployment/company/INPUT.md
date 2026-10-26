@@ -1,4 +1,4 @@
-# Company task input and cancellation
+# Company task input, updates, and cancellation
 
 Authenticated users can answer a hosted worker's questions or cancel their own
 queued or running task. The service advertises `task_input` only when its signed
@@ -61,6 +61,35 @@ retires the cancelled execution and archives its public history before removing
 its image. Failed archival remains pending and preserves the image. Further work
 after retirement requires a new task.
 
-Task amendments, steering, owner configuration, and browser delegation have
-separate authority and contract requirements. Input decisions cannot change
-acceptance obligations or grant additional permissions.
+## Update a task from chat
+
+When `task_amendments` is advertised, follow-up messages and steering submit a
+signed `execute_task` request with the current task revision and, for running
+work, its current execution fence. Its content contains
+`{"version":"omos.company-task-amend/v1","text":"Use blue instead of red."}`.
+Updates are limited to 16 KiB and require explicit compute and submission
+authority. Hosted actor clients cannot submit these controls. Desired-state tasks
+retain their operator policy: change the accepted desired-capability record
+through a proposal so reconciliation can create the replacement task.
+
+The host first retains an immutable `omos_company_task_amendment` intent. It
+retains the original worker precondition, releases the old execution fence,
+and queues the same company task without
+resetting its invocation allowance. The independent planner revises only
+requirements affected by the authenticated update and retains every unaffected
+obligation. Publication still requires independent assessment of the resulting
+candidate. Completed or permanently retired tasks require new work; an exhausted
+invocation allowance cannot be enlarged through a chat update.
+
+Interruption preserves the intent and any applied amendment. A signed
+reconciliation can finish this internal transition after the old execution
+fence has been released. It verifies the original admitted operation and never
+replays actor tools. The private worker checkpoint pins the company contract
+delivered to its invocation. A stale private answer cannot skip execution of an
+updated contract. Before replacing a private image whose task has already
+become read-only, the host acknowledges its public history and collects its
+files into the company proposal. The replacement image projects that revision,
+so an amendment preserves unaffected work. The old answer is not submitted.
+
+Owner configuration and browser delegation retain their separate authority
+requirements. Input decisions and task updates cannot grant permissions.

@@ -17,7 +17,7 @@ try {
   const deadline = Date.now() + 360000;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
-  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false;
+  let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false, amendedTask = false;
   for (;;) {
     if (serverError) throw serverError;
     if (!requested) {
@@ -33,6 +33,12 @@ try {
       requested = true;
     }
     const result = await control.call({ change: "inspect", view: settings.view });
+    if (!result.ok && result.error === "WorkerControlOutcomeUnknown" && Date.now() < deadline) {
+      // Inspection has no effects. A dropped read cannot establish a worker
+      // failure, and the original fixture deadline still bounds observation.
+      await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
+      continue;
+    }
     if (!result.ok || result.jobs.length > 1) throw Object.assign(new Error("FixtureJobInspectionFailed"), { controlCode: result.error });
     if (settings.desiredPolicy && result.jobs.length === 0) {
       if (Date.now() >= deadline) throw new Error("FixtureDesiredTaskUnavailable");
@@ -54,6 +60,15 @@ try {
       if (question) {
         await invoke({ action: "execute_task", view: settings.view, revision: selected.view_revision, execution: { runtime: selected.record.runtime, generation: selected.record.generation }, content: JSON.stringify({ version: "omos.company-task-control/v1", mode: "input", event_offset: question.offset, request_id: question.data.request_id, answers: ["Brief"] }) });
         inputAnswered = true;
+      }
+    }
+    if (settings.amendment && !amendedTask && selected.record.checkpoint?.phase === "running") {
+      const ready = await (await fetch(settings.actorWaitUrl, { signal: AbortSignal.timeout(5000) })).json();
+      if (ready.ready === true) {
+        actor ??= await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
+        const result = await actor.call("company_workspace", { version: "omos.company/v1", action: "execute_task", view: settings.view, revision: selected.view_revision, execution: { runtime: selected.record.runtime, generation: selected.record.generation }, operation: randomUUID(), expires_ms: Date.now() + 120000, content: JSON.stringify({ version: "omos.company-task-amend/v1", text: "Replace the document with Amended by the authenticated user" }) });
+        if (result.isError || JSON.parse(result.content[0].text).state !== "planning") throw new Error("FixtureAmendmentFailed");
+        amendedTask = true;
       }
     }
     if (settings.partialRecovery && !interrupted && selected.record.checkpoint?.phase === "running") {
@@ -137,7 +152,7 @@ try {
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory, amended_task: amendedTask }));
 } catch (error) {
   const code = error.nativeCode ?? error.controlCode;
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}) }));

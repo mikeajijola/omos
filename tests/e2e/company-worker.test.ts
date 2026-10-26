@@ -9,7 +9,7 @@ import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomB
 import { createReadStream } from "node:fs";
 import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl, createActivityHttpControl, createInputHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
-import { createWorkerSnapshot, selectWorkerRoot } from "../../deployment/company/worker-snapshot.mjs";
+import { createWorkerSnapshot, selectWorkerRoot, selectWorkerSession } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
@@ -50,6 +50,12 @@ function absoluteTarget(socket: string) {
     client.on("error", reject);
   });
 }
+
+test("worker continuation resolves only an exact private session fingerprint", () => {
+  const id = "PrivateSession12", fingerprint = createHash("sha256").update(id).digest("hex");
+  expect(selectWorkerSession([{ id: "unrelated" }, { id }], fingerprint)).toBe(id);
+  for (const sessions of [[], [{ id: fingerprint }], [{ id }, { id }], [{ id: "../" + id }]]) expect(() => selectWorkerSession(sessions, fingerprint)).toThrow("WorkerSessionAmbiguous");
+});
 
 test("worker snapshots retain delegated children under exactly one root", () => {
   const root = { id: "a".repeat(64), parent_task_id: null }, child = { id: "b".repeat(64), parent_task_id: root.id }, grandchild = { id: "c".repeat(64), parent_task_id: child.id };
@@ -181,6 +187,49 @@ test("native managed turns use the Unix worker broker for planning, tools and in
     expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
   } finally { await broker.close(); }
 }, 180000);
+
+test("native worker continuation resolves the private session and preserves effects after a pre-answer interruption", async () => {
+  const f = fixture();
+  let ready: () => void = () => {};
+  const waiting = new Promise<void>(resolve => { ready = resolve; });
+  let resumedHistory = false, child: ReturnType<typeof spawn> | undefined;
+  const inference = model(f, async (body, count, signal) => {
+    if (count === 1) return writeMemory("Retained before interruption.");
+    if (count === 2) {
+      ready();
+      await new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+        const timer = setTimeout(done, 120000);
+        signal?.addEventListener("abort", done, { once: true });
+        if (signal?.aborted) done();
+      });
+    }
+    if (count === 3) {
+      expect(body.messages.some(message => message.role === "system" && JSON.stringify(message.content).includes("checkpointedEvidence") && JSON.stringify(message.content).includes("memory/preference.md"))).toBe(true);
+      return { tool_calls: [{ index: 0, id: "inspect-retained-memory", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "memory/preference.md" }) } }] };
+    }
+    if (count === 4) resumedHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Retained before interruption."));
+    return { content: "Preserved the completed memory write." };
+  });
+  const control = { async call(request) { return { ok: true, next_offset: request.action === "inspect" ? 0 : request.offset + request.events.length, ended: false }; } };
+  const launch = () => child = spawn(join(import.meta.dir, "../../zig-out/bin/fx"), ["ui-host", "--stdio"], { cwd: f.cwd, env: { ...process.env, ...f.env }, stdio: ["pipe", "pipe", "pipe"] });
+  try {
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    const interrupted = runWorkerNative({ launch, control, view: "private-fixture", execution: { runtime: "fixture", generation: 1 }, prompt: "Store the checkpoint and finish.", timeout: 120000 }).catch(error => ({ error: error.message }));
+    expect(await Promise.race([waiting.then(() => "waiting"), interrupted])).toBe("waiting");
+    child!.kill("SIGKILL"); expect(await interrupted).toMatchObject({ error: "WorkerNativeInvocationStopped" });
+    const before = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    const sessions = JSON.parse((await f.run(["sessions", "--all", "--json"])).stdout);
+    const session = selectWorkerSession(sessions.sessions, before.tasks[0].session);
+    expect(session).not.toBe(before.tasks[0].session);
+    const resumed = await runWorkerNative({ launch, control, view: "private-fixture", execution: { runtime: "fixture", generation: 2 }, prompt: "Continue from the recorded history. Preserve completed work and return the final answer.", session, timeout: 120000 });
+    expect(resumed.code, resumed.stderr).toBe(0); expect(resumed.stderr).toBe(""); expect(resumedHistory).toBe(true); expect(inference.counts().actors).toBe(4);
+    const after = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
+    expect(after.tasks).toHaveLength(1); expect(after.tasks[0].id).toBe(before.tasks[0].id);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Retained before interruption.");
+    expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+  } finally { child?.kill("SIGKILL"); }
+}, 300000);
 
 test("the Linux worker launcher reports required kernel and namespace availability explicitly", () => {
   if (process.platform === "linux" && process.env.OMOS_E2E_REQUIRE_WORKER_NAMESPACES === "1") {
@@ -1539,12 +1588,15 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "retirement", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "retirement" ? "passive public history retention after cancellation" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "retirement", "amendment", "amend_after_answer", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "retirement" ? "passive public history retention after cancellation" : scenario === "amend_after_answer" ? "an authenticated amendment after a private answer while preserving unaffected files" : scenario === "amendment" ? "an authenticated task amendment in the retained native session" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
   const desiredTask = scenario === "desired", inputTask = scenario === "input";
   const partialRecovery = scenario === "partial_recovery" && support.private_namespaces;
   const retiring = scenario === "retirement" && support.private_namespaces;
-  let resumedNativeHistory = false;
+  const amending = ["amendment", "amend_after_answer"].includes(scenario) && support.private_namespaces;
+  const amendAfterAnswer = scenario === "amend_after_answer" && support.private_namespaces;
+  let amendmentAfterAnswerSubmitted = false;
+  let resumedNativeHistory = false, receivedAmendment = false;
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
@@ -1563,7 +1615,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     // Hold a provider response after the first durable tool completed. The
     // host fixture can interrupt the process without relying on shell tools
     // or optional executables inside the deliberately sparse worker image.
-    if ((partialRecovery || retiring) && count === 2) {
+    if ((partialRecovery || retiring || amending && !amendAfterAnswer) && count === 2) {
       await new Promise<void>(resolve => {
         const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
         const timer = setTimeout(done, 120000);
@@ -1572,7 +1624,18 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
       });
       return { content: answer };
     }
-    if (partialRecovery && count === 3) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("production.txt"));
+    if (amending && count === 3) {
+      receivedAmendment = body.messages.some(message => JSON.stringify(message.content).includes("Replace the document with Amended by the authenticated user"));
+      if (amendAfterAnswer) expect(body.messages.some(message => JSON.stringify(message.content).includes("documents/team/summary.txt"))).toBe(true);
+      return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Amended by the authenticated user" });
+    }
+    if (amendAfterAnswer && count === 1) {
+      const document = tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
+      document.tool_calls.push({ index: 1, id: crypto.randomUUID(), type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/team/summary.txt", content: "Preserve this unaffected summary." }) } });
+      return document;
+    }
+    if (partialRecovery && count === 3) return tool("fossil_workspace", { action: "read", path: "documents/team/production.txt" });
+    if (partialRecovery && count === 4) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Retained by the isolated native worker"));
     if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
       const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
@@ -1663,16 +1726,25 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     }
 
     let archiveAcknowledgementLost = false;
-    if (archiveRecovery || retiring || partialRecovery) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (archiveRecovery || retiring || partialRecovery || amending) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
       const target = new URL(request.url).pathname;
       if (request.method === "GET" && target === "/fixture/actor-ready") return Response.json({ ready: inference.counts().actors >= 2 });
       const body = await request.text();
       const reply = await fetch(service.url + target, { method: request.method, headers: { authorization: request.headers.get("authorization")!, "content-type": "application/json" }, body });
       const content = await reply.text();
+      if (amendAfterAnswer && !amendmentAfterAnswerSubmitted && target === "/v1/company/archives" && reply.status === 200 && JSON.parse(content).data?.complete === true) {
+        const stateResult = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+        expect(stateResult.isError, JSON.stringify(stateResult)).not.toBe(true);
+        const state = JSON.parse(stateResult.content[0].text);
+        const updated = await client.call("company_workspace", { version: "omos.company/v1", action: "execute_task", view, revision: state.revision, execution: { runtime: state.execution.runtime, generation: state.execution.generation }, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, content: JSON.stringify({ version: "omos.company-task-amend/v1", text: "Replace the document with Amended by the authenticated user" }) });
+        expect(updated.isError, JSON.stringify(updated)).not.toBe(true);
+        expect(JSON.parse(updated.content[0].text).state).toBe("planning");
+        amendmentAfterAnswerSubmitted = true;
+      }
       if ((archiveRecovery || retiring) && target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
       return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
-    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, retirement: retiring, actorWaitUrl: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}/fixture/actor-ready` : null, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, retirement: retiring, amendment: amending && !amendAfterAnswer, actorWaitUrl: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}/fixture/actor-ready` : null, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1681,8 +1753,13 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
+      if (outcome.state === "waiting" && !failingChecks) {
+        const activity = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_activity", view, record_id: String(current.record.generation), offset: 0, limit: 32, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+        const page = activity.isError ? null : JSON.parse(activity.content[0].text);
+        throw Error(JSON.stringify({ outcome, checkpoint: current.record.checkpoint, actors: inference.counts().actors, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
+      }
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, state: retiring ? "cancelled" : failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, published: !failingChecks && !retiring });
+      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, state: retiring ? "cancelled" : failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, published: !failingChecks && !retiring });
       expect(result.images).toBe(failingChecks ? 1 : 0);
       expect(current.record.checkpoint.phase).toBe(retiring ? "running" : "retained");
       if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
@@ -1693,10 +1770,16 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
         expect(current.record.checkpoint.generation).toBe(1);
         expect(current.record.checkpoint.continuation.invocation).toBe(2);
       }
+      if (amending) {
+        expect(outcome.amended_task).toBe(!amendAfterAnswer); expect(receivedAmendment).toBe(true);
+        if (amendAfterAnswer) { expect(amendmentAfterAnswerSubmitted).toBe(true); expect(f.fossil("cat", "documents/team/summary.txt", "-r", "trunk")).toBe("Preserve this unaffected summary."); }
+        expect(current.amendments).toEqual(["Replace the document with Amended by the authenticated user"]);
+        expect(current.record.checkpoint.company_contract).toBe(current.record.binding.contract_sha256);
+      }
       if (codingRecovery) { expect(outcome.recovered_coding).toBe(true); expect(current.record.checkpoint.generation).toBe(2); }
       const archives = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_archive", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
       expect(archives.isError, JSON.stringify(archives)).not.toBe(true);
-      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery || partialRecovery ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
+      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery || partialRecovery || amending ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
       if (partialRecovery) expect(new Set(archived.map(entry => entry.source.task)).size).toBe(1);
 
       // Public native progress survives worker cleanup and never establishes
@@ -1762,7 +1845,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
         expect(f.fossil("cat", "documents/team/calculator.py", "-r", "trunk")).toContain("return a + b");
         expect(host.packets.at(-1).evidence.some(item => item.id.startsWith("company-validation:"))).toBe(true);
       } else if (answerOnly) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
-      else expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
+      else expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe(amending ? "Amended by the authenticated user" : "Retained by the isolated native worker and collected by its host.");
       if (projected) {
         expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/remove.txt");
         expect(f.fossil("cat", "documents/team/keep.sh", "-r", "trunk")).toBe("#!/bin/sh\nexit 0\n");
@@ -1770,7 +1853,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
         const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
       }
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : partialRecovery || inputTask ? 3 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : inputTask ? 3 : projected || codingRecovery || amending || partialRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); if (answerOnly || desiredTask) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
@@ -2153,6 +2236,8 @@ test("public worker activity filters private fields and preserves Unicode text c
   expect(selected.every(event => Buffer.byteLength(event.text) <= 2048)).toBe(true);
   expect(selected.every(event => Object.keys(event).sort().join(",") === "text,type")).toBe(true);
   expect(publicWorkerEvents({ type: "reasoning", text: "private" })).toEqual([]);
+  expect(publicWorkerEvents({ type: "result", data: { error: "SessionNotFound", provider_state: "private" } })).toEqual([{ type: "error", code: "SessionNotFound" }]);
+  expect(publicWorkerEvents({ type: "result", data: { error: "private provider message" } })).toEqual([{ type: "error", code: "WorkerNativeInvocationFailed" }]);
   expect(publicWorkerEvents({ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", arguments: { credential: "private" } })).toEqual([{ type: "tool_start", call_id: "tool", name: "read_file", path: "documents/team/a", action: null }]);
 });
 
@@ -2504,4 +2589,116 @@ test("worker model broker checks current signed execution before dispatching pro
     generation = 1; allowed = false;
     expect((await local(socket, "/model/v1/chat/completions", request)).status).toBe(403); expect(providerCalls).toBe(1);
   } finally { await broker.close(); provider.stop(true); }
+});
+
+test("company task amendments survive interruption and revise only authenticated affected requirements", async () => {
+  const f = fixture();
+  const inference = model(f, () => { throw Error("Contract revision cannot execute actor tools"); }, undefined, {
+    plan: { capability: "general_task", summary: "Produce the requested report", obligations: [{ id: "colour", description: "Use red for the report." }, { id: "summary", description: "Include the summary." }], checks: [] },
+    revise: packet => {
+      expect(packet.context.pendingAmendments).toEqual(["Use blue instead of red, and keep the summary."]);
+      return { capability: "general_task", summary: "The authenticated user changed the report colour", obligations: [{ id: "colour", description: "Use blue for the report." }], checks: [], superseded: ["colour"] };
+    },
+  });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const file = join(f.home, "amendment-owner.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const key = await f.run(["fossil", "company-key", "amendment-user", "--json"]); expect(key.code, key.stderr).toBe(0);
+  const actions = ["create_view", "read", "status", "checkpoint", "submit", "execute_task", "reconcile"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "amendment-user", actor: "participant", public_key: (JSON.parse(key.stdout).model_data ?? JSON.parse(key.stdout)).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  let service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-amendment-applied" }), client, bound;
+  const connect = async () => {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "amendment-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "amendment-user", key_handle: "amendment-user", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    return { boot, config };
+  };
+  const call = async (action: string, rest: any = {}, success = true) => {
+    const request = { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest };
+    const result = await client.call("company_workspace", request);
+    if (success && action === "create_view" && result.isError && JSON.parse(result.content[0].text).error === "CompanyOutcomeUnknown") {
+      const status = await client.call("company_workspace", { version: "omos.company/v1", action: "status", outcome: request.operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+      expect(status.isError, JSON.stringify({ dispatch: result, inspection: status })).not.toBe(true);
+      const retained = JSON.parse(status.content[0].text);
+      if (retained.state === "completed") return retained.result;
+      const recovered = await client.call("company_workspace", { version: "omos.company/v1", action: "reconcile", outcome: request.operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+      expect(recovered.isError, JSON.stringify({ dispatch: result, retained, reconciliation: recovered })).not.toBe(true);
+      const outcome = JSON.parse(recovered.content[0].text);
+      expect(outcome.state).toBe("completed");
+      return outcome.result;
+    }
+    if (success && result.isError && action === "reconcile") {
+      const diagnostic = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view: rest.view, outcome: rest.outcome, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+      const retained = JSON.parse(diagnostic.content[0].text);
+      throw Error(JSON.stringify({ recovery: result, retained_state: retained.state, retained_failure: retained.failure }));
+    }
+    expect(result.isError === true, JSON.stringify(result)).toBe(!success); return success ? JSON.parse(result.content[0].text) : result; };
+  try {
+    const { boot, config } = await connect(); expect(boot.features.task_amendments).toBe(true);
+    const created = await call("create_view", { revision: boot.revision, objective: "Write a red report and include the summary." });
+    const view = created.view;
+    let row = (await admin({ action: "workers", worker: { change: "queue", view, operation: crypto.randomUUID() } })).jobs[0];
+    const plan = async () => {
+      const deadline = Date.now() + 120000;
+      do {
+        row = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+        if (["failed", "blocked", "changes_required", "pending"].includes(row.planning_state)) throw Error(JSON.stringify({ planning_state: row.planning_state, planning_job: row.planning_job }));
+        if (!["queued", "running"].includes(row.planning_state)) row = (await admin({ action: "workers", worker: { change: "plan", view, operation: crypto.randomUUID(), expected_sha256: row.sha256 } })).jobs[0];
+        if (!row.planning_required) return;
+        await Bun.sleep(50);
+      } while (Date.now() < deadline);
+      throw Error("Amendment fixture planning did not finish");
+    };
+    await plan();
+    const originalContract = structuredClone(row.contract);
+    row = (await admin({ action: "workers", worker: { change: "claim", view, operation: crypto.randomUUID(), expected_sha256: row.sha256, execution: { runtime: "amendment-worker", generation: 0 } } })).jobs[0];
+    const execution = { runtime: row.record.runtime, generation: row.record.generation };
+    bound = await createCompanyClient(config, { home: f.home, binding: { view, execution, expiresMs: Date.now() + 180000, actions: ["read", "status", "checkpoint"] } });
+    const amendment = { version: "omos.company-task-amend/v1", text: "Use blue instead of red, and keep the summary." };
+    const denied = await bound.call("company_workspace", { version: "omos.company/v1", action: "execute_task", revision: row.view_revision, content: JSON.stringify(amendment), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+    expect(denied.isError).toBe(true);
+    const operation = crypto.randomUUID();
+    await call("execute_task", { view, execution, revision: row.view_revision, operation, content: JSON.stringify(amendment) }, false);
+    const retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+    expect(retained.record.state).toBe("queued"); expect(retained.record.invocations).toBe(1); expect(retained.execution.runtime).toBeNull(); expect(retained.pending_operation).toBe(operation);
+    expect(retained.pending_amendment).toBe(true);
+    const blockedFile = join(f.home, "amendment-claim.json");
+    writeFileSync(blockedFile, JSON.stringify({ version: "omos.company-admin/v1", action: "workers", worker: { change: "claim", view, operation: crypto.randomUUID(), expected_sha256: retained.sha256, execution: { runtime: "must-not-spend-invocation", generation: 1 } } }));
+    const blocked = await f.run(["fossil", "company", blockedFile, "--json"]);
+    expect(blocked.code).not.toBe(0); expect(blocked.stderr).toContain("CompanyOperationRecoveryRequired");
+    const old = await bound.call("company_workspace", { version: "omos.company/v1", action: "checkpoint", revision: retained.view_revision, path: "documents/team/stale.txt", content: "Old worker must stop", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }); expect(old.isError).toBe(true);
+    client.close(); client = null; bound.close(); bound = null; service.child.kill(); await service.child.exited;
+    service = await startWorkspaceService(f, true); await connect();
+    const recovered = await call("reconcile", { view, outcome: operation }); expect(recovered.state).toBe("completed"); expect(recovered.result.state).toBe("planning");
+    expect((await call("reconcile", { view, outcome: operation })).result).toEqual(recovered.result);
+    await plan();
+    expect(row.amendments).toEqual([amendment.text]); expect(row.record.invocations).toBe(1); expect(row.record.max_invocations).toBe(3); expect(row.contract.version).toBeGreaterThan(originalContract.version);
+    expect(row.contract.obligations.find(item => item.id === "colour").description).toBe("Use blue for the report.");
+    expect(row.contract.obligations.find(item => item.id === "summary")).toEqual(originalContract.obligations.find(item => item.id === "summary"));
+    expect(row.contract.obligations.find(item => item.id === "request_complete")).toEqual(originalContract.obligations.find(item => item.id === "request_complete"));
+    const next = (await admin({ action: "workers", worker: { change: "claim", view, operation: crypto.randomUUID(), expected_sha256: row.sha256, execution: { runtime: "replacement-worker", generation: 1 } } })).jobs[0];
+    expect(next.record.generation).toBe(2); expect(next.record.invocations).toBe(2); expect(next.record.max_invocations).toBe(3);
+    expect(inference.counts().actors).toBe(0); expect(inference.revisionPackets).toHaveLength(1);
+    expect(f.fossil("ls", "-r", "omos-company")).toContain("company/amendments/");
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { bound?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 360000);
+
+
+test("worker checkpoint acknowledgements compare typed values independently of JSON member order", async () => {
+  const checkpoint = { version: "omos.company-worker-checkpoint/v1", image: "a".repeat(64), company_contract: "b".repeat(64), continuation: { invocation: 2, archive: "c".repeat(64), source: "d".repeat(64) } };
+  let row: any = { authority_live: true, sha256: "e".repeat(64), record: { state: "running", runtime: "owner", generation: 2 } };
+  const control = { async call(input) {
+    if (input.change === "checkpoint") row.record = { ...row.record, operation: input.operation, checkpoint: Object.fromEntries(Object.entries(input.checkpoint).reverse()) };
+    return { ok: true, jobs: [structuredClone(row)] };
+  } };
+  expect(await createWorkerCheckpointer({ control, view: "view", execution: { runtime: "owner", generation: 2 } })(checkpoint)).toEqual(checkpoint);
+});
+
+test("worker coordinator leaves pending user amendments to internal recovery without claiming actor budget", async () => {
+  let claims = 0, runs = 0;
+  const row = { authority_live: true, pending_operation: "update", pending_amendment: true, record: { state: "queued", binding: { view: "view" } } };
+  const control = { async call(request) { if (request.change === "claim") claims++; return { ok: true, jobs: [row], next_offset: null }; } };
+  const coordinator = createWorkerCoordinator({ control, backend: { async recover() {}, async run() { runs++; } } });
+  try { expect((await coordinator.tick()).started).toBe(0); await coordinator.drain(); expect(claims).toBe(0); expect(runs).toBe(0); } finally { await coordinator.close(); }
 });

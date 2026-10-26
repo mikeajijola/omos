@@ -13,6 +13,7 @@ pub const Job = struct {
     kind: enum { completion, planning } = .completion,
     planning_contract_sha256: ?[]const u8 = null,
     planning_definition: ?contract.Definition = null,
+    planning_amendments: ?usize = null,
     workspace_definition_hash: []const u8 = "",
     workspace_definition_revision: []const u8 = "",
     state: enum { queued, running, pending, changes_required, blocked, published, failed, planned } = .queued,

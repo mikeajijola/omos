@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createCompanyClient } from "./mcp.mjs";
 import { createWorkerBroker } from "./worker-broker.mjs";
-import { createWorkerSnapshot, selectWorkerRoot } from "./worker-snapshot.mjs";
+import { createWorkerSnapshot, selectWorkerRoot, selectWorkerSession } from "./worker-snapshot.mjs";
 import { retainWorkerArchive, prepareWorkerExport } from "./worker-archive.mjs";
 import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
 import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl, createInputHttpControl } from "./worker-http-control.mjs";
@@ -104,8 +104,8 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     } catch (error) { if (error.code !== "ENOENT") throw error; }
   };
   const retirementAttempts = new Map();
-  let identity, continuationSupported = false, activitySupported = false, inputSupported = false;
-  return Object.freeze({
+  let identity, continuationSupported = false, amendmentsSupported = false, activitySupported = false, inputSupported = false;
+  const backend = {
     async canRetire(row) {
       const job = row?.record, binding = job?.binding, saved = job?.checkpoint;
       if (!saved || binding?.workspace !== subject.workspace || binding.actor !== subject.actor || binding.grant !== subject.grant || (row.authority_live && (!["cancelled", "completed", "exhausted"].includes(job.state) || (job.state === "exhausted" && row.review_job_id))) || !hex(saved.image)) return false;
@@ -213,6 +213,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (context.isError || !JSON.parse(context.content[0].text).company.features.actor_archives || !JSON.parse(context.content[0].text).company.features.worker_checkpoints) fail("WorkerArchiveContractRequired");
         identity = structuredClone(client.identity);
         continuationSupported = JSON.parse(context.content[0].text).company.features.worker_continuation === true;
+        amendmentsSupported = JSON.parse(context.content[0].text).company.features.task_amendments === true;
         activitySupported = JSON.parse(context.content[0].text).company.features.actor_activity === true;
         inputSupported = JSON.parse(context.content[0].text).company.features.task_input === true;
         return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [], desired_state: Boolean(JSON.parse(context.content[0].text).company.features.desired_state) };
@@ -249,7 +250,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       const ownerControl = createWorkerHttpControl(evaluation);
       const saveCheckpoint = createWorkerCheckpointer({ control: ownerControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation } });
       const recovering = job.checkpoint && job.checkpoint.phase !== "retained";
-      let checkpoint = recovering ? structuredClone(job.checkpoint) : { version: "omos.company-worker-checkpoint/v1", runtime: job.runtime, generation: job.generation, image: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), source_revision: row.view_revision, model: model.handle, phase: "prepared", export_directory: null };
+      let checkpoint = recovering ? structuredClone(job.checkpoint) : { version: "omos.company-worker-checkpoint/v1", runtime: job.runtime, generation: job.generation, image: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), source_revision: row.view_revision, model: model.handle, phase: "prepared", export_directory: null, ...(amendmentsSupported ? { company_contract: binding.contract_sha256 } : {}) };
       const request = { version: "omos.worker-image-request/v1", action: "prepare", id: checkpoint.image, workspace: binding.workspace, view: binding.view, generation: checkpoint.generation, max_runtime_ms: job.max_runtime_ms, model: checkpoint.model, source_revision: checkpoint.source_revision };
       const mark = async (phase, rest = {}) => { checkpoint = await saveCheckpoint({ ...checkpoint, ...rest, phase }); };
       if (!recovering && job.checkpoint) {
@@ -308,7 +309,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           }
           const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Preserve completed effects and already satisfied criteria. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
           if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
-          await mark("running");
+          await mark("running", amendmentsSupported ? { company_contract: binding.contract_sha256 } : {});
           const actor = await invoke(prompt);
           // The launcher joins and kills descendants before returning. Actor
           // answers and private assessments never establish company acceptance.
@@ -363,15 +364,21 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           } finally { archive.close(); }
           const boundedAnswer = typeof claim.data.candidate === "string" && claim.data.candidate.trim() && Buffer.byteLength(claim.data.candidate) <= 32768;
           const priorInvocation = checkpoint.continuation?.invocation ?? 1;
-          if (!frozen && !boundedAnswer && continuationSupported && recovering && job.invocations > priorInvocation) {
+          const amended = amendmentsSupported && checkpoint.company_contract !== binding.contract_sha256;
+          const restartForAmendment = !frozen && amended && ["accepted", "publication_pending", "conflict"].includes(selected.state);
+          if (restartForAmendment && !archiveRetained) fail("WorkerContinuationEvidenceRequired");
+          if (!restartForAmendment && !frozen && (!boundedAnswer || amended) && continuationSupported && recovering && job.invocations > priorInvocation) {
             if (!archiveRetained || !hex(archiveReceipt?.archive_id) || !/^[A-Za-z0-9_-]{1,128}$/.test(selected.session)) fail("WorkerContinuationEvidenceRequired");
             if (checkpoint.model !== model.handle) fail("WorkerRecoveryModelChanged");
+            const sessions = await run(prepared.root, ["sessions", "--all", "--json"], signal);
+            if (sessions.code !== 0) fail("WorkerSessionUnavailable");
+            const session = selectWorkerSession(JSON.parse(sessions.stdout).sessions, selected.session);
             await startBroker();
-            await mark("running", { export_directory: null, continuation: { invocation: job.invocations, archive: archiveReceipt.archive_id, source: head.data.revision } });
+            await mark("running", { export_directory: null, continuation: { invocation: job.invocations, archive: archiveReceipt.archive_id, source: head.data.revision }, ...(amendmentsSupported ? { company_contract: binding.contract_sha256 } : {}) });
             archiveRetained = false;
             const continuationPrompt = "Continue the retained company task from its recorded history and checkpoint. Inspect prior effects and preserve completed work. Do not repeat uncertain external actions. Reconcile the retained work with the current company contract and scope below; return the retained task's final answer without submitting the company proposal.\n" + JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: current.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } });
             if (Buffer.byteLength(continuationPrompt) > 131072) fail("WorkerInvocationContextTooLarge");
-            const resumed = await invoke(continuationPrompt, selected.session);
+            const resumed = await invoke(continuationPrompt, session);
             await image({ ...request, action: "quiesce" });
             signal?.throwIfAborted();
             if (resumed.killed || ![0, 1].includes(resumed.code)) fail("WorkerInvocationFailed");
@@ -435,6 +442,12 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
             current = { ...current, revision: checkpoint.revision };
           }
           if (frozen) { complete = true; return { outcome: current.publication ? "completed" : "submitted" }; }
+          if (restartForAmendment) {
+            // Retain every proposed file before the fresh image projects this
+            // updated company revision. The old answer cannot be submitted.
+            await mark("retained");
+            return { restartForAmendment: true, checkpoint: structuredClone(checkpoint), revision: current.revision };
+          }
           if (typeof claim.data.candidate !== "string" || !claim.data.candidate.trim() || Buffer.byteLength(claim.data.candidate) > 32768) return { outcome: "waiting", note: "Public history is archived, but the private task has no bounded recorded answer. Requeue to continue its retained native session within the remaining invocation budget; an older declaration requires the worker continuation contract." };
           if (coding) {
             const control = createEvaluationHttpControl(evaluation);
@@ -483,5 +496,18 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         }
       }
     },
-  });
+  };
+  return Object.freeze({ ...backend, async run(row, signal) {
+    let current = row;
+    for (let pass = 0; pass < 2; pass++) {
+      const outcome = await backend.run(current, signal);
+      if (!outcome?.restartForAmendment) return outcome;
+      signal?.throwIfAborted();
+      // The old public history was acknowledged before its checkpoint became
+      // retained. The next image uses the same company claim and remaining
+      // coordinator deadline, and starts one actor against the amended contract.
+      current = { ...current, view_revision: outcome.revision, record: { ...current.record, checkpoint: outcome.checkpoint } };
+    }
+    fail("WorkerAmendmentRestartFailed");
+  } });
 }

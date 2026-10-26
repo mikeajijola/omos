@@ -37,6 +37,7 @@ export function publicWorkerEvents(data) {
   if (type === "tool_end") return [{ type, call_id: data.call_id, outcome: typeof data.outcome === "string" ? data.outcome : data.outcome?.kind ?? "completed", text: bounded(data.outcome?.summary) }];
   if (type === "input_required") return [{ type, kind: data.kind, request_id: data.request_id, ...(data.kind === "approval" ? { prompt: data.prompt } : { questions: (data.questions ?? []).map(question => ({ question: question.question, options: (question.options ?? []).map(option => ({ label: option.label, ...(option.description ? { description: option.description } : {}) })) })) }) }];
   if (type === "error") return [{ type, code: /^[A-Z][A-Za-z0-9]{0,95}$/.test(data.code) ? data.code : "WorkerNativeInvocationFailed" }];
+  if (type === "result" && typeof data.data?.error === "string") return [{ type: "error", code: /^[A-Z][A-Za-z0-9]{0,95}$/.test(data.data.error) ? data.data.error : "WorkerNativeInvocationFailed" }];
   if (type === "turn_end") return [{ type, exit_code: data.exit_code }];
   // Session identities, result metadata, private provider data and unsupported
   // events are not copied into company activity. Final text is handled below.

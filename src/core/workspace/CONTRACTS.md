@@ -1287,3 +1287,17 @@ references the immutable retirement record. This operation grants no actor or
 publication authority. The host removes the private image only after receiving a
 complete archive acknowledgement. See
 [Retain history after execution authority ends](../../../deployment/company/WORKERS.md#retain-history-after-execution-authority-ends).
+
+## Company task amendments
+
+`omos_company_task_amend` retains an authenticated update before fencing its
+previous worker. `omos_company_task_amendment` records the immutable intent,
+request hash, previous revision, prior contract pin, and amendment count.
+`omos_company_worker_amend` queues the retained work under its remaining
+invocation allowance. Independent planning records which authenticated
+amendments it applied; unaffected obligations retain their canonical ownership.
+
+`omos_company_worker_contract_checkpoint` pins the company contract delivered
+to a private invocation. These additive operations require a declaration update
+before an existing company enables task amendments. See
+[Update a task from chat](../../../deployment/company/INPUT.md#update-a-task-from-chat).

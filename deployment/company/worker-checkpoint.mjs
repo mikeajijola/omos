@@ -1,6 +1,7 @@
 // The company record is durable before an actor can start. Lost acknowledgements
 // are resolved by operation identity, never by rerunning the actor.
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 export function createWorkerCheckpointer({ control, view, execution }) {
   return async checkpoint => {
@@ -13,7 +14,7 @@ export function createWorkerCheckpointer({ control, view, execution }) {
     catch { reply = { ok: false }; }
     if (!reply.ok) reply = await control.call({ change: "inspect", view });
     const saved = reply.ok && reply.jobs?.length === 1 ? reply.jobs[0] : null;
-    if (saved?.record.operation !== operation || JSON.stringify(saved.record.checkpoint) !== JSON.stringify(checkpoint)) throw new Error("WorkerCheckpointOutcomeUnknown");
+    if (saved?.record.operation !== operation || !isDeepStrictEqual(saved.record.checkpoint, checkpoint)) throw new Error("WorkerCheckpointOutcomeUnknown");
     return saved.record.checkpoint;
   };
 }

@@ -5,7 +5,7 @@ const authority = @import("company_authority.zig");
 const ownership = @import("company_execution.zig");
 
 pub const State = enum { queued, running, waiting, submitted, failed, cancelled, completed, exhausted };
-pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire, checkpoint, retire };
+pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire, checkpoint, retire, amend };
 pub const Outcome = enum { waiting, submitted, failed, completed };
 pub const Checkpoint = struct {
     version: []const u8 = "omos.company-worker-checkpoint/v1",
@@ -17,6 +17,7 @@ pub const Checkpoint = struct {
     phase: enum { prepared, running, stopped, retained },
     export_directory: ?[]const u8 = null,
     continuation: ?Continuation = null,
+    company_contract: ?[]const u8 = null,
     pub const Continuation = struct { invocation: u32, archive: []const u8, source: []const u8 };
     pub fn jsonStringify(self: Checkpoint, writer: *std.json.Stringify) !void {
         try writer.beginObject();
@@ -25,6 +26,11 @@ pub const Checkpoint = struct {
                 if (self.continuation) |continued| {
                     try writer.objectField(name);
                     try writer.write(continued);
+                }
+            } else if (comptime std.mem.eql(u8, name, "company_contract")) {
+                if (self.company_contract) |pinned| {
+                    try writer.objectField(name);
+                    try writer.write(pinned);
                 }
             } else {
                 try writer.objectField(name);
@@ -35,6 +41,9 @@ pub const Checkpoint = struct {
     }
 };
 
+fn sameContract(a: ?[]const u8, b: ?[]const u8) bool {
+    return if (a) |left| if (b) |right| std.mem.eql(u8, left, right) else false else b == null;
+}
 fn sameContinuation(a: ?Checkpoint.Continuation, b: ?Checkpoint.Continuation) bool {
     if (a) |left| return if (b) |right| left.invocation == right.invocation and std.mem.eql(u8, left.archive, right.archive) and std.mem.eql(u8, left.source, right.source) else false;
     return b == null;
@@ -120,6 +129,7 @@ pub fn validate(record: Record) !void {
     if (record.note) |note| if (note.len > 1024 or !std.unicode.utf8ValidateSlice(note)) return error.InvalidCompanyWorkerJob;
     if (record.checkpoint) |saved| {
         if (!std.mem.eql(u8, saved.version, "omos.company-worker-checkpoint/v1") or !authority.safeIdentity(saved.runtime) or saved.generation == 0 or saved.generation > record.generation or saved.model.len == 0 or saved.model.len > 256 or !std.unicode.utf8ValidateSlice(saved.model)) return error.InvalidCompanyWorkerCheckpoint;
+        if (saved.company_contract) |pinned| _ = try authority.hexBytes(32, pinned);
         _ = try authority.hexBytes(32, saved.image);
         if (!@import("fossil_manifest.zig").validHash(saved.source_revision)) return error.InvalidCompanyWorkerCheckpoint;
         if (saved.continuation) |continued| {
@@ -165,6 +175,12 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
         if (previous == null or request.max_invocations != null or request.max_runtime_ms != null) return error.InvalidCompanyWorkerJob;
         switch (request.change) {
             .retire => return error.InvalidCompanyWorkerJob,
+            .amend => {
+                if (request.execution != null or request.outcome != null or next.state == .completed or next.state == .cancelled) return error.InvalidCompanyWorkerJob;
+                if (next.invocations >= next.max_invocations) return error.CompanyWorkerInvocationBudget;
+                next.state = .queued;
+                next.expires_ms = 0;
+            },
             .claim => {
                 if (request.outcome != null or (next.state != .queued and !(next.state == .running and next.expires_ms <= now))) return error.CompanyWorkerNotQueued;
                 if (next.invocations >= next.max_invocations) return error.CompanyWorkerInvocationBudget;
@@ -195,6 +211,7 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
                             if (!std.mem.eql(u8, saved.runtime, prior.runtime) or saved.generation != prior.generation or !std.mem.eql(u8, saved.model, prior.model) or !std.mem.eql(u8, saved.source_revision, prior.source_revision)) return error.InvalidCompanyWorkerCheckpoint;
                             const continues = prior.phase == .stopped and saved.phase == .running and saved.continuation != null and invocation(saved) == next.invocations and invocation(saved) > invocation(prior) and saved.export_directory == null;
                             if (!continues) {
+                                if (!sameContract(saved.company_contract, prior.company_contract) and !(prior.phase == .prepared and saved.phase == .running and prior.generation < next.generation)) return error.InvalidCompanyWorkerCheckpoint;
                                 if (@backingInt(saved.phase) < @backingInt(prior.phase) or !sameContinuation(saved.continuation, prior.continuation)) return error.InvalidCompanyWorkerCheckpoint;
                                 if (prior.export_directory) |directory| if (saved.export_directory == null or !std.mem.eql(u8, directory, saved.export_directory.?)) return error.InvalidCompanyWorkerCheckpoint;
                             }
@@ -378,7 +395,7 @@ fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bo
     const unplanned = current.task.model_basis == null or current.task.model_basis.?.capability == null;
     const planning = if (review != null and review.?.kind == .planning) review else if (supports_planning and (changed_contract or unplanned)) try manager.planningJob(current.task) else null;
     const planning_required = supports_planning and (unplanned or changed_contract or (planning != null and planning.?.state != .planned));
-    const bytes = try encode(manager.alloc, .{ .record = record, .sha256 = try workspace.hash(manager.alloc, raw), .view_revision = try manager.currentRevision(current.task), .task_state = @tagName(current.task.state), .contract = if (details) current.task.definition else null, .request = if (details) try manager.originalRequest(current.task) else null, .amendments = if (details) current.task.amendments else &.{}, .review_job = if (details) review else null, .review_job_id = current.task.review_job, .review_state = if (review) |job| @tagName(job.state) else null, .planning_required = planning_required, .planning_state = if (planning) |job| @tagName(job.state) else null, .planning_job = if (details) planning else null, .basis = if (details) current.task.model_basis else null, .authority_live = current.live, .grant = if (details) current.grant else null, .execution = current.execution, .pending_operation = current.view.pending, .publication = if (current.task.state == .accepted) try manager.publicationSummary(current.task) else null });
+    const bytes = try encode(manager.alloc, .{ .record = record, .sha256 = try workspace.hash(manager.alloc, raw), .view_revision = try manager.currentRevision(current.task), .task_state = @tagName(current.task.state), .contract = if (details) current.task.definition else null, .request = if (details) try manager.originalRequest(current.task) else null, .amendments = if (details) current.task.amendments else &.{}, .review_job = if (details) review else null, .review_job_id = current.task.review_job, .review_state = if (review) |job| @tagName(job.state) else null, .planning_required = planning_required, .planning_state = if (planning) |job| @tagName(job.state) else null, .planning_job = if (details) planning else null, .basis = if (details) current.task.model_basis else null, .authority_live = current.live, .grant = if (details) current.grant else null, .execution = current.execution, .pending_operation = current.view.pending, .pending_amendment = if (current.view.pending) |pending_operation| try @import("company_amendment.zig").pending(manager, current.task, current.view.id, pending_operation) else false, .publication = if (current.task.state == .accepted) try manager.publicationSummary(current.task) else null });
     return std.json.parseFromSliceLeaky(std.json.Value, original.alloc, bytes, .{ .allocate = .alloc_always });
 }
 
@@ -424,6 +441,9 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         if (!std.mem.eql(u8, committed.request_hash, request_hash)) return error.CompanyOperationConflict;
         return encode(manager.alloc, .{ .revision = revision, .jobs = .{try row(manager, committed, retained, true)}, .next_offset = @as(?usize, null), .replayed = true });
     }
+    if (request.change == .claim) if (selected.view.pending) |pending_operation| {
+        if (try @import("company_amendment.zig").pending(manager, selected.task, selected.view.id, pending_operation)) return error.CompanyOperationRecoveryRequired;
+    };
     const previous_raw = try optionalContent(manager, record_path);
     const previous = if (previous_raw) |raw| try records.decode(Record, manager.alloc, raw, .{}) else null;
     if (previous) |record| try validateStored(manager.alloc, record, record_path);
@@ -435,6 +455,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         try manager.validateTaskBasis(selected.task);
         if (!selected.live) return error.CompanyAccessDenied;
         const saved = request.checkpoint orelse return error.InvalidCompanyWorkerCheckpoint;
+        if (saved.company_contract) |pinned| if ((saved.phase == .prepared or saved.phase == .running) and !std.mem.eql(u8, pinned, selected.binding.contract_sha256)) return error.StaleCompanyWorkerContract;
         const expected_image = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ selected.binding.workspace, selected.binding.view, saved.runtime, saved.generation }));
         if (!std.mem.eql(u8, saved.image, expected_image)) return error.InvalidCompanyWorkerCheckpoint;
         if (saved.continuation) |continued| {
@@ -445,7 +466,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
             if (!archived.complete or !std.mem.eql(u8, archived.task, selected.task.id) or !std.mem.eql(u8, archived.view, view_id) or !std.mem.eql(u8, archived.actor, selected.grant.actor) or !std.mem.eql(u8, archived.grant, selected.grant.id) or !std.mem.eql(u8, archived.source.revision, continued.source)) return error.CompanyArchiveRequired;
         }
     }
-    if (request.change == .queue or request.change == .claim or request.change == .renew or request.change == .requeue) {
+    if (request.change == .queue or request.change == .claim or request.change == .renew or request.change == .requeue or request.change == .amend) {
         try authority.authorizeExecution(manager, selected.task);
         try manager.validateTaskBasis(selected.task);
         if (!selected.live or !authority.permitsAction(selected.grant, .submit) or !authority.permitsAction(selected.grant, .status)) return error.CompanyAccessDenied;
@@ -504,7 +525,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     else
         try transition(previous, normalized, transition_binding, id, request_hash, live, now, publication_verified, selected.task.review_job != null);
     record.request = request;
-    if (request.change == .finish or request.change == .cancel or request.change == .complete or request.change == .expire or request.change == .retire) {
+    if (request.change == .finish or request.change == .cancel or request.change == .complete or request.change == .expire or request.change == .retire or request.change == .amend) {
         if (live) |current| if (record.runtime != null and current.runtime != null and record.generation == current.generation and std.mem.eql(u8, record.runtime.?, current.runtime.?)) {
             var released = current;
             released.runtime = null;
@@ -550,6 +571,11 @@ test "company worker jobs retain pauses and require verified server outcomes" {
     job = try transition(job, .{ .change = .claim, .operation = "claim", .execution = fence }, binding, digest, digest, live, 101, false, false);
     try std.testing.expectEqual(State.running, job.state);
     try std.testing.expectEqual(@as(u32, 1), job.invocations);
+    const amended = try transition(job, .{ .change = .amend, .operation = "user-update" }, binding, digest, digest, live, 102, false, false);
+    try std.testing.expectEqual(State.queued, amended.state);
+    try std.testing.expectEqual(job.invocations, amended.invocations);
+    try std.testing.expectEqual(job.max_invocations, amended.max_invocations);
+    try std.testing.expectEqual(@as(i64, 0), amended.expires_ms);
     const finish: Request = .{ .change = .finish, .operation = "finish", .execution = fence, .outcome = .completed };
     try std.testing.expectError(error.WorkspaceVerificationFailed, transition(job, finish, binding, digest, digest, live, 102, false, false));
     try std.testing.expectError(error.CompanySubmissionRequired, transition(job, .{ .change = .finish, .operation = "submit", .execution = fence, .outcome = .submitted }, binding, digest, digest, live, 102, false, false));
