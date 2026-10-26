@@ -11,7 +11,7 @@ try {
   const settings = JSON.parse(await fs.readFile(process.argv[2], "utf8"));
   control = createWorkerHttpControl(settings.control);
   if (settings.desiredPolicy) desired = createDesiredHttpControl(settings.control);
-  let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false;
+  let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false, recoveredCollection = false;
   const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
   supervisor = start();
   if (![360000, 600000].includes(settings.timeoutMs)) throw new Error("FixtureInvocationBudgetInvalid");
@@ -149,6 +149,17 @@ try {
       stopping = new AbortController(); supervisor = start();
       continue;
     }
+    if (settings.timeoutMs === 600000 && !recoveredCollection && selected.record.state === "failed" && selected.record.invocations === 2 && selected.record.max_invocations === 3 && ["stopped", "retained"].includes(selected.record.checkpoint?.phase) && /^(WorkerCompanyOutcomeUnresolved|WorkerInvocationDeadline)\./.test(selected.record.note)) {
+      // Exercise the remaining, already-authorized allowance after a bounded
+      // collection stop. The outer test still requires the original actor call
+      // count, exact file result, archives, validation, and publication receipt.
+      stopping.abort(); await supervisor;
+      const resumed = await control.call({ change: "requeue", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
+      if (!resumed.ok) throw new Error("FixtureCollectionRequeueFailed");
+      recoveredCollection = true;
+      stopping = new AbortController(); supervisor = start();
+      continue;
+    }
     if (selected.record.state === "completed" && selected.publication) {
       // Native publication can finish before the worker reads its submit ACK
       // and joins cleanup. Observe the pool before aborting the supervisor.
@@ -164,7 +175,7 @@ try {
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory, amended_task: amendedTask }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, recovered_collection: recoveredCollection, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory, amended_task: amendedTask }));
 } catch (error) {
   const code = error.nativeCode ?? error.controlCode;
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}) }));
