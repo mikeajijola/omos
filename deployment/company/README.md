@@ -2,8 +2,9 @@
 
 These files deploy the signed company gateway and independent review workers.
 An optional privileged Linux coordinator dispatches retained jobs through the
-private owner API and an isolated native runtime. Its production qualification
-is separate from the gateway; native `hosted_execution` remains disabled.
+private owner API and an isolated native runtime. The gateway advertises
+`hosted_execution` only while a registered, matching runtime has a live
+heartbeat. Each dispatch requires an explicit `execute_task` grant.
 See the supported operations and limits in
 [the workspace contracts](../../src/core/workspace/CONTRACTS.md#scoped-company-service).
 

@@ -3294,13 +3294,13 @@ sys.exit(result.returncode)
 
   test("reviews independent company proposals concurrently and reassesses an advanced accepted base within the same allowance", async () => {
     const f = fixture();
-    let inspecting = 0;
+    let inspecting = 0, plans = 0;
     let release: () => void = () => {};
     const gate = new Promise<void>(resolve => { release = resolve; });
     const gateway = model(f, () => { throw Error("Company review must not execute actors"); }, async () => {
       if (++inspecting <= 2) await gate;
       return "met";
-    });
+    }, { plan: () => { plans++; return { capability: "general_task", summary: "Save the requested document", obligations: [], checks: [] }; } });
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     expect(JSON.parse(f.fossil("cat", "execution/omos.json", "-r", "trunk")).server.review_workers).toBe(2);
     const admin = async (body: object) => {
@@ -3358,7 +3358,10 @@ sys.exit(result.returncode)
       }
       expect(f.fossil("cat", "documents/alpha.md", "-r", "trunk")).toBe("alpha");
       expect(f.fossil("cat", "documents/beta.md", "-r", "trunk")).toBe("beta");
-      expect(statuses.map(status => status.job.review_attempts).sort()).toEqual([1, 2]);
+      expect(statuses.map(status => status.job.review_attempts).sort()).toEqual([2, 3]);
+      // Each proposal spends one call on independent planning. The later
+      // publication spends one additional assessment against the advanced base.
+      expect(plans).toBe(2);
       expect(gateway.counts()).toEqual({ actors: 0, assessments: 3 });
       const bases = statuses.map(status => JSON.parse(status.publication.issuer_proof.payload).target_base);
       // The later publication must evaluate a base containing the earlier
