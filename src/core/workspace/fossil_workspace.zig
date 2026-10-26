@@ -1316,6 +1316,17 @@ pub const Manager = struct {
         return true;
     }
 
+    pub fn syncReviewUsage(self: Manager, task: Task, previous: @import("review_job.zig").Job) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        try self.checkReviewFence(task);
+        var job = try self.loadReviewJob(task, previous.id);
+        const reported = try self.retainedReviewTokens(task, job);
+        if (reported == job.reported_tokens) return;
+        job.reported_tokens = reported;
+        try self.saveReviewJob(task, job);
+    }
+
     fn retainedReviewTokens(self: Manager, task: Task, job: @import("review_job.zig").Job) !u64 {
         var tokens = job.reported_tokens;
         var cursor = try self.historyCursor(task, try self.revision(task.branch));
@@ -1788,7 +1799,10 @@ pub const Manager = struct {
     pub fn refreshTaskContext(self: Manager, previous: Task) !Task {
         const lease = try self.writerLease();
         defer lease.release();
-        return self.refreshTaskContextLocked(previous);
+        // A caller may have read its snapshot before another writer paused,
+        // resumed, or published the task. Reload operational state under this
+        // lease so a status reader cannot restore that stale state.
+        return self.refreshTaskContextLocked(try self.loadTask(previous.id));
     }
 
     fn refreshTaskContextLocked(self: Manager, previous: Task) !Task {
@@ -3858,7 +3872,9 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         var current = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
-        if (current.definition.version != previous.definition.version or current.state != .active) return error.StaleWorkContract;
+        const paused_review = current.state == .paused and current.authority != null and self.review_fence != null;
+        if (current.definition.version != previous.definition.version or (current.state != .active and !paused_review)) return error.StaleWorkContract;
+        try self.checkReviewFence(current);
         if (current.model_basis == null) return error.WorkspaceMigrationRequired;
         const previous_definition = current.definition;
         const planned_amendments = current.planned_amendments;
@@ -3907,7 +3923,16 @@ pub const Manager = struct {
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, plan) })), plan);
         if (self.review_fence) |fence| {
             var job = try self.loadReviewJob(current, fence.job);
-            if (job.kind != .planning or !@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+            const completion = job.kind == .completion and current.authority != null and model.hasOperation(declaration_value, "omos_company_completion_plan") and @import("company_planning.zig").supported(declaration_value);
+            if ((!completion and job.kind != .planning) or !@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+            if (completion) {
+                const answer = (try self.retainedReviewCandidate(previous)) orelse return error.NoRetainedReviewCandidate;
+                if (!std.mem.eql(u8, job.candidate_hash, try hash(self.alloc, answer))) return error.StaleWorkContract;
+                const now = io_mod.milliTimestamp();
+                const carried = try json(self.alloc, .{ .kind = "review_candidate", .task = current.id, .contract_version = current.definition.version, .recorded_at_ms = now, .definition_hash = current.model_basis.?.definition_hash, .definition_revision = current.model_basis.?.revision, .review_job = fence.job, .review_generation = fence.generation, .value = .{ .at_ms = now, .text = answer, .authority = "actor_claim", .carried_from_contract_version = previous.definition.version } });
+                const pending = try json(self.alloc, .{ .kind = "review_failure", .task = current.id, .contract_version = current.definition.version, .recorded_at_ms = now, .review_job = fence.job, .review_generation = fence.generation, .value = .{ .at_ms = now + 1, .reason = "IndependentCompanyReviewRequired", .candidate_retained = true } });
+                for ([_][]const u8{ carried, pending }) |carried_bytes| try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, carried_bytes) })), carried_bytes);
+            }
             // A resumed planner must observe the strengthened contract and its
             // matching fence in the same commit, without repeating the model.
             job.contract_version = current.definition.version;

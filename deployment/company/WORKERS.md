@@ -480,6 +480,28 @@ files also retains its image. The host removes an image only after accounting
 for its proposed files. Native `hosted_execution` remains disabled pending
 qualification and gateway integration of the complete backend.
 
+### Review proposals from external runtimes
+
+New company tasks pin `omos_company_completion_plan` in their declaration.
+When an external runtime submits an unclassified task, the completion worker
+runs the host's read-only planner before assessing the proposal. Hosted tasks
+already planned before actor dispatch keep that plan. Historical declarations
+without this operation retain their original contract adapter.
+
+The host preserves the original request and obligations. Coding classification
+adds the native validation and delivery obligations, so successful preparation
+calls or an actor's answer cannot substitute for current check evidence. The
+planner cannot replace the submitted answer: its exact bytes and hash travel
+with the strengthened contract in the same atomic checkpoint as the review
+fence. Recovery after that checkpoint reuses the retained plan and answer.
+
+Planning shares the completion job's attempt, time, and token allowance. It
+does not allocate another actor invocation or reset the review deadline. A
+live submission grant authorizes this evaluation; actor dispatch still needs
+its separate execution authority. Any required human approval must cover the
+resulting contract and candidate. Planning itself neither accepts nor publishes
+company state.
+
 ### Run isolated coding checks
 
 Coding tasks require the operator's `backend.validationConfiguration` file and

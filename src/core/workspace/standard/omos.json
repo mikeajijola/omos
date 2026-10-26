@@ -4134,6 +4134,42 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_completion_plan",
+        "capability": "general_task",
+        "description": "Independently classify a new company proposal and strengthen its original obligations before completion assessment. The host preserves the exact candidate, shared review budget, and execution fence.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string"
+            },
+            "contract": {
+              "type": "object"
+            },
+            "definition_hash": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task",
+            "contract",
+            "definition_hash"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "agent"
+        ]
       }
     ],
     "semantic": {

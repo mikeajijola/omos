@@ -37,7 +37,7 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -73,10 +73,11 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         delta = actor(body, ++actors);
         if ((delta as any).tool_calls) reason = "tool_calls";
       }
-      const chunks = [
+      const chunks: object[] = [
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta, finish_reason: null }] },
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: reason }] },
       ];
+      if (governance.usage) chunks.push({ id: "fossil-fixture", model: body.model, choices: [], usage: governance.usage });
       return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
     },
   });

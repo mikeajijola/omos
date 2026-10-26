@@ -731,6 +731,102 @@ test("company coding publication requires current owner-observed validation and 
   } finally { evaluator?.close(); control?.close(); client?.close(); service.child.kill(); await service.child.exited; }
 }, 240000);
 
+for (const scenario of ["normal", "interrupted", "reported usage"]) test(`external company coding proposals receive host obligations before completion (${scenario})`, async () => {
+  const interrupted = scenario === "interrupted";
+  const f = fixture(); let plans = 0;
+  const inference = model(f, () => { throw Error("External proposal review must never dispatch an actor"); }, undefined, { plan: packet => {
+    plans++; expect(packet.context.originalRequest).toContain("Implement add"); expect(packet.context.authority.paths).toEqual(["documents/team/"]);
+    return { capability: "coding_task", summary: "Validate the externally prepared addition function", obligations: [], checks: ["Check add(2, 3) == 5 against the proposed source"] };
+  }, ...(scenario === "reported usage" ? { usage: { prompt_tokens: 41, completion_tokens: 9, total_tokens: 50 } } : {}) });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const file = join(f.home, "external-admin.json");
+  const admin = async input => { writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "external", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "external", actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true, interrupted ? { FX_E2E_FOSSIL_FAULT: "company-plan-committed" } : {});
+  let client, evaluator;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const configuration = join(f.home, "external-client.json"); writeFileSync(configuration, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "external", key_handle: "external", actions }), { mode: 0o600 });
+    client = await createCompanyClient(configuration, { home: f.home });
+    const send = async (action, input = {}) => { const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input }); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const created = await send("create_view", { revision: boot.revision, objective: "Implement add(a, b) in documents/team/calculator.py and verify that add(2, 3) returns 5." });
+    const view = created.view, execution = { runtime: "external-runtime", generation: 1 }, candidate = "Implemented add(a, b), with the proposed source retained for independent checks.";
+    expect(created.basis.capability).toBeNull();
+    await send("execution", { view, revision: created.revision, execution: { ...execution, generation: 0 }, execution_change: "claim", execution_lease_ms: 240000 });
+    const code = "def add(a, b):\n    return a + b\n";
+    const checkpoint = await send("checkpoint", { view, execution, revision: created.revision, path: "documents/team/calculator.py", content: code });
+    const review = async () => { let state; const deadline = Date.now() + 60000; do { state = await send("status", { view }); if (!["queued", "running"].includes(state.job?.state)) return state; await Bun.sleep(50); } while (Date.now() < deadline); throw Error("ExternalProposalReviewDidNotFinish"); };
+    await send("submit", { view, execution, revision: checkpoint.revision, candidate });
+    let held = await review();
+    expect(held.basis.capability, JSON.stringify(held)).toBe("coding_task");
+    expect(held.contract.obligations.map(item => item.id)).toEqual(expect.arrayContaining(["request_complete", "coding_validation", "coding_summary"]));
+    expect(held.publication).toBeNull(); expect(plans).toBe(1);
+    if (interrupted) {
+      expect(held.job.state).toBe("failed"); expect(held.job.reason).toBe("WorkspaceInjectedFailure");
+      await send("submit", { view, execution, revision: held.revision, candidate }); held = await review(); expect(plans).toBe(1);
+    }
+    expect(held.job.state, JSON.stringify(held) + (existsSync(f.env.FX_TRACE_LOG) ? "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-10000) : "")).toBe("changes_required");
+    if (scenario === "reported usage") { expect(held.job.reported_tokens).toBeGreaterThanOrEqual(100); expect(held.job.review_attempts).toBe(2); }
+    evaluator = createEvaluationHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    const prepared = await evaluator.call({ version: "omos.company-evaluation/v1", action: "prepare", view, execution, revision: held.revision }); expect(prepared.ok, JSON.stringify(prepared)).toBe(true);
+    const observed = await send("read", { view, execution, revision: prepared.revision, path: "documents/team/calculator.py" });
+    const source = Buffer.from(observed.content, "base64").toString(); expect(source).toBe(code);
+    const arguments_ = ["/usr/bin/python3", "-I", "-c", source + "\nassert add(2, 3) == 5\nprint('external addition passed')"];
+    const checked = spawnSync(arguments_[0], arguments_.slice(1), { encoding: "utf8" }); expect(checked.status, checked.stderr).toBe(0);
+    const receipt = await evaluator.call({ version: "omos.company-evaluation/v1", action: "record", view, execution, revision: prepared.revision, operation: crypto.randomUUID(), source_sha256: prepared.source_sha256, configuration_handle: prepared.configuration_handle, configuration_sha256: "a".repeat(64), environment_sha256: "b".repeat(64), checks: [{ id: "external-addition", arguments: arguments_, cwd: "documents/team", exit_code: checked.status, stdout: checked.stdout, stderr: checked.stderr, output_complete: true, source_unchanged: true }] });
+    expect(receipt.ok, JSON.stringify(receipt)).toBe(true); expect(receipt.passed).toBe(true);
+    await send("submit", { view, execution, revision: receipt.revision, candidate });
+    const accepted = await review(); expect(accepted.state, JSON.stringify(accepted)).toBe("accepted"); expect(accepted.publication).not.toBeNull(); expect(plans).toBe(1);
+    expect(inference.counts().actors).toBe(0); expect(inference.packets.at(-1).evidence.some(item => item.id === receipt.evidence)).toBe(true);
+    expect(JSON.parse(f.fossil("cat", accepted.publication.receipt_path, "-r", accepted.publication.revision)).review.candidate).toBe(candidate);
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { evaluator?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 240000);
+
+test("external completion planning spends the existing review allowance and retains an unaccepted answer when it is exhausted", async () => {
+  const f = fixture(); let plans = 0;
+  const inference = model(f, () => { throw Error("Review allowance must never dispatch an actor"); }, undefined, { plan: () => {
+    plans++; return { capability: "general_task", summary: "Evaluate the retained greeting", obligations: [], checks: [] };
+  } });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const tree = join(f.home, "review-policy"); mkdirSync(tree);
+  const fossil = (...args: string[]) => { const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+  const policy = JSON.parse(readFileSync(join(tree, "execution/omos.json"), "utf8")); policy.review.max_attempts = 1;
+  writeFileSync(join(tree, "execution/omos.json"), JSON.stringify(policy));
+  fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain the one-attempt review policy fixture");
+  const admin = async input => { const file = join(f.home, "review-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "review", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "submit", "status"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "review", actor: "participant", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "review-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "review", key_handle: "review", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const send = async (action, input = {}) => { const result = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input }); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
+    const view = await send("create_view", { revision: boot.revision, objective: "Reply with Hello, team." });
+    const candidate = "Hello, team.";
+    await send("submit", { view: view.view, revision: view.revision, candidate });
+    let status; const deadline = Date.now() + 60000;
+    do { status = await send("status", { view: view.view }); if (!["queued", "running"].includes(status.job?.state)) break; await Bun.sleep(50); } while (Date.now() < deadline);
+    expect(status.job).toMatchObject({ kind: "completion", state: "pending", review_attempts: 1, candidate_hash: createHash("sha256").update(candidate).digest("hex") });
+    expect(status.basis.capability).toBe("general_task"); expect(status.state).toBe("paused"); expect(status.publication).toBeNull();
+    for (let index = 0; index < 3; index++) {
+      const retained = await send("status", { view: view.view });
+      expect(retained).toMatchObject({ state: "paused", revision: status.revision, publication: null, job: { state: "pending", review_attempts: 1 } });
+    }
+    expect(plans).toBe(1); expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+    const response = await service.post({ version: "omos.workspace-api/v1", workspace: boot.workspace, definition_hash: status.basis.definition_hash, revision: status.revision, task: view.contract.id, action: "candidate" }); expect(response.status, await response.clone().text()).toBe(200);
+    expect((await response.json() as any).data).toMatchObject({ candidate, authority: "actor_claim" });
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+  } finally { client?.close(); service.child.kill(); await service.child.exited; }
+}, 120000);
+
 test("company worker jobs checkpoint dispatch, fence replacement owners and survive portable recovery", async () => {
   const f = fixture();
   let reviews = 0;

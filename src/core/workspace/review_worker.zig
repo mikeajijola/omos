@@ -18,7 +18,8 @@ pub const Model = struct {
     cancel: *std.atomic.Value(bool),
 };
 
-pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
+pub fn perform(original: workspace.Manager, original_job: jobs.Job, model: Model) !void {
+    var job = original_job;
     if (job.kind == .planning) return @import("company_planning.zig").perform(original, job, model);
     var manager = original;
     manager.expected_revision = null;
@@ -28,11 +29,13 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
     var task = try manager.refreshTaskContext(try manager.loadTask(job.task));
     try manager.validateTaskBasis(task);
     try @import("company_reads.zig").validate(manager, task, task.company_reads, try manager.revision(task.parent));
-    try @import("company_authority.zig").authorizeTask(manager, task);
     const candidate = (try manager.retainedReviewCandidate(task)) orelse return error.NoRetainedReviewCandidate;
     if (!std.mem.eql(u8, job.candidate_hash, try workspace.hash(manager.alloc, candidate)) or job.contract_version != task.definition.version) return error.StaleWorkContract;
     const definition_hash = if (task.model_basis) |basis| basis.definition_hash else "legacy-contract";
     if (!std.mem.eql(u8, definition_hash, job.definition_hash)) return error.StaleWorkspaceDefinition;
+    task = (try @import("company_planning.zig").complete(manager, job, model)) orelse return;
+    job = try manager.loadReviewJob(task, job.id);
+    try @import("company_authority.zig").authorizeTask(manager, task);
     var turn: managed.Turn = .{ .manager = manager, .task = task };
     const policy = if (task.model_basis) |basis| basis.execution.review else @import("definition.zig").ReviewPolicy.legacy;
     const remaining_ms = @max(1, @as(i64, policy.total_timeout_ms) - @max(0, io.milliTimestamp() - job.started_ms));
@@ -98,7 +101,8 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
         };
         try turn.sealReview();
         turn.assessment = result.assessment;
-        if (result.decision.disposition == .fulfilled and try turn.sourceAssessmentCurrent(result.assessment)) {
+        const source_current = result.decision.disposition == .fulfilled and try turn.sourceAssessmentCurrent(result.assessment);
+        if (source_current) {
             turn.publish(candidate) catch |err| {
                 if (err != error.CompanyReconciliationRequired) return err;
                 // Retry only a definitely unpublished proposal. Recovery owns
@@ -126,7 +130,8 @@ pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
         }
         turn.task = try manager.setState(task.id, if (result.decision.disposition == .blocked) .blocked else .paused);
         _ = try manager.checkpoint(turn.task);
-        try manager.finishReviewJob(job, if (result.decision.disposition == .blocked) .blocked else .changes_required, result.decision.feedback);
+        const feedback = if (result.decision.disposition == .fulfilled and !source_current) "Successful host validation is missing or no longer matches the current source. Run the applicable checks against this candidate and submit their evidence for review." else result.decision.feedback;
+        try manager.finishReviewJob(job, if (result.decision.disposition == .blocked) .blocked else .changes_required, feedback);
         return;
     }
     turn.task = try manager.setState(task.id, .paused);
@@ -165,7 +170,7 @@ pub const Scheduler = struct {
             };
             if (job) |claimed| {
                 self.executor.run(self.executor.context, manager, claimed, &self.stopping) catch |err| {
-                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.CompanyApprovalRequired or err == error.CompanyApprovalDenied or err == error.CompanyApprovalExpired or err == error.CompanyApprovalStale) .blocked else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.WorkspaceReadDependencyChanged or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
+                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.TaskGovernancePending or err == error.Timeout) .pending else if (err == error.CompanyApprovalRequired or err == error.CompanyApprovalDenied or err == error.CompanyApprovalExpired or err == error.CompanyApprovalStale) .blocked else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.WorkspaceReadDependencyChanged or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
                 };
             } else std.Io.sleep(io.getIo(), .fromSeconds(1), .awake) catch {};
         }

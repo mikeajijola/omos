@@ -191,19 +191,24 @@ fn authenticateRequest(alloc: std.mem.Allocator, state: State, raw: []const u8, 
 }
 
 pub fn authorizeTask(manager: workspace.Manager, task: workspace.Task) !void {
-    return authorizeTaskFor(manager, task, true);
+    return authorizeTaskFor(manager, task, true, false);
 }
 
 pub fn authorizeExecution(manager: workspace.Manager, task: workspace.Task) !void {
-    return authorizeTaskFor(manager, task, false);
+    return authorizeTaskFor(manager, task, false, false);
 }
 
-fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publication: bool) !void {
+/// Read-only planning is part of proposal evaluation, not actor dispatch.
+pub fn authorizePlanning(manager: workspace.Manager, task: workspace.Task) !void {
+    return authorizeTaskFor(manager, task, false, true);
+}
+
+fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publication: bool, planning: bool) !void {
     const binding = task.authority orelse return;
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp()));
-    const permitted = if (publication) permitsAction(grant, .submit) else permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
+    const permitted = if (publication or planning) permitsAction(grant, .submit) else permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitted) return error.CompanyAccessDenied;
     if (publication and grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
     for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
