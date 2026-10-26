@@ -10,7 +10,7 @@ try {
   const settings = JSON.parse(await fs.readFile(process.argv[2], "utf8"));
   control = createWorkerHttpControl(settings.control);
   if (settings.desiredPolicy) desired = createDesiredHttpControl(settings.control);
-  let serverError, started = 0, recoveredArchive = false, recoveredCoding = false;
+  let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false;
   const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
   supervisor = start();
   const deadline = Date.now() + 360000;
@@ -65,6 +65,15 @@ try {
       stopping = new AbortController(); supervisor = start();
       continue;
     }
+    if (settings.partialRecovery && !recoveredPartial && selected.record.state === "failed") {
+      if (selected.record.checkpoint?.phase !== "running" || selected.record.checkpoint.generation !== 1) throw new Error("FixturePartialCheckpointMissing");
+      stopping.abort(); await supervisor;
+      const resumed = await control.call({ change: "requeue", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
+      if (!resumed.ok) throw new Error("FixturePartialRequeueFailed");
+      recoveredPartial = true;
+      stopping = new AbortController(); supervisor = start();
+      continue;
+    }
     if (settings.codingRecovery && !recoveredCoding && selected.record.state === "waiting") {
       if (selected.record.checkpoint?.phase !== "retained" || !selected.record.note.includes("failed coding checks")) throw new Error("FixtureCodingCheckpointMissing");
       stopping.abort(); await supervisor;
@@ -78,7 +87,7 @@ try {
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, view: selected.record.binding.view, desired_met: desiredMetAt !== 0 }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, view: selected.record.binding.view, desired_met: desiredMetAt !== 0 }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed" }));
   process.exitCode = 1;

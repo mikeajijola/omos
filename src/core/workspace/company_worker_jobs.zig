@@ -16,7 +16,32 @@ pub const Checkpoint = struct {
     model: []const u8,
     phase: enum { prepared, running, stopped, retained },
     export_directory: ?[]const u8 = null,
+    continuation: ?Continuation = null,
+    pub const Continuation = struct { invocation: u32, archive: []const u8, source: []const u8 };
+    pub fn jsonStringify(self: Checkpoint, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Checkpoint).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "continuation")) {
+                if (self.continuation) |continued| {
+                    try writer.objectField(name);
+                    try writer.write(continued);
+                }
+            } else {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
+
+fn sameContinuation(a: ?Checkpoint.Continuation, b: ?Checkpoint.Continuation) bool {
+    if (a) |left| return if (b) |right| left.invocation == right.invocation and std.mem.eql(u8, left.archive, right.archive) and std.mem.eql(u8, left.source, right.source) else false;
+    return b == null;
+}
+fn invocation(checkpoint: Checkpoint) u32 {
+    return if (checkpoint.continuation) |continued| continued.invocation else 1;
+}
 
 fn optionalCheckpointJson(value: anytype, writer: *std.json.Stringify) !void {
     try writer.beginObject();
@@ -97,6 +122,10 @@ pub fn validate(record: Record) !void {
         if (!std.mem.eql(u8, saved.version, "omos.company-worker-checkpoint/v1") or !authority.safeIdentity(saved.runtime) or saved.generation == 0 or saved.generation > record.generation or saved.model.len == 0 or saved.model.len > 256 or !std.unicode.utf8ValidateSlice(saved.model)) return error.InvalidCompanyWorkerCheckpoint;
         _ = try authority.hexBytes(32, saved.image);
         if (!@import("fossil_manifest.zig").validHash(saved.source_revision)) return error.InvalidCompanyWorkerCheckpoint;
+        if (saved.continuation) |continued| {
+            if (continued.invocation < 2 or continued.invocation > record.invocations or !@import("fossil_manifest.zig").validHash(continued.source)) return error.InvalidCompanyWorkerCheckpoint;
+            _ = try authority.hexBytes(32, continued.archive);
+        }
         if (saved.export_directory) |directory| if (!std.mem.startsWith(u8, directory, ".omos-host-archive-") or directory.len > 128 or std.mem.findScalar(u8, directory, '/') != null or std.mem.findScalar(u8, directory, '\\') != null or std.mem.find(u8, directory, "..") != null) return error.InvalidCompanyWorkerCheckpoint;
     }
 }
@@ -162,10 +191,14 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
                     const saved = request.checkpoint.?;
                     if (next.checkpoint) |prior| {
                         if (std.mem.eql(u8, saved.image, prior.image)) {
-                            if (!std.mem.eql(u8, saved.image, prior.image) or !std.mem.eql(u8, saved.runtime, prior.runtime) or saved.generation != prior.generation or !std.mem.eql(u8, saved.model, prior.model) or !std.mem.eql(u8, saved.source_revision, prior.source_revision) or @backingInt(saved.phase) < @backingInt(prior.phase)) return error.InvalidCompanyWorkerCheckpoint;
-                            if (prior.export_directory) |directory| if (saved.export_directory == null or !std.mem.eql(u8, directory, saved.export_directory.?)) return error.InvalidCompanyWorkerCheckpoint;
-                        } else if (prior.phase != .retained or saved.phase != .prepared or saved.generation <= prior.generation or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?) or saved.export_directory != null) return error.InvalidCompanyWorkerCheckpoint;
-                    } else if (saved.phase != .prepared or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?)) return error.InvalidCompanyWorkerCheckpoint;
+                            if (!std.mem.eql(u8, saved.runtime, prior.runtime) or saved.generation != prior.generation or !std.mem.eql(u8, saved.model, prior.model) or !std.mem.eql(u8, saved.source_revision, prior.source_revision)) return error.InvalidCompanyWorkerCheckpoint;
+                            const continues = prior.phase == .stopped and saved.phase == .running and saved.continuation != null and invocation(saved) == next.invocations and invocation(saved) > invocation(prior) and saved.export_directory == null;
+                            if (!continues) {
+                                if (@backingInt(saved.phase) < @backingInt(prior.phase) or !sameContinuation(saved.continuation, prior.continuation)) return error.InvalidCompanyWorkerCheckpoint;
+                                if (prior.export_directory) |directory| if (saved.export_directory == null or !std.mem.eql(u8, directory, saved.export_directory.?)) return error.InvalidCompanyWorkerCheckpoint;
+                            }
+                        } else if (prior.phase != .retained or saved.phase != .prepared or saved.generation <= prior.generation or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?) or saved.export_directory != null or saved.continuation != null) return error.InvalidCompanyWorkerCheckpoint;
+                    } else if (saved.phase != .prepared or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?) or saved.continuation != null) return error.InvalidCompanyWorkerCheckpoint;
                     next.checkpoint = saved;
                 } else if (request.change == .renew) {
                     if (request.outcome != null or current.expires_ms <= next.expires_ms) return error.InvalidCompanyExecutionLease;
@@ -383,6 +416,13 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         const saved = request.checkpoint orelse return error.InvalidCompanyWorkerCheckpoint;
         const expected_image = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ selected.binding.workspace, selected.binding.view, saved.runtime, saved.generation }));
         if (!std.mem.eql(u8, saved.image, expected_image)) return error.InvalidCompanyWorkerCheckpoint;
+        if (saved.continuation) |continued| {
+            _ = try authority.hexBytes(32, continued.archive);
+            const archive_path = try manager.alloc.print("company/archives/{s}/{s}/receipt.json", .{ selected.task.id, continued.archive });
+            const archived = try records.decode(@import("company_archive.zig").Record, manager.alloc, try manager.companyContent(archive_path), .{});
+            try @import("company_archive.zig").validateStored(manager.alloc, archived, archive_path);
+            if (!archived.complete or !std.mem.eql(u8, archived.task, selected.task.id) or !std.mem.eql(u8, archived.view, view_id) or !std.mem.eql(u8, archived.actor, selected.grant.actor) or !std.mem.eql(u8, archived.grant, selected.grant.id) or !std.mem.eql(u8, archived.source.revision, continued.source)) return error.CompanyArchiveRequired;
+        }
     }
     if (request.change == .queue or request.change == .claim or request.change == .renew or request.change == .requeue) {
         try authority.authorizeExecution(manager, selected.task);
@@ -547,6 +587,16 @@ test "company worker checkpoint phases retain unfinished images across owners" {
     try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "replace-unfinished", .execution = second, .checkpoint = replacement }, binding, digest, digest, live, 107, false, false));
     checkpoint.phase = .running;
     try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "rewind", .execution = second, .checkpoint = checkpoint }, binding, digest, digest, live, 107, false, false));
+    var continued = checkpoint;
+    continued.continuation = .{ .invocation = 2, .archive = digest, .source = digest };
+    continued.export_directory = null;
+    const resumed = try transition(job, .{ .change = .checkpoint, .operation = "continue-native-session", .execution = second, .checkpoint = continued }, binding, digest, digest, live, 107, false, false);
+    try std.testing.expectEqual(@as(u32, 2), resumed.checkpoint.?.continuation.?.invocation);
+    try std.testing.expectEqualStrings(job.checkpoint.?.image, resumed.checkpoint.?.image);
+    continued.phase = .stopped;
+    const stopped_again = try transition(resumed, .{ .change = .checkpoint, .operation = "stop-continuation", .execution = second, .checkpoint = continued }, binding, digest, digest, live, 107, false, false);
+    continued.phase = .running;
+    try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(stopped_again, .{ .change = .checkpoint, .operation = "repeat-invocation", .execution = second, .checkpoint = continued }, binding, digest, digest, live, 107, false, false));
     checkpoint.phase = .retained;
     job = try transition(job, .{ .change = .checkpoint, .operation = "retained", .execution = second, .checkpoint = checkpoint }, binding, digest, digest, live, 108, false, false);
     checkpoint.phase = .prepared;

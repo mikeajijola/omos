@@ -520,6 +520,16 @@ because its public archive and company validation feedback remain durable. An
 unknown private repository or missing image remains pending for inspection;
 the host does not guess that earlier external effects can be repeated.
 
+If the retained private task has no final answer, a later invocation first
+archives its public history, then resumes its exact native session in the same
+image. The host-owned `omos_company_worker_continuation` contract binds that
+transition to the new invocation count and completed archive receipt. It cannot
+restart the actor twice within one invocation, change the original image, or
+reset the job budget. The resumed native runtime retains completed tool history
+and handles its interrupted turn. A later public export retains both the
+pre-continuation and completed histories. Older declarations keep the image
+pending until they adopt the continuation operation.
+
 Signed callers inspect only their own view with `status` and
 `entity: "omos_company_archive"`. Pages list complete archives at a pinned
 company control revision. Select an archive using `record_id` and retrieve

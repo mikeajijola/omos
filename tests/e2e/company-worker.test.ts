@@ -1071,6 +1071,9 @@ test("company worker jobs checkpoint dispatch, fence replacement owners and surv
     const different = await adminResult({ action: "workers", worker: { ...secondClaim, execution: { runtime: "invented", generation: 1 } } });
     expect(different.code).not.toBe(0); expect(different.stderr).toContain("CompanyOperationConflict");
     const secondFence = { runtime: "job-second", generation: 2 };
+    const missingArchive = await adminResult({ action: "workers", worker: { change: "checkpoint", operation: crypto.randomUUID(), view: view.view, expected_sha256: current.sha256, execution: secondFence, checkpoint: { ...workerCheckpoint, phase: "running", continuation: { invocation: 2, archive: "f".repeat(64), source: workerCheckpoint.source_revision } } } });
+    expect(missingArchive.code).not.toBe(0);
+    expect((await worker({ change: "inspect", view: view.view })).jobs[0].sha256).toBe(current.sha256);
     const waitReview = async () => {
       const deadline = Date.now() + 60000;
       let result: any;
@@ -1535,9 +1538,11 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "desired", "answer", "recovery", "archive_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "desired", "answer", "recovery", "archive_recovery", "partial_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
   const desiredTask = scenario === "desired";
+  const partialRecovery = scenario === "partial_recovery" && support.private_namespaces;
+  let resumedNativeHistory = false;
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
@@ -1548,6 +1553,9 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
   const host = model(f, () => { throw Error("The company host must never execute the actor"); }, undefined, { plan: { capability: coding ? "coding_task" : "general_task", summary: "Retain the requested company outcome", obligations: [], checks: coding ? ["Run the operator-configured isolated behavior check"] : [] } });
   const inference = model(worker, (body, count) => {
     const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+    // PID 1 is the native runtime inside the mandatory private PID namespace.
+    if (partialRecovery && count === 2) return tool("shell", { request: { action: "run", command: "kill -TERM 1", timeout_ms: 10000 } });
+    if (partialRecovery && count === 3) resumedNativeHistory = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("production.txt"));
     if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
       const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
@@ -1645,7 +1653,7 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
       if (target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
       return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
-    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1655,15 +1663,21 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery ? 2 : 1, state: failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery ? 2 : 1, published: !failingChecks });
+      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, state: failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery || partialRecovery ? 2 : 1, published: !failingChecks });
       expect(result.images).toBe(failingChecks ? 1 : 0);
       expect(current.record.checkpoint.phase).toBe("retained");
       if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
       if (desiredTask) expect(outcome.desired_met).toBe(true);
+      if (partialRecovery) {
+        expect(outcome.recovered_partial).toBe(true); expect(resumedNativeHistory).toBe(true);
+        expect(current.record.checkpoint.generation).toBe(1);
+        expect(current.record.checkpoint.continuation.invocation).toBe(2);
+      }
       if (codingRecovery) { expect(outcome.recovered_coding).toBe(true); expect(current.record.checkpoint.generation).toBe(2); }
       const archives = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_archive", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
       expect(archives.isError, JSON.stringify(archives)).not.toBe(true);
-      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
+      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery || partialRecovery ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
+      if (partialRecovery) expect(new Set(archived.map(entry => entry.source.task)).size).toBe(1);
 
       if (failingChecks) {
         expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
@@ -1692,7 +1706,7 @@ for (const scenario of ["files", "desired", "answer", "recovery", "archive_recov
         const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
       }
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : partialRecovery ? 3 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); if (answerOnly || desiredTask) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
