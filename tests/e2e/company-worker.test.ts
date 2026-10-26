@@ -9,11 +9,12 @@ import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomB
 import { createReadStream } from "node:fs";
 import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
-import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
+import { createWorkerSnapshot, selectWorkerRoot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
 import { validateValidationConfiguration } from "../../deployment/company/worker-validation.mjs";
+import { createWorkerCheckpointer } from "../../deployment/company/worker-checkpoint.mjs";
 import { retainWorkerArchive } from "../../deployment/company/worker-archive.mjs";
 import { advertiseWorkerRuntime } from "../../deployment/company/worker-runtime.mjs";
 
@@ -48,6 +49,31 @@ function absoluteTarget(socket: string) {
     client.on("error", reject);
   });
 }
+
+test("worker snapshots retain delegated children under exactly one root", () => {
+  const root = { id: "a".repeat(64), parent_task_id: null }, child = { id: "b".repeat(64), parent_task_id: root.id }, grandchild = { id: "c".repeat(64), parent_task_id: child.id };
+  expect(selectWorkerRoot([child, grandchild, root])).toBe(root);
+  for (const tasks of [[], [root, { ...child, parent_task_id: null }], [root, { ...child, parent_task_id: "d".repeat(64) }], [root, { ...child, parent_task_id: grandchild.id }, grandchild], [root, root]]) expect(() => selectWorkerRoot(tasks)).toThrow("WorkerSnapshotAmbiguous");
+});
+
+test("worker checkpoint acknowledgements are reconciled before actor dispatch and reject stale owners", async () => {
+  const execution = { runtime: "owner", generation: 2 }, checkpoint = { version: "omos.company-worker-checkpoint/v1", runtime: "owner", generation: 2, image: "a".repeat(64), source_revision: "b".repeat(64), model: "fixture-model", phase: "prepared", export_directory: null };
+  for (const lost of ["reply", "exception"]) {
+    let writes = 0, row: any = { sha256: "c".repeat(64), authority_live: true, record: { state: "running", ...execution } };
+    const control = { async call(request: any) {
+      if (request.change === "inspect") return { ok: true, jobs: [structuredClone(row)] };
+      writes++; row.record = { ...row.record, operation: request.operation, checkpoint: structuredClone(request.checkpoint) };
+      if (lost === "exception") throw new Error("AcknowledgementLost");
+      return { ok: false, uncertain: true };
+    } };
+    expect(await createWorkerCheckpointer({ control, view: "view", execution })(checkpoint)).toEqual(checkpoint);
+    expect(writes).toBe(1);
+    row.record.generation = 3;
+    await expect(createWorkerCheckpointer({ control, view: "view", execution })(checkpoint)).rejects.toThrow("WorkerCheckpointFenced"); expect(writes).toBe(1);
+  }
+  const unchanged = { async call() { return { ok: true, jobs: [{ sha256: "a".repeat(64), authority_live: true, record: { state: "running", ...execution, operation: "another-operation", checkpoint } }] }; } };
+  await expect(createWorkerCheckpointer({ control: unchanged, view: "view", execution })(checkpoint)).rejects.toThrow("WorkerCheckpointOutcomeUnknown");
+});
 
 test("worker broker pins destinations, models and company identity while retaining provider credentials outside the worker", async () => {
   const f = fixture(), socket = join(f.home, "broker.sock");
@@ -1010,6 +1036,17 @@ test("company worker jobs checkpoint dispatch, fence replacement owners and surv
     current = (await worker({ change: "claim", operation: crypto.randomUUID(), view: view.view, expected_sha256: current.sha256, execution: first })).jobs[0];
     expect(current.record).toMatchObject({ state: "running", invocations: 1, runtime: "job-first", generation: 1 });
     expect(current.execution.generation).toBe(1);
+    const workerCheckpoint = { version: "omos.company-worker-checkpoint/v1", runtime: "job-first", generation: 1, image: createHash("sha256").update(JSON.stringify([boot.workspace, view.view, "job-first", 1])).digest("hex"), source_revision: current.view_revision, model: "fixture-model", phase: "prepared", export_directory: null };
+    const savedRequest = { change: "checkpoint", operation: crypto.randomUUID(), view: view.view, expected_sha256: current.sha256, execution: { runtime: "job-first", generation: 1 }, checkpoint: workerCheckpoint };
+    current = (await worker(savedRequest)).jobs[0];
+    expect(current.record.checkpoint).toEqual(workerCheckpoint);
+    expect((await worker(savedRequest)).replayed).toBe(true);
+    for (const change of [{ image: "f".repeat(64) }, { export_directory: "../private" }]) {
+      const invalid = await adminResult({ action: "workers", worker: { ...savedRequest, operation: crypto.randomUUID(), expected_sha256: current.sha256, checkpoint: { ...workerCheckpoint, ...change } } });
+      expect(invalid.code).not.toBe(0); expect(invalid.stderr).toContain("InvalidCompanyWorkerCheckpoint");
+    }
+    for (const phase of ["running", "stopped"]) current = (await worker({ ...savedRequest, operation: crypto.randomUUID(), expected_sha256: current.sha256, checkpoint: { ...workerCheckpoint, phase } })).jobs[0];
+    expect(current.record.checkpoint.phase).toBe("stopped");
     const falseCompletion = await adminResult({ action: "workers", worker: { change: "complete", operation: crypto.randomUUID(), view: view.view, expected_sha256: current.sha256 } });
     expect(falseCompletion.code).not.toBe(0); expect(falseCompletion.stderr).toContain("WorkspaceVerificationFailed");
     expect((await worker({ change: "inspect", view: view.view })).jobs[0].sha256).toBe(current.sha256);
@@ -1027,6 +1064,7 @@ test("company worker jobs checkpoint dispatch, fence replacement owners and surv
     current = (await worker({ change: "inspect", view: view.view })).jobs[0];
     expect(current.record).toMatchObject({ state: "running", invocations: 2, runtime: "job-second", generation: 2 });
     expect(current.execution).toMatchObject({ runtime: "job-second", generation: 2 });
+    expect(current.record.checkpoint).toEqual({ ...workerCheckpoint, phase: "stopped" });
     expect(current.record.request).toMatchObject(secondClaim);
     const replay = await worker(secondClaim);
     expect(replay.replayed).toBe(true); expect(replay.jobs[0].record.invocations).toBe(2);
@@ -1497,17 +1535,19 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "answer", "recovery", "projection", "coding", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "answer", "recovery", "archive_recovery", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
+  const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
   const recovering = scenario === "recovery" && support.private_namespaces;
+  const archiveRecovery = scenario === "archive_recovery" && support.private_namespaces;
   const answer = coding ? "Implemented add(a, b) in documents/team/calculator.py." : answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
   const f = fixture(), worker = fixture();
   const host = model(f, () => { throw Error("The company host must never execute the actor"); }, undefined, { plan: { capability: coding ? "coding_task" : "general_task", summary: "Retain the requested company outcome", obligations: [], checks: coding ? ["Run the operator-configured isolated behavior check"] : [] } });
   const inference = model(worker, (body, count) => {
     const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
-    if (coding && count === 1) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks ? "-" : "+"} b\n` });
+    if (coding && (count === 1 || codingRecovery && count === 3)) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks || codingRecovery && count === 1 ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
       const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
       const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/); expect(match).not.toBeNull();
@@ -1553,7 +1593,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
   const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0, validation: coding }), encoding: "utf8", timeout: 120000 });
   expect(setup.status, setup.stderr).toBe(0);
   const { base } = JSON.parse(setup.stdout);
-  let client;
+  let client, ownerProxy;
   try {
     const boot = await (await fetch(service.url + "/v1/company")).json() as any;
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
@@ -1588,7 +1628,15 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
       expect(retained.pending_operation).toBe(recoveredOperation); expect(retained.record.invocations).toBe(1);
     }
 
-    const settings = { ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
+    let archiveAcknowledgementLost = false;
+    if (archiveRecovery) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const body = await request.text(), target = new URL(request.url).pathname;
+      const reply = await fetch(service.url + target, { method: request.method, headers: { authorization: request.headers.get("authorization")!, "content-type": "application/json" }, body });
+      const content = await reply.text();
+      if (target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
+      return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
+    } });
+    const settings = { ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1597,11 +1645,14 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: 1, state: failingChecks ? "waiting" : "completed", invocations: recovering ? 2 : 1, generation: recovering ? 2 : 1, published: !failingChecks });
+      expect(outcome).toMatchObject({ ok: true, started: archiveRecovery || codingRecovery ? 2 : 1, state: failingChecks ? "waiting" : "completed", invocations: recovering || archiveRecovery || codingRecovery ? 2 : 1, generation: recovering || archiveRecovery || codingRecovery ? 2 : 1, published: !failingChecks });
       expect(result.images).toBe(failingChecks ? 1 : 0);
+      expect(current.record.checkpoint.phase).toBe("retained");
+      if (archiveRecovery) { expect(archiveAcknowledgementLost).toBe(true); expect(current.record.checkpoint.generation).toBe(1); expect(outcome.recovered_archive).toBe(true); }
+      if (codingRecovery) { expect(outcome.recovered_coding).toBe(true); expect(current.record.checkpoint.generation).toBe(2); }
       const archives = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_archive", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
       expect(archives.isError, JSON.stringify(archives)).not.toBe(true);
-      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
+      const archived = JSON.parse(archives.content[0].text).archives; expect(archived).toHaveLength(codingRecovery ? 2 : 1); expect(archived[0].authority).toBe("actor_public_history_only"); expect(archived[0].source.bytes).toBeGreaterThan(0);
 
       if (failingChecks) {
         expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
@@ -1630,7 +1681,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
         const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
       }
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : projected ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : projected || codingRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); if (answerOnly) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
@@ -1639,7 +1690,7 @@ for (const scenario of ["files", "answer", "recovery", "projection", "coding", "
     expect(host.counts().actors).toBe(0);
     expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
   } finally {
-    client?.close(); service.child.kill(); await service.child.exited;
+    ownerProxy?.stop(true); client?.close(); service.child.kill(); await service.child.exited;
     const cleaned = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ base, action: "cleanup" }), encoding: "utf8", timeout: 30000 });
     expect(cleaned.status, cleaned.stderr).toBe(0);
   }
@@ -1802,7 +1853,7 @@ test("company views keep a narrower immutable task scope through discovery, work
   } finally { bound?.close(); client?.close(); service.child.kill(); await service.child.exited; }
 }, 360000);
 
-test("lost scoped view creation acknowledgements preserve later reads, private edits and the original task", async () => {
+for (const explicit of [true, false]) test(`lost ${explicit ? "explicit" : "default"} scoped view creation acknowledgements preserve later reads, private edits and the original task`, async () => {
   const f = fixture(); expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   const admin = async (input: object) => {
     const file = join(f.home, "scope-recovery-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
@@ -1819,7 +1870,7 @@ test("lost scoped view creation acknowledgements preserve later reads, private e
     client = await createCompanyClient(config, { home: f.home });
     const args = (action: string, rest: object = {}) => ({ version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 240000, ...rest });
     const send = async (input: object) => { const result = await client.call("company_workspace", input); expect(result.isError, JSON.stringify(result)).not.toBe(true); return JSON.parse(result.content[0].text); };
-    const creation = args("create_view", { revision: boot.revision, objective: "Retain the same private task and observations after its creation acknowledgement is lost", scope: ["documents/team/"] });
+    const creation = args("create_view", { revision: boot.revision, objective: "Retain the same private task and observations after its creation acknowledgement is lost", ...(explicit ? { scope: ["documents/team/"] } : {}) });
     const lost = await client.call("company_workspace", creation); expect(lost.isError).toBe(true);
     const matched = f.fossil("ls", "-r", "omos-company").match(/^company\/views\/([0-9a-f]+)\.json$/m); expect(matched).not.toBeNull();
     const id = matched![1], viewPath = `company/views/${id}.json`;
@@ -1833,7 +1884,7 @@ test("lost scoped view creation acknowledgements preserve later reads, private e
     const before = f.fossil("cat", viewPath, "-r", "omos-company"), observed = JSON.parse(before);
     expect(observed.reads).toHaveLength(1); expect(observed.base).toBe(original.base);
     const recovered = await send(args("reconcile", { outcome: creation.operation }));
-    expect(recovered.state).toBe("completed"); expect(recovered.result).toMatchObject({ view: id, revision: changed.revision, base: original.base, paths: ["documents/team/"] });
+    expect(recovered.state).toBe("completed"); expect(recovered.result).toMatchObject({ view: id, revision: changed.revision, base: original.base, paths: [explicit ? "documents/team/" : "documents/"] });
     expect(f.fossil("cat", viewPath, "-r", "omos-company")).toBe(before);
     expect(f.fossil("cat", original.scope, "-r", "omos-company")).toBe(scopeBytes);
     expect(f.fossil("cat", "documents/team/input.txt", "-r", `task/${original.task}`)).toBe("Retained before the creation outcome was reconciled.");

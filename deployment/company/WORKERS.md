@@ -501,10 +501,24 @@ capacity, and the wire format's exact-integer range still apply.
 
 The host deletes a successful image only after receiving the complete archive
 acknowledgement. A failed export or unresolved transfer retains the image and
-its public export for inspection and recovery. The retention helper can resume
-the transfer without running the actor. Restarting a worker invocation does
-not yet automatically select an older retained image; inspect that checkpoint
-before dispatching more actor work.
+its public export for inspection and recovery. The native worker record retains
+the image identity, original source revision, execution generation, and phase.
+The host acknowledges `prepared` before image creation and `running` before
+actor dispatch. It records `stopped` after joining the actor, then pins the
+export directory before creating the public archive. These checkpoints use
+the separate host-owned `omos_company_worker_checkpoint` operation. An older
+declaration must adopt that operation before this worker can advertise itself.
+
+After explicit requeue and a new execution claim, the replacement host selects
+an unfinished image from that record and quiesces its processes. It resumes
+archive transfer and output collection without starting another actor.
+An unresolved checkpoint acknowledgement is inspected by operation identity
+before dispatch. Failed coding checks retain their evidence and mark that
+invocation collected, allowing a later invocation to revise the work. An
+older collected image can then be removed before allocating that invocation,
+because its public archive and company validation feedback remain durable. An
+unknown private repository or missing image remains pending for inspection;
+the host does not guess that earlier external effects can be repeated.
 
 Signed callers inspect only their own view with `status` and
 `entity: "omos_company_archive"`. Pages list complete archives at a pinned

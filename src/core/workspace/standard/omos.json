@@ -4750,6 +4750,241 @@
           "cli",
           "agent"
         ]
+      },
+      {
+        "id": "omos_company_worker_checkpoint",
+        "capability": "general_task",
+        "description": "Retain host-owned isolated worker phases and immutable image identities before actor dispatch, then resume evidence collection without repeating completed actor work.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "workers"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "worker": {
+              "type": "object",
+              "properties": {
+                "change": {
+                  "type": "string",
+                  "enum": [
+                    "checkpoint"
+                  ]
+                },
+                "operation": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "view": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "expected_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 64,
+                  "maxLength": 64
+                },
+                "execution": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "runtime": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "generation": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "generation"
+                  ],
+                  "additionalProperties": false
+                },
+                "max_invocations": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1,
+                  "maximum": 32
+                },
+                "max_runtime_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 1000,
+                  "maximum": 240000
+                },
+                "outcome": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "waiting",
+                    "submitted",
+                    "failed",
+                    "completed",
+                    null
+                  ]
+                },
+                "note": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 1024
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000000
+                },
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 32
+                },
+                "checkpoint": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "const": "omos.company-worker-checkpoint/v1"
+                    },
+                    "runtime": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "generation": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "image": {
+                      "type": "string",
+                      "minLength": 64,
+                      "maxLength": 64
+                    },
+                    "source_revision": {
+                      "type": "string",
+                      "minLength": 40,
+                      "maxLength": 64
+                    },
+                    "model": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "phase": {
+                      "type": "string",
+                      "enum": [
+                        "prepared",
+                        "running",
+                        "stopped",
+                        "retained"
+                      ]
+                    },
+                    "export_directory": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 128
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "generation",
+                    "image",
+                    "source_revision",
+                    "model",
+                    "phase"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "change",
+                "checkpoint"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "worker"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "jobs": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "maxItems": 32
+            },
+            "next_offset": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "total": {
+              "type": "integer"
+            },
+            "replayed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "revision",
+            "jobs",
+            "next_offset"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "api"
+        ]
       }
     ],
     "semantic": {
@@ -5222,7 +5457,8 @@
             "generation": "number",
             "expires_ms": "number",
             "updated_ms": "number",
-            "request": "json"
+            "request": "json",
+            "checkpoint": "json"
           },
           "required": [
             "version",

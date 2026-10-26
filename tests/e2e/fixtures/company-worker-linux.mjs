@@ -5,12 +5,13 @@ import { createCompanyClient } from "../../../deployment/company/mcp.mjs";
 import { randomUUID } from "node:crypto";
 
 let control, supervisor, actor;
-const stopping = new AbortController();
+let stopping = new AbortController();
 try {
   const settings = JSON.parse(await fs.readFile(process.argv[2], "utf8"));
   control = createWorkerHttpControl(settings.control);
-  let serverError, started = 0;
-  supervisor = runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250 }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
+  let serverError, started = 0, recoveredArchive = false, recoveredCoding = false;
+  const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250 }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
+  supervisor = start();
   const deadline = Date.now() + 360000;
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
@@ -32,11 +33,30 @@ try {
     const result = await control.call({ change: "inspect", view: settings.view });
     if (!result.ok || result.jobs.length !== 1) throw new Error("FixtureJobInspectionFailed");
     selected = result.jobs[0];
+    if (settings.archiveRecovery && !recoveredArchive && selected.record.state === "failed") {
+      const checkpoint = selected.record.checkpoint;
+      if (checkpoint?.phase !== "stopped" || !checkpoint.export_directory || checkpoint.generation !== 1) throw new Error("FixtureArchiveCheckpointMissing");
+      stopping.abort(); await supervisor;
+      const resumed = await control.call({ change: "requeue", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
+      if (!resumed.ok) throw new Error("FixtureArchiveRequeueFailed");
+      recoveredArchive = true;
+      stopping = new AbortController(); supervisor = start();
+      continue;
+    }
+    if (settings.codingRecovery && !recoveredCoding && selected.record.state === "waiting") {
+      if (selected.record.checkpoint?.phase !== "retained" || !selected.record.note.includes("failed coding checks")) throw new Error("FixtureCodingCheckpointMissing");
+      stopping.abort(); await supervisor;
+      const resumed = await control.call({ change: "requeue", operation: randomUUID(), view: settings.view, expected_sha256: selected.sha256 });
+      if (!resumed.ok) throw new Error("FixtureCodingRequeueFailed");
+      recoveredCoding = true;
+      stopping = new AbortController(); supervisor = start();
+      continue;
+    }
     if (!["queued", "running", "submitted"].includes(selected.record.state) || selected.review_state === "failed" || Date.now() >= deadline) break;
     await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
   }
   if (serverError) throw serverError;
-  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note }));
+  process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding }));
 } catch (error) {
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed" }));
   process.exitCode = 1;

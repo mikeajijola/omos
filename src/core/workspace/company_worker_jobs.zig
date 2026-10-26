@@ -5,8 +5,34 @@ const authority = @import("company_authority.zig");
 const ownership = @import("company_execution.zig");
 
 pub const State = enum { queued, running, waiting, submitted, failed, cancelled, completed, exhausted };
-pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire };
+pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire, checkpoint };
 pub const Outcome = enum { waiting, submitted, failed, completed };
+pub const Checkpoint = struct {
+    version: []const u8 = "omos.company-worker-checkpoint/v1",
+    runtime: []const u8,
+    generation: u64,
+    image: []const u8,
+    source_revision: []const u8,
+    model: []const u8,
+    phase: enum { prepared, running, stopped, retained },
+    export_directory: ?[]const u8 = null,
+};
+
+fn optionalCheckpointJson(value: anytype, writer: *std.json.Stringify) !void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |name| {
+        if (comptime std.mem.eql(u8, name, "checkpoint")) {
+            if (value.checkpoint != null) {
+                try writer.objectField(name);
+                try writer.write(value.checkpoint);
+            }
+        } else {
+            try writer.objectField(name);
+            try writer.write(@field(value, name));
+        }
+    }
+    try writer.endObject();
+}
 pub const Binding = struct {
     workspace: []const u8,
     view: []const u8,
@@ -29,6 +55,10 @@ pub const Request = struct {
     note: ?[]const u8 = null,
     offset: usize = 0,
     limit: usize = 32,
+    checkpoint: ?Checkpoint = null,
+    pub fn jsonStringify(self: Request, writer: *std.json.Stringify) !void {
+        try optionalCheckpointJson(self, writer);
+    }
 };
 pub const Record = struct {
     version: []const u8 = "omos.company-worker-job/v1",
@@ -46,6 +76,10 @@ pub const Record = struct {
     request: Request,
     updated_ms: i64,
     note: ?[]const u8 = null,
+    checkpoint: ?Checkpoint = null,
+    pub fn jsonStringify(self: Record, writer: *std.json.Stringify) !void {
+        try optionalCheckpointJson(self, writer);
+    }
 };
 
 pub fn validate(record: Record) !void {
@@ -59,6 +93,12 @@ pub fn validate(record: Record) !void {
     } else if (record.state == .running or record.expires_ms != 0) return error.InvalidCompanyWorkerJob;
     if (record.state != .running and record.expires_ms != 0) return error.InvalidCompanyWorkerJob;
     if (record.note) |note| if (note.len > 1024 or !std.unicode.utf8ValidateSlice(note)) return error.InvalidCompanyWorkerJob;
+    if (record.checkpoint) |saved| {
+        if (!std.mem.eql(u8, saved.version, "omos.company-worker-checkpoint/v1") or !authority.safeIdentity(saved.runtime) or saved.generation == 0 or saved.generation > record.generation or saved.model.len == 0 or saved.model.len > 256 or !std.unicode.utf8ValidateSlice(saved.model)) return error.InvalidCompanyWorkerCheckpoint;
+        _ = try authority.hexBytes(32, saved.image);
+        if (!@import("fossil_manifest.zig").validHash(saved.source_revision)) return error.InvalidCompanyWorkerCheckpoint;
+        if (saved.export_directory) |directory| if (!std.mem.startsWith(u8, directory, ".omos-host-archive-") or directory.len > 128 or std.mem.findScalar(u8, directory, '/') != null or std.mem.findScalar(u8, directory, '\\') != null or std.mem.find(u8, directory, "..") != null) return error.InvalidCompanyWorkerCheckpoint;
+    }
 }
 
 pub fn path(alloc: std.mem.Allocator, id: []const u8) ![]const u8 {
@@ -78,6 +118,7 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
     if (!authority.safeIdentity(operation) or request.change == .inspect or request.offset != 0 or request.limit != 32) return error.InvalidCompanyWorkerJob;
     if (request.view) |view| if (!std.mem.eql(u8, view, binding.view)) return error.CompanyAccessDenied;
     if (request.note) |note| if (note.len > 1024 or !std.unicode.utf8ValidateSlice(note)) return error.InvalidCompanyWorkerJob;
+    if ((request.change == .checkpoint) != (request.checkpoint != null)) return error.InvalidCompanyWorkerCheckpoint;
     if (previous) |record| {
         try validate(record);
         if (!std.mem.eql(u8, record.id, id) or !equalBinding(record.binding, binding)) return error.StaleCompanyWorkerContract;
@@ -109,14 +150,24 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
                 next.generation = current.generation;
                 next.expires_ms = current.expires_ms;
             },
-            .renew, .finish => {
+            .renew, .finish, .checkpoint => {
                 if (next.state != .running) return error.CompanyWorkerNotRunning;
                 const current = live orelse return error.CompanyExecutionNotClaimed;
                 const supplied = request.execution orelse return error.CompanyExecutionFenceRequired;
                 try ownership.require(current, supplied, now);
                 if (next.runtime == null or !std.mem.eql(u8, next.runtime.?, supplied.runtime) or next.generation != supplied.generation) return error.CompanyExecutionFenced;
                 if (next.expires_ms <= now) return error.CompanyExecutionExpired;
-                if (request.change == .renew) {
+                if (request.change == .checkpoint) {
+                    if (request.outcome != null) return error.InvalidCompanyWorkerCheckpoint;
+                    const saved = request.checkpoint.?;
+                    if (next.checkpoint) |prior| {
+                        if (std.mem.eql(u8, saved.image, prior.image)) {
+                            if (!std.mem.eql(u8, saved.image, prior.image) or !std.mem.eql(u8, saved.runtime, prior.runtime) or saved.generation != prior.generation or !std.mem.eql(u8, saved.model, prior.model) or !std.mem.eql(u8, saved.source_revision, prior.source_revision) or @backingInt(saved.phase) < @backingInt(prior.phase)) return error.InvalidCompanyWorkerCheckpoint;
+                            if (prior.export_directory) |directory| if (saved.export_directory == null or !std.mem.eql(u8, directory, saved.export_directory.?)) return error.InvalidCompanyWorkerCheckpoint;
+                        } else if (prior.phase != .retained or saved.phase != .prepared or saved.generation <= prior.generation or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?) or saved.export_directory != null) return error.InvalidCompanyWorkerCheckpoint;
+                    } else if (saved.phase != .prepared or saved.generation != next.generation or !std.mem.eql(u8, saved.runtime, next.runtime.?)) return error.InvalidCompanyWorkerCheckpoint;
+                    next.checkpoint = saved;
+                } else if (request.change == .renew) {
                     if (request.outcome != null or current.expires_ms <= next.expires_ms) return error.InvalidCompanyExecutionLease;
                     next.expires_ms = current.expires_ms;
                 } else {
@@ -128,6 +179,9 @@ pub fn transition(previous: ?Record, request: Request, binding: Binding, id: []c
                         .submitted => .submitted,
                         .failed => .failed,
                         .completed => .completed,
+                    };
+                    if (outcome == .submitted or outcome == .completed) if (next.checkpoint) |*saved| {
+                        saved.phase = .retained;
                     };
                     next.expires_ms = 0;
                 }
@@ -279,7 +333,7 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     if (request.limit == 0 or request.limit > 32 or request.offset > 1000000) return error.InvalidCompanyWorkerJob;
     const revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
     if (request.change == .inspect) {
-        if (request.operation != null or request.expected_sha256 != null or request.execution != null or request.max_invocations != null or request.max_runtime_ms != null or request.outcome != null or request.note != null) return error.InvalidCompanyWorkerJob;
+        if (request.operation != null or request.expected_sha256 != null or request.execution != null or request.max_invocations != null or request.max_runtime_ms != null or request.outcome != null or request.note != null or request.checkpoint != null) return error.InvalidCompanyWorkerJob;
         var jobs: std.ArrayList(std.json.Value) = .empty;
         var count: usize = 0;
         for (try manager.inventory(revision)) |entry| {
@@ -319,6 +373,14 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
     if (previous_raw) |raw| {
         if (request.expected_sha256 == null or !std.mem.eql(u8, request.expected_sha256.?, try workspace.hash(manager.alloc, raw))) return error.CompanyWorkerJobChanged;
     } else if (request.expected_sha256 != null) return error.CompanyWorkerJobChanged;
+    if (request.change == .checkpoint) {
+        try authority.authorizeExecution(manager, selected.task);
+        try manager.validateTaskBasis(selected.task);
+        if (!selected.live) return error.CompanyAccessDenied;
+        const saved = request.checkpoint orelse return error.InvalidCompanyWorkerCheckpoint;
+        const expected_image = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ selected.binding.workspace, selected.binding.view, saved.runtime, saved.generation }));
+        if (!std.mem.eql(u8, saved.image, expected_image)) return error.InvalidCompanyWorkerCheckpoint;
+    }
     if (request.change == .queue or request.change == .claim or request.change == .renew or request.change == .requeue) {
         try authority.authorizeExecution(manager, selected.task);
         try manager.validateTaskBasis(selected.task);
@@ -453,4 +515,50 @@ test "company worker recovery requires a newer execution generation" {
     changed.contract_sha256 = other;
     try std.testing.expectError(error.StaleCompanyWorkerContract, transition(job, .{ .change = .cancel, .operation = "cancel" }, changed, digest, digest, live, 10002, false, false));
     try std.testing.expectError(error.CompanyAccessDenied, transition(job, .{ .change = .cancel, .operation = "cancel", .view = "other" }, binding, digest, digest, live, 10002, false, false));
+}
+
+test "company worker checkpoint phases retain unfinished images across owners" {
+    const digest = "0000000000000000000000000000000000000000000000000000000000000000";
+    const other = "1111111111111111111111111111111111111111111111111111111111111111";
+    const binding: Binding = .{ .workspace = digest, .view = "view", .task = "task", .actor = "actor", .grant = "grant", .contract_sha256 = digest, .definition_sha256 = digest, .policy_sha256 = digest };
+    var live: ownership.Record = .{ .view = "view", .task = "task", .actor = "actor", .grant = "grant", .runtime = "first", .generation = 1, .expires_ms = 50000, .operation = "lease", .request_hash = digest };
+    const first: ownership.Fence = .{ .runtime = "first", .generation = 1 };
+    var job = try transition(null, .{ .change = .queue, .operation = "queue", .max_runtime_ms = 1000 }, binding, digest, digest, null, 100, false, false);
+    job = try transition(job, .{ .change = .claim, .operation = "claim", .execution = first }, binding, digest, digest, live, 101, false, false);
+    var checkpoint: Checkpoint = .{ .runtime = "first", .generation = 1, .image = digest, .source_revision = digest, .model = "model", .phase = .prepared };
+    job = try transition(job, .{ .change = .checkpoint, .operation = "prepared", .execution = first, .checkpoint = checkpoint }, binding, digest, digest, live, 102, false, false);
+    checkpoint.phase = .stopped;
+    checkpoint.export_directory = ".omos-host-archive-fixture";
+    job = try transition(job, .{ .change = .checkpoint, .operation = "stopped", .execution = first, .checkpoint = checkpoint }, binding, digest, digest, live, 103, false, false);
+    job = try transition(job, .{ .change = .finish, .operation = "pause", .execution = first, .outcome = .failed }, binding, digest, digest, live, 104, false, false);
+    live.runtime = null;
+    live.expires_ms = 0;
+    job = try transition(job, .{ .change = .requeue, .operation = "requeue" }, binding, digest, digest, live, 105, false, false);
+    live.runtime = "second";
+    live.generation = 2;
+    live.expires_ms = 50000;
+    const second: ownership.Fence = .{ .runtime = "second", .generation = 2 };
+    job = try transition(job, .{ .change = .claim, .operation = "second", .execution = second }, binding, digest, digest, live, 106, false, false);
+    try std.testing.expectEqual(@as(u64, 1), job.checkpoint.?.generation);
+    var replacement: Checkpoint = .{ .runtime = "second", .generation = 2, .image = other, .source_revision = other, .model = "model", .phase = .prepared };
+    try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "replace-unfinished", .execution = second, .checkpoint = replacement }, binding, digest, digest, live, 107, false, false));
+    checkpoint.phase = .running;
+    try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "rewind", .execution = second, .checkpoint = checkpoint }, binding, digest, digest, live, 107, false, false));
+    checkpoint.phase = .retained;
+    job = try transition(job, .{ .change = .checkpoint, .operation = "retained", .execution = second, .checkpoint = checkpoint }, binding, digest, digest, live, 108, false, false);
+    checkpoint.phase = .prepared;
+    try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "replay-image", .execution = second, .checkpoint = checkpoint }, binding, digest, digest, live, 109, false, false));
+    replacement.export_directory = "../private";
+    try std.testing.expectError(error.InvalidCompanyWorkerCheckpoint, transition(job, .{ .change = .checkpoint, .operation = "unsafe-directory", .execution = second, .checkpoint = replacement }, binding, digest, digest, live, 109, false, false));
+    replacement.export_directory = null;
+    job = try transition(job, .{ .change = .checkpoint, .operation = "replace-collected", .execution = second, .checkpoint = replacement }, binding, digest, digest, live, 109, false, false);
+    try std.testing.expectEqualStrings(other, job.checkpoint.?.image);
+    try std.testing.expectError(error.CompanyExecutionFenced, transition(job, .{ .change = .checkpoint, .operation = "stale", .execution = first, .checkpoint = replacement }, binding, digest, digest, live, 110, false, false));
+}
+
+test "company worker checkpoint extension preserves legacy request hashes" {
+    const alloc = std.testing.allocator;
+    const bytes = try encode(alloc, Request{ .change = .inspect });
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("{\"change\":\"inspect\",\"operation\":null,\"view\":null,\"expected_sha256\":null,\"execution\":null,\"max_invocations\":null,\"max_runtime_ms\":null,\"outcome\":null,\"note\":null,\"offset\":0,\"limit\":32}", bytes);
 }

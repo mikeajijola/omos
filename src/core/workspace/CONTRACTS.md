@@ -549,6 +549,17 @@ the original path scope are checked again for every request. Archive contents
 are labelled `actor_public_history_only`; they cannot replace company checks,
 assessments, or publication receipts.
 
+`features.worker_checkpoints` advertises the host-only
+`omos_company_worker_checkpoint` operation. Its worker `change: "checkpoint"`
+requires a live execution fence and expected worker-record hash. The optional
+checkpoint records a stable image identity, original runtime and generation,
+source revision, model handle, phase, and export-directory basename. Phases
+advance through `prepared`, `running`, `stopped`, and `retained`. A replacement
+generation preserves an unfinished image instead of dispatching another actor.
+Successful submission marks the invocation retained as part of the native
+worker outcome. Omitting the optional field preserves legacy request hashes
+and record encoding.
+
 The local operator can initialize company authority using
 `omos fossil company REQUEST.json --json`. Administrative requests use
 `omos.company-admin/v1`; actions are `initialize`, `status`, `grant`, `revoke`,

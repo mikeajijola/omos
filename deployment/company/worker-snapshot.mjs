@@ -2,6 +2,31 @@
 // Transport, execution ownership and company publication belong to the host.
 import { createHash } from "node:crypto";
 
+// A delegated task shares its root's private repository. Independent roots and
+// malformed ancestry remain ambiguous; a child does not hide its parent's work.
+export function selectWorkerRoot(tasks) {
+  if (!Array.isArray(tasks) || tasks.length === 0) throw new Error("WorkerSnapshotAmbiguous");
+  const byId = new Map();
+  for (const task of tasks) {
+    if (!task || !/^[0-9a-f]{64}$/.test(task.id) || byId.has(task.id)) throw new Error("WorkerSnapshotAmbiguous");
+    byId.set(task.id, task);
+  }
+  const roots = tasks.filter(task => task.parent_task_id == null);
+  if (roots.length !== 1) throw new Error("WorkerSnapshotAmbiguous");
+  const root = roots[0];
+  for (const task of tasks) {
+    const visited = new Set();
+    let current = task;
+    while (current !== root) {
+      if (visited.has(current.id)) throw new Error("WorkerSnapshotAmbiguous");
+      visited.add(current.id);
+      current = byId.get(current.parent_task_id);
+      if (!current) throw new Error("WorkerSnapshotAmbiguous");
+    }
+  }
+  return root;
+}
+
 const fail = code => { throw new Error(code); };
 const hash = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 const artifact = value => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);

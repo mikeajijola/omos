@@ -7,9 +7,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createCompanyClient } from "./mcp.mjs";
 import { createWorkerBroker } from "./worker-broker.mjs";
-import { createWorkerSnapshot } from "./worker-snapshot.mjs";
+import { createWorkerSnapshot, selectWorkerRoot } from "./worker-snapshot.mjs";
 import { retainWorkerArchive } from "./worker-archive.mjs";
-import { createArchiveHttpControl, createEvaluationHttpControl } from "./worker-http-control.mjs";
+import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
+import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
 
 const fail = code => { throw new Error(code); };
@@ -98,7 +99,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         const checked = await client.call("company_workspace", { version: "omos.company/v1", action: "status", operation: randomUUID(), expires_ms: Date.now() + 120000 }, signal);
         if (checked.isError) fail("WorkerCompanyIdentityChanged");
         const context = await client.call("company_context", {}, signal);
-        if (context.isError || !JSON.parse(context.content[0].text).company.features.actor_archives) fail("WorkerArchiveContractRequired");
+        if (context.isError || !JSON.parse(context.content[0].text).company.features.actor_archives || !JSON.parse(context.content[0].text).company.features.worker_checkpoints) fail("WorkerArchiveContractRequired");
         identity = structuredClone(client.identity);
         return { workspace: client.identity.workspace, package_sha256: environmentSha256, model_handle: model.handle, subjects: [{ actor: client.identity.actor, grant: client.identity.grant }], validation_handles: validation ? [validation.handle] : [] };
       } finally { client.close(); }
@@ -131,9 +132,26 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       const actions = ["discover", "read", "query", "checkpoint", "record", "submit", "status", "reconcile"].filter(action => row.grant.actions.includes(action));
       if (!["discover", "read", "checkpoint", "submit", "status"].every(action => actions.includes(action))) fail("WorkerGrantIncomplete");
       const deadline = Math.min(Date.now() + job.max_runtime_ms, job.expires_ms - 1000);
-      const request = { version: "omos.worker-image-request/v1", action: "prepare", id: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), workspace: binding.workspace, view: binding.view, generation: job.generation, max_runtime_ms: job.max_runtime_ms, model: model.handle, source_revision: row.view_revision };
+      const ownerControl = createWorkerHttpControl(evaluation);
+      const saveCheckpoint = createWorkerCheckpointer({ control: ownerControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation } });
+      const recovering = job.checkpoint && job.checkpoint.phase !== "retained";
+      let checkpoint = recovering ? structuredClone(job.checkpoint) : { version: "omos.company-worker-checkpoint/v1", runtime: job.runtime, generation: job.generation, image: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), source_revision: row.view_revision, model: model.handle, phase: "prepared", export_directory: null };
+      const request = { version: "omos.worker-image-request/v1", action: "prepare", id: checkpoint.image, workspace: binding.workspace, view: binding.view, generation: checkpoint.generation, max_runtime_ms: job.max_runtime_ms, model: checkpoint.model, source_revision: checkpoint.source_revision };
+      const mark = async (phase, rest = {}) => { checkpoint = await saveCheckpoint({ ...checkpoint, ...rest, phase }); };
+      if (!recovering && job.checkpoint) {
+        const previous = job.checkpoint;
+        let exists = false;
+        try { await fs.lstat(path.join(configuration.root, previous.image.slice(0, 24))); exists = true; }
+        catch (error) { if (error.code !== "ENOENT") throw error; }
+        if (exists) {
+          const retained = { ...request, id: previous.image, generation: previous.generation, source_revision: previous.source_revision, model: previous.model };
+          await image({ ...retained, action: "quiesce" });
+          await image({ ...retained, action: "remove" });
+        }
+      }
+      if (!recovering) await mark("prepared");
       const prepared = await image(request, signal);
-      if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== job.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
+      if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== checkpoint.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
       let client, actorClient, broker, complete = false, archiveRetained = false;
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
@@ -144,26 +162,31 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       try {
         client = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions } });
         if (client.identity.workspace !== binding.workspace || client.identity.actor !== binding.actor || client.identity.grant !== binding.grant) fail("WorkerCompanyIdentityChanged");
+        if (recovering) await image({ ...request, action: "quiesce" });
         const actorActions = actions.filter(action => action !== "submit");
-        actorClient = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions: actorActions } });
-        broker = await createWorkerBroker({ socket: prepared.root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: job.expires_ms, model, companyClient: actorClient, company: { endpoint: JSON.parse((await trustedFile(companyConfiguration)).toString("utf8")).endpoint, workspace: binding.workspace, actor: binding.actor, grant: binding.grant, view: binding.view, source_revision: row.view_revision, actions: actorActions } });
-        const state = await call("status");
-        if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
-        const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
-        if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
-        const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
-        // The launcher joins and kills descendants before returning. Actor
-        // answers and private assessments never establish company acceptance.
-        await image({ ...request, action: "quiesce" });
-        signal?.throwIfAborted();
-        if (actor.killed || ![0, 1].includes(actor.code)) fail("WorkerInvocationFailed");
+        if (checkpoint.phase === "prepared") {
+          actorClient = await createCompanyClient(companyConfiguration, { home: companyHome, binding: { view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, expiresMs: job.expires_ms, actions: actorActions } });
+          broker = await createWorkerBroker({ socket: prepared.root + "/run/omos-broker.sock", socketMode: 0o666, expiresMs: job.expires_ms, model, companyClient: actorClient, company: { endpoint: JSON.parse((await trustedFile(companyConfiguration)).toString("utf8")).endpoint, workspace: binding.workspace, actor: binding.actor, grant: binding.grant, view: binding.view, source_revision: checkpoint.source_revision, actions: actorActions } });
+          const state = await call("status");
+          if (state.publication) return { outcome: "completed", note: "The company task was already published; the unused prepared image is retained for operator inspection." };
+          const prompt = `Complete the recorded company task within the current company_workspace MCP scope. The host pins your view and execution generation. Retrieve existing company inputs through company_workspace before editing them. Checkpoint company changes through that service. Local filesystem outputs are collected as proposals after this invocation stops; local reviews do not establish company acceptance. Return your final answer without submitting the company proposal; the host retains public evidence and owns that step. ${coding ? "The host runs isolated coding validation after this invocation." : ""} Read referenced host validation feedback with company_workspace action status, record_id and company_revision, using bounded offset/limit pages. Treat prior logs as evidence to inspect. Do not repeat uncertain external effects.\n${JSON.stringify({ request: row.request, amendments: row.amendments, contract: row.contract, basis: row.basis, company_revision: state.revision, authorised_paths: row.grant.paths, previous_invocation: { note: row.record.note, invocations: row.record.invocations, max_invocations: row.record.max_invocations } })}`;
+          if (Buffer.byteLength(prompt) > 131072) fail("WorkerInvocationContextTooLarge");
+          await mark("running");
+          const actor = await run(prepared.root, ["ask", "--json"], signal, prompt);
+          // The launcher joins and kills descendants before returning. Actor
+          // answers and private assessments never establish company acceptance.
+          await image({ ...request, action: "quiesce" });
+          signal?.throwIfAborted();
+          if (actor.killed || ![0, 1].includes(actor.code)) fail("WorkerInvocationFailed");
+          await mark("stopped");
+        } else await mark("stopped");
         let current = await call("status");
         const frozen = !!current.publication || ["queued", "running"].includes(current.job?.state);
         const snapshot = await run(prepared.root, ["fossil", "status", "--json"], signal);
         if (snapshot.code !== 0) fail("WorkerSnapshotUnavailable");
         const local = JSON.parse(snapshot.stdout);
-        if (!hex(local.workspace_id) || !hex(local.trunk_revision) || !Array.isArray(local.tasks) || local.tasks.length !== 1) fail("WorkerSnapshotAmbiguous");
-        const selected = local.tasks[0];
+        if (!hex(local.workspace_id) || !hex(local.trunk_revision)) fail("WorkerSnapshotAmbiguous");
+        const selected = selectWorkerRoot(local.tasks);
         if (!/^[0-9a-f]{64}$/.test(selected.id) || !hex(selected.model_basis?.definition_hash)) fail("WorkerSnapshotAmbiguous");
         const requestNative = async input => {
           const filename = ".omos-host-read-" + randomUUID() + ".json";
@@ -180,10 +203,15 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         const head = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: selected.model_basis.definition_hash, action: "head", task: selected.id });
         const claim = await requestNative({ version: "omos.workspace-api/v1", workspace: local.workspace_id, definition_hash: head.data.definition_hash, revision: head.data.revision, action: "candidate", task: selected.id });
         if (claim.revision !== head.data.revision || claim.data.task !== selected.id || claim.data.authority !== "actor_claim") fail("WorkerCandidateChanged");
-        const exportDirectory = await fs.mkdtemp(path.join(prepared.root, "workspace", ".omos-host-archive-"));
+        const exportDirectory = checkpoint.export_directory ? path.join(prepared.root, "workspace", checkpoint.export_directory) : await fs.mkdtemp(path.join(prepared.root, "workspace", ".omos-host-archive-"));
+        if (!checkpoint.export_directory) await mark("stopped", { export_directory: path.basename(exportDirectory) });
+        const directoryInfo = await fs.lstat(exportDirectory);
+        if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink() || ![0, prepared.uid].includes(directoryInfo.uid)) fail("UnsafeWorkerArchiveDirectory");
         await fs.chown(exportDirectory, prepared.uid, prepared.uid);
         const exportPath = path.join(exportDirectory, "actor.fossil");
-        const exported = await run(prepared.root, ["fossil", "export", "/workspace/" + path.basename(exportDirectory) + "/actor.fossil", "--json"], signal);
+        let exists = false;
+        try { await fs.lstat(exportPath); exists = true; } catch (error) { if (error.code !== "ENOENT") throw error; }
+        const exported = exists ? { code: 0 } : await run(prepared.root, ["fossil", "export", "/workspace/" + path.basename(exportDirectory) + "/actor.fossil", "--json"], signal);
         await image({ ...request, action: "quiesce" });
         if (exported.code !== 0) fail("WorkerArchiveExportFailed");
         await fs.chown(exportDirectory, 0, 0);
@@ -200,7 +228,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           const name = `records/omos_worker_projection/${selected.id}.json`;
           if (provenanceFiles[0].path !== name) fail("WorkerProjectionIdentityChanged");
           const ledger = JSON.parse((await provenance.read(name, signal)).content.toString("utf8"));
-          if (ledger.version !== "omos.worker-projection/v1" || ledger.task !== selected.id || ledger.source?.version !== "omos.worker-source/v1" || ledger.source.workspace !== binding.workspace || ledger.source.view !== binding.view || ledger.source.revision !== row.view_revision || ledger.source.generation !== job.generation || !Array.isArray(ledger.files) || ledger.files.length > 10000) fail("WorkerProjectionIdentityChanged");
+          if (ledger.version !== "omos.worker-projection/v1" || ledger.task !== selected.id || ledger.source?.version !== "omos.worker-source/v1" || ledger.source.workspace !== binding.workspace || ledger.source.view !== binding.view || ledger.source.revision !== checkpoint.source_revision || ledger.source.generation !== checkpoint.generation || !Array.isArray(ledger.files) || ledger.files.length > 10000) fail("WorkerProjectionIdentityChanged");
           let total = 0;
           for (const file of ledger.files) {
             if (!file || typeof file.path !== "string" || !/^(memory|skills|documents|artifacts|ui)\//.test(file.path) || !file.path.split("/").every(part => part && part !== "." && part !== "..") || /[\x00-\x1f\x7f\\]/.test(file.path) || baseline.has(file.path) || !hex(file.sha256) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || file.bytes > 8 * 1024 * 1024 || (total += file.bytes) > 64 * 1024 * 1024 || typeof file.executable !== "boolean" || !row.grant.paths.some(scope => scope.endsWith("/") ? file.path.startsWith(scope) : file.path === scope)) fail("InvalidWorkerProjectionLedger");
@@ -208,7 +236,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           }
         }
         const originalFile = async (filename, previous) => {
-          const original = await call("read", { revision: row.view_revision, path: filename, offset: 0 });
+          const original = await call("read", { revision: checkpoint.source_revision, path: filename, offset: 0 });
           const observed = baseline.get(filename);
           if (observed && (original.exists === false || original.sha256 !== observed.sha256 || original.bytes !== observed.bytes || original.executable !== observed.executable)) fail("WorkerProjectionSourceChanged");
           if (previous.exists !== false && (original.exists === false || previous.sha256 !== original.sha256 || previous.executable !== original.executable)) fail("WorkerCompanyOutputConflict");
@@ -249,13 +277,14 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           current = { ...current, revision: checkpoint.revision };
         }
         if (frozen) { complete = true; return { outcome: current.publication ? "completed" : "submitted" }; }
-        if (typeof claim.data.candidate !== "string" || !claim.data.candidate.trim() || Buffer.byteLength(claim.data.candidate) > 32768) return { outcome: "waiting", note: "The invocation has no bounded recorded answer; inspect retained local task evidence before requeueing." };
+        if (typeof claim.data.candidate !== "string" || !claim.data.candidate.trim() || Buffer.byteLength(claim.data.candidate) > 32768) return { outcome: "waiting", note: "Public history is archived, but the private task has no bounded recorded answer. Inspect and resume that retained task before dispatching another actor." };
         if (coding) {
           const control = createEvaluationHttpControl(evaluation);
           let checked;
           try { checked = await runCompanyValidation({ configuration: validation, configurationSha256: validationSha256, environmentSha256, control, client, row, revision: current.revision, candidate: claim.data.candidate, image, run, signal }); }
           finally { control.close(); }
           if (!checked.passed) {
+            await mark("retained");
             const failed = checked.feedback.checks[0];
             const reference = `record_id=${checked.record_id}; evidence=${checked.evidence};`;
             const details = failed ? ` check=${failed.id}; exit=${failed.exit_code}; ${failed.stderr || failed.stdout}` : " Inspect incomplete validation evidence.";
@@ -270,6 +299,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (broker) await broker.close();
         if (actorClient && actorClient !== client) actorClient.close();
         if (client) client.close();
+        ownerControl.close();
         // Retain an unsuccessful image, including its private Fossil checkpoint,
         // for operator recovery. It consumes the bounded pool until resolved.
         try {
