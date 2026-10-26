@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { createWorkerHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
@@ -1035,6 +1035,91 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
     expect(cleaned.status, cleaned.stderr).toBe(0);
   }
 }, 480000);
+
+test.skipIf(process.platform !== "linux")("company metadata pages keep file bodies bounded while inspecting a quarter-gigabyte inventory", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const tree = join(f.home, "capacity-source"); mkdirSync(tree);
+  const fossil = (...args: string[]) => {
+    const result = spawnSync(existsSync(join(import.meta.dir, "../../zig-out/libexec/fossil")) ? join(import.meta.dir, "../../zig-out/libexec/fossil") : Bun.which("fossil")!, args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk"); mkdirSync(join(tree, "documents/capacity"), { recursive: true });
+  const content = Buffer.alloc(8 * 1024 * 1024 - 64, 120), expected = createHash("sha256").update(content).digest("hex");
+  for (let index = 0; index < 32; index++) writeFileSync(join(tree, "documents/capacity", `${index}.txt`), content);
+  fossil("addremove"); fossil("commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain bounded metadata capacity fixture");
+  const admin = async (input: object) => {
+    const file = join(f.home, "capacity-operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "capacity-reader", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "capacity-reader", actor: "reader", public_key: (key.model_data ?? key).public_key, paths: ["documents/capacity/"], actions: ["discover", "read"], expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client;
+  const resident = () => Number(readFileSync(`/proc/${service.child.pid}/status`, "utf8").match(/^VmRSS:\s+(\d+) kB$/m)![1]) * 1024;
+  const before = resident(); let peak = before;
+  const sample = setInterval(() => { try { peak = Math.max(peak, resident()); } catch {} }, 10);
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const file = join(f.home, "capacity-client.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "reader", grant: "capacity-reader", key_handle: "capacity-reader", actions: ["discover", "read"] }), { mode: 0o600 });
+    client = await createCompanyClient(file, { home: f.home });
+    const started = Date.now(), paths = new Set(); let offset = 0, pages = 0, maximumResponse = 0, maximumLatency = 0;
+    for (;;) {
+      const requestStarted = Date.now();
+      const result = await client.call("company_workspace", { version: "omos.company/v2", action: "discover", revision: boot.revision, offset, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+      maximumLatency = Math.max(maximumLatency, Date.now() - requestStarted);
+      expect(result.isError, JSON.stringify({ result, pages, elapsed_ms: Date.now() - started, peak_resident_growth_bytes: peak - before })).not.toBe(true);
+      const data = JSON.parse(result.content[0].text); pages++;
+      expect(data.total).toBe(32); expect(data.files.length).toBeGreaterThan(0); expect(data.files.length).toBeLessThanOrEqual(32);
+      expect(data.files.every(file => file.sha256 === expected && file.bytes === content.length && file.executable === false)).toBe(true);
+      for (const file of data.files) { expect(paths.has(file.path)).toBe(false); paths.add(file.path); }
+      maximumResponse = Math.max(maximumResponse, Buffer.byteLength(result.content[0].text));
+      offset += data.files.length;
+      if (data.next_offset === null) break;
+      expect(data.next_offset).toBe(offset);
+    }
+    expect(pages).toBeGreaterThan(1); expect(paths.size).toBe(32);
+    expect(maximumResponse).toBeLessThan(16384);
+    expect(peak - before).toBeLessThan(192 * 1024 * 1024);
+    console.info(JSON.stringify({ measurement: "company_metadata_pages", files: 32, pages, referenced_bytes: 32 * content.length, maximum_response_bytes: maximumResponse, maximum_request_ms: maximumLatency, peak_resident_growth_bytes: peak - before, elapsed_ms: Date.now() - started }));
+  } finally { clearInterval(sample); client?.close(); service.child.kill(); await service.child.exited; }
+}, 180000);
+
+test("portable scope verification accepts every signed short inventory page beyond the former fixed page count", async () => {
+  const f = fixture(), offline = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const keyed = await f.run(["fossil", "company-key", "short-reader", "--json"]); expect(keyed.code, keyed.stderr).toBe(0);
+  const identity = JSON.parse(keyed.stdout), actorKey = (identity.model_data ?? identity).public_key;
+  const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(actorKey, "hex")]), format: "der", type: "spki" });
+  const signer = generateKeyPairSync("ed25519"), issuer = signer.publicKey.export({ type: "spki", format: "der" }).subarray(-32).toString("hex");
+  const workspace = "a".repeat(64), revision = "b".repeat(64), digest = createHash("sha256").update("x").digest("hex");
+  let inventories = 0, reads = 0, rechecks = 0;
+  const source = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (request.method === "GET") return Response.json({ version: "omos.company/v1", workspace, issuer, epoch: 1, features: { file_attributes: "omos.company/v2" } });
+    const envelope = await request.json() as any, args = JSON.parse(envelope.payload);
+    expect(verify(null, Buffer.from(envelope.payload), publicKey, Buffer.from(envelope.signature, "hex"))).toBe(true);
+    expect(args).toMatchObject({ action: "export_scope", version: "omos.company/v2", workspace, revision, actor: "reader", grant: "short-pages" });
+    let result;
+    if (typeof args.path === "string") { reads++; expect(args.offset).toBe(0); result = { revision, path: args.path, exists: true, executable: false, offset: 0, bytes: 1, sha256: digest, content: "eA==", encoding: "base64", next_offset: null }; }
+    else {
+      if (inventories === 314) { expect(args.offset).toBe(0); rechecks++; }
+      else { expect(args.offset).toBe(inventories); inventories++; }
+      result = { version: "omos.scoped-export/v2", workspace, revision, actor: args.actor, grant: args.grant, total: 314, next_offset: args.offset === 313 ? null : args.offset + 1, files: [{ path: `documents/short/${args.offset}.txt`, sha256: digest, bytes: 1, executable: false }] };
+    }
+    const payload = JSON.stringify({ version: "omos.company-receipt/v1", workspace, actor: args.actor, grant: args.grant, operation: args.operation, request_hash: createHash("sha256").update(envelope.payload).digest("hex"), action: args.action, epoch: 1, result });
+    return Response.json({ issuer, payload, signature: sign(null, Buffer.from(payload), signer.privateKey).toString("hex") });
+  } });
+  try {
+    const config = { version: "omos.scope-export-request/v1", endpoint: `http://127.0.0.1:${source.port}`, workspace, revision, issuer, actor: "reader", grant: "short-pages", key_handle: "short-reader" };
+    const input = join(f.home, "short-pages.json"), output = join(f.home, "short-pages.tar"); writeFileSync(input, JSON.stringify(config));
+    const exported = await f.run(["fossil", "export-scope", input, output, "--json"], {}, 120000);
+    expect(exported.code, exported.stderr).toBe(0); expect(inventories).toBe(314); expect(reads).toBe(1); expect(rechecks).toBe(1);
+    const pins = join(offline.home, "pins.json"); writeFileSync(pins, JSON.stringify({ ...config, endpoint: "http://127.0.0.1:1" }));
+    const checked = await offline.run(["fossil", "verify-scope", pins, output, "--json"], {}, 120000);
+    expect(checked.code, checked.stderr).toBe(0); expect(JSON.parse(checked.stdout)).toMatchObject({ files: 314, bytes: 314, revision, file_attributes: "verified" });
+    expect(existsSync(join(offline.home, ".fx/omos-workspace.json"))).toBe(false);
+  } finally { source.stop(true); }
+}, 180000);
 
 test("personal tasks retain more than one hundred distinct read dependencies without discarding earlier observations", async () => {
   const f = fixture();

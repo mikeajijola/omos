@@ -759,15 +759,20 @@ fn perform(original: workspace.Manager, current: authority.State, grant: authori
         }
         var files: std.ArrayList(std.json.Value) = .empty;
         var count: usize = 0;
+        // Row count alone can hide 32 maximum-sized object reads. Stop after
+        // crossing the byte budget; one bounded object can cross the boundary.
+        var inspected_bytes: usize = 0;
+        const inspection_budget = 4 * 1024 * 1024;
         for (try manager.inventory(pinned)) |path| {
             if (!authority.permitsPath(grant, path)) continue;
             if (export_plan) |plan| if (!package.includes(plan, path)) continue;
-            if (count >= request.offset and files.items.len < 32) {
+            if (count >= request.offset and files.items.len < 32 and inspected_bytes < inspection_budget) {
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
                 var reader = manager;
                 reader.alloc = scratch.allocator();
                 const bytes = try reader.contentAt(path, pinned);
+                inspected_bytes += bytes.len;
                 if (attributes) try fossil_manifest.verifyObject((flags.get(path) orelse return error.WorkspaceVerificationFailed).artifact.?, bytes);
                 var result = try parse(alloc, try encode(alloc, .{ .path = path, .sha256 = try workspace.hash(scratch.allocator(), bytes), .bytes = bytes.len }));
                 if (attributes) try result.object.put(alloc, "executable", .{ .bool = (flags.get(path) orelse return error.WorkspaceVerificationFailed).mode == .executable });

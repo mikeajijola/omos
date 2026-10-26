@@ -413,6 +413,13 @@ most 20,000 projection requests within the invocation deadline, separately from
 its actor request budget. This is an on-demand projection for native managed
 roots; it is not a general network filesystem.
 
+Company inventory pages contain at most 32 file rows. They also stop after
+inspecting 4 MiB of content, allowing one bounded object to cross that boundary.
+With the 8 MiB object limit, a page inspects less than 12 MiB. Follow
+`next_offset` until it is null even when a page contains fewer than 32 rows.
+Each body is released before the next object is inspected; the accumulated
+inventory never has to fit in one response or request deadline.
+
 After stopping and joining the actor, the backend verifies a quiescent worker
 UID and reads its private Fossil snapshot through native read-only commands.
 It proposes permitted managed files through signed company checkpoints, with

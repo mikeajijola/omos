@@ -57,6 +57,10 @@ and hashes rather than combining the referenced file bodies. Completion checks
 still verify the retained observations against the publication candidate.
 Company inventory requests release each hashed file body before inspecting the
 next one, so a metadata page does not retain 32 full documents in memory.
+Company metadata pagination stops after 32 rows or after inspecting 4 MiB of
+content. One object can cross the byte boundary, with an 8 MiB per-object limit.
+Use `next_offset` to retrieve every remaining row; a short page can still have
+more results. This bounds inspection work without rejecting a large inventory.
 
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
