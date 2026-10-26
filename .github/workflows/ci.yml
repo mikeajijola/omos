@@ -665,8 +665,12 @@ jobs:
         include:
           - suite: contracts
             pattern: '^(?!.*the production company coordinator)'
-          - suite: isolated execution
-            pattern: 'the production company coordinator'
+          - suite: isolated execution 1/3
+            pattern: 'the production company coordinator.*\[isolation group 1\]$'
+          - suite: isolated execution 2/3
+            pattern: 'the production company coordinator.*\[isolation group 2\]$'
+          - suite: isolated execution 3/3
+            pattern: 'the production company coordinator.*\[isolation group 3\]$'
     env:
       AI_GATEWAY_API_KEY: ""
       VERCEL_OIDC_TOKEN: ""

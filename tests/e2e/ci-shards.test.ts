@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { companyWorkerScenarios, companyWorkerScenarioName } from "./company-worker-scenarios";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -179,4 +180,17 @@ describe("macOS platform E2E list", () => {
     expect(() => restrictToFiles(files, manifest, ["z.test.ts"])).toThrow("not a discovered test");
     expect(() => restrictToFiles(files, manifest, ["a.test.ts", "a.test.ts"])).toThrow("duplicate");
   });
+});
+
+
+test("every production company worker scenario belongs to exactly one isolated CI group", () => {
+  const workflow = readFileSync(join(import.meta.dir, "../../.github/workflows/ci.yml"), "utf8");
+  const job = workflow.slice(workflow.indexOf("  e2e_company_workers:"), workflow.indexOf("  e2e_conformance:"));
+  const patterns = Array.from(job.matchAll(/pattern: '([^']+)'/g), match => new RegExp(match[1]));
+  expect(patterns).toHaveLength(4);
+  expect(new Set(companyWorkerScenarios.map(scenario => scenario.id)).size).toBe(companyWorkerScenarios.length);
+  for (const scenario of companyWorkerScenarios) {
+    const name = companyWorkerScenarioName(scenario);
+    expect(patterns.map((pattern, index) => pattern.test(name) ? index : -1).filter(index => index >= 0)).toEqual([scenario.group]);
+  }
 });

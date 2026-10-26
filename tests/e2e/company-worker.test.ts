@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { companyWorkerScenarios, companyWorkerScenarioName } from "./company-worker-scenarios";
 import http from "node:http";
 import net from "node:net";
 import { join } from "node:path";
@@ -1588,7 +1589,8 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "desired", "input", "answer", "recovery", "archive_recovery", "partial_recovery", "retirement", "amendment", "amend_after_answer", "projection", "coding", "coding_recovery", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding_recovery" ? "coding recovery after retained failed checks" : scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "desired" ? "continuous desired capability reconciliation" : scenario === "input" ? "authenticated human input in the isolated worker" : scenario === "partial_recovery" ? "the retained native session after interruption before an answer" : scenario === "retirement" ? "passive public history retention after cancellation" : scenario === "amend_after_answer" ? "an authenticated amendment after a private answer while preserving unaffected files" : scenario === "amendment" ? "an authenticated task amendment in the retained native session" : scenario === "archive_recovery" ? "archive recovery without replaying the actor" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_supported)(companyWorkerScenarioName(scenarioSpec), async () => {
+  const scenario = scenarioSpec.id;
   const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
   const desiredTask = scenario === "desired", inputTask = scenario === "input";
   const partialRecovery = scenario === "partial_recovery" && support.private_namespaces;
@@ -1596,7 +1598,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
   const amending = ["amendment", "amend_after_answer"].includes(scenario) && support.private_namespaces;
   const amendAfterAnswer = scenario === "amend_after_answer" && support.private_namespaces;
   let amendmentAfterAnswerSubmitted = false;
-  let resumedNativeHistory = false, receivedAmendment = false;
+  let resumedNativeHistory = false, receivedAmendment = false, retainedSummaryRead = false;
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
@@ -1626,7 +1628,11 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
     }
     if (amending && count === 3) {
       receivedAmendment = body.messages.some(message => JSON.stringify(message.content).includes("Replace the document with Amended by the authenticated user"));
-      if (amendAfterAnswer) expect(body.messages.some(message => JSON.stringify(message.content).includes("documents/team/summary.txt"))).toBe(true);
+      if (amendAfterAnswer) return tool("fossil_workspace", { action: "read", path: "documents/team/summary.txt" });
+      return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Amended by the authenticated user" });
+    }
+    if (amendAfterAnswer && count === 4) {
+      retainedSummaryRead = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Preserve this unaffected summary."));
       return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Amended by the authenticated user" });
     }
     if (amendAfterAnswer && count === 1) {
@@ -1772,7 +1778,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
       }
       if (amending) {
         expect(outcome.amended_task).toBe(!amendAfterAnswer); expect(receivedAmendment).toBe(true);
-        if (amendAfterAnswer) { expect(amendmentAfterAnswerSubmitted).toBe(true); expect(f.fossil("cat", "documents/team/summary.txt", "-r", "trunk")).toBe("Preserve this unaffected summary."); }
+        if (amendAfterAnswer) { expect(amendmentAfterAnswerSubmitted).toBe(true); expect(retainedSummaryRead).toBe(true); expect(f.fossil("cat", "documents/team/summary.txt", "-r", "trunk")).toBe("Preserve this unaffected summary."); }
         expect(current.amendments).toEqual(["Replace the document with Amended by the authenticated user"]);
         expect(current.record.checkpoint.company_contract).toBe(current.record.binding.contract_sha256);
       }
@@ -1853,7 +1859,7 @@ for (const scenario of ["files", "desired", "input", "answer", "recovery", "arch
         const kept = await client.call("company_workspace", { version: "omos.company/v2", action: "read", revision: current.publication.revision, path: "documents/team/keep.sh", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         expect(kept.isError, JSON.stringify(kept)).not.toBe(true); expect(JSON.parse(kept.content[0].text).executable).toBe(true);
       }
-      expect(inference.counts().actors).toBe(answerOnly ? 1 : inputTask ? 3 : projected || codingRecovery || amending || partialRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
+      expect(inference.counts().actors).toBe(answerOnly ? 1 : inputTask ? 3 : amendAfterAnswer ? 5 : projected || codingRecovery || amending || partialRecovery ? 4 : 2); expect(host.counts().assessments).toBeGreaterThan(0);
     } else {
       expect(result.code).toBe(1); expect(outcome).toEqual({ ok: false, error: "WorkerPrivateNamespacesRequired" });
       expect(result.images).toBe(0); if (answerOnly || desiredTask) expect(current).toBeUndefined(); else { expect(current.record.state).toBe("queued"); expect(current.record.invocations).toBe(0); }
