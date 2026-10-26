@@ -1,6 +1,7 @@
 //! Durable review scheduling identities. Model output cannot acquire a lease
 //! or authorize publication. The manager persists and fences these records.
 const std = @import("std");
+const contract = @import("../agent/runtime/work_contract.zig");
 
 pub const Job = struct {
     version: []const u8 = "omos.review-job/v1",
@@ -9,9 +10,12 @@ pub const Job = struct {
     contract_version: u32,
     definition_hash: []const u8,
     candidate_hash: []const u8,
+    kind: enum { completion, planning } = .completion,
+    planning_contract_sha256: ?[]const u8 = null,
+    planning_definition: ?contract.Definition = null,
     workspace_definition_hash: []const u8 = "",
     workspace_definition_revision: []const u8 = "",
-    state: enum { queued, running, pending, changes_required, blocked, published, failed } = .queued,
+    state: enum { queued, running, pending, changes_required, blocked, published, failed, planned } = .queued,
     generation: u64 = 0,
     owner: []const u8 = "",
     lease_expires_ms: i64 = 0,

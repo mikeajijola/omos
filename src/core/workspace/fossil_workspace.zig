@@ -1022,19 +1022,124 @@ pub const Manager = struct {
         }
         if (!std.mem.eql(u8, value.version, "omos.review-job/v1")) return error.UnsupportedReviewJobVersion;
         if (!std.mem.eql(u8, value.id, id) or !std.mem.eql(u8, value.task, task.id) or value.generation > std.math.maxInt(i64)) return error.InvalidReviewJob;
+        if (value.kind == .planning) {
+            const original = value.planning_definition orelse return error.InvalidReviewJob;
+            if (!std.mem.eql(u8, original.id, task.id) or original.version > value.contract_version) return error.InvalidReviewJob;
+            _ = try @import("company_authority.zig").hexBytes(32, value.planning_contract_sha256 orelse return error.InvalidReviewJob);
+        }
         return value;
     }
 
-    fn saveReviewJob(self: Manager, task: Task, job: @import("review_job.zig").Job) !void {
+    fn reviewJobBytes(self: Manager, job: @import("review_job.zig").Job) ![]const u8 {
+        var value = try parse(self.alloc, std.json.Value, try json(self.alloc, job));
         if (job.workspace_definition_revision.len > 0) {
             const declaration = try self.loadDeclaration(job.workspace_definition_revision);
             if (!std.mem.eql(u8, declaration.hash, job.workspace_definition_hash)) return error.StaleWorkspaceDefinition;
-            try model.validateOperation(self.alloc, declaration, "omos_record_review_job", (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, job), .{})).value, .input);
+            var accepts_kind = false;
+            for (model.items(model.spec(declaration.value), "operations")) |operation| if (std.mem.eql(u8, model.text(operation, "id"), "omos_record_review_job")) {
+                const input = model.field(operation, "input") orelse return error.InvalidReviewJob;
+                accepts_kind = model.field(model.field(input, "properties") orelse return error.InvalidReviewJob, "kind") != null;
+            };
+            if (!accepts_kind) {
+                if (job.kind != .completion) return error.CompanyDefinitionUpdateRequired;
+                _ = value.object.swapRemove("kind");
+                _ = value.object.swapRemove("planning_contract_sha256");
+                _ = value.object.swapRemove("planning_definition");
+            }
+            try model.validateOperation(self.alloc, declaration, "omos_record_review_job", value, .input);
         }
+        return json(self.alloc, value);
+    }
+
+    fn saveReviewJob(self: Manager, task: Task, job: @import("review_job.zig").Job) !void {
+        const bytes = try self.reviewJobBytes(job);
         const tree = try self.checkout(task.branch);
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
-        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try json(self.alloc, job));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), bytes);
         _ = try self.commit(tree, "Retain durable review job state");
+    }
+
+    pub fn planningJobId(self: Manager, task: Task) ![]const u8 {
+        const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
+        return hash(self.alloc, try json(self.alloc, .{ "company-planning", task.id, basis.definition_hash }));
+    }
+
+    pub fn planningJob(self: Manager, task: Task) !?@import("review_job.zig").Job {
+        const id = try self.planningJobId(task);
+        const selected = try self.jobPath(id);
+        for (try self.inventory(try self.currentRevision(task))) |entry| if (std.mem.eql(u8, entry, selected)) {
+            const job = try self.loadReviewJob(task, id);
+            if (job.kind != .planning) return error.InvalidReviewJob;
+            return job;
+        };
+        return null;
+    }
+
+    /// Queue read-only planning on the existing fenced auxiliary worker pool.
+    /// No model or actor runs while holding the company writer boundary.
+    pub fn queuePlanning(self: Manager, previous: Task, previous_contract: []const u8, retry: bool) !@import("review_job.zig").Job {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
+        if (task.authority == null or task.revision_pending or task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.TaskIsReadOnly;
+        const basis = task.model_basis orelse return error.WorkspaceMigrationRequired;
+        const transport = (try self.modelBasis(try self.revision("trunk"))) orelse return error.WorkspaceMigrationRequired;
+        if (!@import("company_planning.zig").supported(try self.loadDeclaration(transport.revision))) return error.CompanyDefinitionUpdateRequired;
+        var job: @import("review_job.zig").Job = .{ .id = try self.planningJobId(task), .task = task.id, .kind = .planning, .contract_version = task.definition.version, .definition_hash = basis.definition_hash, .candidate_hash = try hash(self.alloc, ""), .planning_contract_sha256 = previous_contract, .planning_definition = task.definition, .workspace_definition_hash = transport.definition_hash, .workspace_definition_revision = transport.revision };
+        if (task.review_job) |selected| if (!std.mem.eql(u8, selected, job.id)) {
+            const retained = try self.loadReviewJob(task, selected);
+            if (retained.state == .queued or retained.state == .running) return error.TaskReviewInProgress;
+        };
+        if (try self.planningJob(task)) |retained| {
+            if (!std.mem.eql(u8, retained.planning_contract_sha256.?, previous_contract)) return error.StaleCompanyWorkerContract;
+            if (retained.state == .queued or retained.state == .running or retained.state == .planned or !retry) return retained;
+            job = retained;
+            job.state = .queued;
+            job.reason = "";
+            job.owner = "";
+            job.lease_expires_ms = 0;
+            job.started_ms = 0;
+            job.review_attempts = 0;
+            job.reported_tokens = 0;
+            job.budget_epoch = std.math.add(u64, job.generation, 1) catch return error.InvalidReviewJob;
+        } else {
+            if (basis.capability != null) return error.StaleCompanyWorkerContract;
+            if (!std.mem.eql(u8, previous_contract, try hash(self.alloc, try json(self.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })))) return error.StaleCompanyWorkerContract;
+        }
+        task.review_job = job.id;
+        task.state = .active;
+        try atomicWrite(self.alloc, try self.reviewSelectionPath(task.id), task.id);
+        try self.saveReviewJob(task, job);
+        try self.saveTask(task);
+        try self.clearReviewSelection(task.id);
+        return job;
+    }
+
+    pub fn finishPlanning(self: Manager, previous: @import("review_job.zig").Job) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.task));
+        try self.checkReviewFence(task);
+        var job = try self.loadReviewJob(task, previous.id);
+        if (job.kind != .planning or (task.model_basis orelse return error.WorkspaceMigrationRequired).capability == null) return error.InvalidReviewJob;
+        const original = job.planning_definition orelse return error.InvalidReviewJob;
+        if (!std.mem.eql(u8, original.objective, task.definition.objective)) return error.WeakenedParentContract;
+        for (original.obligations) |required| {
+            const preserved = for (task.definition.obligations) |actual| {
+                if (std.mem.eql(u8, required.id, actual.id) and std.mem.eql(u8, required.description, actual.description)) break true;
+            } else false;
+            if (!preserved) return error.WeakenedParentContract;
+        }
+        if (task.review_job == null or !std.mem.eql(u8, task.review_job.?, job.id)) return error.StaleReviewLease;
+        job.state = .planned;
+        job.reason = "The host retained the task plan. Completion still requires independent verification and publication.";
+        job.lease_expires_ms = 0;
+        job.reported_tokens = try self.retainedReviewTokens(task, job);
+        task.review_job = null;
+        try atomicWrite(self.alloc, try self.reviewSelectionPath(task.id), task.id);
+        try self.saveReviewJob(task, job);
+        try self.saveTask(task);
+        try self.clearReviewSelection(task.id);
     }
 
     fn reviewSelectionPath(self: Manager, id: []const u8) ![]const u8 {
@@ -3298,6 +3403,7 @@ pub const Manager = struct {
             if (publication.task.authority != null and !try self.sameRevision(publication.task.base_revision, try self.revision(publication.target))) return error.CompanyReconciliationRequired;
             if (publication.review_fence) |fence| {
                 const job = try self.loadReviewJob(publication.task, fence.job);
+                if (job.kind != .completion) return error.WorkspaceReviewRequired;
                 if (!@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
             }
             if (!try self.sameRevision(try self.revision(publication.task.branch), publication.source)) return error.WorkspaceRevisionChanged;
@@ -3332,7 +3438,7 @@ pub const Manager = struct {
                 job.state = .published;
                 job.lease_expires_ms = 0;
                 job.reported_tokens = try self.retainedReviewTokens(publication.task, job);
-                try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try json(self.alloc, job));
+                try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try self.reviewJobBytes(job));
             }
             try atomicWrite(self.alloc, try join(self.alloc, tree, receipt), try json(self.alloc, publication));
             accepted_revision = try self.commit(tree, try self.alloc.print("Accept verified task {s} operation {s}", .{ publication.task.id, publication.operation }));
@@ -3788,12 +3894,21 @@ pub const Manager = struct {
         }
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(current.id)), try json(self.alloc, current));
         try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, plan) })), plan);
+        if (self.review_fence) |fence| {
+            var job = try self.loadReviewJob(current, fence.job);
+            if (job.kind != .planning or !@import("review_job.zig").owns(job, fence, io_mod.milliTimestamp())) return error.StaleReviewLease;
+            // A resumed planner must observe the strengthened contract and its
+            // matching fence in the same commit, without repeating the model.
+            job.contract_version = current.definition.version;
+            try atomicWrite(self.alloc, try join(self.alloc, tree, try self.jobPath(job.id)), try self.reviewJobBytes(job));
+        }
         if (superseded) |ids| {
             const revision_record = try json(self.alloc, .{ .kind = "contract_revision", .task = current.id, .contract_version = current.definition.version, .value = .{ .previous_contract = previous_definition, .contract = current.definition, .previous_capability = previous_capability, .capability = capability, .superseded = ids, .removed_host_obligations = removed_host_obligations, .summary = recorded_summary, .amendments = current.amendments[planned_amendments..], .origin = "authenticated_user_amendment" } });
             try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ current.id, try hash(self.alloc, revision_record) })), revision_record);
         }
         _ = try self.commit(tree, if (superseded == null) "Pin task plan and preserve original acceptance criteria" else "Revise requirements from authenticated user amendments");
         try self.saveTask(current);
+        if (self.review_fence != null) try fault("company-plan-committed");
         return current;
     }
 

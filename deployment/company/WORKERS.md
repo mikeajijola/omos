@@ -133,8 +133,9 @@ active requests; closing the company client cancels its active signed calls.
 The client expires with its binding, independently of the execution lease
 that the native company service checks on each operation.
 
-This connection does not yet provide a durable hosted job coordinator or image
-preparation service. The gateway continues to report `hosted_execution: false`.
+The durable job coordinator and image preparer described below use this
+connection. The gateway continues to report `hosted_execution: false` pending
+qualification and gateway integration of the complete backend.
 
 The broker accepts fixed model and company routes. Model calls map an allowed
 worker model handle to a configured provider model and receive credentials
@@ -256,6 +257,25 @@ Call `tick()` to inspect native jobs and dispatch queued work. The default allow
 one invocation at a time; an operator can select up to four. Each pass reads at
 most 1,024 job metadata rows and retains a disposable cursor for the next pass.
 Claiming a job retrieves its full pinned contract and authority context.
+
+Before dispatching an unplanned task, the coordinator requests `change: "plan"`.
+The native host queues read-only planning on its existing auxiliary worker
+pool. Model calls run outside the company writer boundary. Inspection reports
+`planning_required`, `planning_state`, and the selected planning job. Waiting
+for planning does not consume an actor invocation.
+
+The planner preserves the original request and obligations, records concrete
+acceptance criteria, and selects the native task capability. Coding tasks gain
+the host's `coding_validation` and `coding_summary` requirements. A committed
+plan and its matching contract version survive interruption together. Recovery
+finishes that retained plan without another planning call. The operator's next
+`plan` request updates the worker's contract pin only after the host verifies
+that planning receipt; arbitrary contract changes remain rejected.
+
+A failed plan leaves actor work waiting for inspection and explicit `requeue`.
+It cannot publish a task or establish coding validation. Tasks pinned to older
+definitions retain their original contracts; migrate company transport
+definitions before requesting the new planning operation.
 
 The backend's `run(row, signal)` must resolve or reject only after stopping and
 joining every actor process. The coordinator clips that invocation to the job's

@@ -41,6 +41,7 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
           if (invocation.pending_operation) fail("WorkerRecoveryRequired");
         }
         if (invocation.publication || ["queued", "running"].includes(invocation.review_state)) result = { outcome: "submitted" };
+        else if (invocation.planning_required) result = { outcome: "waiting", note: "The retained internal operation was reconciled. Requeue for host planning before starting actor work." };
         else result = await backend.run(structuredClone(invocation), controller.signal);
       }
       catch (error) { if (error?.executionUncertain) return; const cause = /^[A-Z][A-Za-z0-9]{0,95}$/.test(error?.message) ? error.message : "IsolatedInvocationFailed"; result = { outcome: "failed", note: `${cause}. Inspect the retained isolated checkpoint before resuming.` }; }
@@ -84,7 +85,14 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
             } else if (row.record.state === "running" && row.record.expires_ms <= Date.now()) {
               await update({ change: "expire", operation: randomUUID(), view, expected_sha256: row.sha256 });
             } else if (!closed && row.record.state === "queued" && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function")) {
-              const claimed = await update({ change: "claim", operation: randomUUID(), view, expected_sha256: row.sha256, execution: { runtime, generation: row.execution?.generation ?? 0 } });
+              if (["queued", "running"].includes(row.review_state)) continue;
+              let prepared = row;
+              if (row.planning_required && !row.pending_operation) {
+                if (["queued", "running"].includes(row.planning_state)) continue;
+                prepared = await update({ change: "plan", operation: randomUUID(), view, expected_sha256: row.sha256 });
+                if (closed || prepared.record.state !== "queued" || prepared.planning_required) continue;
+              }
+              const claimed = await update({ change: "claim", operation: randomUUID(), view, expected_sha256: prepared.sha256, execution: { runtime, generation: prepared.execution?.generation ?? 0 } });
               const owned = { runtime, generation: claimed.record.generation };
               if (!sameOwner(claimed, owned) || !claimed.authority_live || claimed.record.expires_ms - Date.now() < 1000 || (claimed.pending_operation && typeof backend.recover !== "function") || !claimed.contract || !claimed.request || !claimed.basis || !claimed.grant) fail("WorkerCoordinatorClaimChanged");
               if (closed) {

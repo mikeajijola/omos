@@ -37,7 +37,7 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object; revise?: (packet: any) => object; progress?: (packet: any) => object } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number) => object, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -52,7 +52,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         const revising = body.tools.some((tool: any) => tool.function?.name === "omos_contract_revision");
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
         if (revising) revisionPackets.push(packet);
-        const decision = planning ? governance.plan ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
+        const decision = planning ? (typeof governance.plan === "function" ? await governance.plan(packet) : governance.plan) ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
           : revising ? governance.revise?.(packet) ?? { capability: packet.context.model.basis?.capability ?? "general_task", summary: "Retain requirements with the supplied clarification", obligations: [], checks: [], superseded: [] }
           : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
         delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };

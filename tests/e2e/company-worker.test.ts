@@ -394,6 +394,119 @@ test("host-held company keys bind native worker MCP calls to one view and execut
   }
 }, 360000);
 
+for (const scenario of ["general_task", "coding_task", "retry", "resume"]) test(`company host records ${scenario} planning before actor dispatch without holding its writer`, async () => {
+  const capability = scenario === "retry" || scenario === "resume" ? "general_task" : scenario;
+  const f = fixture();
+  let release!: () => void, entered!: () => void, plans = 0;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const inference = model(f, () => { throw Error("Read-only planning cannot execute actor tools"); }, undefined, { plan: async packet => {
+    plans++;
+    expect(packet.context.originalRequest).toContain("Preserve the original task");
+    expect(packet.context.contract.obligations.some(item => item.id === "request_complete")).toBe(true);
+    expect(packet.context.authority.paths).toEqual(["documents/team/"]);
+    entered(); await pending;
+    if (scenario === "retry" && plans === 1) return { capability, summary: "Reject attempted replacement of a host obligation", obligations: [{ id: "request_forbidden", description: "An invalid planner requirement" }], checks: [] };
+    return { capability, summary: "Preserve the original task and record its acceptance criteria", obligations: [{ id: "retained_outcome", description: "Retain the requested result within the authorised company task." }], checks: capability === "coding_task" ? ["Run the applicable repository checks"] : [] };
+  } });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const path = join(f.home, "planning-admin.json"); writeFileSync(path, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", path, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initial = await admin({ action: "initialize" });
+  const keyResult = await f.run(["fossil", "company-key", "planning-worker", "--json"]); expect(keyResult.code, keyResult.stderr).toBe(0); const key = JSON.parse(keyResult.stdout);
+  const actions = ["create_view", "execution", "read", "checkpoint", "submit", "status"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "planning-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true, scenario === "resume" ? { FX_E2E_FOSSIL_FAULT: "company-plan-committed" } : {});
+  let client, control;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const path = join(f.home, "planning-client.json"); writeFileSync(path, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "planning-worker", key_handle: "planning-worker", actions }), { mode: 0o600 });
+    client = await createCompanyClient(path, { home: f.home });
+    const response = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, scope: ["documents/team/"], objective: "Preserve the original task and retain the requested result." });
+    expect(response.isError, JSON.stringify(response)).not.toBe(true); const view = JSON.parse(response.content[0].text).view;
+    const transport = createWorkerHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    let losePlanAcknowledgement = true;
+    control = { ...transport, async call(input) {
+      const result = await transport.call(input);
+      if (input.change === "plan" && result.ok && losePlanAcknowledgement) { losePlanAcknowledgement = false; return { ok: false, uncertain: true, error: "WorkerControlOutcomeUnknown" }; }
+      return result;
+    } };
+    const mutate = async (input: object) => { const result = await control.call(input); expect(result.ok, JSON.stringify(result)).toBe(true); return result.jobs[0]; };
+    let current = await mutate({ change: "queue", operation: crypto.randomUUID(), view });
+    const original = structuredClone(current.contract), previousContract = current.record.binding.contract_sha256;
+    expect(current.planning_required).toBe(true); expect(current.record.invocations).toBe(0);
+    let actors = 0;
+    const coordinator = createWorkerCoordinator({ control, backend: { async run() { actors++; return { outcome: "waiting", note: "Retain the planned invocation for inspection." }; } }, runtime: "planned-worker" });
+    try {
+      expect((await coordinator.tick()).started).toBe(0);
+      await Promise.race([started, Bun.sleep(15000).then(() => { throw Error("CompanyPlannerDidNotStart"); })]);
+      const observedAt = Date.now(); current = await mutate({ change: "inspect", view });
+      expect(Date.now() - observedAt).toBeLessThan(5000);
+      expect(current.planning_state).toBe("running"); expect(current.record.invocations).toBe(0); expect(current.execution).toBeNull(); expect(actors).toBe(0);
+      expect((await coordinator.tick()).started).toBe(0);
+      release();
+      if (scenario === "retry" || scenario === "resume") {
+        const failureDeadline = Date.now() + 45000;
+        do { current = await mutate({ change: "inspect", view }); if (current.planning_state === "failed") break; await Bun.sleep(50); } while (Date.now() < failureDeadline);
+        expect(current.planning_state).toBe("failed"); expect(current.record.invocations).toBe(0);
+        expect((await coordinator.tick()).started).toBe(0);
+        current = await mutate({ change: "inspect", view }); expect(current.record.state).toBe("waiting"); expect(actors).toBe(0); expect(plans).toBe(1);
+        await mutate({ change: "requeue", operation: crypto.randomUUID(), view, expected_sha256: current.sha256 });
+        expect((await coordinator.tick()).started).toBe(0);
+      }
+      const deadline = Date.now() + 45000;
+      do { current = await mutate({ change: "inspect", view }); if (current.planning_state === "planned") break; await Bun.sleep(50); } while (Date.now() < deadline);
+      expect(current.planning_state, JSON.stringify(current)).toBe("planned");
+      expect(current.basis.capability).toBe(capability); expect(current.contract.objective).toBe(original.objective);
+      for (const obligation of original.obligations) expect(current.contract.obligations).toContainEqual(obligation);
+      expect(current.contract.obligations.map(item => item.id)).toContain("retained_outcome");
+      if (capability === "coding_task") expect(current.contract.obligations.map(item => item.id)).toEqual(expect.arrayContaining(["coding_validation", "coding_summary"]));
+      expect(current.record.binding.contract_sha256).toBe(previousContract); expect(current.planning_required).toBe(true);
+      expect((await coordinator.tick()).started).toBe(1); await coordinator.drain();
+      current = await mutate({ change: "inspect", view });
+      expect(current.record).toMatchObject({ state: "waiting", invocations: 1 }); expect(current.planning_required).toBe(false); expect(current.record.binding.contract_sha256).not.toBe(previousContract);
+      expect(actors).toBe(1); expect(plans).toBe(scenario === "retry" ? 2 : 1); expect(current.publication).toBeNull(); expect(inference.counts()).toEqual({ actors: 0, assessments: 0 });
+      const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
+    } finally { release(); await coordinator.close(); }
+  } finally { release(); control?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 180000);
+
+test("server completion preserves a workspace's historical review job schema", async () => {
+  const f = fixture();
+  let permit = false;
+  const inference = model(f, () => ({ content: "Retain the historical contract answer." }), packet => permit ? "met" : {
+    name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map(item => ({ id: item.id, status: "met", evidence: ["unseen-fixture-evidence"], note: "Retain the answer after verification rejects unseen evidence" })) },
+  });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const declaration = JSON.parse((await f.run(["fossil", "definition", "show", "--json"])).stdout).model_data.declaration;
+  const operation = declaration.spec.operations.find(item => item.id === "omos_record_review_job");
+  for (const field of ["kind", "planning_definition", "planning_contract_sha256"]) delete operation.input.properties[field];
+  operation.input.properties.state.enum = operation.input.properties.state.enum.filter(state => state !== "planned");
+  const tree = join(f.home, "historical-review"); mkdirSync(tree);
+  const fossil = (...args: string[]) => { const result = spawnSync("fossil", args, { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "omos", LC_ALL: "C" }, encoding: "utf8" }); expect(result.status, result.stderr).toBe(0); };
+  fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk"); writeFileSync(join(tree, "omniform/company.json"), JSON.stringify(declaration));
+  fossil("commit", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Retain the historical review transport contract");
+  const answer = await f.run(["ask", "Give a short informational answer under the historical contract", "--json"]); expect(answer.code, answer.stderr).toBe(1);
+  expect(inference.counts().actors, answer.stderr + answer.stdout).toBe(1);
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  permit = true;
+  const service = await startWorkspaceService(f, true);
+  try {
+    const bootstrap = await (await fetch(service.url + "/v1/definition", { headers: service.headers })).json() as any;
+    const basis = { version: "omos.workspace-api/v1", workspace: service.ready.workspace, definition_hash: bootstrap.definition.basis.definition_hash, revision: bootstrap.revision };
+    const head = await (await service.post({ ...basis, revision: undefined, action: "head", task: task.id })).json() as any;
+    const response = await service.post({ ...basis, revision: head.data.revision, action: "queue_review", task: task.id }); expect(response.status, await response.clone().text()).toBe(200);
+    const queued = (await response.json() as any).data;
+    let current: any; const deadline = Date.now() + 45000;
+    do { const reply = await service.post({ ...basis, action: "job", task: task.id, job: queued.id }); if (reply.status === 409) { await Bun.sleep(50); continue; } expect(reply.status, await reply.clone().text()).toBe(200); current = (await reply.json() as any).data; if (!["queued", "running"].includes(current.state)) break; await Bun.sleep(100); } while (Date.now() < deadline);
+    expect(current).toMatchObject({ state: "published" });
+    const retained = JSON.parse(f.fossil("cat", `jobs/${queued.id}.json`, "-r", "trunk")); expect(retained.kind).toBeUndefined(); expect(retained.planning_definition).toBeUndefined();
+    const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0); expect(inference.counts().actors).toBe(1);
+  } finally { service.child.kill(); await service.child.exited; }
+}, 150000);
+
 test("company worker jobs checkpoint dispatch, fence replacement owners and survive portable recovery", async () => {
   const f = fixture();
   let reviews = 0;
@@ -979,6 +1092,14 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
     let recoveredOperation: string | undefined;
     if (recovering) {
       let retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+      retained = (await admin({ action: "workers", worker: { change: "plan", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256 } })).jobs[0];
+      const planningDeadline = Date.now() + 45000;
+      while (retained.planning_required && Date.now() < planningDeadline) {
+        await Bun.sleep(50);
+        retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
+        if (retained.planning_state === "planned") retained = (await admin({ action: "workers", worker: { change: "plan", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256 } })).jobs[0];
+      }
+      expect(retained.planning_required).toBe(false);
       retained = (await admin({ action: "workers", worker: { change: "claim", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256, execution: { runtime: "interrupted-worker", generation: 0 } } })).jobs[0];
       recoveredOperation = crypto.randomUUID();
       const interrupted = await client.call("company_workspace", { version: "omos.company/v1", action: "checkpoint", operation: recoveredOperation, expires_ms: Date.now() + 120000, view, execution: { runtime: "interrupted-worker", generation: retained.record.generation }, revision: createdView.revision, path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });

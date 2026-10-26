@@ -722,7 +722,8 @@
                 "changes_required",
                 "blocked",
                 "published",
-                "failed"
+                "failed",
+                "planned"
               ]
             },
             "contract_version": {
@@ -756,6 +757,25 @@
             "budget_epoch": {
               "type": "integer",
               "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "completion",
+                "planning"
+              ]
+            },
+            "planning_contract_sha256": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "planning_definition": {
+              "type": [
+                "object",
+                "null"
+              ]
             }
           },
           "required": [
@@ -3148,7 +3168,8 @@
                     "requeue",
                     "cancel",
                     "complete",
-                    "expire"
+                    "expire",
+                    "plan"
                   ]
                 },
                 "operation": {

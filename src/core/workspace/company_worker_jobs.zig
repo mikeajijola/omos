@@ -5,7 +5,7 @@ const authority = @import("company_authority.zig");
 const ownership = @import("company_execution.zig");
 
 pub const State = enum { queued, running, waiting, submitted, failed, cancelled, completed, exhausted };
-pub const Change = enum { inspect, queue, claim, renew, finish, requeue, cancel, complete, expire };
+pub const Change = enum { inspect, queue, plan, claim, renew, finish, requeue, cancel, complete, expire };
 pub const Outcome = enum { waiting, submitted, failed, completed };
 pub const Binding = struct {
     workspace: []const u8,
@@ -217,6 +217,44 @@ fn context(manager: workspace.Manager, view_id: []const u8) !Context {
     return .{ .view = view, .task = task, .grant = try @import("company_task_scope.zig").forView(manager, task, grant, view.id, view.scope), .live = live, .execution = execution, .binding = .{ .workspace = manager.manifest.id, .view = view_id, .task = task.id, .actor = view.actor, .grant = view.grant, .contract_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })), .definition_sha256 = basis.definition_hash, .policy_sha256 = basis.execution_hash orelse try workspace.hash(manager.alloc, try encode(manager.alloc, basis.execution)) } };
 }
 
+fn planRecord(manager: workspace.Manager, previous: Record, request: Request, selected: Context, operation: []const u8, request_hash: []const u8) !Record {
+    if (previous.state != .queued or request.execution != null or request.outcome != null or request.max_invocations != null or request.max_runtime_ms != null) return error.CompanyWorkerNotQueued;
+    var comparable = selected.binding;
+    comparable.contract_sha256 = previous.binding.contract_sha256;
+    if (!equalBinding(previous.binding, comparable)) return error.StaleCompanyWorkerContract;
+    if (selected.execution) |execution| if (execution.runtime != null and execution.expires_ms > io.milliTimestamp()) return error.CompanyExecutionBusy;
+    if (!selected.live) return error.CompanyAccessDenied;
+    try authority.authorizeExecution(manager, selected.task);
+    try manager.validateTaskBasis(selected.task);
+    var next = previous;
+    const retained = try manager.planningJob(selected.task);
+    if (retained) |job| {
+        if (job.kind != .planning or !std.mem.eql(u8, job.planning_contract_sha256.?, previous.binding.contract_sha256)) return error.StaleCompanyWorkerContract;
+        if (job.state == .planned) {
+            if (selected.task.model_basis == null or selected.task.model_basis.?.capability == null or selected.task.review_job != null) return error.InvalidReviewJob;
+            next.binding = selected.binding;
+            next.note = "The host retained the task plan before actor dispatch.";
+        } else if (job.state == .queued or job.state == .running) {
+            next.note = "Independent host planning is pending; no actor has started.";
+        } else if (previous.request.change == .requeue) {
+            _ = try manager.queuePlanning(selected.task, previous.binding.contract_sha256, true);
+            next.note = "Independent host planning was explicitly requeued.";
+        } else {
+            next.state = .waiting;
+            next.note = "Host planning needs attention. Inspect the retained planning job and requeue explicitly; actor work has not started.";
+        }
+    } else {
+        _ = try manager.queuePlanning(selected.task, previous.binding.contract_sha256, false);
+        next.note = "Independent host planning is queued; no actor has started.";
+    }
+    next.operation = operation;
+    next.request_hash = request_hash;
+    next.request = request;
+    next.updated_ms = io.milliTimestamp();
+    try validate(next);
+    return next;
+}
+
 fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bool) !std.json.Value {
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
@@ -224,7 +262,13 @@ fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bo
     manager.alloc = scratch.allocator();
     const current = try context(manager, record.binding.view);
     const review = if (current.task.review_job) |review_id| try manager.loadReviewJob(current.task, review_id) else null;
-    const bytes = try encode(manager.alloc, .{ .record = record, .sha256 = try workspace.hash(manager.alloc, raw), .view_revision = try manager.currentRevision(current.task), .task_state = @tagName(current.task.state), .contract = if (details) current.task.definition else null, .request = if (details) try manager.originalRequest(current.task) else null, .amendments = if (details) current.task.amendments else &.{}, .review_job = if (details) review else null, .review_job_id = current.task.review_job, .review_state = if (review) |job| @tagName(job.state) else null, .basis = if (details) current.task.model_basis else null, .authority_live = current.live, .grant = if (details) current.grant else null, .execution = current.execution, .pending_operation = current.view.pending, .publication = if (current.task.state == .accepted) try manager.publicationSummary(current.task) else null });
+    const basis = (try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired;
+    const supports_planning = @import("company_planning.zig").supported(try manager.loadDeclaration(basis.revision));
+    const changed_contract = !std.mem.eql(u8, record.binding.contract_sha256, current.binding.contract_sha256);
+    const unplanned = current.task.model_basis == null or current.task.model_basis.?.capability == null;
+    const planning = if (review != null and review.?.kind == .planning) review else if (supports_planning and (changed_contract or unplanned)) try manager.planningJob(current.task) else null;
+    const planning_required = supports_planning and (unplanned or changed_contract or (planning != null and planning.?.state != .planned));
+    const bytes = try encode(manager.alloc, .{ .record = record, .sha256 = try workspace.hash(manager.alloc, raw), .view_revision = try manager.currentRevision(current.task), .task_state = @tagName(current.task.state), .contract = if (details) current.task.definition else null, .request = if (details) try manager.originalRequest(current.task) else null, .amendments = if (details) current.task.amendments else &.{}, .review_job = if (details) review else null, .review_job_id = current.task.review_job, .review_state = if (review) |job| @tagName(job.state) else null, .planning_required = planning_required, .planning_state = if (planning) |job| @tagName(job.state) else null, .planning_job = if (details) planning else null, .basis = if (details) current.task.model_basis else null, .authority_live = current.live, .grant = if (details) current.grant else null, .execution = current.execution, .pending_operation = current.view.pending, .publication = if (current.task.state == .accepted) try manager.publicationSummary(current.task) else null });
     return std.json.parseFromSliceLeaky(std.json.Value, original.alloc, bytes, .{ .allocate = .alloc_always });
 }
 
@@ -302,7 +346,22 @@ pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
         _ = try manager.publicationSummary(selected.task);
         publication_verified = true;
     }
-    var record = try transition(previous, normalized, selected.binding, id, request_hash, live, now, publication_verified, selected.task.review_job != null);
+    var transition_binding = selected.binding;
+    if (request.change == .requeue or request.change == .cancel) if (previous) |retained| {
+        if (!equalBinding(retained.binding, selected.binding)) {
+            var comparable = selected.binding;
+            comparable.contract_sha256 = retained.binding.contract_sha256;
+            const planning = (try manager.planningJob(selected.task)) orelse return error.StaleCompanyWorkerContract;
+            if (!equalBinding(retained.binding, comparable) or !std.mem.eql(u8, planning.planning_contract_sha256.?, retained.binding.contract_sha256)) return error.StaleCompanyWorkerContract;
+            // Keep the old pin through an interrupted plan. Only planRecord
+            // can adopt the strengthened contract after verified completion.
+            transition_binding = retained.binding;
+        }
+    };
+    var record = if (request.change == .plan)
+        try planRecord(manager, previous orelse return error.CompanyWorkerNotQueued, request, selected, operation, request_hash)
+    else
+        try transition(previous, normalized, transition_binding, id, request_hash, live, now, publication_verified, selected.task.review_job != null);
     record.request = request;
     if (request.change == .finish or request.change == .cancel or request.change == .complete or request.change == .expire) {
         if (live) |current| if (record.runtime != null and current.runtime != null and record.generation == current.generation and std.mem.eql(u8, record.runtime.?, current.runtime.?)) {

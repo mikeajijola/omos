@@ -19,6 +19,7 @@ pub const Model = struct {
 };
 
 pub fn perform(original: workspace.Manager, job: jobs.Job, model: Model) !void {
+    if (job.kind == .planning) return @import("company_planning.zig").perform(original, job, model);
     var manager = original;
     manager.expected_revision = null;
     manager.review_fence = .{ .task = job.task, .job = job.id, .generation = job.generation, .owner = job.owner };
