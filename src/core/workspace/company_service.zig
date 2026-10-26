@@ -43,7 +43,7 @@ const Submission = struct {
 };
 const Admin = struct {
     version: []const u8,
-    action: enum { initialize, status, grant, revoke, rotate, inspect_proposal, approve, deny, grant_capabilities, inspect_capabilities, workers },
+    action: enum { initialize, status, grant, revoke, rotate, inspect_proposal, approve, deny, grant_capabilities, inspect_capabilities, workers, evaluate },
     revision: ?[]const u8 = null,
     grant: ?authority.Grant = null,
     id: ?[]const u8 = null,
@@ -52,6 +52,7 @@ const Admin = struct {
     expires_ms: ?i64 = null,
     capabilities: ?[]const []const u8 = null,
     worker: ?@import("company_worker_jobs.zig").Request = null,
+    evaluation: ?@import("company_validation.zig").Request = null,
 };
 fn encode(alloc: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(alloc, value, .{});
@@ -94,21 +95,29 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
         .grant_capabilities => "omos_grant_capability_scope",
         .inspect_capabilities => "omos_inspect_capability_scopes",
         .workers => "omos_company_worker_admin",
+        .evaluate => "omos_company_evaluation",
         else => "omos_company_admin",
     };
     if (model.hasOperation(declaration, admin_operation)) {
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, raw), .input);
-    } else if (capability_control or request.action == .workers or request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
+    } else if (capability_control or request.action == .workers or request.action == .evaluate or request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
         // Older profiles retain their administrative recovery interface. New
         // decisions require the declared operation and protected record type.
         return error.CompanyDefinitionUpdateRequired;
     }
     if (request.worker != null and request.action != .workers) return error.UnsupportedCompanyApi;
+    if (request.evaluation != null and request.action != .evaluate) return error.UnsupportedCompanyApi;
     const recovery_lease = if (request.action == .rotate) try keys.recoveryLease(manager) else null;
     defer if (recovery_lease) |held| held.release();
     const revision_id = try manager.companyRevision();
     if (request.action == .status) return encode(manager.alloc, .{ .revision = revision_id, .authority = try state(manager) });
     if (request.action != .initialize and request.action != .rotate) try validateInstance(manager);
+    if (request.action == .evaluate) {
+        if (request.revision != null or request.worker != null) return error.UnsupportedCompanyApi;
+        const output = try @import("company_validation.zig").execute(manager, request.evaluation orelse return error.InvalidCompanyValidation);
+        try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
+        return output;
+    }
     if (request.action == .workers) {
         if (request.revision != null and !equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
         const output = try @import("company_worker_jobs.zig").administer(manager, request.worker orelse return error.InvalidCompanyWorkerJob);

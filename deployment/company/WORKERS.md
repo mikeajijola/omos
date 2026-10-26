@@ -480,6 +480,71 @@ files also retains its image. The host removes an image only after accounting
 for its proposed files. Native `hosted_execution` remains disabled pending
 qualification and gateway integration of the complete backend.
 
+### Run isolated coding checks
+
+Coding tasks require the operator's `backend.validationConfiguration` file and
+the private evaluation transport supplied by `worker-server.mjs`. Without that
+configuration, the job waits before starting an actor. The configuration is a
+root-owned file, read and pinned by the supervisor. It selects commands from
+the verified runtime template; task text cannot select a host executable.
+
+For example, a company whose approved check script lives in
+`documents/project/tests/check_behavior.py` can configure:
+
+```json
+{
+  "version": "omos.worker-validation/v1",
+  "handle": "company-default",
+  "entry": {
+    "path": "/bin/bash",
+    "sha256": "VERIFIED_TEMPLATE_BASH_SHA256"
+  },
+  "checks": [{
+    "id": "behavior",
+    "arguments": ["/runtime/bin/python3", "-I", "-B", "tests/check_behavior.py"],
+    "cwd": "documents/project",
+    "timeout_ms": 60000
+  }]
+}
+```
+
+Include the interpreter, libraries, and approved check dependencies in the
+runtime template. Set the Bash hash to that template's executable identity.
+Allow at least two image slots per configured concurrent worker: the actor's
+retained image and its separate checker image must coexist.
+The handle must match the task's pinned `server.validation_handle` execution
+setting; an omitted setting uses `company-default`. Changing a configured
+handle requires an explicit policy decision. Handles confer no permissions.
+
+After stopping the actor and collecting its proposals, the host obtains an
+immutable scoped input manifest. It creates a separate image, verifies every
+input's Fossil identity and content hash, and installs those files under the
+root-owned, read-only `/runtime/validation-source/` tree. Checks use the declared
+relative working directory there. Write caches and temporary outputs beneath
+`/tmp`. The checker has no broker socket, provider credential, signing key, or
+owner token. Coding actors cannot submit their proposal before this host step.
+
+Checks share the invocation deadline and permit 1–16 commands, each limited to
+two minutes. Input limits are 10,000 files, 8 MiB per file and 64 MiB overall.
+The launcher stops descendants before the host rechecks source identities.
+Output is bounded to 8 KiB per stream per check. Failed checks, changed inputs,
+timeouts, and incomplete output cannot produce a passing receipt.
+
+The owner-only `/v1/company/evaluation` endpoint provides `prepare` and `record`
+operations. The same requests are available through `omos fossil company`
+with action `evaluate`. Receipts bind the task, immutable source fingerprint,
+configuration and environment hashes, execution generation, command arguments
+and observed outcomes. They use the existing host-owned evidence records in
+Fossil. A retained image result permits retrying its recording without running
+the checks again. Actor requests and browser-origin requests cannot enter this
+owner boundary.
+
+Independent completion review must cite successful validation for the current
+source fingerprint. Later source edits invalidate earlier checks. A receipt
+does not accept or publish a task. Failed checks retain their evidence and the
+actor's image for inspection; successful submission still passes the normal
+contract, authority, integration and publication gates.
+
 ### Supervise the coordinator
 
 `worker-server.mjs` runs the optional Linux coordinator with Node.js 22 or newer.
@@ -491,7 +556,8 @@ Its root-owned `0600` configuration has version `omos.company-workers/v1`,
 - `backend`: `imageTool`, `imageToolSha256`, `launcher`, `launcherSha256`,
   `imageConfiguration`, `companyConfiguration`, `companyHome`, and `model` for
   `createLinuxWorkerBackend`. The model declares its exact completion endpoint,
-  worker handle, provider model, and optional credential.
+  worker handle, provider model, and optional credential. Add
+  `validationConfiguration` to select the isolated coding checks described above.
 
 Install the reviewed companion tree and its pinned operation schema beneath a
 root-owned version directory. Preserve their repository-relative locations:

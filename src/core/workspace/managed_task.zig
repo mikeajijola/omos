@@ -113,7 +113,7 @@ pub const Turn = struct {
         }
         const evidence = try review.collectToolEvidence(alloc, messages);
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
-        const source = if (coding) try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
+        const source = if (coding) if (self.task.authority != null) try @import("company_validation.zig").fingerprint(self.manager, self.task) else try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
         for (evidence) |original_record| {
             var record = original_record;
             if (self.invocation_id) |invocation| if (record.assistant_index) |index| if (record.raw_call_id) |id| {
@@ -376,7 +376,7 @@ pub const Turn = struct {
         const basis = self.task.model_basis orelse return true;
         if (basis.capability == null or !std.mem.eql(u8, basis.capability.?, "coding_task")) return true;
         const alloc = self.manager.alloc;
-        const current = try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
+        const current = if (self.task.authority != null) try @import("company_validation.zig").fingerprint(self.manager, self.task) else try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
         const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, alloc, bytes, .{});
         var validations: std.StringHashMapUnmanaged(void) = .empty;
         var receipts: std.StringHashMapUnmanaged([]const u8) = .empty;

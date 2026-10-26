@@ -67,6 +67,18 @@ pub const ReviewPolicy = struct {
 };
 pub const ServerPolicy = struct {
     review_workers: usize = 2,
+    validation_handle: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: ServerPolicy, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("review_workers");
+        try writer.write(self.review_workers);
+        if (self.validation_handle) |handle| {
+            try writer.objectField("validation_handle");
+            try writer.write(handle);
+        }
+        try writer.endObject();
+    }
 };
 
 pub const ProjectionPolicy = struct { max_clean_bytes: u64 = 256 * 1024 * 1024, max_clean_views: usize = 32 };
@@ -80,6 +92,10 @@ pub const Execution = struct {
 
     pub fn reviewWorkers(self: Execution) usize {
         return if (self.server) |server| server.review_workers else 1;
+    }
+
+    pub fn validationHandle(self: Execution) []const u8 {
+        return if (self.server) |server| server.validation_handle orelse "company-default" else "company-default";
     }
 
     // Preserve hashes of pre-server policies embedded in existing task bases.
@@ -203,6 +219,10 @@ pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
     const p = execution.defaults;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
     if (execution.reviewWorkers() < 1 or execution.reviewWorkers() > 4) return error.InvalidExecutionPolicy;
+    if (execution.server) |server| if (server.validation_handle) |handle| {
+        if (handle.len == 0 or handle.len > 128) return error.InvalidExecutionPolicy;
+        for (handle) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return error.InvalidExecutionPolicy;
+    };
     if (execution.projections) |pinned| if (pinned.max_clean_views > 1024 or pinned.max_clean_bytes > 4 * 1024 * 1024 * 1024) return error.InvalidExecutionPolicy;
     try execution.review.validate();
     return execution;
@@ -214,6 +234,7 @@ pub fn compatibleExecution(old: Execution, next: Execution) bool {
     const b = next.defaults;
     const x = old.review;
     const y = next.review;
+    if (!std.mem.eql(u8, old.validationHandle(), next.validationHandle())) return false;
     return next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and b.stalled_checks <= a.stalled_checks and
         y.max_calls <= x.max_calls and y.reserved_calls >= x.reserved_calls and y.response_timeout_ms <= x.response_timeout_ms and
         y.attempt_timeout_ms <= x.attempt_timeout_ms and y.max_attempts <= x.max_attempts and y.total_timeout_ms <= x.total_timeout_ms and
@@ -780,12 +801,21 @@ test "workspace declaration bounds server review capacity and preserves legacy p
     try std.testing.expect(std.mem.find(u8, legacy, "server") == null);
     const parallel = try parseExecution(a, "{\"server\":{\"review_workers\":2}}");
     try std.testing.expectEqual(@as(usize, 2), parallel.reviewWorkers());
+    try std.testing.expectEqualStrings("{\"review_workers\":2}", try std.json.Stringify.valueAlloc(a, parallel.server.?, .{}));
+    const checked = try parseExecution(a, "{\"server\":{\"review_workers\":2,\"validation_handle\":\"company-checks\"}}");
+    try std.testing.expectEqualStrings("company-checks", checked.server.?.validation_handle.?);
+    try std.testing.expect(!compatibleExecution(parallel, checked));
+    try std.testing.expect(!compatibleExecution(checked, parallel));
+    const changed = try parseExecution(a, "{\"server\":{\"review_workers\":2,\"validation_handle\":\"other-checks\"}}");
+    try std.testing.expect(!compatibleExecution(checked, changed));
     try std.testing.expect(!compatibleExecution(old, parallel));
     try std.testing.expect(compatibleExecution(parallel, old));
     for ([_][]const u8{
         "{\"server\":{\"review_workers\":0}}",
         "{\"server\":{\"review_workers\":5}}",
         "{\"server\":{\"unknown\":1}}",
+        "{\"server\":{\"validation_handle\":\"../checks\"}}",
+        "{\"server\":{\"validation_handle\":\"\"}}",
     }) |raw| {
         if (parseExecution(a, raw)) |_| return error.ExpectedInvalidPolicy else |_| {}
     }

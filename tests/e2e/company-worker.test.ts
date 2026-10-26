@@ -7,12 +7,13 @@ import { spawnSync } from "node:child_process";
 import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { createWorkerHttpControl } from "../../deployment/company/worker-http-control.mjs";
+import { createWorkerHttpControl, createEvaluationHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
 import { createWorkerSnapshot } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
 import { createWorkerBroker } from "../../deployment/company/worker-broker.mjs";
+import { validateValidationConfiguration } from "../../deployment/company/worker-validation.mjs";
 
 const launcher = join(import.meta.dir, "../../deployment/company/worker-launcher.py");
 const rootFixture = join(import.meta.dir, "fixtures/company-worker-root.py");
@@ -114,6 +115,22 @@ test("worker invocation expiry closes an incomplete request body", async () => {
 
 test("a broker socket shared with an isolated UID requires a private host directory boundary", async () => {
   await expect(createWorkerBroker({ socket: "/tmp/omos-public-broker-" + crypto.randomUUID(), socketMode: 0o666, expiresMs: Date.now() + 60000, model: { endpoint: "http://127.0.0.1:1/model", handle: "worker", model: "provider" }, company: { endpoint: "http://127.0.0.1:1/company", workspace: "workspace", actor: "actor", grant: "grant", actions: ["status"] } })).rejects.toThrow("WorkerBrokerSocketBoundaryRequired");
+});
+
+test("isolated validation configurations pin a template entry and bound operator-selected checks", () => {
+  const config = { version: "omos.worker-validation/v1", handle: "company-default", entry: { path: "/bin/bash", sha256: "a".repeat(64) }, checks: [{ id: "behavior", arguments: ["/runtime/bin/python3", "-I", "-c", "assert 2 + 3 == 5"], cwd: "documents/team", timeout_ms: 10000 }] };
+  const checked = validateValidationConfiguration(config);
+  config.checks[0].arguments[3] = "changed";
+  expect(checked.checks[0].arguments[3]).toBe("assert 2 + 3 == 5");
+  for (const invalid of [
+    { ...checked, entry: { ...checked.entry, path: "/workspace/actor.sh" } },
+    { ...checked, entry: { ...checked.entry, sha256: "invalid" } },
+    { ...checked, checks: [] },
+    { ...checked, checks: [checked.checks[0], checked.checks[0]] },
+    { ...checked, checks: [{ ...checked.checks[0], cwd: "../private" }] },
+    { ...checked, checks: [{ ...checked.checks[0], timeout_ms: 0 }] },
+    { ...checked, checks: [{ ...checked.checks[0], arguments: ["python3"] }] },
+  ]) expect(() => validateValidationConfiguration(invalid)).toThrow("InvalidWorkerValidationConfiguration");
 });
 
 test("native managed turns use the Unix worker broker for planning, tools and independent publication", async () => {
@@ -507,6 +524,87 @@ test("server completion preserves a workspace's historical review job schema", a
   } finally { service.child.kill(); await service.child.exited; }
 }, 150000);
 
+test("company coding publication requires current owner-observed validation and rejects stale checks", async () => {
+  const f = fixture();
+  const inference = model(f, () => { throw Error("Host evaluation must not run actor tools"); }, undefined, { plan: { capability: "coding_task", summary: "Implement and validate the requested addition function", obligations: [], checks: ["Check add(2, 3) == 5"] } });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async (input: object) => {
+    const file = join(f.home, "evaluation-admin.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input }));
+    const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data;
+  };
+  const initialized = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "evaluation-worker", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "execution", "read", "checkpoint", "submit", "status", "record"];
+  await admin({ action: "grant", revision: initialized.revision, grant: { id: "evaluation-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true);
+  let client, control, evaluator;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const file = join(f.home, "evaluation-client.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "evaluation-worker", key_handle: "evaluation-worker", actions }), { mode: 0o600 });
+    client = await createCompanyClient(file, { home: f.home });
+    const send = async (action: string, rest: object = {}) => {
+      const result = await client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest });
+      expect(result.isError, JSON.stringify(result) + (result.isError && existsSync(f.env.FX_TRACE_LOG) ? "\n" + readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-6000) : "")).not.toBe(true); return JSON.parse(result.content[0].text);
+    };
+    const created = await send("create_view", { revision: boot.revision, scope: ["documents/team/"], objective: "Implement add(a, b) in documents/team/calculator.py, validate that add(2, 3) is 5, and publish the verified result." }), view = created.view;
+    const transport = { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) };
+    control = createWorkerHttpControl(transport); evaluator = createEvaluationHttpControl(transport);
+    const owner = async input => { const reply = await control.call(input); expect(reply.ok, JSON.stringify(reply)).toBe(true); return reply.jobs[0]; };
+    let row = await owner({ change: "queue", operation: crypto.randomUUID(), view });
+    row = await owner({ change: "plan", operation: crypto.randomUUID(), view, expected_sha256: row.sha256 });
+    const planDeadline = Date.now() + 45000;
+    while (row.planning_required && Date.now() < planDeadline) {
+      await Bun.sleep(100); row = await owner({ change: "inspect", view });
+      if (row.planning_state === "planned") row = await owner({ change: "plan", operation: crypto.randomUUID(), view, expected_sha256: row.sha256 });
+    }
+    expect(row.planning_required, JSON.stringify(row)).toBe(false);
+    row = await owner({ change: "claim", operation: crypto.randomUUID(), view, expected_sha256: row.sha256, execution: { runtime: "evaluation-owner", generation: 0 } });
+    const execution = { runtime: row.record.runtime, generation: row.record.generation };
+    const code = "def add(a, b):\n    return a + b\n";
+    let checkpoint = await send("checkpoint", { view, execution, revision: row.view_revision, path: "documents/team/calculator.py", content: code });
+    const prepare = async revision => {
+      const reply = await evaluator.call({ version: "omos.company-evaluation/v1", action: "prepare", view, execution, revision }); expect(reply.ok, JSON.stringify(reply)).toBe(true); return reply;
+    };
+    const first = await prepare(checkpoint.revision);
+    expect(first.files.map(item => item.path)).toEqual(["documents/team/calculator.py"]);
+    const forged = await client.call("company_workspace", { version: "omos.company/v1", action: "record", view, execution, revision: checkpoint.revision, entity: "omos_evidence", content: JSON.stringify({ id: "forged", data: { status: "passed" } }), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }); expect(forged.isError).toBe(true);
+    const unauthenticated = await fetch(service.url + "/v1/company/evaluation", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); expect(unauthenticated.status).toBe(401);
+    const origin = await fetch(service.url + "/v1/company/evaluation", { method: "POST", headers: { ...service.headers, origin: "http://127.0.0.1" }, body: "{}" }); expect(origin.status).toBe(401);
+    const checks = async (input: string) => {
+      const arguments_ = ["/usr/bin/python3", "-I", "-c", input];
+      const child = Bun.spawn(arguments_, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const [exit_code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return [{ id: "addition", arguments: arguments_, cwd: "documents/team", exit_code, stdout, stderr, output_complete: true, source_unchanged: true }];
+    };
+    const record = async (snapshot, values) => ({ version: "omos.company-evaluation/v1", action: "record", view, execution, revision: snapshot.revision, source_sha256: snapshot.source_sha256, configuration_handle: snapshot.configuration_handle, configuration_sha256: "a".repeat(64), environment_sha256: "b".repeat(64), operation: crypto.randomUUID(), checks: values });
+    const bad = await record(first, await checks("assert False, 'deliberate check failure'"));
+    const stale = await evaluator.call({ ...bad, source_sha256: "0".repeat(64) }); expect(stale.ok).toBe(false);
+    const mismatched = await evaluator.call({ ...bad, configuration_handle: "another-configuration" }); expect(mismatched.ok).toBe(false);
+    const failed = await evaluator.call(bad); expect(failed.ok, JSON.stringify(failed)).toBe(true); expect(failed.passed).toBe(false);
+    const replay = await evaluator.call(bad); expect(replay.ok, JSON.stringify(replay)).toBe(true); expect(replay).toMatchObject({ replayed: true, passed: false, evidence: failed.evidence, revision: failed.revision });
+    const passedInput = await prepare(failed.revision);
+    const passed = await evaluator.call(await record(passedInput, await checks(`${code}\nassert add(2, 3) == 5\nprint('addition passed')`)));
+    expect(passed.ok, JSON.stringify(passed)).toBe(true); expect(passed.passed).toBe(true);
+    checkpoint = await send("checkpoint", { view, execution, revision: passed.revision, path: "documents/team/calculator.py", previous_hash: createHash("sha256").update(code).digest("hex"), content: "def add(a, b):\n    return a - b\n" });
+    await send("submit", { view, execution, revision: checkpoint.revision, candidate: "Implemented the requested addition function." });
+    const review = async () => {
+      let status; const deadline = Date.now() + 60000;
+      do { status = await send("status", { view }); if (!["queued", "running"].includes(status.job?.state)) break; await Bun.sleep(100); } while (Date.now() < deadline);
+      return status;
+    };
+    const held = await review(); expect(held.publication).toBeNull(); expect(held.state).not.toBe("accepted"); expect(held.job.state).toBe("changes_required");
+    checkpoint = await send("checkpoint", { view, execution, revision: held.revision, path: "documents/team/calculator.py", previous_hash: createHash("sha256").update("def add(a, b):\n    return a - b\n").digest("hex"), content: "def add(a, b):\n    return (a + b)\n" });
+    const fresh = await prepare(checkpoint.revision); expect(fresh.source_sha256).not.toBe(passedInput.source_sha256);
+    const verified = await evaluator.call(await record(fresh, await checks("def add(a, b): return (a + b)\nassert add(2, 3) == 5\nprint('fresh addition passed')")));
+    expect(verified.ok, JSON.stringify(verified)).toBe(true); expect(verified.passed).toBe(true);
+    await send("submit", { view, execution, revision: verified.revision, candidate: "Implemented add(a, b), ran the current addition check, and retained its host evidence." });
+    const accepted = await review(); expect(accepted.state, JSON.stringify(accepted)).toBe("accepted"); expect(accepted.publication).not.toBeNull();
+    expect(inference.packets.at(-1).evidence.some(item => item.id === verified.evidence)).toBe(true);
+    expect(inference.counts().actors).toBe(0);
+    const full = await f.run(["fossil", "verify", "--json"]); expect(full.code, full.stderr).toBe(0);
+  } finally { evaluator?.close(); control?.close(); client?.close(); service.child.kill(); await service.child.exited; }
+}, 240000);
+
 test("company worker jobs checkpoint dispatch, fence replacement owners and survive portable recovery", async () => {
   const f = fixture();
   let reviews = 0;
@@ -721,7 +819,14 @@ test("the private worker controller uses verified native job operations and disp
       expect(row.execution).toMatchObject({ runtime: "controller", generation: 1 });
       return { outcome: "waiting", note: "Stopped after inspecting the immutable native job context." };
     } } });
-    expect((await coordinator.tick()).started).toBe(1);
+    let dispatched = await coordinator.tick();
+    expect(dispatched.started).toBe(0);
+    const dispatchDeadline = Date.now() + 45000;
+    while (!dispatched.started && Date.now() < dispatchDeadline) {
+      await Bun.sleep(100);
+      dispatched = await coordinator.tick();
+    }
+    expect(dispatched.started).toBe(1);
     await coordinator.drain();
     const running = await control.call({ change: "inspect", view });
     expect(running.ok, JSON.stringify(running)).toBe(true); expect(running.jobs[0].record.generation).toBe(1);
@@ -1019,21 +1124,32 @@ test.skipIf(!support?.kernel_supported)("production worker images pin trusted ru
       expect(launched.stderr).toContain("private namespaces unavailable");
     }
     expect(run({ base, action: "invoke", request: { ...request, action: "remove" } }).code).toBe(0);
+    const deniedEntry = run({ base, action: "invoke", request: { ...request, entry: { path: "/workspace/check.sh", sha256: "d".repeat(64) } } });
+    expect(deniedEntry.code).toBe(125); expect(deniedEntry.stderr).toContain("InvalidImageEntry");
+    const missingEntry = run({ base, action: "invoke", request: { ...request, entry: { path: "/bin/unknown", sha256: "d".repeat(64) } } });
+    expect(missingEntry.code).toBe(125); expect(missingEntry.stderr).toContain("ImageEntryNotInTemplate");
+    const entry = run({ base, action: "template_entry", request });
+    const validationRequest = { ...request, entry };
+    const validationImage = run({ base, action: "invoke", request: validationRequest });
+    expect(validationImage.code, validationImage.stderr).toBe(0); expect(JSON.parse(validationImage.stdout).executable).toBe("/bin/bash");
+    expect(run({ base, action: "invoke", request: { ...validationRequest, action: "remove" } }).code).toBe(0);
     const corrupted = run({ base, action: "corrupt_template", request });
     expect(corrupted.code).toBe(125); expect(corrupted.stderr).toMatch(/UnsafeImageTemplateFile|ImageTemplateChanged/);
     expect(run({ base, action: "invoke", request: { ...request, action: "inspect" } }).stderr).toContain("ImageNotFound");
   } finally { run({ base, action: "cleanup" }); }
 }, 240000);
 
-for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+for (const scenario of ["files", "answer", "recovery", "projection", "coding", "coding_failure"]) test.skipIf(!support?.kernel_supported)(`the production company coordinator runs isolated native work and independently verifies ${scenario.startsWith("coding") ? scenario === "coding" ? "successful coding checks" : "failed coding checks without publication" : scenario === "answer" ? "answers without file changes" : scenario === "recovery" ? "recovered internal checkpoints" : scenario === "projection" ? "ordinary projected file edits and deletions" : "file proposals"}`, async () => {
+  const coding = scenario.startsWith("coding"), failingChecks = scenario === "coding_failure";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
   const recovering = scenario === "recovery" && support.private_namespaces;
-  const answer = answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
+  const answer = coding ? "Implemented add(a, b) in documents/team/calculator.py." : answerOnly ? "The requested company greeting is Hello, team." : "Retained the proposed document in the private Fossil workspace.";
   const f = fixture(), worker = fixture();
-  const host = model(f, () => { throw Error("The company host must never execute the actor"); });
+  const host = model(f, () => { throw Error("The company host must never execute the actor"); }, undefined, { plan: { capability: coding ? "coding_task" : "general_task", summary: "Retain the requested company outcome", obligations: [], checks: coding ? ["Run the operator-configured isolated behavior check"] : [] } });
   const inference = model(worker, (body, count) => {
     const tool = (name: string, args: object) => ({ tool_calls: [{ index: 0, id: crypto.randomUUID(), type: "function", function: { name, arguments: JSON.stringify(args) } }] });
+    if (coding && count === 1) return tool("fossil_workspace", { action: "write", path: "documents/team/calculator.py", content: `def add(a, b):\n    return a ${failingChecks ? "-" : "+"} b\n` });
     if (projected && count <= 3) {
       const context = body.messages.map(message => typeof message.content === "string" ? message.content : "").join("\n");
       const match = context.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/); expect(match).not.toBeNull();
@@ -1076,7 +1192,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
   await admin({ action: "grant", revision: initial.revision, grant: { id: "production-worker", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: projected ? ["documents/"] : ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
   let service = await startWorkspaceService(f, true, recovering ? { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" } : {});
   const imageFixture = join(import.meta.dir, "fixtures/company-worker-image.py");
-  const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0 }), encoding: "utf8", timeout: 120000 });
+  const setup = spawnSync("sudo", ["-n", "/usr/bin/python3", "-I", imageFixture], { input: JSON.stringify({ action: "setup", owner: 0, group: 0, validation: coding }), encoding: "utf8", timeout: 120000 });
   expect(setup.status, setup.stderr).toBe(0);
   const { base } = JSON.parse(setup.stdout);
   let client;
@@ -1085,7 +1201,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
     const company = { version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "production-worker", key_handle: "production-worker", actions };
     const file = join(f.home, "production-client.json"); writeFileSync(file, JSON.stringify(company), { mode: 0o600 });
     client = await createCompanyClient(file, { home: f.home });
-    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, revision: boot.revision, ...(projected ? { scope: ["documents/team/"] } : {}), objective: coding ? "Implement add(a, b) in documents/team/calculator.py so that adding 2 and 3 returns 5. Validate the requested behavior before publication." : answerOnly ? "Reply with the company greeting Hello, team. No file change is requested." : projected ? "Update documents/team/production.txt with the requested worker checkpoint text, delete documents/team/remove.txt and preserve all other files and executable modes." : "Retain documents/team/production.txt with the requested worker checkpoint text." });
     expect(created.isError, JSON.stringify(created)).not.toBe(true);
     const createdView = JSON.parse(created.content[0].text), view = createdView.view;
     await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view } });
@@ -1102,7 +1218,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
       expect(retained.planning_required).toBe(false);
       retained = (await admin({ action: "workers", worker: { change: "claim", operation: crypto.randomUUID(), view, expected_sha256: retained.sha256, execution: { runtime: "interrupted-worker", generation: 0 } } })).jobs[0];
       recoveredOperation = crypto.randomUUID();
-      const interrupted = await client.call("company_workspace", { version: "omos.company/v1", action: "checkpoint", operation: recoveredOperation, expires_ms: Date.now() + 120000, view, execution: { runtime: "interrupted-worker", generation: retained.record.generation }, revision: createdView.revision, path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
+      const interrupted = await client.call("company_workspace", { version: "omos.company/v1", action: "checkpoint", operation: recoveredOperation, expires_ms: Date.now() + 120000, view, execution: { runtime: "interrupted-worker", generation: retained.record.generation }, revision: retained.view_revision, path: "documents/team/production.txt", content: "Retained by the isolated native worker and collected by its host." });
       expect(interrupted.isError).toBe(true);
       retained = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
       expect(retained.pending_operation).toBe(recoveredOperation);
@@ -1114,7 +1230,7 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
       expect(retained.pending_operation).toBe(recoveredOperation); expect(retained.record.invocations).toBe(1);
     }
 
-    const settings = { company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" } };
+    const settings = { company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), control: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -1123,8 +1239,15 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
-      expect(outcome).toMatchObject({ ok: true, started: 1, state: "completed", invocations: recovering ? 2 : 1, generation: recovering ? 2 : 1, published: true });
-      expect(result.images).toBe(0);
+      expect(outcome).toMatchObject({ ok: true, started: 1, state: failingChecks ? "waiting" : "completed", invocations: recovering ? 2 : 1, generation: recovering ? 2 : 1, published: !failingChecks });
+      expect(result.images).toBe(failingChecks ? 1 : 0);
+      if (failingChecks) {
+        expect(current.publication).toBeNull(); expect(current.record.note).toContain("failed coding checks");
+        expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/calculator.py");
+        expect(host.counts().assessments).toBe(0); expect(inference.counts().actors).toBe(2);
+        expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
+        return;
+      }
       if (recovering) {
         expect(current.pending_operation).toBeNull();
         const recovered = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, outcome: recoveredOperation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
@@ -1133,7 +1256,10 @@ for (const scenario of ["files", "answer", "recovery", "projection"]) test.skipI
       expect(current.record.state).toBe("completed"); expect(current.publication).not.toBeNull();
       const publication = JSON.parse(f.fossil("cat", current.publication.receipt_path, "-r", current.publication.revision));
       expect(publication.review.candidate).toBe(answer);
-      if (answerOnly) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
+      if (coding) {
+        expect(f.fossil("cat", "documents/team/calculator.py", "-r", "trunk")).toContain("return a + b");
+        expect(host.packets.at(-1).evidence.some(item => item.id.startsWith("company-validation:"))).toBe(true);
+      } else if (answerOnly) expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/production.txt");
       else expect(f.fossil("cat", "documents/team/production.txt", "-r", "trunk")).toBe("Retained by the isolated native worker and collected by its host.");
       if (projected) {
         expect(f.fossil("ls", "-r", "trunk")).not.toContain("documents/team/remove.txt");

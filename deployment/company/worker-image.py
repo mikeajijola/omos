@@ -1,8 +1,8 @@
 #!/usr/bin/python3 -I
 """Prepare disposable worker roots from an operator-verified runtime template.
 
-Run only as the operator. Request data selects identities, never host source
-paths, executable commands, credentials, or namespace policy.
+Run only as the operator. Entries must name verified immutable template files.
+Requests cannot select host source paths, credentials, or namespace policy.
 """
 import fcntl
 import hashlib
@@ -145,12 +145,20 @@ def main():
             raw = sys.stdin.buffer.read(65537)
             require(len(raw) <= 65536, "ImageRequestTooLarge")
             request = json.loads(raw)
-            require(isinstance(request, dict) and set(request) in ({"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model"}, {"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model", "source_revision"}) and request["version"] == "omos.worker-image-request/v1" and request["action"] in ("prepare", "inspect", "remove", "quiesce") and all(identity(request[key]) for key in ("id", "workspace", "view")) and type(request["generation"]) is int and request["generation"] > 0 and type(request["max_runtime_ms"]) is int and 1000 <= request["max_runtime_ms"] <= 240000 and isinstance(request["model"], str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", request["model"]), "InvalidImageRequest")
+            required = {"version", "action", "id", "workspace", "view", "generation", "max_runtime_ms", "model"}
+            require(isinstance(request, dict) and required <= set(request) <= required | {"source_revision", "entry"} and request["version"] == "omos.worker-image-request/v1" and request["action"] in ("prepare", "inspect", "remove", "quiesce") and all(identity(request[key]) for key in ("id", "workspace", "view")) and type(request["generation"]) is int and request["generation"] > 0 and type(request["max_runtime_ms"]) is int and 1000 <= request["max_runtime_ms"] <= 240000 and isinstance(request["model"], str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", request["model"]), "InvalidImageRequest")
             root = pathlib.Path(config["root"])
             require("source_revision" not in request or identity(request["source_revision"]), "InvalidImageSourceRevision")
             target = root / request["id"][:24]
             uid = 100000 + int(request["id"][:12], 16) % 15900001
             descriptor = {"version": "omos.worker-root/v1", "uid": uid, "workspace": request["workspace"], "view": request["view"], "generation": request["generation"], "max_runtime_ms": request["max_runtime_ms"], "executable": "/runtime/bin/omos", "executable_sha256": config["executable_sha256"]}
+            if "entry" in request:
+                entry = request["entry"]
+                require(isinstance(entry, dict) and set(entry) == {"path", "sha256"} and isinstance(entry["path"], str) and entry["path"].startswith(("/runtime/bin/", "/bin/", "/usr/bin/")) and all(part and part not in (".", "..") for part in entry["path"].split("/")[1:]) and identity(entry["sha256"]), "InvalidImageEntry")
+                manifest, manifest_hash = trusted_json(config["template_manifest"], 4 * 1024 * 1024)
+                require(manifest_hash == config["template_manifest_sha256"] and any(item["path"] == entry["path"][1:] and item["sha256"] == entry["sha256"] and item["executable"] for item in manifest["files"]), "ImageEntryNotInTemplate")
+                descriptor["executable"] = entry["path"]
+                descriptor["executable_sha256"] = entry["sha256"]
             image_identity = {"request": {key: value for key, value in request.items() if key != "action"}, "configuration_sha256": configuration_hash}
             if target.exists() or target.is_symlink():
                 image_metadata, _ = trusted_json(str(target / ".omos-worker-image.json"), 8192)

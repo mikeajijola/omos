@@ -10,14 +10,14 @@ import { createWorkerHttpControl } from "./worker-http-control.mjs";
 
 const fields = (value, expected) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).every(key => expected.includes(key));
 function validate(config) {
-  if (!fields(config, ["version", "control", "backend", "concurrency", "poll_ms"]) || config.version !== "omos.company-workers/v1" || !fields(config.control, ["endpoint", "workspaceId", "token"]) || !fields(config.backend, ["imageTool", "imageToolSha256", "launcher", "launcherSha256", "imageConfiguration", "companyConfiguration", "companyHome", "model"]) || !fields(config.backend.model, ["endpoint", "handle", "model", "credential"]) || !Number.isSafeInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isSafeInteger(config.poll_ms) || config.poll_ms < 250 || config.poll_ms > 5000) throw new Error("InvalidCompanyWorkersConfiguration");
+  if (!fields(config, ["version", "control", "backend", "concurrency", "poll_ms"]) || config.version !== "omos.company-workers/v1" || !fields(config.control, ["endpoint", "workspaceId", "token"]) || !fields(config.backend, ["imageTool", "imageToolSha256", "launcher", "launcherSha256", "imageConfiguration", "companyConfiguration", "companyHome", "model", "validationConfiguration"]) || !fields(config.backend.model, ["endpoint", "handle", "model", "credential"]) || !Number.isSafeInteger(config.concurrency) || config.concurrency < 1 || config.concurrency > 4 || !Number.isSafeInteger(config.poll_ms) || config.poll_ms < 250 || config.poll_ms > 5000) throw new Error("InvalidCompanyWorkersConfiguration");
   return config;
 }
 
 export async function runWorkerServer(config, signal, report = () => {}) {
   validate(config);
   signal?.throwIfAborted();
-  const backend = await createLinuxWorkerBackend(structuredClone(config.backend));
+  const backend = await createLinuxWorkerBackend({ ...structuredClone(config.backend), evaluation: structuredClone(config.control), concurrency: config.concurrency });
   const control = createWorkerHttpControl(structuredClone(config.control));
   const coordinator = createWorkerCoordinator({ control, backend, concurrency: config.concurrency });
   let previous;

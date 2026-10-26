@@ -31,6 +31,10 @@ increases remain inactive. The optional `server.review_workers` setting accepts
 The server reads this capacity at startup. Increasing capacity requires an
 explicit contract migration rather than automatic proposal activation. Existing
 task policy hashes remain unchanged. See [contract authority](../CONTRACTS.md).
+The optional `server.validation_handle` pins the operator's configuration handle
+for isolated company coding checks. An omitted handle uses `company-default`.
+The handle grants no permissions. Replacing or removing a pinned handle cannot
+activate automatically, and older serialized policy hashes remain unchanged.
 
 `semantic.ts` is an unchanged reference copy of the SaaS extension from commit
 `e3d1d5f1ed7d5918f9d6997949a942c7fcdcb2f1`. Parity tests use it with the SaaS's

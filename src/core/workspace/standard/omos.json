@@ -3655,6 +3655,169 @@
           "cli"
         ],
         "approval": "policy"
+      },
+      {
+        "id": "omos_company_evaluation",
+        "capability": "general_task",
+        "description": "Inspect a scoped immutable validation candidate and retain host-observed isolated check evidence through the local operator boundary. Actor requests cannot grant this authority.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "evaluate"
+            },
+            "evaluation": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-evaluation/v1"
+                },
+                "action": {
+                  "type": "string",
+                  "enum": [
+                    "prepare",
+                    "record"
+                  ]
+                },
+                "view": {
+                  "type": "string"
+                },
+                "execution": {
+                  "type": "object",
+                  "properties": {
+                    "runtime": {
+                      "type": "string"
+                    },
+                    "generation": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "runtime",
+                    "generation"
+                  ],
+                  "additionalProperties": false
+                },
+                "revision": {
+                  "type": "string"
+                },
+                "operation": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "source_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "configuration_handle": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "configuration_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "environment_sha256": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "arguments": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "minItems": 1,
+                        "maxItems": 64
+                      },
+                      "cwd": {
+                        "type": "string"
+                      },
+                      "exit_code": {
+                        "type": "integer"
+                      },
+                      "stdout": {
+                        "type": "string"
+                      },
+                      "stderr": {
+                        "type": "string"
+                      },
+                      "output_complete": {
+                        "type": "boolean"
+                      },
+                      "source_unchanged": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "arguments",
+                      "cwd",
+                      "exit_code",
+                      "stdout",
+                      "stderr",
+                      "output_complete",
+                      "source_unchanged"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 16
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "version",
+                "action",
+                "view",
+                "execution",
+                "revision"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "evaluation"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object"
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "api"
+        ]
       }
     ],
     "semantic": {

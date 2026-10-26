@@ -43,10 +43,25 @@ if spec["action"] == "setup":
     binary("/bin/bash", "/bin/bash")
     binary("/usr/bin/env", "/usr/bin/env")
     binary("/bin/rm", "/bin/rm")
+    if spec.get("validation"):
+        binary(sys.executable, "/runtime/bin/python3")
+        stdlib = pathlib.Path(sys.base_prefix) / "lib" / ("python" + ".".join(map(str, sys.version_info[:2])))
+        for source in stdlib.rglob("*"):
+            if not source.is_file() or any(part in ("__pycache__", "site-packages", "dist-packages", "test", "tests") for part in source.relative_to(stdlib).parts):
+                continue
+            target = template / str(source).lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(0o644)
+            files[str(target.relative_to(template))] = {"path": str(target.relative_to(template)), "bytes": target.stat().st_size, "sha256": hashlib.file_digest(target.open("rb"), "sha256").hexdigest(), "executable": False}
+        for module in (stdlib / "lib-dynload").glob("*.so"):
+            result = subprocess.run(["/usr/bin/ldd", str(module)], capture_output=True, text=True)
+            for dependency in re.findall(r"(?<!\S)(/[^\s()]+)", result.stdout):
+                binary(dependency, dependency)
     manifest = base / "template.json"
     manifest.write_text(json.dumps({"version": "omos.worker-template/v1", "files": list(files.values())}))
     manifest.chmod(0o600)
-    configuration = {"version": "omos.worker-images/v1", "root": str(pool), "template": str(template), "template_manifest": str(manifest), "template_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(), "executable_sha256": files["runtime/bin/omos"]["sha256"], "service_uid": spec["owner"], "service_gid": spec["group"], "max_images": 1, "context_window": 262144, "max_output_tokens": 8192}
+    configuration = {"version": "omos.worker-images/v1", "root": str(pool), "template": str(template), "template_manifest": str(manifest), "template_manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(), "executable_sha256": files["runtime/bin/omos"]["sha256"], "service_uid": spec["owner"], "service_gid": spec["group"], "max_images": 2 if spec.get("validation") else 1, "context_window": 262144, "max_output_tokens": 8192}
     (base / "configuration.json").write_text(json.dumps(configuration))
     (base / "configuration.json").chmod(0o600)
     print(json.dumps({"base": str(base)}))
@@ -78,6 +93,15 @@ if spec["action"] == "backend":
         selected.chmod(0o600)
         program[name] = {"path": str(selected), "sha256": hashlib.sha256(selected.read_bytes()).hexdigest()}
     backend = {"imageTool": program["worker-image.py"]["path"], "imageToolSha256": program["worker-image.py"]["sha256"], "launcher": program["worker-launcher.py"]["path"], "launcherSha256": program["worker-launcher.py"]["sha256"], "imageConfiguration": str(base / "configuration.json"), "companyConfiguration": str(company), "companyHome": str(profile), "model": settings["model"]}
+    if "validation" in settings:
+        image_config = json.loads((base / "configuration.json").read_text())
+        manifest = json.loads(pathlib.Path(image_config["template_manifest"]).read_text())
+        shell = next(item for item in manifest["files"] if item["path"] == "bin/bash")
+        validation = {"version": "omos.worker-validation/v1", "handle": "company-default", "entry": {"path": "/bin/bash", "sha256": shell["sha256"]}, "checks": settings["validation"]}
+        validation_file = base / "validation.json"
+        validation_file.write_text(json.dumps(validation))
+        validation_file.chmod(0o600)
+        backend["validationConfiguration"] = str(validation_file)
     configuration = base / "backend.json"
     configuration.write_text(json.dumps({"backend": backend, "control": settings["control"], "view": settings["view"]}))
     configuration.chmod(0o600)
@@ -92,6 +116,11 @@ def invoke(value):
     return {"code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 if spec["action"] == "invoke":
     print(json.dumps(invoke(request)))
+elif spec["action"] == "template_entry":
+    config = json.loads((base / "configuration.json").read_text())
+    manifest = json.loads(pathlib.Path(config["template_manifest"]).read_text())
+    entry = next(item for item in manifest["files"] if item["path"] == "bin/bash")
+    print(json.dumps({"path": "/bin/bash", "sha256": entry["sha256"]}))
 elif spec["action"] == "profile":
     root = base / "pool" / request["id"][:24]
     print(json.dumps({"settings": json.loads((root / "home/worker/.fx/settings.json").read_text()), "mcp": json.loads((root / "home/worker/.fx/mcp.json").read_text()), "marker": json.loads((root / ".omos-worker-root.json").read_text()), "directories": {name: stat.S_IMODE((root / name).stat().st_mode) for name in ("runtime", "runtime/bin", "home", "home/worker", "home/worker/.fx", "run", "dev")}, "keys": list((root / "home/worker/.fx").iterdir()).__len__()}))
