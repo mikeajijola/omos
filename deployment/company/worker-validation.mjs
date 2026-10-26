@@ -69,9 +69,13 @@ async function readResult(filename) {
   } finally { await file.close(); }
 }
 
-export async function runCompanyValidation({ configuration, configurationSha256, environmentSha256, control, client, row, revision, image, run, signal }) {
+export async function runCompanyValidation({ configuration, configurationSha256, environmentSha256, control, client, row, revision, candidate, image, run, signal }) {
   const config = validateValidationConfiguration(configuration);
   const job = row.record, binding = job.binding;
+  if (typeof candidate !== "string" || !candidate.trim() || Buffer.byteLength(candidate) > 32768) fail("InvalidWorkerValidationCandidate");
+  const retained = await control.call({ version: "omos.company-evaluation/v1", action: "candidate", view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, revision, operation: randomUUID(), candidate }, signal);
+  if (!retained.ok || retained.version !== "omos.company-candidate-outcome/v1" || retained.task !== binding.task || retained.authority !== "actor_claim" || retained.candidate_sha256 !== createHash("sha256").update(candidate).digest("hex")) fail("WorkerCandidateRetentionPending");
+  revision = retained.revision;
   const base = { version: "omos.company-evaluation/v1", view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, revision };
   const prepare = async offset => {
     const reply = await control.call({ ...base, action: "prepare", offset }, signal);
@@ -95,7 +99,7 @@ export async function runCompanyValidation({ configuration, configurationSha256,
   const prepared = await image(request, signal);
   if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== job.generation || prepared.executable !== config.entry.path || prepared.executable_sha256 !== config.entry.sha256) fail("WorkerValidationImageChanged");
   const marker = path.join(prepared.root, ".omos-validation-result.json");
-  let result = await readResult(marker), retained = false;
+  let result = await readResult(marker), receiptRetained = false;
   try {
     if (!result) {
       const root = path.join(prepared.root, "runtime/validation-source");
@@ -145,10 +149,10 @@ export async function runCompanyValidation({ configuration, configurationSha256,
     if (result.source_sha256 !== first.source_sha256 || result.configuration_sha256 !== configurationSha256 || result.environment_sha256 !== environmentSha256 || result.view !== binding.view || result.execution?.runtime !== job.runtime || result.execution?.generation !== job.generation) fail("WorkerValidationResultChanged");
     const receipt = await control.call(result, signal);
     if (!receipt.ok) fail(receipt.uncertain ? "WorkerValidationOutcomeUnknown" : "WorkerValidationRejected");
-    retained = true;
+    receiptRetained = true;
     return receipt;
   } finally {
     await image({ ...request, action: "quiesce" });
-    if (retained) await image({ ...request, action: "remove" });
+    if (receiptRetained) await image({ ...request, action: "remove" });
   }
 }

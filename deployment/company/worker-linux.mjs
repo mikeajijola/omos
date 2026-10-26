@@ -223,7 +223,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         if (coding) {
           const control = createEvaluationHttpControl(evaluation);
           let checked;
-          try { checked = await runCompanyValidation({ configuration: validation, configurationSha256: validationSha256, environmentSha256, control, client, row, revision: current.revision, image, run, signal }); }
+          try { checked = await runCompanyValidation({ configuration: validation, configurationSha256: validationSha256, environmentSha256, control, client, row, revision: current.revision, candidate: claim.data.candidate, image, run, signal }); }
           finally { control.close(); }
           if (!checked.passed) return { outcome: "waiting", note: "The company host retained failed coding checks. Inspect their evidence before revising the task." };
           current = { ...current, revision: checked.revision };

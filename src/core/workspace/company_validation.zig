@@ -22,7 +22,7 @@ pub const Check = struct {
 };
 pub const Request = struct {
     version: []const u8,
-    action: enum { prepare, record },
+    action: enum { prepare, candidate, record },
     view: []const u8,
     execution: ownership.Fence,
     revision: []const u8,
@@ -33,6 +33,23 @@ pub const Request = struct {
     environment_sha256: ?[]const u8 = null,
     checks: []const Check = &.{},
     offset: usize = 0,
+    candidate: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: Request, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Request).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "candidate")) {
+                if (self.candidate != null) {
+                    try writer.objectField(name);
+                    try writer.write(self.candidate);
+                }
+            } else {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 const File = struct { path: []const u8, artifact: []const u8, executable: bool };
 const Source = struct { sha256: []const u8, files: []const File };
@@ -119,6 +136,7 @@ fn handle(task: workspace.Task) []const u8 {
 pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
     if (!std.mem.eql(u8, request.version, "omos.company-evaluation/v1")) return error.UnsupportedCompanyApi;
+    if (request.action != .candidate and request.candidate != null) return error.InvalidCompanyValidation;
     const selected = try context(manager, request);
     const lease = (try manager.tryTaskExecutionLease(selected.task.id)) orelse return error.WorkspaceExecutionBusy;
     defer lease.release();
@@ -140,14 +158,26 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
         const batch = (try history.next(scratch.allocator())) orelse break;
         for (batch) |raw| {
             const row = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), raw, .{});
-            if (!std.mem.eql(u8, model.text(row, "kind"), "company_evaluation")) continue;
+            const kind = model.text(row, "kind");
+            if (!std.mem.eql(u8, kind, "company_candidate") and !std.mem.eql(u8, kind, "company_evaluation")) continue;
             const value = model.field(row, "value") orelse continue;
             if (!std.mem.eql(u8, model.text(value, "operation"), operation)) continue;
             if (!std.mem.eql(u8, model.text(value, "request_sha256"), request_hash)) return error.CompanyOperationConflict;
+            if (request.action == .candidate) return json(manager.alloc, .{ .version = "omos.company-candidate-outcome/v1", .task = selected.task.id, .revision = current, .candidate_sha256 = model.text(value, "candidate_sha256"), .authority = "actor_claim", .replayed = true });
             return json(manager.alloc, .{ .version = "omos.company-evaluation-outcome/v1", .task = selected.task.id, .revision = current, .evidence = model.text(value, "evidence"), .passed = model.field(value, "passed") orelse return error.InvalidCompanyValidation, .replayed = true });
         }
     }
-    if (!std.mem.eql(u8, current, request.revision) or !std.mem.eql(u8, request.source_sha256 orelse return error.InvalidCompanyValidation, pinned.sha256)) return error.WorkspaceRevisionChanged;
+    if (!std.mem.eql(u8, current, request.revision)) return error.WorkspaceRevisionChanged;
+    if (request.action == .candidate) {
+        const candidate = request.candidate orelse return error.InvalidCompanyValidation;
+        if (candidate.len == 0 or candidate.len > 32768 or std.mem.trim(u8, candidate, " \t\r\n").len == 0 or request.source_sha256 != null or request.configuration_handle != null or request.configuration_sha256 != null or request.environment_sha256 != null or request.checks.len != 0) return error.InvalidCompanyValidation;
+        const candidate_hash = try workspace.hash(manager.alloc, candidate);
+        try manager.record(selected.task, "review_candidate", .{ .at_ms = io.milliTimestamp(), .text = candidate, .authority = "actor_claim" });
+        try manager.record(selected.task, "company_candidate", .{ .operation = operation, .request_sha256 = request_hash, .candidate_sha256 = candidate_hash, .source = pinned.sha256 });
+        const retained = try manager.checkpoint(selected.task);
+        return json(manager.alloc, .{ .version = "omos.company-candidate-outcome/v1", .task = selected.task.id, .revision = retained, .candidate_sha256 = candidate_hash, .authority = "actor_claim", .replayed = false });
+    }
+    if (!std.mem.eql(u8, request.source_sha256 orelse return error.InvalidCompanyValidation, pinned.sha256)) return error.WorkspaceRevisionChanged;
     if (!std.mem.eql(u8, request.configuration_handle orelse return error.InvalidCompanyValidation, handle(selected.task))) return error.CompanyValidationConfigurationChanged;
     _ = try authority.hexBytes(32, request.configuration_sha256 orelse return error.InvalidCompanyValidation);
     _ = try authority.hexBytes(32, request.environment_sha256 orelse return error.InvalidCompanyValidation);
@@ -175,4 +205,18 @@ test "company validation requires complete unchanged checks and rejects duplicat
     try std.testing.expect(!try validateChecks(&.{changed}));
     try std.testing.expectError(error.InvalidCompanyValidation, validateChecks(&.{}));
     try std.testing.expectError(error.InvalidCompanyValidation, validateChecks(&.{ check, check }));
+}
+
+test "company validation preserves previously retained request hashes when adding candidate checkpoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a: [64]u8 = @splat('a');
+    const b: [64]u8 = @splat('b');
+    const c: [64]u8 = @splat('c');
+    const d: [64]u8 = @splat('d');
+    const e: [64]u8 = @splat('e');
+    const request: Request = .{ .version = "omos.company-evaluation/v1", .action = .record, .view = &a, .execution = .{ .runtime = "worker", .generation = 3 }, .revision = &b, .operation = "retained-check", .source_sha256 = &c, .configuration_handle = "company-default", .configuration_sha256 = &d, .environment_sha256 = &e, .checks = &.{.{ .id = "syntax", .arguments = &.{"/bin/true"}, .cwd = "ui", .exit_code = 0, .stdout = "", .stderr = "", .output_complete = true, .source_unchanged = true }} };
+    const bytes = try json(arena.allocator(), request);
+    // Golden digest of the original v1 wire format, before candidate support.
+    try std.testing.expectEqualStrings("bcae201de9b76b7dc1aae670f190af07813e4e22b99dff8297f4810bc1add4e7", try workspace.hash(arena.allocator(), bytes));
 }

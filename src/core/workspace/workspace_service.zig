@@ -58,7 +58,7 @@ pub fn executeEvaluation(manager: workspace.Manager, raw: []const u8, writable: 
     const envelope = try records.decode(Envelope, manager.alloc, raw, .{});
     if (!std.mem.eql(u8, envelope.version, "omos.company-evaluation-api/v1")) return error.UnsupportedCompanyApi;
     if (!std.mem.eql(u8, envelope.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
-    if (envelope.request.action == .record and !writable) return error.ServiceReadOnly;
+    if (envelope.request.action != .prepare and !writable) return error.ServiceReadOnly;
     const parsed = try parse(manager.alloc, raw);
     const response = try @import("company_service.zig").administer(manager, try std.json.Stringify.valueAlloc(manager.alloc, .{ .version = "omos.company-admin/v1", .action = "evaluate", .evaluation = parsed.object.get("request").? }, .{}));
     return std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .data = try parse(manager.alloc, response) }, .{});

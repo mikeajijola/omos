@@ -530,8 +530,12 @@ The launcher stops descendants before the host rechecks source identities.
 Output is bounded to 8 KiB per stream per check. Failed checks, changed inputs,
 timeouts, and incomplete output cannot produce a passing receipt.
 
-The owner-only `/v1/company/evaluation` endpoint provides `prepare` and `record`
-operations. The same requests are available through `omos fossil company`
+The host checkpoints the actor's exact candidate answer before starting checks.
+That answer remains an unverified actor claim and travels with the task even
+when validation stops before recording a result.
+
+The owner-only `/v1/company/evaluation` endpoint provides `candidate`, `prepare`
+and `record` operations. The same requests are available through `omos fossil company`
 with action `evaluate`. Receipts bind the task, immutable source fingerprint,
 configuration and environment hashes, execution generation, command arguments
 and observed outcomes. They use the existing host-owned evidence records in

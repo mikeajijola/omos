@@ -13,7 +13,7 @@ function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
       if (closed) throw new Error("WorkerControlClosed");
       if (active.size >= 4) throw new Error("WorkerControlBusy");
       if (!request || typeof request !== "object" || Array.isArray(request)) throw new Error("InvalidWorkerControlRequest");
-      const mutation = evaluation ? request.action === "record" : request.change !== "inspect";
+      const mutation = evaluation ? request.action !== "prepare" : request.change !== "inspect";
       const body = JSON.stringify({ version: evaluation ? "omos.company-evaluation-api/v1" : "omos.company-worker-api/v1", workspace: workspaceId, request: structuredClone(request) });
       if (Buffer.byteLength(body) > (evaluation ? 256 * 1024 : 65536)) throw new Error("WorkerControlRequestTooLarge");
       const controller = new AbortController();
@@ -40,7 +40,7 @@ function createOwnerControl({ endpoint, workspaceId, token }, evaluation) {
         if (response.status !== 200) return { ok: false, error: typeof parsed.error === "string" && /^[A-Z][A-Za-z0-9]{0,95}$/.test(parsed.error) ? parsed.error : "WorkerControlRejected", uncertain: mutation, operation: request.operation ?? null };
         const value = parsed.data;
         if (parsed.workspace !== workspaceId || !value || (evaluation
-          ? !["omos.company-validation-input/v1", "omos.company-evaluation-outcome/v1"].includes(value.version) || !/^[0-9a-f]{64}$/.test(value.task) || !/^[0-9a-f]{64}$/.test(value.revision)
+          ? !["omos.company-validation-input/v1", "omos.company-evaluation-outcome/v1", "omos.company-candidate-outcome/v1"].includes(value.version) || !/^[0-9a-f]{64}$/.test(value.task) || !/^[0-9a-f]{64}$/.test(value.revision)
           : !Array.isArray(value.jobs) || value.jobs.length > 32 || value.jobs.some(row => row.record?.binding?.workspace !== workspaceId))) throw new Error("WorkerControlBindingChanged");
         return { ...value, ok: true };
       } catch {

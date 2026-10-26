@@ -565,11 +565,22 @@ test("company coding publication requires current owner-observed validation and 
     const prepare = async revision => {
       const reply = await evaluator.call({ version: "omos.company-evaluation/v1", action: "prepare", view, execution, revision }); expect(reply.ok, JSON.stringify(reply)).toBe(true); return reply;
     };
-    const first = await prepare(checkpoint.revision);
+    const savedClaim = { version: "omos.company-evaluation/v1", action: "candidate", view, execution, revision: checkpoint.revision, operation: crypto.randomUUID(), candidate: "Implemented the company addition function; host checks are pending." };
+    const saved = await evaluator.call(savedClaim); expect(saved.ok, JSON.stringify(saved)).toBe(true); expect(saved.authority).toBe("actor_claim");
+    const savedReplay = await evaluator.call(savedClaim); expect(savedReplay.ok, JSON.stringify(savedReplay)).toBe(true); expect(savedReplay).toMatchObject({ replayed: true, candidate_sha256: saved.candidate_sha256, revision: saved.revision });
+    const inspected = await service.post({ version: "omos.workspace-api/v1", workspace: boot.workspace, definition_hash: row.basis.definition_hash, revision: saved.revision, action: "candidate", task: row.record.binding.task });
+    expect(inspected.status, await inspected.clone().text()).toBe(200); expect((await inspected.json() as any).data).toMatchObject({ authority: "actor_claim", candidate: savedClaim.candidate });
+    const first = await prepare(saved.revision);
     expect(first.files.map(item => item.path)).toEqual(["documents/team/calculator.py"]);
     const forged = await client.call("company_workspace", { version: "omos.company/v1", action: "record", view, execution, revision: checkpoint.revision, entity: "omos_evidence", content: JSON.stringify({ id: "forged", data: { status: "passed" } }), operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }); expect(forged.isError).toBe(true);
-    const unauthenticated = await fetch(service.url + "/v1/company/evaluation", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }); expect(unauthenticated.status).toBe(401);
-    const origin = await fetch(service.url + "/v1/company/evaluation", { method: "POST", headers: { ...service.headers, origin: "http://127.0.0.1" }, body: "{}" }); expect(origin.status).toBe(401);
+    const denied = headers => new Promise<number>((resolve, reject) => {
+      const request = http.request(service.url + "/v1/company/evaluation", { method: "POST", agent: false, headers: { "content-type": "application/json", "content-length": 2, connection: "close", ...headers } }, response => {
+        response.resume(); response.once("end", () => resolve(response.statusCode!)); response.once("error", reject);
+      });
+      request.once("error", reject); request.end("{}");
+    });
+    expect(await denied({})).toBe(401);
+    expect(await denied({ ...service.headers, origin: "http://127.0.0.1" })).toBe(401);
     const checks = async (input: string) => {
       const arguments_ = ["/usr/bin/python3", "-I", "-c", input];
       const child = Bun.spawn(arguments_, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -578,10 +589,12 @@ test("company coding publication requires current owner-observed validation and 
     };
     const record = async (snapshot, values) => ({ version: "omos.company-evaluation/v1", action: "record", view, execution, revision: snapshot.revision, source_sha256: snapshot.source_sha256, configuration_handle: snapshot.configuration_handle, configuration_sha256: "a".repeat(64), environment_sha256: "b".repeat(64), operation: crypto.randomUUID(), checks: values });
     const bad = await record(first, await checks("assert False, 'deliberate check failure'"));
-    const stale = await evaluator.call({ ...bad, source_sha256: "0".repeat(64) }); expect(stale.ok).toBe(false);
-    const mismatched = await evaluator.call({ ...bad, configuration_handle: "another-configuration" }); expect(mismatched.ok).toBe(false);
+    const crossAction = await evaluator.call({ ...bad, operation: savedClaim.operation }); expect(crossAction).toMatchObject({ ok: false, error: "CompanyOperationConflict" });
+    const stale = await evaluator.call({ ...bad, operation: crypto.randomUUID(), source_sha256: "0".repeat(64) }); expect(stale.ok).toBe(false);
+    const mismatched = await evaluator.call({ ...bad, operation: crypto.randomUUID(), configuration_handle: "another-configuration" }); expect(mismatched.ok).toBe(false);
     const failed = await evaluator.call(bad); expect(failed.ok, JSON.stringify(failed)).toBe(true); expect(failed.passed).toBe(false);
     const replay = await evaluator.call(bad); expect(replay.ok, JSON.stringify(replay)).toBe(true); expect(replay).toMatchObject({ replayed: true, passed: false, evidence: failed.evidence, revision: failed.revision });
+    const different = await evaluator.call({ ...bad, environment_sha256: "c".repeat(64) }); expect(different).toMatchObject({ ok: false, error: "CompanyOperationConflict" });
     const passedInput = await prepare(failed.revision);
     const passed = await evaluator.call(await record(passedInput, await checks(`${code}\nassert add(2, 3) == 5\nprint('addition passed')`)));
     expect(passed.ok, JSON.stringify(passed)).toBe(true); expect(passed.passed).toBe(true);

@@ -3679,6 +3679,7 @@
                   "type": "string",
                   "enum": [
                     "prepare",
+                    "candidate",
                     "record"
                   ]
                 },
@@ -3787,6 +3788,12 @@
                 "offset": {
                   "type": "integer",
                   "minimum": 0
+                },
+                "candidate": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 }
               },
               "required": [
