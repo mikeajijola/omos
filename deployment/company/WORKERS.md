@@ -491,6 +491,14 @@ operator can requeue the task within its existing invocation allowance; the
 host inspects the retained checkpoint before resuming. This does not reset the
 allowance or replay an uncertain external effect.
 
+If a saved answer only needs collection, the host reads the last native public
+episode through `session.events` and restores it under the collecting execution
+generation. This read-only recovery starts no prompt, answers no question, and
+runs no actor tools. It requires a complete recorded episode and uses the same
+public event filter as live delivery. Missing or changing history retains the
+image instead of inventing completion events. Saved questions and approvals
+appear as historical notices rather than actionable input requests.
+
 ### Retain public worker evidence
 
 Hosted actors cannot submit their own company proposal. After the actor and

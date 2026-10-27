@@ -44,8 +44,8 @@ export function publicWorkerEvents(data) {
   return [];
 }
 
-export async function runWorkerNative({ launch, control, view, execution, prompt, session, inputControl, signal, timeout = 240000 }) {
-  if (typeof launch !== "function" || typeof control?.call !== "function" || typeof prompt !== "string" || Buffer.byteLength(prompt) > 131072 || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 300000) fail("InvalidWorkerNativeInvocation");
+export async function runWorkerNative({ launch, control, view, execution, prompt, session, replayOnly = false, inputControl, signal, timeout = 240000 }) {
+  if (typeof launch !== "function" || typeof control?.call !== "function" || typeof prompt !== "string" || Buffer.byteLength(prompt) > 131072 || typeof replayOnly !== "boolean" || (replayOnly && (typeof session !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(session))) || !Number.isSafeInteger(timeout) || timeout < 1 || timeout > 300000) fail("InvalidWorkerNativeInvocation");
   signal?.throwIfAborted();
   const before = await control.call({ action: "inspect", view, execution }, signal);
   if (!before.ok || before.next_offset !== 0 || before.ended) fail("WorkerNativeActivityAlreadyStarted");
@@ -112,6 +112,19 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     if (queue.length >= 4) await flush();
     else if (!flushTimer) flushTimer = setTimeout(() => { void flush(); }, 100);
   };
+  const emitPublic = async data => {
+    if (["assistant_started", "assistant_restarted"].includes(data.type)) { textHash = createHash("sha256"); textBytes = 0; }
+    if (data.type === "text_delta") { textHash.update(data.text); textBytes += Buffer.byteLength(data.text); }
+    if (data.type === "result") {
+      const text = data.data?.final_output;
+      if (typeof text === "string" && text.length && (Buffer.byteLength(text) !== textBytes || createHash("sha256").update(text).digest("hex") !== textHash.copy().digest("hex"))) {
+        await emit({ type: "assistant_restarted" });
+        for (const part of textParts(text)) await emit({ type: "text_delta", text: part });
+      }
+    }
+    if (data.type === "validate_ui") await emit({ type: "notice", text: "The retained private task is waiting for a configured UI validator." });
+    for (const selected of publicWorkerEvents(data)) await emit(selected);
+  };
   const pollInput = () => {
     clearTimeout(inputTimer);
     if (!inputControl || ending || killed || !waitingInput) return;
@@ -168,17 +181,7 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
           if (event.type !== "event" || event.turn !== turn || event.cursor !== nativeCursor + 1) fail("InvalidWorkerNativeEvent");
           nativeCursor = event.cursor;
           const data = event.data;
-          if (["assistant_started", "assistant_restarted"].includes(data.type)) { textHash = createHash("sha256"); textBytes = 0; }
-          if (data.type === "text_delta") { textHash.update(data.text); textBytes += Buffer.byteLength(data.text); }
-          if (data.type === "result") {
-            const text = data.data?.final_output;
-            if (typeof text === "string" && text.length && (Buffer.byteLength(text) !== textBytes || createHash("sha256").update(text).digest("hex") !== textHash.copy().digest("hex"))) {
-              await emit({ type: "assistant_restarted" });
-              for (const part of textParts(text)) await emit({ type: "text_delta", text: part });
-            }
-          }
-          if (data.type === "validate_ui") await emit({ type: "notice", text: "The retained private task is waiting for a configured UI validator." });
-          for (const selected of publicWorkerEvents(data)) await emit(selected);
+          await emitPublic(data);
           if (data.type === "input_required" && inputControl) {
             await flush(); await uploads;
             waitingInput = true;
@@ -197,8 +200,34 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     })();
     consume.catch(error => { failure ??= error; stop(); });
     await initialized;
-    started = request("prompt", { text: prompt, ...(session ? { session } : {}) }, turn);
-    await started;
+    if (replayOnly) {
+      let offset = 0, savedTurn, finished = false;
+      // The image is quiescent. Read the last recorded episode without starting
+      // a prompt or answering any retained input request.
+      while (!killed) {
+        signal?.throwIfAborted();
+        const page = await request("session.events", { session, offset });
+        if (page.active !== false || !Array.isArray(page.events) || page.events.length > 32 || !Number.isSafeInteger(page.next_offset) || page.next_offset < offset || (page.events.length && page.next_offset === offset)) fail("WorkerNativeHistoryChanged");
+        for (const event of page.events) {
+          if (event.version !== "omos.ui-host/v1" || event.type !== "event" || typeof event.turn !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(event.turn) || (savedTurn && event.turn !== savedTurn) || event.cursor !== nativeCursor + 1 || exitCode !== undefined) fail("WorkerNativeHistoryChanged");
+          savedTurn = event.turn; nativeCursor = event.cursor;
+          if (event.data?.type === "input_required") {
+            const text = event.data.kind === "approval" ? event.data.prompt : (event.data.questions ?? []).map(question => question.question).join("; ");
+            await emit({ type: "notice", text: "Saved input from the previous invocation: " + bounded(text, 8000) });
+          } else await emitPublic(event.data);
+          if (event.data.type === "turn_end") exitCode = event.data.exit_code;
+        }
+        if (page.events.length < 32 || page.next_offset === offset) { finished = true; break; }
+        offset = page.next_offset;
+      }
+      if (!finished || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255) fail("WorkerNativeHistoryIncomplete");
+      ending = true;
+      await flush(); await uploads;
+      child.stdin.end();
+    } else {
+      started = request("prompt", { text: prompt, ...(session ? { session } : {}) }, turn);
+      await started;
+    }
     const result = await closed;
     await consume;
     ending = true; clearTimeout(inputTimer);

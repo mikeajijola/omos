@@ -228,6 +228,15 @@ test("native worker continuation resolves the private session and preserves effe
     const after = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout);
     expect(after.tasks).toHaveLength(1); expect(after.tasks[0].id).toBe(before.tasks[0].id);
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Retained before interruption.");
+    const recovered = [];
+    const replayed = await runWorkerNative({ launch, control: { async call(request) {
+      if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false };
+      recovered.push(...request.events.map(JSON.parse));
+      return { ok: true, next_offset: request.offset + request.events.length };
+    } }, view: "private-fixture", execution: { runtime: "collector", generation: 3 }, prompt: "", session, replayOnly: true, timeout: 120000 });
+    expect(replayed.code, replayed.stderr).toBe(0); expect(replayed.stderr).toBe(""); expect(inference.counts().actors).toBe(4);
+    expect(recovered.some(event => event.type === "tool_start")).toBe(true); expect(recovered.some(event => event.type === "text_delta" && event.text.includes("Preserved the completed memory write."))).toBe(true); expect(recovered.at(-1).type).toBe("turn_end");
+    expect(f.fossil("timeline", "ancestors", "trunk", "--type", "ci", "--limit", "1", "--format", "%H").trim().split("\n")[0]).toBe(after.trunk_revision);
     expect((await f.run(["fossil", "verify", "--json"])).code).toBe(0);
   } finally { child?.kill("SIGKILL"); }
 }, 300000);
@@ -2412,6 +2421,33 @@ input.on('line',line=>{const request=JSON.parse(line);send({type:'response',id:r
   })).rejects.toMatchObject({ message: "WorkerActivityRetentionPending", retention: { kind: "activity", action: "append", offset: 0, error: "WorkerControlOutcomeUnknown" } });
   expect(appends).toBe(2); expect(Date.now() - started).toBeLessThan(5000);
   expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+}, 10000);
+
+for (const corruption of ["none", "incomplete", "changed"]) test(`worker native recovery replays its saved public episode without prompting an actor (${corruption})`, async () => {
+  const source = String.raw`import readline from 'node:readline';
+const input=readline.createInterface({input:process.stdin});
+const send=value=>process.stdout.write(JSON.stringify({version:'omos.ui-host/v1',type:'response',...value})+'\n');
+const events=[{type:'turn_start'},{type:'session',session_id:'PrivateSession12'},{type:'input_required',kind:'question',request_id:7,questions:[{question:'Retain the saved choice?',options:[{label:'Yes'}]}]},{type:'assistant_started'},{type:'tool_start',call_id:'saved-file',name:'write_file',path:'documents/team/result.txt'},{type:'tool_end',call_id:'saved-file',outcome:'completed'},{type:'text_delta',text:'Saved **answer**.'},{type:'result',data:{final_output:'Saved **answer**.',provider_replay:'fixture-private-checkpoint'}},{type:'turn_end',exit_code:0}].map((data,index)=>({version:'omos.ui-host/v1',type:'event',turn:'saved-native-turn',cursor:index+1,data}));
+if('${corruption}'==='incomplete')events.pop();if('${corruption}'==='changed')events[4].cursor=99;
+input.on('line',line=>{const request=JSON.parse(line);if(request.method==='prompt')process.exit(77);if(request.method==='initialize')send({id:request.id,result:{},err:null});else if(request.method==='session.events')send({id:request.id,result:{events:request.params.offset===0?events:[],next_offset:request.params.offset===0?1024:request.params.offset,active:false},err:null});});`;
+  let child, offset = 0;
+  const retained = [];
+  const invocation = runWorkerNative({
+    launch: () => child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] }),
+    control: { async call(request) { if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false }; expect(request.offset).toBe(offset); retained.push(...request.events.map(JSON.parse)); offset += request.events.length; return { ok: true, next_offset: offset }; } },
+    view: "view", execution: { runtime: "collector", generation: 3 }, prompt: "", session: "PrivateSession12", replayOnly: true, timeout: 3000,
+  });
+  if (corruption !== "none") {
+    await expect(invocation).rejects.toThrow(corruption === "incomplete" ? "WorkerNativeHistoryIncomplete" : "WorkerNativeHistoryChanged");
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+    return;
+  }
+  const result = await invocation;
+  expect(result.code).toBe(0); expect(result.killed).toBe(false); expect(child.exitCode).toBe(0);
+  expect(retained.map(event => event.type)).toEqual(["turn_start", "notice", "assistant_started", "tool_start", "tool_end", "text_delta", "turn_end"]);
+  expect(retained.find(event => event.type === "notice").text).toContain("Retain the saved choice?");
+  expect(retained.find(event => event.type === "text_delta").text).toBe("Saved **answer**.");
+  expect(JSON.stringify(retained)).not.toContain("PrivateSession12"); expect(JSON.stringify(retained)).not.toContain("fixture-private-checkpoint");
 }, 10000);
 
 for (const cancelled of [false, true]) test(`company retirement archives public history after revocation without restoring execution${cancelled ? " after live cancellation" : ""}`, async () => {

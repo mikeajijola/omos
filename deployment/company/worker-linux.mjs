@@ -267,7 +267,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       if (!recovering) await mark("prepared");
       const prepared = await image(request, signal);
       if (prepared.workspace !== binding.workspace || prepared.view !== binding.view || prepared.generation !== checkpoint.generation || prepared.executable_sha256 !== configuration.executable_sha256 || path.dirname(prepared.root) !== configuration.root || !Number.isSafeInteger(prepared.uid)) fail("WorkerImageIdentityChanged");
-      let client, actorClient, broker, complete = false, archiveRetained = false, unused = false;
+      let client, actorClient, broker, complete = false, archiveRetained = false, unused = false, activityDelivered = false;
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const operation = randomUUID();
@@ -279,20 +279,22 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
         }
         return JSON.parse(result.content[0].text);
       };
-      const invoke = async (text, session) => {
+      const invoke = async (text, session, replayOnly = false) => {
         if (!activitySupported) return run(prepared.root, ["ask", ...(session ? ["--resume-id", session] : []), "--json"], signal, text);
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const control = createActivityHttpControl(evaluation);
         const inputControl = inputSupported ? createInputHttpControl(evaluation) : null;
         try {
-          return await runWorkerNative({
+          const result = await runWorkerNative({
             launch: async () => {
               await trustedFile(launcher, launcherSha256, 131072);
               if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
               return spawn("/usr/bin/python3", ["-I", launcher, prepared.root, "--", "ui-host", "--stdio"], { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" }, stdio: ["pipe", "pipe", "pipe"] });
             },
-            control, inputControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, prompt: text, session, signal, timeout: Math.max(1, Math.min(240000, deadline - Date.now())),
+            control, inputControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, prompt: text, session, replayOnly, signal, timeout: Math.max(1, Math.min(240000, deadline - Date.now())),
           });
+          activityDelivered = true;
+          return result;
         } finally { control.close(); inputControl?.close(); }
       };
       const startBroker = async () => {
@@ -389,6 +391,12 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
             if (resumed.killed || ![0, 1].includes(resumed.code)) fail("WorkerInvocationFailed");
             await mark("stopped");
             continue;
+          }
+          if (activitySupported && recovering && !activityDelivered && boundedAnswer && !restartForAmendment) {
+            const sessions = await run(prepared.root, ["sessions", "--all", "--json"], signal);
+            if (sessions.code !== 0) fail("WorkerSessionUnavailable");
+            const session = selectWorkerSession(JSON.parse(sessions.stdout).sessions, selected.session);
+            await invoke("", session, true);
           }
           const reader = createWorkerSnapshot({ workspace: local.workspace_id, definitionHash: head.data.definition_hash, revision: head.data.revision, request: input => requestNative({ ...input, task: selected.id }), maxFileBytes: 8 * 1024 * 1024, maxBytes: 64 * 1024 * 1024 });
           const inventory = await reader.inventory(signal);
