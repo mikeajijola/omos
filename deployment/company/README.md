@@ -18,6 +18,10 @@ Use a dedicated service account with persistent home storage. Install the built
 `scripts/install-omos.sh`. Keep this profile separate from a person's installation.
 The service account's configuration selects the review provider and credentials.
 
+See [encrypted backups and recovery](BACKUP.md) for the optional trusted operator
+companion. Keep backup passwords and authority recovery material separate from
+ordinary portable exports.
+
 ## Initialize the empty instance
 
 Run these commands as the service account, after installing its binaries:
@@ -257,9 +261,10 @@ the operation. The companion stores no task, grant, or operation database.
 
 Create a verified portable export with `omos fossil export PATH`. Preserve all
 company branches, including authority, views, proposals, and operation outcomes.
-Back up issuer material under `~/.fx/authority/`, review provider credentials,
-and the private environment file separately using the operator's protected
-backup procedure. Plain company exports do not contain those secrets. Fossil
+The [encrypted backup companion](BACKUP.md) packages the verified repository and
+selected authority keys in a private Restic domain. Back up review provider
+credentials and the private environment file through your separate secret
+recovery process. Plain company exports do not contain those secrets. Fossil
 repositories and scoped packages currently contain plaintext content. Use the
 host's encrypted storage and protected backup transport where your deployment
 requires encryption; object-level encryption and portable key-domain recovery
