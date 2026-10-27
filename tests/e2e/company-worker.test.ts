@@ -27,6 +27,11 @@ const support = probeResult?.status === 0 ? JSON.parse(probeResult.stdout) : nul
 
 afterEach(cleanupFixtures);
 
+function forwardOwnerFixture(endpoint: string, request: Request, body: string) {
+  // Match the production owner transport: one fresh connection, no replay.
+  return fetch(endpoint + new URL(request.url).pathname, { method: request.method, keepalive: false, headers: { authorization: request.headers.get("authorization") ?? "", "content-type": "application/json" }, body });
+}
+
 function local(socket: string, path: string, data?: object, headers: Record<string, string> = {}) {
   return new Promise<{ status: number; text: string }>((resolve, reject) => {
     const request = http.request({ socketPath: socket, path, method: data ? "POST" : "GET", headers: { "content-type": "application/json", ...headers } }, response => {
@@ -1619,7 +1624,7 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
   const retiring = scenario === "retirement" && support.private_namespaces;
   const amending = ["amendment", "amend_after_answer"].includes(scenario) && support.private_namespaces;
   const amendAfterAnswer = scenario === "amend_after_answer" && support.private_namespaces;
-  let amendmentAfterAnswerSubmitted = false;
+  let amendmentAfterAnswerSubmitted = false, amendmentAfterAnswerStarted = false;
   let resumedNativeHistory = false, receivedAmendment = false, retainedSummaryRead = false;
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
@@ -1754,28 +1759,36 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
     }
 
     let archiveAcknowledgementLost = false;
+    const proxyErrors: string[] = [];
     if (archiveRecovery || retiring || partialRecovery || amending) ownerProxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
-      const target = new URL(request.url).pathname;
-      if (request.method === "GET" && target === "/fixture/actor-ready") return Response.json({ ready: inference.counts().actors >= 2 });
-      const body = await request.text();
-      const reply = await fetch(service.url + target, { method: request.method, headers: { authorization: request.headers.get("authorization")!, "content-type": "application/json" }, body });
-      const content = await reply.text();
-      if (amendAfterAnswer && !amendmentAfterAnswerSubmitted && target === "/v1/company/archives" && reply.status === 200 && JSON.parse(content).data?.complete === true) {
-        const stateResult = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
-        expect(stateResult.isError, JSON.stringify(stateResult)).not.toBe(true);
-        const state = JSON.parse(stateResult.content[0].text);
-        const updated = await client.call("company_workspace", { version: "omos.company/v1", action: "execute_task", view, revision: state.revision, execution: { runtime: state.execution.runtime, generation: state.execution.generation }, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, content: JSON.stringify({ version: "omos.company-task-amend/v1", text: "Replace the document with Amended by the authenticated user" }) });
-        expect(updated.isError, JSON.stringify(updated)).not.toBe(true);
-        expect(JSON.parse(updated.content[0].text).state).toBe("planning");
-        amendmentAfterAnswerSubmitted = true;
+      try {
+        const target = new URL(request.url).pathname;
+        if (request.method === "GET" && target === "/fixture/actor-ready") return Response.json({ ready: inference.counts().actors >= 2 });
+        const body = await request.text();
+        const reply = await forwardOwnerFixture(service.url, request, body);
+        const content = await reply.text();
+        if (amendAfterAnswer && !amendmentAfterAnswerStarted && target === "/v1/company/archives" && reply.status === 200 && JSON.parse(content).data?.complete === true) {
+          amendmentAfterAnswerStarted = true;
+          const stateResult = await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
+          expect(stateResult.isError, JSON.stringify(stateResult)).not.toBe(true);
+          const state = JSON.parse(stateResult.content[0].text);
+          const updated = await client.call("company_workspace", { version: "omos.company/v1", action: "execute_task", view, revision: state.revision, execution: { runtime: state.execution.runtime, generation: state.execution.generation }, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, content: JSON.stringify({ version: "omos.company-task-amend/v1", text: "Replace the document with Amended by the authenticated user" }) });
+          expect(updated.isError, JSON.stringify(updated)).not.toBe(true);
+          expect(JSON.parse(updated.content[0].text).state).toBe("planning");
+          amendmentAfterAnswerSubmitted = true;
+        }
+        if ((archiveRecovery || retiring) && target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
+        return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
+      } catch (error) {
+        if (proxyErrors.length < 8) proxyErrors.push(error instanceof Error ? error.message.slice(0, 2048) : "FixtureOwnerProxyFailure");
+        return Response.json({ error: "FixtureOwnerProxyFailure" }, { status: 503 });
       }
-      if ((archiveRecovery || retiring) && target === "/v1/company/archives" && JSON.parse(body).request.action !== "inspect" && reply.status === 200 && !archiveAcknowledgementLost) { archiveAcknowledgementLost = true; return Response.json({ error: "FixtureArchiveAcknowledgementLost" }, { status: 503 }); }
-      return new Response(content, { status: reply.status, headers: { "content-type": "application/json" } });
     } });
     const settings = { ...(desiredTask ? { desiredPolicy: "production-target", reconciliation: true } : {}), ...(answerOnly ? { hostedRequest: { view, revision: createdView.revision } } : {}), company, key_file: join(f.home, ".fx/company-keys/production-worker.seed"), archiveRecovery, codingRecovery, partialRecovery, invocationCount: archiveRecovery || codingRecovery || partialRecovery || amending ? 2 : 1, retirement: retiring, amendment: amending && !amendAfterAnswer, actorWaitUrl: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}/fixture/actor-ready` : null, inputResponse: inputTask, control: { endpoint: ownerProxy ? `http://127.0.0.1:${ownerProxy.port}` : service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view, model: { endpoint: provider + "/chat/completions", handle: "fixture-model", model: "fixture-model", credential: "fixture-provider-kept-outside-image" }, ...(coding ? { validation: [{ id: "addition-behavior", arguments: ["/runtime/bin/python3", "-I", "-B", "-c", "import runpy; code = runpy.run_path(\"calculator.py\"); assert code[\"add\"](2, 3) == 5; print(\"addition-behavior passed\")"], cwd: "documents/team", timeout_ms: 10000 }] } : {}) };
     const child = Bun.spawn(["sudo", "-n", "/usr/bin/python3", "-I", imageFixture], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     child.stdin.write(JSON.stringify({ base, action: "backend", settings, node: process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath })); child.stdin.end();
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(proxyErrors, stderr + stdout).toEqual([]);
     expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
     const result = JSON.parse(stdout), outcome = JSON.parse(result.stdout);
     if (desiredTask) view = outcome.view;
@@ -2932,6 +2945,11 @@ test("owner worker and retention inspections do not wait for an unrelated compan
   const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit"];
   await admin({ action: "grant", revision: initial.revision, grant: { id: "inspection", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, expires_ms: Date.now() + 3600000 } });
   const service = await startWorkspaceService(f, true); let client, holder;
+  const proxyErrors: string[] = [];
+  const proxy = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    try { return await forwardOwnerFixture(service.url, request, await request.text()); }
+    catch (error) { proxyErrors.push(error instanceof Error ? error.message.slice(0, 2048) : "FixtureOwnerProxyFailure"); return Response.json({ error: "FixtureOwnerProxyFailure" }, { status: 503 }); }
+  } });
   try {
     const boot = await (await fetch(service.url + "/v1/company")).json() as any;
     const config = join(f.home, "inspection-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "inspection", key_handle: "inspection", actions }), { mode: 0o600 });
@@ -2943,11 +2961,12 @@ test("owner worker and retention inspections do not wait for an unrelated compan
     holder = Bun.spawn(["/usr/bin/python3", "-I", "-c", "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); sys.stdin.read(1)", join(f.home, ".fx/authority", boot.workspace, "operation.lock")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const reader = holder.stdout.getReader(); try { const ready = await reader.read(); expect(new TextDecoder().decode(ready.value)).toBe("held\n"); } finally { reader.releaseLock(); }
     const probe = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-inspection-writer.mjs")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    probe.stdin.write(JSON.stringify({ transport: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view: view.view, execution: { runtime: row.record.runtime, generation: row.record.generation }, source: { workspace: boot.workspace, task: row.record.binding.task, revision: row.view_revision, sha256: "e".repeat(64), bytes: 512 } })); probe.stdin.end();
+    probe.stdin.write(JSON.stringify({ transport: { endpoint: `http://127.0.0.1:${proxy.port}`, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view: view.view, execution: { runtime: row.record.runtime, generation: row.record.generation }, source: { workspace: boot.workspace, task: row.record.binding.task, revision: row.view_revision, sha256: "e".repeat(64), bytes: 512 } })); probe.stdin.end();
     const [code, stdout, stderr] = await Promise.all([probe.exited, new Response(probe.stdout).text(), new Response(probe.stderr).text()]); expect(code, stderr).toBe(0); expect(stderr).toBe("");
+    expect(proxyErrors).toEqual([]);
     const result = JSON.parse(stdout); expect(result.jobs.ok, stdout).toBe(true); expect(result.jobs.jobs[0].record).toEqual(row.record); expect(result.jobs.jobs[0].contract).toEqual(row.contract);
     expect(result.retained).toMatchObject({ ok: true, resume_offset: 0, complete: false }); expect(result.events).toMatchObject({ ok: true, next_offset: 0, ended: false }); expect(result.fenced).toMatchObject({ ok: false, error: "CompanyExecutionFenced" }); expect(inference.counts().actors).toBe(0);
-  } finally { if (holder) { holder.stdin.end(); await holder.exited; } client?.close(); service.child.kill(); await service.child.exited; expect(await new Response(service.child.stderr).text()).toBe(""); }
+  } finally { if (holder) { holder.stdin.end(); await holder.exited; } client?.close(); proxy.stop(true); service.child.kill(); await service.child.exited; expect(await new Response(service.child.stderr).text()).toBe(""); }
 }, 120000);
 
 test("worker runtime heartbeat and stop do not wait for an unrelated company writer", async () => {
