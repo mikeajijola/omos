@@ -80,7 +80,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm, company_backup]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -88,7 +88,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 5 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 6 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -129,6 +129,30 @@ jobs:
         with:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  company_backup:
+    name: Company encrypted backup and recovery
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/download-artifact@v4
+        with:
+          name: fx-linux-x86_64
+          path: zig-out/bin
+      - name: Install backup dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y restic fossil
+          restic version
+          fossil version
+          chmod +x zig-out/bin/fx
+      - name: Exercise encrypted backup, cancellation and cold recovery
+        run: node --test deployment/company/backup.test.mjs
 
   sdk-wasm:
     name: SDK build (WASM)

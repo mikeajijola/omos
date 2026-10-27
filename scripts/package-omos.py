@@ -41,6 +41,7 @@ def main():
     helper = validate_inputs(root, args.platform, lock)
     paths = ["zig-out/bin/fx", "zig-out/libexec/fossil", "scripts/install-omos.sh", "scripts/fossil-helper.lock.json", "deployment/company/mcp.mjs", "src/core/workspace/standard/omos.json", "LICENSE", "THIRD_PARTY_NOTICES.md", "deployment/company/FOSSIL-NOTICES.md", "deployment/INSTALL.md"]
     paths.extend("deployment/company/" + name for name in (
+        "backup.mjs", "backup-runtime.mjs", "BACKUP.md",
         "worker-broker.mjs", "worker-control.mjs", "worker-http-control.mjs",
         "worker-coordinator.mjs", "worker-recovery.mjs", "worker-snapshot.mjs", "worker-linux.mjs", "worker-validation.mjs", "worker-runtime.mjs", "worker-archive.mjs", "worker-checkpoint.mjs", "worker-native.mjs",
         "worker-server.mjs", "worker-launcher.py", "worker-image.py",
