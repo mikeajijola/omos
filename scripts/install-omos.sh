@@ -27,6 +27,10 @@ if [ ! -x "$binary_path" ]; then
     exit 1
 fi
 source_binary="$binary_path"
+if ! "$source_binary" --version >/dev/null; then
+    echo 'The runtime cannot start on this host; installation was not changed.' >&2
+    exit 1
+fi
 runtime_hash=$(sha256_file "$binary_path")
 runtime_dir="$HOME/.fx/releases/$runtime_hash"
 if [ "$copy_binary" -eq 1 ]; then

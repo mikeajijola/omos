@@ -1,7 +1,8 @@
 # Install a portable native bundle
 
 Extract the archive for your platform and run `sh omos/install.sh`. The installer
-verifies the bundle's component checksums, copies the native runtime into
+verifies the bundle's component checksums and checks that the runtime starts
+before changing the installation. It copies the native runtime into
 `~/.fx/releases/<runtime-hash>/`, and copies the pinned Fossil helper into
 `~/.fx/libexec/`. It then installs `omos` and `omo` aliases in `~/.local/bin/`
 or `XDG_BIN_HOME`. You can remove the unpacked download afterward. Keep the
@@ -28,7 +29,10 @@ Managed workspace invocations disable the upstream fx background updater and
 reject `upgrade` before contacting that service. An upstream fx binary would
 not preserve the Omniseed workspace runtime or its installed companions.
 
-To package a freshly built runtime, stage the matching pinned upstream helper
+Build a portable runtime for the selected target before packaging. For Linux
+Intel, use `zig build -Dtarget=x86_64-linux -Doptimize=ReleaseSafe -Dcpu=baseline`.
+Use `aarch64-linux`, `x86_64-macos`, or `aarch64-macos` for the other platforms.
+Stage the matching pinned upstream helper
 with `python3 scripts/stage-fossil-helper.py --platform PLATFORM`, then run
 `python3 scripts/package-omos.py --platform PLATFORM --output PATH.tar.gz`.
 The lock file records upstream source identity, archive hashes, executable
@@ -54,6 +58,9 @@ separate operator service, and follow [the worker deployment procedure](company/
 
 The `Preview installation bundles` workflow builds Linux Intel, Linux ARM,
 macOS Intel, and macOS Apple Silicon candidates on matching native runners.
+It selects an explicit target and baseline CPU rather than inheriting the runner's
+instruction set and operating-system defaults.
+The Linux Intel job also starts the runtime on an emulated older CPU.
 It stages the pinned helper and tests two fresh installations, both CLI aliases,
 unique empty instances, portable export and restoration, and repository
 verification after removing the unpacked source and making system Fossil

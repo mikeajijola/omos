@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 
@@ -21,6 +22,60 @@ def elf(machine):
 
 
 class InstallationInputsTests(unittest.TestCase):
+    def test_unstartable_runtime_preserves_fresh_and_existing_installations(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                (source / "scripts").mkdir(parents=True)
+                installer = source / "scripts/install-omos.sh"
+                shutil.copyfile(scripts / "install-omos.sh", installer)
+                runtime = source / "zig-out/bin/fx"
+                runtime.parent.mkdir(parents=True)
+                runtime.write_text("#!/bin/sh\nexit 126\n")
+                runtime.chmod(0o700)
+                for relative, content in (
+                    ("deployment/company/mcp.mjs", "export {};\n"),
+                    ("src/core/workspace/standard/omos.json", "{}\n"),
+                    ("zig-out/libexec/fossil", "#!/bin/sh\nexit 0\n"),
+                ):
+                    component = source / relative
+                    component.parent.mkdir(parents=True, exist_ok=True)
+                    component.write_text(content)
+                (source / "zig-out/libexec/fossil").chmod(0o700)
+                home = root / "home"
+                home.mkdir()
+                aliases = [home / ".local/bin" / name for name in ("omos", "omo")]
+                previous = home / ".fx/releases/previous/fx"
+                if existing:
+                    previous.parent.mkdir(parents=True)
+                    previous.write_bytes(b"previous runtime")
+                    aliases[0].parent.mkdir(parents=True)
+                    for alias in aliases:
+                        alias.symlink_to(previous)
+                    (home / ".fx/omos-workspace.json").write_bytes(b"retained binding")
+                def files():
+                    return {
+                        str(path.relative_to(home)): path.read_bytes()
+                        for path in home.rglob("*")
+                        if path.is_file() and not path.is_symlink()
+                    }
+
+                before = files()
+                result = subprocess.run(
+                    ["sh", str(installer), "--copy"],
+                    env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(before, files())
+                for alias in aliases:
+                    self.assertEqual(alias.is_symlink(), existing)
+                    if existing:
+                        self.assertEqual(alias.readlink(), previous)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("runtime cannot start on this host", result.stderr)
+                self.assertNotIn("Installed", result.stdout)
+
     def fixture(self, root, runtime):
         (root / "scripts").mkdir()
         shutil.copyfile(scripts / "stage-fossil-helper.py", root / "scripts/stage-fossil-helper.py")

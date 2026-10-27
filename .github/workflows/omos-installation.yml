@@ -31,12 +31,16 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
+            target: x86_64-linux
             runner: ubuntu-24.04
           - platform: linux-aarch64
+            target: aarch64-linux
             runner: ubuntu-24.04-arm
           - platform: macos-x86_64
+            target: x86_64-macos
             runner: macos-15-intel
           - platform: macos-aarch64
+            target: aarch64-macos
             runner: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -49,7 +53,14 @@ jobs:
       - name: Check packaging Python
         run: python3 -c 'import sys; assert sys.version_info >= (3, 12), "Packaging requires Python 3.12 or newer"'
       - name: Build preview runtime
-        run: zig build -Doptimize=ReleaseSafe
+        # Downloaded bundles must not inherit the build runner's CPU features.
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe -Dcpu=baseline
+      - name: Verify an older x86 CPU can start the runtime
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          sudo timeout --kill-after=15s 3m apt-get update
+          sudo timeout --kill-after=15s 3m apt-get install -y --no-install-recommends qemu-user
+          timeout --kill-after=5s 30s qemu-x86_64 -cpu Nehalem zig-out/bin/fx --version
       - name: Stage the pinned Fossil helper
         env:
           PLATFORM: ${{ matrix.platform }}
