@@ -111,13 +111,29 @@ fn captureLinuxToken(
     defer stat_file.close(zio);
     var stat_text: [4096]u8 = undefined;
     const stat_text_len = try readLinuxProcStat(stat_file, &stat_text);
-    const stat = stat_text[0..stat_text_len];
+    const ticks = try linuxStartTicks(stat_text[0..stat_text_len]);
+    var token_buf: [128]u8 = undefined;
+    const text = try std.mem.print(
+        &token_buf,
+        "linux:{s}:{s}",
+        .{ boot_id[0..], ticks },
+    );
+    return process_identity.ProcessInstanceToken.parse(text);
+}
+
+fn linuxStartTicks(stat: []const u8) ![]const u8 {
     const close_paren = std.mem.findScalarLast(u8, stat, ')') orelse
         return error.ProcessIdentityUnavailable;
     var fields = std.mem.tokenizeScalar(u8, stat[close_paren + 1 ..], ' ');
     var field_number: usize = 3;
     var start_ticks: ?[]const u8 = null;
     while (fields.next()) |field| : (field_number += 1) {
+        if (field_number == 3) {
+            if (field.len != 1) return error.ProcessIdentityUnavailable;
+            // An unreaped owner retains its PID and start token after exit.
+            // It cannot own a live terminal or accept a takeover command.
+            if (field[0] == 'Z' or field[0] == 'X' or field[0] == 'x') return error.ProcessNotFound;
+        }
         if (field_number == 22) {
             start_ticks = field;
             break;
@@ -126,13 +142,7 @@ fn captureLinuxToken(
     const ticks = start_ticks orelse return error.ProcessIdentityUnavailable;
     _ = std.fmt.parseUnsigned(u64, ticks, 10) catch
         return error.ProcessIdentityUnavailable;
-    var token_buf: [128]u8 = undefined;
-    const text = try std.mem.print(
-        &token_buf,
-        "linux:{s}:{s}",
-        .{ boot_id[0..], ticks },
-    );
-    return process_identity.ProcessInstanceToken.parse(text);
+    return ticks;
 }
 
 fn captureMacOSToken(
@@ -252,4 +262,13 @@ test "native process provider delegates tree signaling to the neutral tracker" {
     try std.testing.expect(provider.capture_token_fn == captureToken);
     try std.testing.expect(provider.match_token_fn == matchToken);
     try std.testing.expect(provider.signal_process_fn == signalProcess);
+}
+
+test "native process identity excludes exited Linux processes before matching their tokens" {
+    const prefix = "42 (name with ) spaces) ";
+    const fields = " 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 12345 0\n";
+    try std.testing.expectEqualStrings("12345", try linuxStartTicks(prefix ++ "S" ++ fields));
+    inline for (.{ "Z", "X", "x" }) |state| try std.testing.expectError(error.ProcessNotFound, linuxStartTicks(prefix ++ state ++ fields));
+    try std.testing.expectError(error.ProcessIdentityUnavailable, linuxStartTicks(prefix ++ "SS" ++ fields));
+    try std.testing.expectError(error.ProcessIdentityUnavailable, linuxStartTicks("42 (truncated) S 1"));
 }

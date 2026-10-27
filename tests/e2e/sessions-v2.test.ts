@@ -3438,6 +3438,12 @@ test.skipIf(!tmuxAvailable())("a hosted terminal ends with an app crash, and the
   const alive = (pid: number) => {
     try {
       process.kill(pid, 0);
+      if (process.platform === "linux") {
+        // A subreaper can retain the PID after the terminal has exited. It
+        // cannot execute or receive input while waiting to be reaped.
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return false;
+      }
       return true;
     } catch {
       return false;
