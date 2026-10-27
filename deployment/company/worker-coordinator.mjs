@@ -12,7 +12,9 @@ function failureNote(error) {
   const retention = error?.retention;
   const retained = retention && ["activity", "archive"].includes(retention.kind) && ["inspect", "append", "chunk"].includes(retention.action) && Number.isSafeInteger(retention.offset) && retention.offset >= 0
     ? ` retention=${retention.kind}; action=${retention.action}; offset=${retention.offset}; error=${diagnosticCode(retention.error)}${retention.transport ? `; transport=${diagnosticCode(retention.transport)}` : ""}.` : "";
-  return `${cause}.${details}${retained} Inspect the retained isolated checkpoint before resuming.`;
+  const inspection = error?.inspection;
+  const observed = inspection?.kind === "checkpoint" ? ` inspection=checkpoint; error=${diagnosticCode(inspection.error)}; transport=${diagnosticCode(inspection.transport)}.` : "";
+  return `${cause}.${details}${retained}${observed} Inspect the retained isolated checkpoint before resuming.`;
 }
 const sameOwner = (row, owned) => row?.record?.state === "running" && row.record.runtime === owned.runtime && row.record.generation === owned.generation && row.execution?.runtime === owned.runtime && row.execution.generation === owned.generation;
 

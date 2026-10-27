@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 export function createWorkerCheckpointer({ control, view, execution }) {
   return async checkpoint => {
     const inspected = await control.call({ change: "inspect", view });
+    if (!inspected.ok) throw Object.assign(new Error("WorkerCheckpointInspectionPending"), { inspection: { kind: "checkpoint", error: inspected.error, transport: inspected.transport } });
     const row = inspected.ok && inspected.jobs?.length === 1 ? inspected.jobs[0] : null;
     if (!row?.authority_live || row.record.state !== "running" || row.record.runtime !== execution.runtime || row.record.generation !== execution.generation) throw new Error("WorkerCheckpointFenced");
     const operation = randomUUID();

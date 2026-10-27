@@ -123,10 +123,11 @@ fn permits(grant: authority.Grant, record: Record) !void {
     for (record.paths) |path| if (!authority.permitsSelector(grant, path)) return error.CompanyAccessDenied;
 }
 
-/// The owner route holds the company lease. A live generation authorizes
-/// retention, including after publication; it cannot change task source.
-pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
-    if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
+/// Owner mutations hold the company lease; inspections pin immutable heads.
+/// A live generation authorizes retention without changing task source.
+pub fn execute(original: workspace.Manager, request: Request) ![]const u8 {
+    var manager = original;
+    if (!manager.company_operation_held and !(request.action == .inspect and manager.company_read_revision != null)) return error.CompanyOperationLeaseRequired;
     const retired = std.mem.eql(u8, request.version, "omos.company-retired-archive-write/v1");
     if ((!retired and !std.mem.eql(u8, request.version, "omos.company-actor-archive-write/v1")) or !authority.safeIdentity(request.view)) return error.InvalidCompanyArchive;
     try validateSource(request.source);
@@ -134,7 +135,9 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
     const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8 };
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{request.view})), .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, view.id, request.view)) return error.CompanyAccessDenied;
-    const task = try manager.refreshTaskContext(try manager.loadTask(view.task));
+    const snapshot = if (manager.company_read_revision != null) try manager.taskStatusSnapshot(view.task) else null;
+    const task = if (snapshot) |selected| selected.task else try manager.refreshTaskContext(try manager.loadTask(view.task));
+    if (snapshot) |selected| manager.task_read_revision = .{ .branch = task.branch, .revision = selected.revision };
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     const live = if (retired) original: {
@@ -155,8 +158,8 @@ pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
         try ownership.validate(execution, request.view, task.id, grant);
         try ownership.require(execution, request.execution, io.milliTimestamp());
     }
-    const lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy;
-    defer lease.release();
+    const lease: ?workspace.ExecutionLease = if (request.action == .inspect) null else (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy;
+    defer if (lease) |held| held.release();
     const id = try identifier(manager.alloc, request.source);
     const completed = try receiptPath(manager.alloc, task.id, id);
     const progress_path = try headPath(manager.alloc, task.id, id);

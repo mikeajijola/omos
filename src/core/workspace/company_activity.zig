@@ -113,12 +113,15 @@ fn permits(manager: workspace.Manager, row: Record, task: workspace.Task, grant:
     if (!std.mem.eql(u8, row.workspace, manager.manifest.id) or !std.mem.eql(u8, row.task, task.id) or !std.mem.eql(u8, row.view, view) or !std.mem.eql(u8, row.actor, grant.actor) or !std.mem.eql(u8, row.grant, grant.id)) return error.CompanyAccessDenied;
     for (row.paths) |selector| if (!authority.permitsSelector(grant, selector)) return error.CompanyAccessDenied;
 }
-pub fn execute(manager: workspace.Manager, request: Request) ![]const u8 {
-    if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
+pub fn execute(original: workspace.Manager, request: Request) ![]const u8 {
+    var manager = original;
+    if (!manager.company_operation_held and !(request.action == .inspect and manager.company_read_revision != null)) return error.CompanyOperationLeaseRequired;
     if (!std.mem.eql(u8, request.version, "omos.company-activity-write/v1") or !authority.safeIdentity(request.view) or request.offset > max_position or request.events.len > 8 or (request.action == .inspect and (request.offset != 0 or request.events.len != 0)) or (request.action == .append and request.events.len == 0)) return error.InvalidCompanyActivity;
     const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8 };
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{request.view})), .{ .ignore_unknown_fields = true });
-    const task = try manager.refreshTaskContext(try manager.loadTask(view.task));
+    const snapshot = if (manager.company_read_revision != null) try manager.taskStatusSnapshot(view.task) else null;
+    const task = if (snapshot) |selected| selected.task else try manager.refreshTaskContext(try manager.loadTask(view.task));
+    if (snapshot) |selected| manager.task_read_revision = .{ .branch = task.branch, .revision = selected.revision };
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     const grant = try scope.forTask(manager, task, try authority.liveGrant(state, binding.grant, io.milliTimestamp()));

@@ -99,12 +99,16 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     // Runtime liveness changes only the fenced in-memory cache. An unrelated
     // company write must not expire an otherwise healthy coordinator.
     const liveness = request.action == .runtimes and request.runtime != null and (request.runtime.?.change == .heartbeat or request.runtime.?.change == .stop);
-    const lease: ?workspace.ExecutionLease = if (liveness) null else try manager.companyOperationLease();
+    const inspection = (request.action == .workers and request.worker != null and request.worker.?.change == .inspect) or
+        (request.action == .archive and request.archive != null and request.archive.?.action == .inspect) or
+        (request.action == .activity and request.activity != null and request.activity.?.action == .inspect);
+    const snapshot_read = liveness or inspection;
+    const lease: ?workspace.ExecutionLease = if (snapshot_read) null else try manager.companyOperationLease();
     defer if (lease) |held| held.release();
-    manager.company_operation_held = !liveness;
-    if (liveness) manager.company_read_revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
+    manager.company_operation_held = !snapshot_read;
+    if (snapshot_read) manager.company_read_revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
     var revision_cache: workspace.Manager.CompanyRevisionCache = .{ .alloc = manager.alloc };
-    if (!liveness) {
+    if (!snapshot_read) {
         revision_cache.revision = try manager.companyRevision();
         manager.company_revision_cache = &revision_cache;
     }
@@ -148,6 +152,7 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     }
     if (request.action == .activity) {
         const output = try @import("company_activity.zig").execute(manager, request.activity orelse return error.InvalidCompanyActivity);
+        if (inspection) try validateInspection(manager, request);
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
         return output;
     }
@@ -159,6 +164,7 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     if (request.action == .archive) {
         if (request.revision != null or request.worker != null or request.evaluation != null or request.runtime != null) return error.UnsupportedCompanyApi;
         const output = try @import("company_archive.zig").execute(manager, request.archive orelse return error.InvalidCompanyArchive);
+        if (inspection) try validateInspection(manager, request);
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
         return output;
     }
@@ -177,6 +183,7 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     if (request.action == .workers) {
         if (request.revision != null and !equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
         const output = try @import("company_worker_jobs.zig").administer(manager, request.worker orelse return error.InvalidCompanyWorkerJob);
+        if (inspection) try validateInspection(manager, request);
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
         return output;
     }
@@ -310,6 +317,34 @@ fn signed(manager: workspace.Manager, current: authority.State, request: authori
     const signature = try key.sign(payload, null);
     const signature_hex = std.fmt.bytesToHex(signature.toBytes(), .lower);
     return encode(manager.alloc, .{ .payload = payload, .signature = &signature_hex, .issuer = &public });
+}
+
+// Owner inspections are revision snapshots, never execution admission. Check
+// live authority and the retention fence again before returning their data.
+fn validateInspection(manager: workspace.Manager, request: Admin) !void {
+    var live = manager;
+    live.company_read_revision = null;
+    live.company_revision_cache = null;
+    const pinned = try state(manager);
+    const current = try state(live);
+    if (!std.mem.eql(u8, try encode(manager.alloc, pinned), try encode(manager.alloc, current))) return error.CompanyAccessDenied;
+    _ = try keys.current(live, current.epoch, current.issuer);
+    // Retirement is a separate owner permission, including revoked actors.
+    // Its immutable retirement record was checked by the archive reader.
+    if (request.archive) |selected| if (std.mem.eql(u8, selected.version, "omos.company-retired-archive-write/v1")) return;
+    const view_id = if (request.archive) |selected| selected.view else if (request.activity) |selected| selected.view else return;
+    const fence = if (request.archive) |selected| selected.execution else request.activity.?.execution;
+    const view = try records.decode(View, manager.alloc, try live.companyContent(try manager.alloc.print("company/views/{s}.json", .{view_id})), .{});
+    var reader = live;
+    reader.company_read_revision = (try live.companyRevision()) orelse return error.CompanyNotInitialized;
+    const task = (try reader.taskStatusSnapshot(view.task)).task;
+    const binding = task.authority orelse return error.CompanyAccessDenied;
+    const grant = try authority.liveGrant(current, binding.grant, io.milliTimestamp());
+    if (!std.mem.eql(u8, grant.actor, binding.actor) or !std.mem.eql(u8, view.actor, grant.actor) or !std.mem.eql(u8, view.grant, grant.id)) return error.CompanyAccessDenied;
+    try @import("company_desired.zig").require(live, task);
+    const execution = try records.decode(ownership.Record, manager.alloc, try live.companyContent(try ownership.path(manager.alloc, view_id)), .{});
+    try ownership.validate(execution, view_id, task.id, grant);
+    try ownership.require(execution, fence, io.milliTimestamp());
 }
 
 pub fn validateInstance(manager: workspace.Manager) !void {

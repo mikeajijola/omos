@@ -319,13 +319,14 @@ fn optionalContent(manager: workspace.Manager, record_path: []const u8) !?[]cons
 }
 
 const View = struct { id: []const u8, actor: []const u8, grant: []const u8, task: []const u8, pending: ?[]const u8 = null, scope: ?[]const u8 = null };
-const Context = struct { view: View, task: workspace.Task, grant: authority.Grant, binding: Binding, execution: ?ownership.Record, live: bool };
+const Context = struct { view: View, task: workspace.Task, revision: []const u8, grant: authority.Grant, binding: Binding, execution: ?ownership.Record, live: bool };
 
 fn context(manager: workspace.Manager, view_id: []const u8) !Context {
     if (!authority.safeIdentity(view_id)) return error.InvalidCompanyIdentity;
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{view_id})), .{ .ignore_unknown_fields = true });
     if (!std.mem.eql(u8, view.id, view_id)) return error.WorkspaceIdentityMismatch;
-    const task = try manager.refreshTaskContext(try manager.loadTask(view.task));
+    const snapshot = if (manager.company_read_revision != null) try manager.taskStatusSnapshot(view.task) else null;
+    const task = if (snapshot) |pinned| pinned.task else try manager.refreshTaskContext(try manager.loadTask(view.task));
     const selected = task.authority orelse return error.CompanyAccessDenied;
     if (!std.mem.eql(u8, selected.actor, view.actor) or !std.mem.eql(u8, selected.grant, view.grant)) return error.CompanyAccessDenied;
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
@@ -341,7 +342,7 @@ fn context(manager: workspace.Manager, view_id: []const u8) !Context {
         try ownership.validate(record, view_id, task.id, grant);
         break :value record;
     } else null;
-    return .{ .view = view, .task = task, .grant = try @import("company_task_scope.zig").forView(manager, task, grant, view.id, view.scope), .live = live, .execution = execution, .binding = .{ .workspace = manager.manifest.id, .view = view_id, .task = task.id, .actor = view.actor, .grant = view.grant, .contract_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })), .definition_sha256 = basis.definition_hash, .policy_sha256 = basis.execution_hash orelse try workspace.hash(manager.alloc, try encode(manager.alloc, basis.execution)) } };
+    return .{ .view = view, .task = task, .revision = if (snapshot) |pinned| pinned.revision else try manager.currentRevision(task), .grant = try @import("company_task_scope.zig").forView(manager, task, grant, view.id, view.scope), .live = live, .execution = execution, .binding = .{ .workspace = manager.manifest.id, .view = view_id, .task = task.id, .actor = view.actor, .grant = view.grant, .contract_sha256 = try workspace.hash(manager.alloc, try encode(manager.alloc, .{ .definition = task.definition, .amendments = task.amendments, .request_artifact = task.request_artifact })), .definition_sha256 = basis.definition_hash, .policy_sha256 = basis.execution_hash orelse try workspace.hash(manager.alloc, try encode(manager.alloc, basis.execution)) } };
 }
 
 fn planRecord(manager: workspace.Manager, previous: Record, request: Request, selected: Context, operation: []const u8, request_hash: []const u8) !Record {
@@ -388,6 +389,7 @@ fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bo
     var manager = original;
     manager.alloc = scratch.allocator();
     const current = try context(manager, record.binding.view);
+    if (manager.company_read_revision != null) manager.task_read_revision = .{ .branch = current.task.branch, .revision = current.revision };
     const review = if (current.task.review_job) |review_id| try manager.loadReviewJob(current.task, review_id) else null;
     const basis = (try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired;
     const supports_planning = @import("company_planning.zig").supported(try manager.loadDeclaration(basis.revision));
@@ -399,10 +401,10 @@ fn row(original: workspace.Manager, record: Record, raw: []const u8, details: bo
     return std.json.parseFromSliceLeaky(std.json.Value, original.alloc, bytes, .{ .allocate = .alloc_always });
 }
 
-/// Called only by the local operator API with the company operation lease.
-/// Definitions and actor-visible record writes cannot enter this path.
+/// Only the local operator API enters this path. Mutations hold the company
+/// operation lease; inspections use an immutable company snapshot.
 pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
-    if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
+    if (!manager.company_operation_held and !(request.change == .inspect and manager.company_read_revision != null)) return error.CompanyOperationLeaseRequired;
     if (request.limit == 0 or request.limit > 32 or request.offset > 1000000) return error.InvalidCompanyWorkerJob;
     const revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
     if (request.change == .inspect) {

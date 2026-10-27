@@ -716,6 +716,14 @@ preserving registrations, task checkpoints, and invocation budgets. The
 supervisor renews its lease every 10 seconds and stops its workers if renewal
 fails.
 
+Owner worker, archive, and activity inspections read revision snapshots without
+waiting for the company writer. Each task's contract and review use the same
+pinned task revision. Retention inspections recheck live grant and execution
+authority before returning. Checkpoints and content mutations still acquire the
+writer and enforce their expected revision and execution fence. An unavailable
+checkpoint inspection retains its transport cause; it does not imply that the
+worker's authority was revoked.
+
 The public bootstrap advertises `hosted_execution` only while a registered
 implementation is live. This reports service availability, not permission.
 Enroll `execute_task` explicitly in an actor's grant and client configuration

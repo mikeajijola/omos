@@ -2887,6 +2887,15 @@ test("company verification observation survives completion planning without allo
 }, 600000);
 
 
+test("an unavailable checkpoint inspection preserves its transport cause without claiming revocation", async () => {
+  let calls = 0;
+  const control = { async call(request) { calls++; expect(request.change).toBe("inspect"); return { ok: false, error: "WorkerControlOutcomeUnknown", transport: "RequestDeadline" }; } };
+  let error;
+  try { await createWorkerCheckpointer({ control, view: "view", execution: { runtime: "owner", generation: 2 } })({ phase: "stopped" }); } catch (caught) { error = caught; }
+  expect(error?.message).toBe("WorkerCheckpointInspectionPending");
+  expect(error?.inspection).toEqual({ kind: "checkpoint", error: "WorkerControlOutcomeUnknown", transport: "RequestDeadline" }); expect(calls).toBe(1);
+});
+
 test("company status reads remain available while the company writer is occupied", async () => {
   const f = fixture();
   const inference = model(f, () => { throw Error("Status inspection must never dispatch an actor"); });
@@ -2912,6 +2921,33 @@ test("company status reads remain available while the company writer is occupied
     expect(inspected.isError, JSON.stringify(inspected)).not.toBe(true);
     const state = JSON.parse(inspected.content[0].text); expect(state.revision).toBe(view.revision); expect(state.contract.version).toBe(1); expect(state.job).toBeNull(); expect(state.publication).toBeNull(); expect(inference.counts().actors).toBe(0);
   } finally { if (holder) { holder.stdin.end(); await new Promise<void>(resolve => { if (holder.exitCode !== null) resolve(); else holder.once("exit", () => resolve()); }); } client?.close(); service.child.kill(); await service.child.exited; }
+}, 120000);
+
+test("owner worker and retention inspections do not wait for an unrelated company writer", async () => {
+  const f = fixture(); const inference = model(f, () => { throw Error("Inspection must not dispatch an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const filename = join(f.home, "inspection-admin.json"); writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", filename, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "inspection", "--json"]); expect(keyed.code).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "execution", "status", "read", "checkpoint", "submit"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "inspection", actor: "worker", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true); let client, holder;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "inspection-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "worker", grant: "inspection", key_handle: "inspection", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const created = await client.call("company_workspace", { version: "omos.company/v1", action: "create_view", revision: boot.revision, objective: "Inspect an owned worker without taking the company writer", operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }); expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const view = JSON.parse(created.content[0].text);
+    let row = (await admin({ action: "workers", worker: { change: "queue", operation: crypto.randomUUID(), view: view.view } })).jobs[0];
+    row = (await admin({ action: "workers", worker: { change: "claim", operation: crypto.randomUUID(), view: view.view, expected_sha256: row.sha256, execution: { runtime: "inspection-runtime", generation: 0 } } })).jobs[0];
+    holder = Bun.spawn(["/usr/bin/python3", "-I", "-c", "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); sys.stdin.read(1)", join(f.home, ".fx/authority", boot.workspace, "operation.lock")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = holder.stdout.getReader(); try { const ready = await reader.read(); expect(new TextDecoder().decode(ready.value)).toBe("held\n"); } finally { reader.releaseLock(); }
+    const probe = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-inspection-writer.mjs")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    probe.stdin.write(JSON.stringify({ transport: { endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) }, view: view.view, execution: { runtime: row.record.runtime, generation: row.record.generation }, source: { workspace: boot.workspace, task: row.record.binding.task, revision: row.view_revision, sha256: "e".repeat(64), bytes: 512 } })); probe.stdin.end();
+    const [code, stdout, stderr] = await Promise.all([probe.exited, new Response(probe.stdout).text(), new Response(probe.stderr).text()]); expect(code, stderr).toBe(0); expect(stderr).toBe("");
+    const result = JSON.parse(stdout); expect(result.jobs.ok, stdout).toBe(true); expect(result.jobs.jobs[0].record).toEqual(row.record); expect(result.jobs.jobs[0].contract).toEqual(row.contract);
+    expect(result.retained).toMatchObject({ ok: true, resume_offset: 0, complete: false }); expect(result.events).toMatchObject({ ok: true, next_offset: 0, ended: false }); expect(result.fenced).toMatchObject({ ok: false, error: "CompanyExecutionFenced" }); expect(inference.counts().actors).toBe(0);
+  } finally { if (holder) { holder.stdin.end(); await holder.exited; } client?.close(); service.child.kill(); await service.child.exited; expect(await new Response(service.child.stderr).text()).toBe(""); }
 }, 120000);
 
 test("worker runtime heartbeat and stop do not wait for an unrelated company writer", async () => {
