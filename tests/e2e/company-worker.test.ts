@@ -712,7 +712,7 @@ test("signed hosted execution requires compute authority and a live matching imp
     let invoked = 0; const coordinator = createWorkerCoordinator({ control, backend: { supports: row => row.record.binding.grant === "hosted", async run() { invoked++; return { outcome: "waiting", note: "Retained the isolated invocation for the next user instruction." }; } } });
     const deadline = Date.now() + 45000;
     while (!invoked && Date.now() < deadline) { await advertised.heartbeat(); await coordinator.tick(); await Bun.sleep(50); }
-    await coordinator.drain(); await coordinator.close(); expect(invoked).toBe(1);
+    await coordinator.drain(); await coordinator.close(); expect(invoked, invoked ? undefined : JSON.stringify(await control.call({ change: "inspect", view: view.view }))).toBe(1);
     const waiting = await send(args("status", { view: view.view })); expect(waiting.hosted_execution.job).toMatchObject({ state: "waiting", invocations: 1, max_invocations: 3 });
     const resumed = await send(args("execute_task", { view: view.view, revision: waiting.revision })); expect(resumed.job).toMatchObject({ id: queued.job.id, state: "queued", invocations: 1, max_invocations: 3, note: waiting.hosted_execution.job.note });
     expect(inference.counts().actors).toBe(0); const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);
@@ -1889,15 +1889,17 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(proxyErrors, stderr + stdout).toEqual([]);
     expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
-    const result = JSON.parse(stdout), outcome = JSON.parse(result.stdout);
+    const result = JSON.parse(stdout);
+    if (support.private_namespaces) expect(result.code, JSON.stringify({ ...result, actors: inference.counts().actors, host_assessments: host.counts().assessments, amendment_started: amendmentAfterAnswerStarted, amendment_submitted: amendmentAfterAnswerSubmitted })).toBe(0);
+    const outcome = JSON.parse(result.stdout);
     if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
-      if ((outcome.state === "waiting" && !failingChecks) || outcome.state === "failed") {
+      if (outcome.state !== (retiring ? "cancelled" : failingChecks ? "waiting" : "completed")) {
         const activity = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_activity", view, record_id: String(current.record.generation), offset: 0, limit: 32, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         const page = activity.isError ? null : JSON.parse(activity.content[0].text);
         const operation = current.pending_operation ? await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, outcome: current.pending_operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }) : null;
-        throw Error(JSON.stringify({ outcome, checkpoint: current.record.checkpoint, execution: current.execution, pending_operation: current.pending_operation, operation, actors: inference.counts().actors, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
+        throw Error(JSON.stringify({ outcome, diagnostic: result.diagnostic, checkpoint: current.record.checkpoint, execution: current.execution, pending_operation: current.pending_operation, operation, actors: inference.counts().actors, host_assessments: host.counts().assessments, amendment_started: amendmentAfterAnswerStarted, amendment_submitted: amendmentAfterAnswerSubmitted, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
       }
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
       const collectionRecovery = outcome.recovered_collection ? 1 : 0;

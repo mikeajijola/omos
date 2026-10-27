@@ -94,6 +94,9 @@ fn viewBytes(manager: workspace.Manager, view: View) ![]const u8 {
 /// and scoped actor requests can never enroll or enlarge a root authority.
 pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     var manager = original;
+    var reads: @import("immutable_read_cache.zig").Cache = .{ .alloc = manager.alloc };
+    defer reads.deinit();
+    manager.immutable_reads = &reads;
     const request = try records.decode(Admin, manager.alloc, raw, .{});
     if (!std.mem.eql(u8, request.version, "omos.company-admin/v1")) return error.UnsupportedCompanyApi;
     // Runtime liveness changes only the fenced in-memory cache. An unrelated
@@ -427,6 +430,9 @@ pub fn progress(original: workspace.Manager, raw: []const u8, writable: bool, cu
 
 fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, progress_only: bool, cursor: ?[]const u8) ![]const u8 {
     var manager = original;
+    var reads: @import("immutable_read_cache.zig").Cache = .{ .alloc = manager.alloc };
+    defer reads.deinit();
+    manager.immutable_reads = &reads;
     if (raw.len > 1024 * 1024) return error.ServiceRequestTooLarge;
     const incoming = try records.decode(authority.Envelope, manager.alloc, raw, .{});
     // This hint only installs a deadline. Authentication and declaration
