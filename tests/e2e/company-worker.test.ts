@@ -712,7 +712,7 @@ test("signed hosted execution requires compute authority and a live matching imp
     let invoked = 0; const coordinator = createWorkerCoordinator({ control, backend: { supports: row => row.record.binding.grant === "hosted", async run() { invoked++; return { outcome: "waiting", note: "Retained the isolated invocation for the next user instruction." }; } } });
     const deadline = Date.now() + 45000;
     while (!invoked && Date.now() < deadline) { await advertised.heartbeat(); await coordinator.tick(); await Bun.sleep(50); }
-    await coordinator.drain(); await coordinator.close(); expect(invoked).toBe(1);
+    await coordinator.drain(); await coordinator.close(); expect(invoked, invoked ? undefined : JSON.stringify(await control.call({ change: "inspect", view: view.view }))).toBe(1);
     const waiting = await send(args("status", { view: view.view })); expect(waiting.hosted_execution.job).toMatchObject({ state: "waiting", invocations: 1, max_invocations: 3 });
     const resumed = await send(args("execute_task", { view: view.view, revision: waiting.revision })); expect(resumed.job).toMatchObject({ id: queued.job.id, state: "queued", invocations: 1, max_invocations: 3, note: waiting.hosted_execution.job.note });
     expect(inference.counts().actors).toBe(0); const verified = await f.run(["fossil", "verify", "--json"]); expect(verified.code, verified.stderr).toBe(0);

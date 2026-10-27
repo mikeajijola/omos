@@ -130,7 +130,7 @@ try {
         continue;
       }
     }
-    if (["queued", "running"].includes(selected.review_state) && Date.now() < deadline) {
+    if (Date.now() < deadline && (["queued", "running"].includes(selected.review_state) || (selected.task_state === "accepted" && selected.publication && selected.record.state !== "completed" && selected.record.state !== "cancelled"))) {
       // A timed-out submit can already have queued independent review. Observe
       // its recorded outcome before attempting any actor requeue.
       await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
@@ -174,12 +174,6 @@ try {
       if (!resumed.ok) throw new Error("FixtureCollectionRequeueFailed");
       recoveredCollection = true;
       stopping = new AbortController(); supervisor = start();
-      continue;
-    }
-    if (selected.task_state === "accepted" && selected.publication && selected.record.state !== "completed" && selected.record.state !== "cancelled" && Date.now() < deadline) {
-      // A canonical publication can precede the owner's completion and joined
-      // cleanup. Observe that reconciliation without dispatching another actor.
-      await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
       continue;
     }
     if (selected.record.state === "completed" && selected.publication) {
