@@ -453,6 +453,7 @@ pub const Manager = struct {
     company_read_revision: ?[]const u8 = null,
     company_revision_cache: ?*CompanyRevisionCache = null,
     immutable_reads: ?*@import("immutable_read_cache.zig").Cache = null,
+    shared_immutable_reads: ?*@import("immutable_read_cache.zig").Shared = null,
     task_read_revision: ?struct { branch: []const u8, revision: []const u8 } = null,
     company_runtime_live: ?*@import("company_runtime.zig").LiveHosts = null,
     operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
@@ -2358,8 +2359,10 @@ pub const Manager = struct {
         if (!allowedPath(path)) return error.WorkspacePathDenied;
         try self.checkOperation();
         if (self.immutable_reads) |cache| if (cache.get(.content, self.repository, revision_id, path)) |bytes| return self.alloc.dupe(u8, bytes);
+        if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .content, self.repository, revision_id, path)) |bytes| return bytes;
         const bytes = try self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
         if (self.immutable_reads) |cache| try cache.put(.content, self.repository, revision_id, path, bytes);
+        if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .content, self.repository, revision_id, path, bytes);
         return bytes;
     }
 
@@ -3250,13 +3253,14 @@ pub const Manager = struct {
 
     pub fn inventory(self: Manager, branch: []const u8) ![]const []const u8 {
         try self.checkOperation();
-        const output = if (self.immutable_reads) |cache| if (cache.get(.inventory, self.repository, branch, "")) |bytes|
-            try self.alloc.dupe(u8, bytes)
-        else fresh: {
+        const output = cached: {
+            if (self.immutable_reads) |cache| if (cache.get(.inventory, self.repository, branch, "")) |bytes| break :cached try self.alloc.dupe(u8, bytes);
+            if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .inventory, self.repository, branch, "")) |bytes| break :cached bytes;
             const bytes = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
-            try cache.put(.inventory, self.repository, branch, "", bytes);
-            break :fresh bytes;
-        } else try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
+            if (self.immutable_reads) |cache| try cache.put(.inventory, self.repository, branch, "", bytes);
+            if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .inventory, self.repository, branch, "", bytes);
+            break :cached bytes;
+        };
         var paths: std.ArrayList([]const u8) = .empty;
         var lines = std.mem.splitScalar(u8, output, '\n');
         while (lines.next()) |path| {
@@ -3282,8 +3286,10 @@ pub const Manager = struct {
         try self.checkOperation();
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
         if (self.immutable_reads) |cache| if (cache.get(.artifact, self.repository, identity, "")) |bytes| return self.alloc.dupe(u8, bytes);
+        if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .artifact, self.repository, identity, "")) |bytes| return bytes;
         const bytes = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
         if (self.immutable_reads) |cache| try cache.put(.artifact, self.repository, identity, "", bytes);
+        if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .artifact, self.repository, identity, "", bytes);
         return bytes;
     }
 

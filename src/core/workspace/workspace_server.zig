@@ -8,8 +8,11 @@ const bounded = @import("../shared/bounded_operation.zig");
 
 pub fn run(original: workspace.Manager, port: u16, writable: bool, context: *anyopaque, ready: *const fn (*anyopaque, []const u8) anyerror!void, executor: ?@import("review_worker.zig").Executor, schedule_executor: ?@import("schedule_worker.zig").Executor) !void {
     var live_hosts: @import("company_runtime.zig").LiveHosts = .{};
+    var shared_reads: @import("immutable_read_cache.zig").Shared = .{ .cache = .{ .alloc = std.heap.c_allocator } };
+    defer shared_reads.deinit();
     var manager = original;
     manager.company_runtime_live = &live_hosts;
+    manager.shared_immutable_reads = &shared_reads;
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     @import("../shared/debug_trace.zig").configureFromEnv(manager.alloc, std.Io.Dir.path.dirname(manager.repository) orelse ".");
     defer @import("../shared/debug_trace.zig").shutdown();
