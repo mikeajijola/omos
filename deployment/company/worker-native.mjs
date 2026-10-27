@@ -5,6 +5,8 @@ import { StringDecoder } from "node:string_decoder";
 
 const fail = code => { throw new Error(code); };
 const maximumLine = 12 * 1024 * 1024;
+const maximumActivityEvents = 8;
+const maximumActivityRequest = 128 * 1024;
 function bounded(text, limit = 8192) {
   if (typeof text !== "string") return "";
   let result = "", bytes = 0;
@@ -92,15 +94,23 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
   const flush = () => {
     clearTimeout(flushTimer); flushTimer = undefined;
     if (!queue.length) return uploads;
-    const events = queue.splice(0, 4);
+    const waiting = queue.splice(0);
     uploads = uploads.then(async () => {
-      const mutation = { action: "append", view, execution, offset, events };
-      let saved = await control.call(mutation, signal);
-      // Native offsets and exact immutable payloads make this one explicit
-      // metadata retry safe. It cannot restart an actor or execute a tool.
-      if (!saved.ok) saved = await control.call(mutation, signal);
-      if (!saved.ok || saved.next_offset !== offset + events.length) throw Object.assign(Error("WorkerActivityRetentionPending"), { retention: { kind: "activity", action: "append", offset, error: typeof saved.error === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(saved.error) ? saved.error : saved.ok ? "WorkerActivityPositionChanged" : "Unknown", ...(typeof saved.transport === "string" && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(saved.transport) ? { transport: saved.transport } : {}) } });
-      offset = saved.next_offset;
+      while (waiting.length) {
+        const events = waiting.slice(0, maximumActivityEvents);
+        const mutation = { action: "append", view, execution, offset, events };
+        // Events are JSON strings inside the request. Bound their encoded size,
+        // including escaping, rather than just summing the source event bytes.
+        while (Buffer.byteLength(JSON.stringify(mutation)) > maximumActivityRequest && events.length > 1) events.pop();
+        if (Buffer.byteLength(JSON.stringify(mutation)) > maximumActivityRequest) fail("WorkerNativeActivityEventTooLarge");
+        let saved = await control.call(mutation, signal);
+        // Native offsets and exact immutable payloads make this one explicit
+        // metadata retry safe. It cannot restart an actor or execute a tool.
+        if (!saved.ok) saved = await control.call(mutation, signal);
+        if (!saved.ok || saved.next_offset !== offset + events.length) throw Object.assign(Error("WorkerActivityRetentionPending"), { retention: { kind: "activity", action: "append", offset, error: typeof saved.error === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(saved.error) ? saved.error : saved.ok ? "WorkerActivityPositionChanged" : "Unknown", ...(typeof saved.transport === "string" && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(saved.transport) ? { transport: saved.transport } : {}) } });
+        offset = saved.next_offset;
+        waiting.splice(0, events.length);
+      }
     });
     uploads.catch(error => { failure ??= error; stop(); });
     return uploads;
@@ -109,7 +119,7 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
     const raw = JSON.stringify(data);
     if (Buffer.byteLength(raw) > 16384) fail("WorkerNativeActivityEventTooLarge");
     queue.push(raw);
-    if (queue.length >= 4) await flush();
+    if (queue.length >= maximumActivityEvents) await flush();
     else if (!flushTimer) flushTimer = setTimeout(() => { void flush(); }, 100);
   };
   const emitPublic = async data => {

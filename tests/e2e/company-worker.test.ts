@@ -2582,6 +2582,43 @@ input.on('line',line=>{const request=JSON.parse(line);if(request.method==='promp
   expect(JSON.stringify(retained)).not.toContain("PrivateSession12"); expect(JSON.stringify(retained)).not.toContain("fixture-private-checkpoint");
 }, 10000);
 
+test("worker native recovery batches paged public history within encoded request limits", async () => {
+  const replayData = () => [
+    { type: "turn_start" },
+    ...Array.from({ length: 40 }, (_, index) => ({ type: "tool_start", call_id: `saved-${index}`, name: "read_file", path: index < 16 ? `documents/team/${index}.txt` : '"\\'.repeat(2400) + "🌱".repeat(20) })),
+    { type: "text_delta", text: "Retained Unicode: 🌱 and escaped text: \"\\\n" },
+    { type: "turn_end", exit_code: 0 },
+  ];
+  const data = replayData();
+  const source = `import readline from 'node:readline';
+const input=readline.createInterface({input:process.stdin});
+const events=(${replayData.toString()})().map((data,index)=>({version:'omos.ui-host/v1',type:'event',turn:'saved-native-turn',cursor:index+1,data}));
+input.on('line',line=>{const request=JSON.parse(line);let result;if(request.method==='initialize')result={};else if(request.method==='session.events'){const offset=request.params.offset;const page=events.slice(offset,offset+32);result={events:page,next_offset:offset+page.length,active:false};}else process.exit(77);process.stdout.write(JSON.stringify({version:'omos.ui-host/v1',type:'response',id:request.id,result,err:null})+'\\n');});`;
+  let child, offset = 0, retry;
+  const batches = [], retained = [];
+  const result = await runWorkerNative({
+    launch: () => child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] }),
+    control: { async call(request) {
+      if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false };
+      expect(request.events.length).toBeGreaterThan(0); expect(request.events.length).toBeLessThanOrEqual(8);
+      expect(Buffer.byteLength(JSON.stringify(request))).toBeLessThanOrEqual(128 * 1024);
+      expect(request.offset).toBe(offset);
+      // Simulate one uncertain write response. Its sole retry must preserve
+      // the complete payload and offset before advancing to the next batch.
+      if (offset === 16 && !retry) { retry = JSON.stringify(request); return { ok: false, uncertain: true, error: "WorkerControlOutcomeUnknown" }; }
+      if (offset === 16) expect(JSON.stringify(request)).toBe(retry);
+      batches.push(request.events.length); retained.push(...request.events.map(JSON.parse));
+      offset += request.events.length;
+      return { ok: true, next_offset: offset };
+    } },
+    view: "view", execution: { runtime: "collector", generation: 3 }, prompt: "", session: "PrivateSession12", replayOnly: true, timeout: 3000,
+  });
+  expect(result.code).toBe(0); expect(result.killed).toBe(false); expect(child.exitCode).toBe(0);
+  expect(retained).toEqual(data.map(event => publicWorkerEvents(event)).flat());
+  expect(batches).toContain(8); expect(batches.some(count => count > 1 && count < 8)).toBe(true);
+  expect(batches.length).toBeLessThan(Math.ceil(retained.length / 4)); expect(retry).toBeDefined();
+}, 10000);
+
 for (const cancelled of [false, true]) test(`company retirement archives public history after revocation without restoring execution${cancelled ? " after live cancellation" : ""}`, async () => {
   const f = fixture(), sourceWorker = fixture();
   const host = model(f, () => { throw Error("Passive retention must not start company actors"); });
