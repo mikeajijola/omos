@@ -17,7 +17,7 @@ on:
       diagnostic_scenario:
         description: Isolated recovery scenario
         type: choice
-        options: [late-amendment, partial-recovery, coding-recovery]
+        options: [all, late-amendment, partial-recovery, coding-recovery]
         default: late-amendment
       artifact_run:
         description: Successful native build run to reuse
@@ -809,10 +809,14 @@ jobs:
           test "$WORKER_RESULT" = success
 
   recovery-diagnostic:
-    name: Isolated recovery diagnostic
+    name: Isolated recovery diagnostic (${{ matrix.scenario }})
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.recovery_diagnostic }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ inputs.diagnostic_scenario == 'all' && fromJSON('["late-amendment","partial-recovery","coding-recovery"]') || fromJSON(format('["{0}"]', inputs.diagnostic_scenario)) }}
     permissions:
       contents: read
       actions: read
@@ -862,7 +866,7 @@ jobs:
         working-directory: tests/e2e
       - name: Inspect the selected isolated recovery
         env:
-          SCENARIO: ${{ inputs.diagnostic_scenario }}
+          SCENARIO: ${{ matrix.scenario }}
         run: |
           case "$SCENARIO" in
             late-amendment) pattern='an authenticated amendment after a private answer' ;;
