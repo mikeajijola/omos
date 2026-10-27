@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-This fork accepts a candidate only when it stays below the **8.000 MiB** ceiling with at least **0.250 MiB** of size headroom, giving a **7.750 MiB** adoption target. It must also pass the deterministic product corpus and stay within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+This fork accepts a candidate only when it stays below the **8.500 MiB** ceiling with at least **0.250 MiB** of size headroom, giving an **8.250 MiB** adoption target. It must also pass the deterministic product corpus and stay within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 

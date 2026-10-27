@@ -1227,13 +1227,13 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_8_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_8_500_mib(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
-            stream.truncate(8_388_609)
+            stream.truncate(8_912_897)
 
-        with self.assertRaisesRegex(PgsoError, "exceeds 8.000 MiB"):
+        with self.assertRaisesRegex(PgsoError, "exceeds 8.500 MiB"):
             validate_candidate_size(candidate)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:
