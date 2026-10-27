@@ -2585,8 +2585,8 @@ input.on('line',line=>{const request=JSON.parse(line);if(request.method==='promp
 test("worker native recovery batches paged public history within encoded request limits", async () => {
   const replayData = () => [
     { type: "turn_start" },
-    ...Array.from({ length: 40 }, (_, index) => ({ type: "tool_start", call_id: `saved-${index}`, name: "read_file", path: index < 16 ? `documents/team/${index}.txt` : '"\\'.repeat(2400) + "🌱".repeat(20) })),
-    { type: "text_delta", text: "Retained Unicode: 🌱 and escaped text: \"\\\n" },
+    ...Array.from({ length: 40 }, (_, index) => ({ type: "tool_start", call_id: `saved-${index}`, name: "read_file", path: index < 16 ? `documents/team/${index}.txt` : '"\\'.repeat(2400) + "漢字".repeat(20) })),
+    { type: "text_delta", text: "Retained Unicode: 漢字 and escaped text: \"\\\n" },
     { type: "turn_end", exit_code: 0 },
   ];
   const data = replayData();
