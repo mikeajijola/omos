@@ -64,7 +64,17 @@ async function command(program, args, { input, signal, timeout = 120000, maxByte
   });
 }
 
-export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, launcher, launcherSha256, imageConfiguration, companyConfiguration, companyHome, model, validationConfiguration, evaluation, concurrency = 1 }) {
+export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, launcher, launcherSha256, imageConfiguration, companyConfiguration, companyHome, model, validationConfiguration, evaluation, concurrency = 1, report = () => {} }) {
+  if (typeof report !== "function") fail("InvalidWorkerProgressReporter");
+  const progress = event => { try { report(event); } catch {} };
+  const cancellation = signal => signal?.aborted ? ["WorkerInvocationDeadline", "WorkerExecutionRevoked", "WorkerCoordinatorClosed"].includes(signal.reason?.message) ? signal.reason.message : "Cancelled" : null;
+  const observedControl = (kind, control, view, generation) => ({ ...control, async call(request, signal) {
+    const started = Date.now(), action = request.action ?? request.change;
+    progress({ event: "worker_operation", kind, view, generation, action, phase: "start", offset: request.offset ?? null, bytes: request.source?.bytes ?? null });
+    let result;
+    try { result = await control.call(request, signal); return result; }
+    finally { progress({ event: "worker_operation", kind, view, generation, action, phase: "end", duration_ms: Date.now() - started, ok: result?.ok === true, abort_reason: cancellation(signal) }); }
+  } });
   if (process.platform !== "linux" || process.getuid?.() !== 0 || !hex(imageToolSha256) || !hex(launcherSha256) || !model || typeof model.handle !== "string") fail("WorkerOperatorPrivilegesRequired");
   model = structuredClone(model);
   await trustedFile(imageTool, imageToolSha256, 131072);
@@ -83,15 +93,23 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
   if (!support?.kernel_supported || !support.private_namespaces) fail("WorkerPrivateNamespacesRequired");
   if (!evaluation) fail("WorkerArchiveControlRequired");
   const image = async (request, signal) => {
-    await trustedFile(imageTool, imageToolSha256, 131072);
-    if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
-    const result = await command("/usr/bin/python3", ["-I", imageTool, imageConfiguration], { input: JSON.stringify(request), signal, maxBytes: 8192 });
-    if (result.code !== 0) fail("WorkerImageOperationFailed");
-    return JSON.parse(result.stdout);
+    const started = Date.now();
+    progress({ event: "worker_image", action: request.action, image: request.id, phase: "start" });
+    try {
+      await trustedFile(imageTool, imageToolSha256, 131072);
+      if (!(await trustedFile(imageConfiguration)).equals(configurationBytes)) fail("WorkerHostFileChanged");
+      const result = await command("/usr/bin/python3", ["-I", imageTool, imageConfiguration], { input: JSON.stringify(request), signal, maxBytes: 8192 });
+      if (result.code !== 0) fail("WorkerImageOperationFailed");
+      return JSON.parse(result.stdout);
+    } finally { progress({ event: "worker_image", action: request.action, image: request.id, phase: "end", duration_ms: Date.now() - started, abort_reason: cancellation(signal) }); }
   };
   const run = async (root, args, signal, input) => {
-    await trustedFile(launcher, launcherSha256, 131072);
-    return command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
+    const started = Date.now(), verb = args[0], operation = verb === "fossil" ? args[1] : null;
+    progress({ event: "worker_command", image: path.basename(root), verb, operation, phase: "start" });
+    try {
+      await trustedFile(launcher, launcherSha256, 131072);
+      return await command("/usr/bin/python3", ["-I", launcher, root, "--", ...args], { signal, input, timeout: 300000 });
+    } finally { progress({ event: "worker_command", image: path.basename(root), verb, operation, phase: "end", duration_ms: Date.now() - started, abort_reason: cancellation(signal) }); }
   };
   const subjectBytes = await trustedFile(companyConfiguration);
   const subject = JSON.parse(subjectBytes.toString("utf8"));
@@ -251,7 +269,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       const actions = ["discover", "read", "query", "checkpoint", "record", "submit", "status", "reconcile"].filter(action => row.grant.actions.includes(action));
       if (!["discover", "read", "checkpoint", "submit", "status"].every(action => actions.includes(action))) fail("WorkerGrantIncomplete");
       const deadline = Math.min(Date.now() + job.max_runtime_ms, job.expires_ms - 1000);
-      const ownerControl = createWorkerHttpControl(evaluation);
+      const ownerControl = observedControl("worker", createWorkerHttpControl(evaluation), binding.view, job.generation);
       const saveCheckpoint = createWorkerCheckpointer({ control: ownerControl, view: binding.view, execution: { runtime: job.runtime, generation: job.generation } });
       const recovering = job.checkpoint && job.checkpoint.phase !== "retained";
       let checkpoint = recovering ? structuredClone(job.checkpoint) : { version: "omos.company-worker-checkpoint/v1", runtime: job.runtime, generation: job.generation, image: createHash("sha256").update(JSON.stringify([binding.workspace, binding.view, job.runtime, job.generation])).digest("hex"), source_revision: row.view_revision, model: model.handle, phase: "prepared", export_directory: null, ...(amendmentsSupported ? { company_contract: binding.contract_sha256 } : {}) };
@@ -275,18 +293,24 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
       const call = async (action, rest = {}) => {
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
         const operation = randomUUID();
-        const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation, expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
-        if (result.isError) {
-          let failure;
-          try { failure = JSON.parse(result.content?.[0]?.text); } catch { failure = {}; }
-          throw Object.assign(new Error("WorkerCompanyOutcomeUnresolved"), { companyOperation: { action, operation, error: failure?.error, transport: failure?.failure_code } });
-        }
-        return JSON.parse(result.content[0].text);
+        const started = Date.now();
+        progress({ event: "worker_company_operation", view: binding.view, generation: job.generation, action, operation, phase: "start" });
+        try {
+          const result = await client.call("company_workspace", { version: action === "read" ? "omos.company/v2" : "omos.company/v1", action, operation, expires_ms: Math.min(job.expires_ms, Date.now() + 300000), ...rest }, signal);
+          if (result.isError) {
+            let failure;
+            try { failure = JSON.parse(result.content?.[0]?.text); } catch { failure = {}; }
+            throw Object.assign(new Error("WorkerCompanyOutcomeUnresolved"), { companyOperation: { action, operation, error: failure?.error, transport: failure?.failure_code } });
+          }
+          return JSON.parse(result.content[0].text);
+        } finally { progress({ event: "worker_company_operation", view: binding.view, generation: job.generation, action, operation, phase: "end", duration_ms: Date.now() - started, abort_reason: cancellation(signal) }); }
       };
       const invoke = async (text, session, replayOnly = false) => {
+        const started = Date.now();
+        progress({ event: "worker_native", view: binding.view, generation: job.generation, mode: replayOnly ? "history" : "actor", phase: "start" });
         if (!activitySupported) return run(prepared.root, ["ask", ...(session ? ["--resume-id", session] : []), "--json"], signal, text);
         if (Date.now() >= deadline) fail("WorkerInvocationDeadline");
-        const control = createActivityHttpControl(evaluation);
+        const control = observedControl("activity", createActivityHttpControl(evaluation), binding.view, job.generation);
         const inputControl = inputSupported ? createInputHttpControl(evaluation) : null;
         try {
           const result = await runWorkerNative({
@@ -299,7 +323,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           });
           activityDelivered = true;
           return result;
-        } finally { control.close(); inputControl?.close(); }
+        } finally { control.close(); inputControl?.close(); progress({ event: "worker_native", view: binding.view, generation: job.generation, mode: replayOnly ? "history" : "actor", phase: "end", duration_ms: Date.now() - started, abort_reason: cancellation(signal) }); }
       };
       const startBroker = async () => {
         if (broker) return;
@@ -339,6 +363,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           const selected = selectWorkerRoot(local.tasks);
           if (!/^[0-9a-f]{64}$/.test(selected.id) || !hex(selected.model_basis?.definition_hash)) fail("WorkerSnapshotAmbiguous");
           const requestNative = async input => {
+            progress({ event: "worker_private_request", view: binding.view, generation: job.generation, action: input.action });
             const filename = ".omos-host-read-" + randomUUID() + ".json";
             const output = path.join(prepared.root, "workspace", filename);
             const file = await fs.open(output, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
@@ -366,7 +391,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           await image({ ...request, action: "quiesce" });
           if (exported.code !== 0) fail("WorkerArchiveExportFailed");
           await fs.chown(exportDirectory, 0, 0);
-          const archive = createArchiveHttpControl(evaluation);
+          const archive = observedControl("archive", createArchiveHttpControl(evaluation), binding.view, job.generation);
           let archiveReceipt;
           try {
             const retained = await retainWorkerArchive({ filename: exportPath, uid: prepared.uid, source: { workspace: local.workspace_id, task: selected.id, revision: head.data.revision }, view: binding.view, execution: { runtime: job.runtime, generation: job.generation }, control: archive, signal });
@@ -485,6 +510,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           return { outcome: "submitted", note: "Company changes are checkpointed and queued for independent host review." };
         }
       } finally {
+        progress({ event: "worker_cleanup", view: binding.view, generation: job.generation, phase: "broker", abort_reason: cancellation(signal) });
         if (broker) await broker.close();
         if (actorClient && actorClient !== client) actorClient.close();
         if (client) client.close();
@@ -511,6 +537,7 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
           const error = new Error("WorkerCleanupPending"); error.executionUncertain = true;
           throw error;
         }
+        progress({ event: "worker_cleanup", view: binding.view, generation: job.generation, phase: "joined", abort_reason: cancellation(signal) });
       }
     },
   };

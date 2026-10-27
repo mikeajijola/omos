@@ -18,7 +18,7 @@ try {
   control = createWorkerHttpControl(settings.control);
   if (settings.desiredPolicy) desired = createDesiredHttpControl(settings.control);
   let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false, recoveredCollection = false;
-  const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; progress.push({ at: Date.now(), ...event }); if (progress.length > 16) progress.shift(); }).catch(error => { serverError = error; });
+  const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; progress.push({ at: Date.now(), ...event }); if (progress.length > 64) progress.shift(); }).catch(error => { serverError = error; });
   supervisor = start();
   if (![360000, 600000].includes(settings.timeoutMs)) throw new Error("FixtureInvocationBudgetInvalid");
   const deadline = Date.now() + settings.timeoutMs;
@@ -168,6 +168,12 @@ try {
       if (!resumed.ok) throw new Error("FixtureCollectionRequeueFailed");
       recoveredCollection = true;
       stopping = new AbortController(); supervisor = start();
+      continue;
+    }
+    if (selected.task_state === "accepted" && selected.publication && selected.record.state !== "completed" && selected.record.state !== "cancelled" && Date.now() < deadline) {
+      // A canonical publication can precede the owner's completion and joined
+      // cleanup. Observe that reconciliation without dispatching another actor.
+      await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
       continue;
     }
     if (selected.record.state === "completed" && selected.publication) {

@@ -19,7 +19,7 @@ function validate(config) {
 export async function runWorkerServer(config, signal, report = () => {}) {
   validate(config);
   signal?.throwIfAborted();
-  const backend = await createLinuxWorkerBackend({ ...structuredClone(config.backend), evaluation: structuredClone(config.control), concurrency: config.concurrency });
+  const backend = await createLinuxWorkerBackend({ ...structuredClone(config.backend), evaluation: structuredClone(config.control), concurrency: config.concurrency, report });
   const control = createWorkerHttpControl(structuredClone(config.control));
   const runtimeControl = createRuntimeHttpControl(structuredClone(config.control));
   const desiredControl = config.reconciliation ? createDesiredHttpControl(structuredClone(config.control)) : null;

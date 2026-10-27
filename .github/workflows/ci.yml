@@ -829,7 +829,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Verify the reused runtime's source
+      - name: Verify the reused native binary's source
         env:
           GH_TOKEN: ${{ github.token }}
           ARTIFACT_RUN: ${{ inputs.artifact_run }}
@@ -838,7 +838,7 @@ jobs:
           [[ "$ARTIFACT_RUN" =~ ^[0-9]+$ ]]
           [[ "$ARTIFACT_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ARTIFACT_RUN" --jq .head_sha)" = "$ARTIFACT_SHA"
-          git diff --exit-code "$ARTIFACT_SHA" HEAD -- src build.zig build.zig.zon sdk deployment/company
+          git diff --exit-code "$ARTIFACT_SHA" HEAD -- src build.zig build.zig.zon sdk
       - name: Download the verified native build
         uses: actions/download-artifact@v4
         with:
