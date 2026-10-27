@@ -1725,6 +1725,7 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
   const amendAfterAnswer = scenario === "amend_after_answer" && support.private_namespaces;
   let amendmentAfterAnswerSubmitted = false, amendmentAfterAnswerStarted = false;
   let resumedNativeHistory = false, receivedAmendment = false, retainedSummaryRead = false;
+  let retainedSummaryResult = "";
   const codingRecovery = scenario === "coding_recovery";
   const answerOnly = scenario === "answer";
   const projected = scenario === "projection";
@@ -1758,6 +1759,7 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
       return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Amended by the authenticated user" });
     }
     if (amendAfterAnswer && count === 4) {
+      retainedSummaryResult = body.messages.filter(message => message.role === "tool").map(message => JSON.stringify(message.content)).join("\n").slice(-8192);
       retainedSummaryRead = body.messages.some(message => message.role === "tool" && JSON.stringify(message.content).includes("Preserve this unaffected summary."));
       return tool("fossil_workspace", { action: "write", path: "documents/team/production.txt", content: "Amended by the authenticated user" });
     }
@@ -1917,7 +1919,7 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
       }
       if (amending) {
         expect(outcome.amended_task).toBe(!amendAfterAnswer); expect(receivedAmendment).toBe(true);
-        if (amendAfterAnswer) { expect(amendmentAfterAnswerSubmitted).toBe(true); expect(retainedSummaryRead).toBe(true); expect(f.fossil("cat", "documents/team/summary.txt", "-r", "trunk")).toBe("Preserve this unaffected summary."); }
+        if (amendAfterAnswer) { expect(amendmentAfterAnswerSubmitted).toBe(true); expect(retainedSummaryRead, retainedSummaryResult).toBe(true); expect(f.fossil("cat", "documents/team/summary.txt", "-r", "trunk")).toBe("Preserve this unaffected summary."); }
         expect(current.amendments).toEqual(["Replace the document with Amended by the authenticated user"]);
         expect(current.record.checkpoint.company_contract).toBe(current.record.binding.contract_sha256);
       }

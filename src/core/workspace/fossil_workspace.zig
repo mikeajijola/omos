@@ -2453,6 +2453,7 @@ pub const Manager = struct {
     }
 
     pub fn readContent(self: Manager, task: Task, path: []const u8) ![]const u8 {
+        try @import("worker_projection.zig").hydrateRead(self, task, path);
         const bytes = try self.content(task, path);
         if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) return bytes;
         const lease = try self.writerLease();

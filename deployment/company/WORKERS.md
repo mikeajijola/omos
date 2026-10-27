@@ -442,7 +442,10 @@ external effect. Backends without this recovery interface leave pending jobs
 queued for operator inspection.
 
 Ordinary file tools fetch selected company files into the private Fossil branch
-before materialising them on disk. Skill discovery fetches skill entrypoints;
+before materialising them on disk. Canonical Fossil reads fetch the selected
+input through the same pinned source and commit its bytes and provenance before
+returning it. Already fetched files retain their private changes and deletions.
+Skill discovery fetches skill entrypoints;
 loading a skill fetches its package. A shell can open arbitrary files, so it
 fetches the permitted managed roots before execution. The broker fixes the
 workspace, view, revision and execution generation for these reads and the
