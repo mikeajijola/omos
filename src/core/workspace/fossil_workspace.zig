@@ -452,6 +452,7 @@ pub const Manager = struct {
     company_operation_held: bool = false,
     company_read_revision: ?[]const u8 = null,
     company_revision_cache: ?*CompanyRevisionCache = null,
+    immutable_reads: ?*@import("immutable_read_cache.zig").Cache = null,
     task_read_revision: ?struct { branch: []const u8, revision: []const u8 } = null,
     company_runtime_live: ?*@import("company_runtime.zig").LiveHosts = null,
     operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
@@ -2355,7 +2356,11 @@ pub const Manager = struct {
 
     pub fn contentAt(self: Manager, path: []const u8, revision_id: []const u8) ![]const u8 {
         if (!allowedPath(path)) return error.WorkspacePathDenied;
-        return self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
+        try self.checkOperation();
+        if (self.immutable_reads) |cache| if (cache.get(.content, self.repository, revision_id, path)) |bytes| return self.alloc.dupe(u8, bytes);
+        const bytes = try self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
+        if (self.immutable_reads) |cache| try cache.put(.content, self.repository, revision_id, path, bytes);
+        return bytes;
     }
 
     pub fn currentRevision(self: Manager, task: Task) ![]const u8 {
@@ -3222,7 +3227,7 @@ pub const Manager = struct {
 
     pub fn checkinMetadata(self: Manager, identity: []const u8) !fossil_manifest.Checkin {
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
-        const raw = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        const raw = try self.immutableArtifact(identity);
         // Progress positions require complete identities, including legacy
         // SHA-1, rather than accepting abbreviated SHA-3 display prefixes.
         try fossil_manifest.verifyObject(identity, raw);
@@ -3244,7 +3249,14 @@ pub const Manager = struct {
     }
 
     pub fn inventory(self: Manager, branch: []const u8) ![]const []const u8 {
-        const output = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
+        try self.checkOperation();
+        const output = if (self.immutable_reads) |cache| if (cache.get(.inventory, self.repository, branch, "")) |bytes|
+            try self.alloc.dupe(u8, bytes)
+        else fresh: {
+            const bytes = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
+            try cache.put(.inventory, self.repository, branch, "", bytes);
+            break :fresh bytes;
+        } else try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
         var paths: std.ArrayList([]const u8) = .empty;
         var lines = std.mem.splitScalar(u8, output, '\n');
         while (lines.next()) |path| {
@@ -3266,13 +3278,22 @@ pub const Manager = struct {
         return .{ .repository = self.repository, .workspace_id = self.manifest.id, .trunk_revision = try self.revision("trunk"), .tasks = all, .files = try self.inventory("trunk"), .pending_journals = pending, .publication = if (pending_publication) "pending" else if (pending_delivery) "pending_delivery" else if (pending > 0) "local_pending" else "checkpointed", .detail = detail };
     }
 
+    fn immutableArtifact(self: Manager, identity: []const u8) ![]const u8 {
+        try self.checkOperation();
+        if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
+        if (self.immutable_reads) |cache| if (cache.get(.artifact, self.repository, identity, "")) |bytes| return self.alloc.dupe(u8, bytes);
+        const bytes = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        if (self.immutable_reads) |cache| try cache.put(.artifact, self.repository, identity, "", bytes);
+        return bytes;
+    }
+
     fn fileEntries(self: Manager, identity: []const u8, verify_objects: bool) ![]const fossil_manifest.File {
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
-        const raw = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        const raw = try self.immutableArtifact(identity);
         if (verify_objects) try fossil_manifest.verifyCheckinReference(identity, raw);
         const current = try fossil_manifest.parse(self.alloc, raw);
         const baseline = if (current.baseline) |id| base: {
-            const bytes = try self.run(null, &.{ "artifact", id, "-R", self.repository });
+            const bytes = try self.immutableArtifact(id);
             if (verify_objects) try fossil_manifest.verifyObject(id, bytes);
             break :base try fossil_manifest.parse(self.alloc, bytes);
         } else null;
@@ -3942,20 +3963,23 @@ pub const Manager = struct {
     }
 
     pub fn modelBasis(self: Manager, revision_id: []const u8) !?model.Basis {
+        // Definition and policy must come from one immutable check-in, even
+        // when the caller supplies a moving selector such as trunk.
+        const pinned = if (immutableRevision(revision_id)) revision_id else try self.revision(revision_id);
         // Presence is checked through inventory, so transport or corruption is
         // never confused with a legacy workspace.
         var present = false;
-        for (try self.inventory(revision_id)) |path| present = present or std.mem.eql(u8, path, model.declaration_path);
+        for (try self.inventory(pinned)) |path| present = present or std.mem.eql(u8, path, model.declaration_path);
         if (!present) {
-            const at_revision = try parse(self.alloc, Manifest, try self.contentAt(manifest_path, revision_id));
+            const at_revision = try parse(self.alloc, Manifest, try self.contentAt(manifest_path, pinned));
             if (at_revision.format >= 2) return error.WorkspaceDefinitionMissing;
             return null;
         }
-        const declaration_value = try self.loadDeclaration(revision_id);
-        const execution_bytes = try self.contentAt(model.execution_path, revision_id);
+        const declaration_value = try self.loadDeclaration(pinned);
+        const execution_bytes = try self.contentAt(model.execution_path, pinned);
         const execution = try model.parseExecution(self.alloc, execution_bytes);
         const execution_value = (try std.json.parseFromSlice(std.json.Value, self.alloc, execution_bytes, .{})).value;
-        return .{ .definition_hash = declaration_value.hash, .revision = revision_id, .execution = execution, .execution_hash = try model.digest(self.alloc, execution_value) };
+        return .{ .definition_hash = declaration_value.hash, .revision = pinned, .execution = execution, .execution_hash = try model.digest(self.alloc, execution_value) };
     }
 
     pub fn migrate(self: Manager) ![]const u8 {

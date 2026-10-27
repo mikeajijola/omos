@@ -204,6 +204,15 @@ Each commit still compares the actual repository head, advances the cached head
 only after verification, and invalidates it on failure. Signing authority checks
 always read the live heads. This cache lasts only for that operation.
 
+Each company request also reuses immutable content, inventories, and check-in
+objects it has already read. This cache holds at most 128 entries and 2 MiB of
+keys and content, belongs to that request, and disappears when it ends. Its keys
+include the repository, complete revision, operation kind, and path. Moving
+selectors, failed reads, authority decisions, and execution state are not cached.
+Definition and execution-policy reads resolve a moving selector once so both
+come from the same immutable revision. Live authority and publication checks
+still resolve current heads.
+
 For resumable view updates, call `status` with the view identity and
 `progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
 `progress.resume_cursor` for the next poll. Each signed request rechecks the
