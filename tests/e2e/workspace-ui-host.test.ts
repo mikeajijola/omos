@@ -1,6 +1,6 @@
 import {afterEach,expect,test} from 'bun:test';
 import {resolve,join} from 'node:path';
-import {existsSync,mkdirSync} from 'node:fs';
+import {existsSync,mkdirSync,readFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
@@ -117,7 +117,13 @@ async function workspaceService(f:ReturnType<typeof fixture>) {
   }
  }finally{reader.releaseLock()}
  const ready=JSON.parse(bytes.split('\n')[0]);
- return {child,ready,request:(body:object,authorized=true)=>fetch(`http://127.0.0.1:${ready.port}/v1/schedules`,{method:'POST',headers:{authorization:`Bearer ${authorized?token:'wrong-token'}`,'content-type':'application/json'},body:JSON.stringify({version:'omos.schedule/v1',workspace:ready.workspace,...body})})};
+ return {child,ready,async request(body:object,authorized=true){
+  try{return await fetch(`http://127.0.0.1:${ready.port}/v1/schedules`,{method:'POST',headers:{authorization:`Bearer ${authorized?token:'wrong-token'}`,'content-type':'application/json'},body:JSON.stringify({version:'omos.schedule/v1',workspace:ready.workspace,...body})})}
+  catch(error){
+   const exit=child.exitCode;child.kill();await child.exited;
+   throw Error(`${error}\nService exit before cleanup: ${exit}\n${await new Response(child.stderr).text()}\n${existsSync(f.env.FX_TRACE_LOG)?readFileSync(f.env.FX_TRACE_LOG,'utf8').slice(-16000):''}`);
+  }
+ }};
 }
 
 test.each(['question','approval'])('scheduled HTTP work retains %s without waiting for terminal input',async(kind)=>{

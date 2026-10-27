@@ -450,6 +450,8 @@ pub const Manager = struct {
     expected_revision: ?[]const u8 = null,
     review_fence: ?@import("review_job.zig").Fence = null,
     company_operation_held: bool = false,
+    company_read_revision: ?[]const u8 = null,
+    task_read_revision: ?struct { branch: []const u8, revision: []const u8 } = null,
     company_runtime_live: ?*@import("company_runtime.zig").LiveHosts = null,
     operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
 
@@ -533,6 +535,7 @@ pub const Manager = struct {
     pub const CompanyFile = struct { path: []const u8, content: []const u8 };
 
     pub fn companyRevision(self: Manager) !?[]const u8 {
+        if (self.company_read_revision) |revision_id| return revision_id;
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
         while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), company_branch)) return try self.revision(company_branch);
@@ -1071,6 +1074,21 @@ pub const Manager = struct {
     }
 
     pub fn taskStatusSnapshot(self: Manager, id: []const u8) !struct { task: Task, revision: []const u8, job: ?@import("review_job.zig").Job, publication: std.json.Value } {
+        if (self.company_read_revision != null) {
+            const previous = try self.loadTask(id);
+            const revision_id = try self.currentRevision(previous);
+            var reader = self;
+            reader.task_read_revision = .{ .branch = previous.branch, .revision = revision_id };
+            var task = try reader.taskAtRevision(id, revision_id);
+            if (task.definition.version < previous.definition.version) return error.WorkspaceRecoveryRequired;
+            if (task.definition.version == previous.definition.version) task.state = previous.state;
+            return .{
+                .task = task,
+                .revision = revision_id,
+                .job = if (task.review_job) |job| try reader.loadReviewJob(task, job) else null,
+                .publication = if (task.state == .accepted) try reader.publicationSummary(task) else .null,
+            };
+        }
         const lease = try self.writerLease();
         defer lease.release();
         // Completion planning commits the contract and matching review fence
@@ -1085,7 +1103,7 @@ pub const Manager = struct {
     }
 
     pub fn loadReviewJob(self: Manager, task: Task, id: []const u8) !@import("review_job.zig").Job {
-        var value = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(try self.jobPath(id), try self.revision(task.branch)), .{});
+        var value = try record_json.decode(@import("review_job.zig").Job, self.alloc, try self.contentAt(try self.jobPath(id), try self.currentRevision(task)), .{});
         if (task.state == .accepted) {
             const accepted = self.contentAt(try self.jobPath(id), task.parent) catch null;
             if (accepted) |raw| value = try record_json.decode(@import("review_job.zig").Job, self.alloc, raw, .{});
@@ -1720,7 +1738,7 @@ pub const Manager = struct {
 
     /// Query an immutable control manifest without loading unrelated records.
     pub fn companyRecordExists(self: Manager, path: []const u8, revision_id: []const u8) !bool {
-        if (!self.company_operation_held or !fossil_manifest.validHash(revision_id) or !allowedPath(path)) return error.WorkspacePathDenied;
+        if ((!self.company_operation_held and self.company_read_revision == null) or !fossil_manifest.validHash(revision_id) or !allowedPath(path)) return error.WorkspacePathDenied;
         const escaped = try std.mem.replaceOwned(u8, self.alloc, path, "'", "''");
         const query = try self.alloc.print("SELECT count(*) AS found FROM files_of_checkin('{s}') WHERE filename='{s}';", .{ revision_id, escaped });
         const rows = try parse(self.alloc, []const struct { found: usize }, try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query }));
@@ -2326,6 +2344,7 @@ pub const Manager = struct {
     }
 
     pub fn currentRevision(self: Manager, task: Task) ![]const u8 {
+        if (self.task_read_revision) |pinned| if (std.mem.eql(u8, pinned.branch, task.branch)) return pinned.revision;
         return self.revision(task.branch);
     }
 

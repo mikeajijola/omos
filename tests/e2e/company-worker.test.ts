@@ -2876,6 +2876,40 @@ test("company verification observation survives completion planning without allo
 }, 600000);
 
 
+test("company status reads remain available while the company writer is occupied", async () => {
+  const f = fixture();
+  const inference = model(f, () => { throw Error("Status inspection must never dispatch an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const file = join(f.home, "status-reader-admin.json");
+  const admin = async input => { writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const initial = await admin({ action: "initialize" });
+  const keyed = await f.run(["fossil", "company-key", "reader", "--json"]); expect(keyed.code, keyed.stderr).toBe(0); const key = JSON.parse(keyed.stdout);
+  const actions = ["create_view", "status"];
+  await admin({ action: "grant", revision: initial.revision, grant: { id: "reader", actor: "reader", public_key: (key.model_data ?? key).public_key, paths: ["documents/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true);
+  let client, holder;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "status-reader.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "reader", grant: "reader", key_handle: "reader", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const send = (action, rest = {}, signal?) => client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...rest }, signal);
+    const created = await send("create_view", { revision: boot.revision, objective: "Inspect retained work without waiting for a company mutation" }); expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const view = JSON.parse(created.content[0].text);
+    holder = spawn("/usr/bin/python3", ["-I", "-c", "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); sys.stdin.read(1)", join(f.home, ".fx/authority", boot.workspace, "operation.lock")], { stdio: ["pipe", "pipe", "pipe"] });
+    await new Promise<void>((resolve, reject) => { holder.stdout.once("data", () => resolve()); holder.once("error", reject); holder.once("exit", code => reject(Error("Writer lock exited: " + code))); });
+    const inspected = await send("status", { view: view.view }, AbortSignal.timeout(10000));
+    expect(inspected.isError, JSON.stringify(inspected)).not.toBe(true);
+    const state = JSON.parse(inspected.content[0].text); expect(state.revision).toBe(view.revision); expect(state.contract.version).toBe(1); expect(state.job).toBeNull(); expect(state.publication).toBeNull(); expect(inference.counts().actors).toBe(0);
+  } finally { if (holder) { holder.stdin.end(); await new Promise<void>(resolve => { if (holder.exitCode !== null) resolve(); else holder.once("exit", () => resolve()); }); } client?.close(); service.child.kill(); await service.child.exited; }
+}, 120000);
+
+test("owner control distinguishes a closed socket from cancellation without replaying mutations", async () => {
+  const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-owner-transport.mjs")], { stdout: "pipe", stderr: "pipe" });
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect(code, stderr).toBe(0); expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual([{ transport: "ECONNRESET", requests: 1, uncertain: true }, { transport: "RequestCancelled", requests: 1, uncertain: true }]);
+}, 15000);
+
 test("worker failure notes retain bounded operation diagnostics without replaying requests", async () => {
   for (const unsafe of [false, true]) {
     let runs = 0, note;
@@ -2917,7 +2951,7 @@ test("worker failure notes retain bounded activity and archive positions without
       return { ok: true, jobs: [structuredClone(row)], next_offset: null };
     } };
     const action = kind === "activity" ? "append" : "chunk";
-    const coordinator = createWorkerCoordinator({ control, backend: { async run() { runs++; throw Object.assign(Error(kind === "activity" ? "WorkerActivityRetentionPending" : "WorkerArchiveRetentionPending"), { retention: { kind, action, offset: 131072, error: unsafe ? "private credential\n" : "WorkerControlOutcomeUnknown" } }); } } });
-    try { await coordinator.tick(); await coordinator.drain(); expect(runs).toBe(1); expect(note).toContain(`retention=${kind}; action=${action}; offset=131072`); expect(note).toContain(unsafe ? "error=Unknown" : "error=WorkerControlOutcomeUnknown"); expect(note).not.toContain("private"); expect(note.length).toBeLessThanOrEqual(512); } finally { await coordinator.close(); }
+    const coordinator = createWorkerCoordinator({ control, backend: { async run() { runs++; throw Object.assign(Error(kind === "activity" ? "WorkerActivityRetentionPending" : "WorkerArchiveRetentionPending"), { retention: { kind, action, offset: 131072, error: unsafe ? "private credential\n" : "WorkerControlOutcomeUnknown", transport: unsafe ? "/private/transport" : "RequestDeadline" } }); } } });
+    try { await coordinator.tick(); await coordinator.drain(); expect(runs).toBe(1); expect(note).toContain(`retention=${kind}; action=${action}; offset=131072`); expect(note).toContain(unsafe ? "error=Unknown" : "error=WorkerControlOutcomeUnknown"); expect(note).toContain(unsafe ? "transport=Unknown" : "transport=RequestDeadline"); expect(note).not.toContain("private"); expect(note.length).toBeLessThanOrEqual(512); } finally { await coordinator.close(); }
   }
 });

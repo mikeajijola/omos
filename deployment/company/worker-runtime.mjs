@@ -34,7 +34,7 @@ export async function advertiseWorkerRuntime({ control, description, signal }) {
     // This exact process nonce can renew only its own disposable lease. A lost
     // acknowledgement does not justify cancelling its already fenced actor.
     if (!result.ok && result.error === "WorkerControlOutcomeUnknown") result = await control.call(request, signal);
-    if (!result.ok || !result.live || result.sha256 !== expected) throw Object.assign(new Error(result.error === "CompanyRuntimeBusy" ? "WorkerRuntimeAlreadyActive" : "WorkerRuntimeHeartbeatFailed"), { nativeCode: result.error });
+    if (!result.ok || !result.live || result.sha256 !== expected) throw Object.assign(new Error(result.error === "CompanyRuntimeBusy" ? "WorkerRuntimeAlreadyActive" : "WorkerRuntimeHeartbeatFailed"), { nativeCode: result.error, transportCode: result.transport });
     last = Date.now();
   };
   await heartbeat(true);

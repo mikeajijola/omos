@@ -99,7 +99,7 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
       // Native offsets and exact immutable payloads make this one explicit
       // metadata retry safe. It cannot restart an actor or execute a tool.
       if (!saved.ok) saved = await control.call(mutation, signal);
-      if (!saved.ok || saved.next_offset !== offset + events.length) throw Object.assign(Error("WorkerActivityRetentionPending"), { retention: { kind: "activity", action: "append", offset, error: typeof saved.error === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(saved.error) ? saved.error : saved.ok ? "WorkerActivityPositionChanged" : "Unknown" } });
+      if (!saved.ok || saved.next_offset !== offset + events.length) throw Object.assign(Error("WorkerActivityRetentionPending"), { retention: { kind: "activity", action: "append", offset, error: typeof saved.error === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(saved.error) ? saved.error : saved.ok ? "WorkerActivityPositionChanged" : "Unknown", ...(typeof saved.transport === "string" && /^[A-Za-z][A-Za-z0-9_]{0,95}$/.test(saved.transport) ? { transport: saved.transport } : {}) } });
       offset = saved.next_offset;
     });
     uploads.catch(error => { failure ??= error; stop(); });

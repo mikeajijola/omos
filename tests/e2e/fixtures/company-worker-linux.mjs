@@ -178,7 +178,7 @@ try {
   process.stdout.write(JSON.stringify({ ok: true, started, state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, published: !!selected.publication, note: selected.record.note, recovered_archive: recoveredArchive, recovered_coding: recoveredCoding, recovered_partial: recoveredPartial, recovered_collection: recoveredCollection, view: selected.record.binding.view, desired_met: desiredMetAt !== 0, input_answered: inputAnswered, retired_history: retiredHistory, amended_task: amendedTask }));
 } catch (error) {
   const code = error.nativeCode ?? error.controlCode;
-  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}) }));
+  process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}), ...(typeof error.transportCode === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(error.transportCode) ? { transport: error.transportCode } : {}) }));
   process.exitCode = 1;
 } finally {
   stopping.abort();

@@ -77,7 +77,10 @@ fn readKey(manager: workspace.Manager, dir: std.Io.Dir, value: Descriptor) !Ed25
     return key;
 }
 
-pub fn current(manager: workspace.Manager, epoch: u64, public_key: []const u8) !Ed25519.KeyPair {
+pub fn current(original: workspace.Manager, epoch: u64, public_key: []const u8) !Ed25519.KeyPair {
+    var manager = original;
+    // Snapshot reads must still validate signing authority against live heads.
+    manager.company_read_revision = null;
     var dir = try open(manager);
     defer dir.close();
     const lease = try issuerLock(manager, dir.dir);

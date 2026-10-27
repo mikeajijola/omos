@@ -105,5 +105,5 @@ async function main() {
 }
 
 if (process.argv[1] && (await fs.realpath(path.resolve(process.argv[1]))) === fileURLToPath(import.meta.url)) {
-  main().catch(error => { process.stderr.write(JSON.stringify({ event: "worker_server_failed", error: /^[A-Z][A-Za-z0-9]{0,95}$/.test(error.message) ? error.message : "WorkerServerFailed" }) + "\n"); process.exitCode = 1; });
+  main().catch(error => { process.stderr.write(JSON.stringify({ event: "worker_server_failed", error: /^[A-Z][A-Za-z0-9]{0,95}$/.test(error.message) ? error.message : "WorkerServerFailed", ...(typeof error.transportCode === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(error.transportCode) ? { transport: error.transportCode } : {}) }) + "\n"); process.exitCode = 1; });
 }

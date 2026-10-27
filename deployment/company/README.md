@@ -189,6 +189,13 @@ task's pinned model. Discovery requires the `discover` action and a record path
 in scope, works on read-only hosts, and rechecks live grants on every request.
 These schemas describe expected data and grant no additional permissions.
 
+Plain view `status` requests read immutable company and task revisions without
+waiting for the company writer. The contract, review job, and publication summary
+come from one pinned task revision. Before signing the response, the service
+rechecks the caller's current grant, expiry, and issuer authority. A revoked or
+changed grant cannot receive a response authorised by the older snapshot.
+Mutations and read-dependency recording still use the controlled writer boundary.
+
 For resumable view updates, call `status` with the view identity and
 `progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
 `progress.resume_cursor` for the next poll. Each signed request rechecks the
@@ -265,3 +272,8 @@ Each task retains its own review allowance and execution lease. Compatible
 changes to accepted state trigger reconciliation and fresh assessment within
 that allowance, while publication stays behind the coordinated writer boundary.
 Conflicts, stale approvals, and exhausted allowances remain recorded outcomes.
+
+Interrupted worker retention reports its archive or activity position and a
+sanitised transport code when available. A deadline, cancelled request, or
+closed socket leaves a mutation's outcome uncertain. These diagnostics do not
+retry the mutation or spend another actor invocation.

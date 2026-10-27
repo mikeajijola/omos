@@ -55,8 +55,10 @@ function createOwnerControl({ endpoint, workspaceId, token }, kind) {
           : runtimes ? request.change === "inspect" ? !Array.isArray(value.runtimes) || value.runtimes.length > 32 || value.runtimes.some(row => row.registration?.workspace !== workspaceId) : !/^[0-9a-f]{64}$/.test(value.id) || !/^[0-9a-f]{64}$/.test(value.sha256)
           : !Array.isArray(value.jobs) || value.jobs.length > 32 || value.jobs.some(row => row.record?.binding?.workspace !== workspaceId))) throw new Error("WorkerControlBindingChanged");
         return { ...value, ok: true };
-      } catch {
-        return { ok: false, error: "WorkerControlOutcomeUnknown", uncertain: mutation, operation: request.operation ?? null };
+      } catch (error) {
+        const code = error?.cause?.code ?? error?.code;
+        const transport = controller.signal.aborted ? "RequestDeadline" : signal?.aborted ? "RequestCancelled" : typeof code === "string" && /^[A-Z_0-9]{1,48}$/.test(code) ? code : "ResponseUnavailable";
+        return { ok: false, error: "WorkerControlOutcomeUnknown", transport, uncertain: mutation, operation: request.operation ?? null };
       } finally { clearTimeout(timer); active.delete(controller); }
     },
     close() {

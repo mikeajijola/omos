@@ -384,7 +384,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     const incoming = try records.decode(authority.Envelope, manager.alloc, raw, .{});
     // This hint only installs a deadline. Authentication and declaration
     // validation below remain mandatory before inspecting workspace state.
-    const hint = try records.decode(struct { action: ?[]const u8 = null, progress_cursor: ?[]const u8 = null }, manager.alloc, incoming.payload, .{ .ignore_unknown_fields = true });
+    const hint = try records.decode(struct { action: ?[]const u8 = null, progress_cursor: ?[]const u8 = null, entity: ?[]const u8 = null, record_id: ?[]const u8 = null, outcome: ?[]const u8 = null, view: ?[]const u8 = null }, manager.alloc, incoming.payload, .{ .ignore_unknown_fields = true });
     if (progress_only and (hint.progress_cursor == null or hint.action == null or !std.mem.eql(u8, hint.action.?, "status"))) return error.CompanyProgressRequired;
     var cancelled = std.atomic.Value(bool).init(false);
     if (hint.progress_cursor != null) {
@@ -393,9 +393,11 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
             if (std.Io.Clock.Timestamp.compare(deadline, .lt, control.deadline)) control.deadline = deadline;
         } else manager.operation_control = .{ .cancel = &cancelled, .deadline = deadline };
     }
-    const lease = try manager.companyOperationLease();
-    defer lease.release();
-    manager.company_operation_held = true;
+    const snapshot_read = hint.action != null and std.mem.eql(u8, hint.action.?, "status") and hint.view != null and hint.progress_cursor == null and hint.entity == null and hint.record_id == null and hint.outcome == null;
+    const lease: ?workspace.ExecutionLease = if (snapshot_read) null else try manager.companyOperationLease();
+    defer if (lease) |held| held.release();
+    manager.company_operation_held = !snapshot_read;
+    if (snapshot_read) manager.company_read_revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
     const current = try state(manager);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, raw), .input);
@@ -404,6 +406,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
         try model.validateOperation(manager.alloc, declaration, "omos_company_subscription", try parse(manager.alloc, raw), .input);
     }
     var request = try authority.authenticate(manager.alloc, current, raw, io.milliTimestamp());
+    if (snapshot_read and request.action != .status) return error.UnsupportedCompanyApi;
     if (request.scope != null and request.action != .create_view) return error.UnsupportedCompanyApi;
     if (request.scope != null and !task_scope.supported(declaration)) return error.CompanyDefinitionUpdateRequired;
     if (request.action == .create_view and request.view != null) return error.UnsupportedCompanyApi;
@@ -515,6 +518,15 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     if (schema_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_schema", try parse(manager.alloc, result), .output);
     if (capability_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_capability", try parse(manager.alloc, result), .output);
     if (request.action == .execution) try model.validateOperation(manager.alloc, declaration, "omos_company_execution", try parse(manager.alloc, result), .output);
+    if (snapshot_read) {
+        var live = manager;
+        live.company_read_revision = null;
+        const latest = try state(live);
+        _ = try authority.authenticate(manager.alloc, latest, raw, io.milliTimestamp());
+        const permitted = try authority.liveGrant(latest, request.grant, io.milliTimestamp());
+        if (!std.mem.eql(u8, try encode(manager.alloc, grant), try encode(manager.alloc, permitted))) return error.CompanyAccessDenied;
+        if (latest.epoch != current.epoch or !std.mem.eql(u8, latest.issuer, current.issuer)) return error.CompanyIssuerRecoveryRequired;
+    }
     const response = try signed(manager, current, request, request_hash, result);
     if (mutation) {
         journal.state = .completed;
@@ -532,7 +544,8 @@ fn loadView(manager: workspace.Manager, grant: authority.Grant, id: []const u8) 
     const view = try records.decode(View, manager.alloc, try manager.companyContent(try manager.alloc.print("company/views/{s}.json", .{id})), .{});
     if (!std.mem.eql(u8, view.id, id)) return error.WorkspaceIdentityMismatch;
     if (!std.mem.eql(u8, view.actor, grant.actor) or !std.mem.eql(u8, view.grant, grant.id)) return error.CompanyAccessDenied;
-    return .{ .view = view, .task = try manager.refreshTaskContext(try manager.loadTask(view.task)) };
+    const task = try manager.loadTask(view.task);
+    return .{ .view = view, .task = if (manager.company_read_revision != null) task else try manager.refreshTaskContext(task) };
 }
 
 fn requestPage(manager: workspace.Manager, bytes: []const u8, offset: usize, limit: usize) !std.json.Value {
