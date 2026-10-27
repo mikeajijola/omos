@@ -558,14 +558,46 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
 });
 
 describe("cli: version", () => {
+  test(
+    "version preserves invalid auth-mode and extra-argument diagnostics",
+    async () => {
+      const home = createIsolatedTestHome();
+      try {
+        for (const alias of ["--version", "-v"]) {
+          const invalid = await runFx([alias], {
+            env: { HOME: home, FX_AUTH_MODE: "invalid", FX_SOUND: "0" },
+          });
+          expect(invalid.code).toBe(1);
+          expect(invalid.stdout).toBe("");
+          expect(invalid.stderr).toBe(
+            "fx: FX_AUTH_MODE must be local or host-managed\n",
+          );
+          const extra = await runFx([alias, "extra"], {
+            env: { HOME: home, FX_AUTH_MODE: "local", FX_SOUND: "0" },
+          });
+          expect(extra.code).toBe(1);
+          expect(extra.stdout).toBe("");
+          expect(extra.stderr).toBe("usage: fx --version\n");
+        }
+        expect(existsSync(join(home, ".fx", "omos-workspace.json"))).toBe(false);
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
   for (const alias of ["--version", "-v"]) {
     test(
       `fx ${alias} prints the source version`,
       async () => {
-        const r = await runFx([alias]);
-        expect(r.code).toBe(0);
-        expect(r.stdout).toBe(`${sourceVersion()}\n`);
-        expect(r.stderr).toBe("");
+        const home = createIsolatedTestHome();
+        try {
+          const r = await runFx([alias], { env: { HOME: home, FX_AUTH_MODE: "host-managed", FX_SOUND: "0" } });
+          expect(r.code).toBe(0);
+          expect(r.stdout).toBe(`${sourceVersion()}\n`);
+          expect(r.stderr).toBe("");
+          expect(existsSync(join(home, ".fx", "omos-workspace.json"))).toBe(false);
+        } finally { cleanupIsolatedTestHome(home); }
       },
       TIMEOUT,
     );

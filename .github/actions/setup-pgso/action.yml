@@ -56,6 +56,12 @@ runs:
       with:
         bun-version: "1.3.14"
 
+    - name: Setup Node 22 for E2E runtime fixtures
+      if: inputs.bun == 'true'
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: "22"
+
     - name: Install E2E system tools and record Bun
       id: runtime
       if: inputs.bun == 'true'
@@ -63,6 +69,7 @@ runs:
       run: |
         brew install tmux fossil
         test "$(bun --version)" = "1.3.14"
+        node --version | grep -E '^v22\.'
         tmux -V
         fossil version
         echo "bun=$(which bun)" >> "$GITHUB_OUTPUT"

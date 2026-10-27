@@ -4515,6 +4515,20 @@ fn joinArgs(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+/// Only a bare version flag can bypass normal launch parsing. Modifiers and
+/// extra arguments retain their regular validation and diagnostics.
+pub fn isBareVersionRequest(args: []const [:0]const u8) bool {
+    return args.len == 1 and isVersionFlag(args[0]);
+}
+
+test "bare version request excludes modifiers and extra arguments" {
+    try std.testing.expect(isBareVersionRequest(&.{"--version"}));
+    try std.testing.expect(isBareVersionRequest(&.{"-v"}));
+    for ([_][]const [:0]const u8{ &.{}, &.{"version"}, &.{ "--version", "extra" }, &.{ "--provider", "codex", "--version" }, &.{ "--model", "example", "-v" } }) |args| {
+        try std.testing.expect(!isBareVersionRequest(args));
+    }
+}
+
 fn isVersionFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v");
 }

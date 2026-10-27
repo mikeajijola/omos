@@ -3571,6 +3571,16 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         try command_runner.runForegroundSessionBootstrap(cli_args);
         return;
     }
+    if (cli_surface.isBareVersionRequest(cli_args)) {
+        // Preserve the same environment validation as normal launch, while
+        // avoiding provider/tool configuration for this constant response.
+        _ = credentials.parseAuthMode(rawEnvValue(raw_env, "FX_AUTH_MODE")) catch {
+            try writeStderrFast("fx: FX_AUTH_MODE must be local or host-managed\n");
+            exitFast(1);
+        };
+        try writeStdoutFast(version ++ "\n");
+        exitFast(0);
+    }
     if (cli_args.len > 0 and isTopLevelHelp(cli_args)) {
         try writeTopLevelHelpFast(raw_env);
         exitFast(0);
