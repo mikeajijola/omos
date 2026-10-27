@@ -1,5 +1,5 @@
-//! Request-local reuse of immutable Fossil bytes. Mutable selectors, authority
-//! decisions, errors and execution state never enter this cache.
+//! Request-local reuse of immutable Fossil bytes. Mutable selectors, errors,
+//! authority decisions and live ownership decisions never enter this cache.
 const std = @import("std");
 const manifest = @import("fossil_manifest.zig");
 

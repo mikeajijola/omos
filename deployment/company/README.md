@@ -208,7 +208,9 @@ Each company request also reuses immutable content, inventories, and check-in
 objects it has already read. This cache holds at most 128 entries and 2 MiB of
 keys and content, belongs to that request, and disappears when it ends. Its keys
 include the repository, complete revision, operation kind, and path. Moving
-selectors, failed reads, authority decisions, and execution state are not cached.
+selectors, failed reads, and authority or live ownership decisions are not cached.
+Versioned authority and execution records can reuse their exact immutable bytes;
+their current heads, expiry, grants, and execution fences are still checked.
 Definition and execution-policy reads resolve a moving selector once so both
 come from the same immutable revision. Live authority and publication checks
 still resolve current heads.
