@@ -130,6 +130,12 @@ try {
         continue;
       }
     }
+    if (["queued", "running"].includes(selected.review_state) && Date.now() < deadline) {
+      // A timed-out submit can already have queued independent review. Observe
+      // its recorded outcome before attempting any actor requeue.
+      await Promise.race([supervisor, new Promise(resolve => setTimeout(resolve, 250))]);
+      continue;
+    }
     if (settings.archiveRecovery && !recoveredArchive && selected.record.state === "failed") {
       const checkpoint = selected.record.checkpoint;
       if (checkpoint?.phase !== "stopped" || !checkpoint.export_directory || checkpoint.generation !== 1) throw new Error("FixtureArchiveCheckpointMissing");
