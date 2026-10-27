@@ -121,7 +121,8 @@ fn load(manager: workspace.Manager, id: []const u8) !Registration {
 }
 
 pub fn administer(manager: workspace.Manager, request: Request) ![]const u8 {
-    if (!manager.company_operation_held) return error.CompanyOperationLeaseRequired;
+    const liveness = request.change == .heartbeat or request.change == .stop;
+    if (!manager.company_operation_held and (!liveness or manager.company_read_revision == null)) return error.CompanyOperationLeaseRequired;
     if (!std.mem.eql(u8, request.version, "omos.company-runtime/v1")) return error.UnsupportedCompanyApi;
     const current = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
     if (request.change == .inspect) {

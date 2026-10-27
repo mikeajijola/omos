@@ -96,9 +96,18 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     var manager = original;
     const request = try records.decode(Admin, manager.alloc, raw, .{});
     if (!std.mem.eql(u8, request.version, "omos.company-admin/v1")) return error.UnsupportedCompanyApi;
-    const lease = try manager.companyOperationLease();
-    defer lease.release();
-    manager.company_operation_held = true;
+    // Runtime liveness changes only the fenced in-memory cache. An unrelated
+    // company write must not expire an otherwise healthy coordinator.
+    const liveness = request.action == .runtimes and request.runtime != null and (request.runtime.?.change == .heartbeat or request.runtime.?.change == .stop);
+    const lease: ?workspace.ExecutionLease = if (liveness) null else try manager.companyOperationLease();
+    defer if (lease) |held| held.release();
+    manager.company_operation_held = !liveness;
+    if (liveness) manager.company_read_revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
+    var revision_cache: workspace.Manager.CompanyRevisionCache = .{ .alloc = manager.alloc };
+    if (!liveness) {
+        revision_cache.revision = try manager.companyRevision();
+        manager.company_revision_cache = &revision_cache;
+    }
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     const capability_control = request.action == .grant_capabilities or request.action == .inspect_capabilities;
     const admin_operation = switch (request.action) {
@@ -355,9 +364,12 @@ fn frozenTask(manager: workspace.Manager, task: workspace.Task) !bool {
     return false;
 }
 
-pub fn bootstrap(manager: workspace.Manager) ![]const u8 {
+pub fn bootstrap(original: workspace.Manager) ![]const u8 {
+    var manager = original;
     const lease = try manager.companyOperationLease();
     defer lease.release();
+    var revision_cache: workspace.Manager.CompanyRevisionCache = .{ .alloc = manager.alloc, .revision = try manager.companyRevision() };
+    manager.company_revision_cache = &revision_cache;
     const current = try state(manager);
     _ = try keys.current(manager, current.epoch, current.issuer);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
@@ -398,6 +410,11 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     defer if (lease) |held| held.release();
     manager.company_operation_held = !snapshot_read;
     if (snapshot_read) manager.company_read_revision = (try manager.companyRevision()) orelse return error.CompanyNotInitialized;
+    var revision_cache: workspace.Manager.CompanyRevisionCache = .{ .alloc = manager.alloc };
+    if (!snapshot_read) {
+        revision_cache.revision = try manager.companyRevision();
+        manager.company_revision_cache = &revision_cache;
+    }
     const current = try state(manager);
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     try model.validateOperation(manager.alloc, declaration, "omos_company_request", try parse(manager.alloc, raw), .input);

@@ -195,6 +195,14 @@ come from one pinned task revision. Before signing the response, the service
 rechecks the caller's current grant, expiry, and issuer authority. A revoked or
 changed grant cannot receive a response authorised by the older snapshot.
 Mutations and read-dependency recording still use the controlled writer boundary.
+Coordinator heartbeat and stop requests also avoid that boundary: they validate
+the pinned runtime registration and update only the fenced liveness cache.
+Registering a runtime still requires the company writer. A stopped process nonce
+cannot renew its lease, including after a delayed heartbeat acknowledgement.
+Within a writer operation, repeated control reads reuse its known company head.
+Each commit still compares the actual repository head, advances the cached head
+only after verification, and invalidates it on failure. Signing authority checks
+always read the live heads. This cache lasts only for that operation.
 
 For resumable view updates, call `status` with the view identity and
 `progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
@@ -277,3 +285,7 @@ Interrupted worker retention reports its archive or activity position and a
 sanitised transport code when available. A deadline, cancelled request, or
 closed socket leaves a mutation's outcome uncertain. These diagnostics do not
 retry the mutation or spend another actor invocation.
+After an archive chunk deadline, the worker makes one read-only inspection.
+It continues only if the host confirms the exact archive identity, source hash,
+size, next position, and completion state. It never resends that chunk. An
+unconfirmed position keeps the image retained for later recovery.

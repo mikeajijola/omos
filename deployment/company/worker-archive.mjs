@@ -92,6 +92,17 @@ export async function retainWorkerArchive({ filename, uid, source, view, executi
         try { result = await control.call({ version: "omos.company-actor-archive-write/v1", action: "chunk", view, execution, source: selected, offset, content: bytes.toString("base64") }, signal); }
         catch (error) { retentionPending("chunk", offset, error?.message); }
         const next = offset + bytes.length < info.size ? offset + bytes.length : null;
+        if (!result.ok && result.transport === "RequestDeadline" && !signal?.aborted) {
+          // The timed-out write may already have committed. Inspect once with
+          // the same source and execution fence; never resend the chunk.
+          let observed;
+          try { observed = await control.call({ version: "omos.company-actor-archive-write/v1", action: "inspect", view, execution, source: selected, offset: 0, content: "" }, signal); }
+          catch { observed = null; }
+          if (observed?.ok && observed.view === view && observed.sha256 === selected.sha256 && observed.bytes === selected.bytes && observed.archive_id === retained.archive_id && hash(observed.revision) && observed.resume_offset === offset + bytes.length && observed.complete === (next === null) && observed.next_offset === next) {
+            retained = observed;
+            continue;
+          }
+        }
         if (!result.ok || result.view !== view || result.sha256 !== selected.sha256 || result.bytes !== selected.bytes || result.offset !== offset || result.next_offset !== next || result.complete !== (next === null) || !hash(result.archive_id) || !hash(result.revision) || (retained && retained.archive_id !== result.archive_id)) retentionPending("chunk", offset, result.error ?? "WorkerArchivePositionChanged", result.transport);
         retained = result;
       }

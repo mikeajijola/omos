@@ -81,6 +81,7 @@ pub fn current(original: workspace.Manager, epoch: u64, public_key: []const u8) 
     var manager = original;
     // Snapshot reads must still validate signing authority against live heads.
     manager.company_read_revision = null;
+    manager.company_revision_cache = null;
     var dir = try open(manager);
     defer dir.close();
     const lease = try issuerLock(manager, dir.dir);
@@ -105,7 +106,10 @@ pub fn current(original: workspace.Manager, epoch: u64, public_key: []const u8) 
 /// Advance protected observed heads after a committed company effect and
 /// before acknowledging it. A crash between these writes catches up only
 /// along retained ancestry; restoring an older repository requires recovery.
-pub fn observe(manager: workspace.Manager) !void {
+pub fn observe(original: workspace.Manager) !void {
+    var manager = original;
+    manager.company_read_revision = null;
+    manager.company_revision_cache = null;
     const authority = try records.decode(@import("company_authority.zig").State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try current(manager, authority.epoch, authority.issuer);
 }

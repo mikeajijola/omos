@@ -975,8 +975,19 @@ test("company actor archives preserve exact private Fossil history under live sc
     const originalObjects = objects(); expect(originalObjects.length).toBeGreaterThan(0);
     const reusedView = await call(0, { action: "create_view", revision: boot.revision, objective: "Reference the retained worker history from another isolated task" });
     const reusedClaim = await call(0, { action: "execution", view: reusedView.view, revision: reusedView.revision, execution_change: "claim", execution: { runtime: "archive-worker", generation: 0 }, execution_lease_ms: 300000 });
-    const reused = await retainWorkerArchive({ filename, uid: process.getuid!(), source, view: reusedView.view, execution: { runtime: "archive-worker", generation: reusedClaim.generation }, control });
+    const timedChunks = new Set(), timedRequests = [];
+    const timedAck = { async call(request, signal) {
+      timedRequests.push(request.action);
+      const reply = await control.call(request, signal);
+      if (request.action === "chunk" && reply.ok) {
+        expect(timedChunks.has(request.offset)).toBe(false); timedChunks.add(request.offset);
+        return { ok: false, error: "WorkerControlOutcomeUnknown", transport: "RequestDeadline" };
+      }
+      return reply;
+    } };
+    const reused = await retainWorkerArchive({ filename, uid: process.getuid!(), source, view: reusedView.view, execution: { runtime: "archive-worker", generation: reusedClaim.generation }, control: timedAck });
     expect(reused.complete).toBe(true); expect(objects()).toEqual(originalObjects);
+    expect(timedChunks.size).toBeGreaterThan(0); expect(timedRequests.filter(action => action === "inspect")).toHaveLength(timedChunks.size + 1);
     expect((await call(0, { action: "status", entity: "omos_company_archive", view: reusedView.view })).archives[0].source.sha256).toBe(retained.sha256);
     await call(1, { action: "status", entity: "omos_company_archive", view: view.view }, false);
     const state = await call(0, { action: "status", view: view.view }); expect(state.publication).toBeNull(); expect(state.state).toBe("active"); expect(host.counts()).toEqual({ actors: 0, assessments: 0 }); expect(worker.counts().actors).toBe(2);
@@ -2903,6 +2914,30 @@ test("company status reads remain available while the company writer is occupied
   } finally { if (holder) { holder.stdin.end(); await new Promise<void>(resolve => { if (holder.exitCode !== null) resolve(); else holder.once("exit", () => resolve()); }); } client?.close(); service.child.kill(); await service.child.exited; }
 }, 120000);
 
+test("worker runtime heartbeat and stop do not wait for an unrelated company writer", async () => {
+  const f = fixture(); model(f, () => { throw Error("A runtime heartbeat must never dispatch an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const filename = join(f.home, "heartbeat-owner.json"); writeFileSync(filename, JSON.stringify({ version: "omos.company-admin/v1", action: "initialize" }));
+  const initialized = await f.run(["fossil", "company", filename, "--json"]); expect(initialized.code, initialized.stderr).toBe(0);
+  const service = await startWorkspaceService(f, true); let holder;
+  const control = createRuntimeHttpControl({ endpoint: service.url, workspaceId: service.ready.workspace, token: service.headers.authorization.slice(7) });
+  try {
+    const inspected = await control.call({ version: "omos.company-runtime/v1", change: "inspect" }); expect(inspected.ok, JSON.stringify(inspected)).toBe(true);
+    const id = "a".repeat(64), registration = { version: "omos.company-runtime-registration/v1", id, workspace: service.ready.workspace, package_sha256: "b".repeat(64), model_handle: "fixture", isolation: "omos.linux-worker/v1", subjects: [{ actor: "worker", grant: "fixture" }], validation_handles: [] };
+    const registered = await control.call({ version: "omos.company-runtime/v1", change: "register", id, revision: inspected.revision, registration }); expect(registered.ok, JSON.stringify(registered)).toBe(true);
+    holder = Bun.spawn(["/usr/bin/python3", "-I", "-c", "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('held',flush=True); sys.stdin.read(1)", join(f.home, ".fx/authority", service.ready.workspace, "operation.lock")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = holder.stdout.getReader();
+    try { const ready = await Promise.race([reader.read(), Bun.sleep(10000).then(() => { throw Error("Fixture writer did not acquire its lock"); })]); expect(new TextDecoder().decode(ready.value)).toBe("held\n"); } finally { reader.releaseLock(); }
+    const probe = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-runtime-writer.mjs")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    probe.stdin.write(JSON.stringify({ transport: { endpoint: service.url, workspaceId: service.ready.workspace, token: service.headers.authorization.slice(7) }, id, sha256: registered.sha256 })); probe.stdin.end();
+    const [code, stdout, stderr] = await Promise.all([probe.exited, new Response(probe.stdout).text(), new Response(probe.stderr).text()]); expect(code, stderr).toBe(0); expect(stderr).toBe("");
+    const result = JSON.parse(stdout); expect(result.heartbeat.ok, stdout).toBe(true); expect(result.heartbeat.live).toBe(true);
+    expect(result.replacement).toMatchObject({ ok: false, error: "CompanyRuntimeBusy" });
+    expect(result.stopped).toMatchObject({ ok: true, live: false });
+    expect(result.delayed).toMatchObject({ ok: false, error: "CompanyRuntimeFenced" });
+  } finally { if (holder) { holder.stdin.end(); await holder.exited; } control.close(); service.child.kill(); await service.child.exited; }
+}, 120000);
+
 test("owner control distinguishes a closed socket from cancellation without replaying mutations", async () => {
   const child = Bun.spawn([process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, join(import.meta.dir, "fixtures/company-owner-transport.mjs")], { stdout: "pipe", stderr: "pipe" });
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -2937,6 +2972,32 @@ test("worker archive retention preserves an unresolved position without resendin
     } };
     await expect(retainWorkerArchive({ filename, uid: process.getuid!(), source, view: "f".repeat(64), execution: { runtime: "worker", generation: 1 }, control })).rejects.toMatchObject({ message: "WorkerArchiveRetentionPending", retention: { kind: "archive", action, offset: 0, error: "WorkerControlOutcomeUnknown" } });
     expect(requests).toEqual(action === "inspect" ? ["inspect"] : ["inspect", "chunk"]);
+    expect(readFileSync(filename).equals(bytes)).toBe(true);
+  }
+});
+
+test("worker archive deadlines inspect the exact committed prefix without resending a chunk", async () => {
+  const f = fixture(), filename = join(f.home, "deadline-archive.fossil"), bytes = randomBytes(180 * 1024);
+  writeFileSync(filename, bytes);
+  for (const verifiable of [true, false]) {
+    const requests = [], chunks = []; let offset = 0;
+    const control = { async call(request) {
+      requests.push(request.action);
+      const complete = offset === bytes.length;
+      const outcome = { ok: true, view: request.view, sha256: request.source.sha256, bytes: bytes.length, archive_id: !verifiable && offset ? "f".repeat(64) : "d".repeat(64), revision: "e".repeat(64), offset: 0, resume_offset: offset, next_offset: complete ? null : offset, complete };
+      if (request.action === "inspect") return outcome;
+      expect(request.offset).toBe(offset);
+      const chunk = Buffer.from(request.content, "base64"); chunks.push(chunk); offset += chunk.length;
+      return { ok: false, error: "WorkerControlOutcomeUnknown", transport: "RequestDeadline" };
+    } };
+    const input = { filename, uid: process.getuid!(), source: { workspace: "a".repeat(64), task: "b".repeat(64), revision: "c".repeat(64) }, view: "1".repeat(64), execution: { runtime: "worker", generation: 1 }, control };
+    if (verifiable) {
+      const retained = await retainWorkerArchive(input); expect(retained.complete).toBe(true); expect(retained.sha256).toBe(createHash("sha256").update(bytes).digest("hex")); expect(Buffer.concat(chunks).equals(bytes)).toBe(true);
+      expect(requests).toEqual(["inspect", "chunk", "inspect", "chunk", "inspect"]);
+    } else {
+      await expect(retainWorkerArchive(input)).rejects.toMatchObject({ message: "WorkerArchiveRetentionPending", retention: { kind: "archive", action: "chunk", offset: 0, transport: "RequestDeadline" } });
+      expect(chunks).toHaveLength(1); expect(requests).toEqual(["inspect", "chunk", "inspect"]);
+    }
     expect(readFileSync(filename).equals(bytes)).toBe(true);
   }
 });

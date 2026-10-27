@@ -451,6 +451,7 @@ pub const Manager = struct {
     review_fence: ?@import("review_job.zig").Fence = null,
     company_operation_held: bool = false,
     company_read_revision: ?[]const u8 = null,
+    company_revision_cache: ?*CompanyRevisionCache = null,
     task_read_revision: ?struct { branch: []const u8, revision: []const u8 } = null,
     company_runtime_live: ?*@import("company_runtime.zig").LiveHosts = null,
     operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
@@ -533,9 +534,11 @@ pub const Manager = struct {
     const company_branch = "omos-company";
     const runtime_branch = "omos-runtime";
     pub const CompanyFile = struct { path: []const u8, content: []const u8 };
+    pub const CompanyRevisionCache = struct { alloc: Allocator, revision: ?[]const u8 = null, valid: bool = true };
 
     pub fn companyRevision(self: Manager) !?[]const u8 {
         if (self.company_read_revision) |revision_id| return revision_id;
+        if (self.company_revision_cache) |cache| if (cache.valid) return cache.revision;
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
         while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), company_branch)) return try self.revision(company_branch);
@@ -585,9 +588,17 @@ pub const Manager = struct {
     /// Company control records are host-owned and never enter actor checkouts.
     pub fn companyWrite(self: Manager, expected: ?[]const u8, files: []const CompanyFile) ![]const u8 {
         if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
+        errdefer if (self.company_revision_cache) |cache| {
+            cache.valid = false;
+        };
         const lease = try self.writerLease();
         defer lease.release();
-        const current = try self.companyRevision();
+        // Repeated reads share the operation's known head. Every commit still
+        // checks the actual repository head, including out-of-band changes.
+        var live = self;
+        live.company_revision_cache = null;
+        live.company_read_revision = null;
+        const current = try live.companyRevision();
         if (!optionalEqual(current, expected)) return error.WorkspaceRevisionChanged;
         const basis = (try self.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired;
         const declaration = try self.loadDeclaration(basis.revision);
@@ -663,6 +674,10 @@ pub const Manager = struct {
             for (files[0..index]) |previous| if (std.mem.eql(u8, previous.path, file.path)) return error.DuplicateWorkspacePath;
         }
         const mutation = try self.commitCompanyFiles(current, files);
+        if (self.company_revision_cache) |cache| {
+            cache.revision = try cache.alloc.dupe(u8, mutation.revision);
+            cache.valid = true;
+        }
         try @import("company_keys.zig").observe(self);
         for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
         for (files) |file| if (std.mem.startsWith(u8, file.path, "company/execution/")) try fault("company-execution-committed");

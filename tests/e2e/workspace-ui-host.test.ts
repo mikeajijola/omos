@@ -118,7 +118,9 @@ async function workspaceService(f:ReturnType<typeof fixture>) {
  }finally{reader.releaseLock()}
  const ready=JSON.parse(bytes.split('\n')[0]);
  return {child,ready,async request(body:object,authorized=true){
-  try{return await fetch(`http://127.0.0.1:${ready.port}/v1/schedules`,{method:'POST',headers:{authorization:`Bearer ${authorized?token:'wrong-token'}`,'content-type':'application/json'},body:JSON.stringify({version:'omos.schedule/v1',workspace:ready.workspace,...body})})}
+  // These fixtures restart services and intentionally close rejected requests.
+  // Use one connection per operation rather than a stale Bun pooled socket.
+  try{return await fetch(`http://127.0.0.1:${ready.port}/v1/schedules`,{method:'POST',keepalive:false,headers:{authorization:`Bearer ${authorized?token:'wrong-token'}`,'content-type':'application/json'},body:JSON.stringify({version:'omos.schedule/v1',workspace:ready.workspace,...body})})}
   catch(error){
    const exit=child.exitCode;child.kill();await child.exited;
    throw Error(`${error}\nService exit before cleanup: ${exit}\n${await new Response(child.stderr).text()}\n${existsSync(f.env.FX_TRACE_LOG)?readFileSync(f.env.FX_TRACE_LOG,'utf8').slice(-16000):''}`);
@@ -134,9 +136,11 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
  const task=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
  const isolated=kind==='approval'?{...f,env:{...f.env,FX_PERMISSION_MODE:'ask'}}:f;
  const service=await workspaceService(isolated);
- expect((await service.request({action:'list'},false)).status).toBe(401);
+ const unauthorized=await service.request({action:'list'},false);
+ expect(unauthorized.status).toBe(401);expect(await unauthorized.json()).toEqual({error:'Unauthorized'});
  const list=await(await service.request({action:'list'})).json();
- expect((await service.request({action:'add',task:task.id,at:'2020-01-01T09:00:00Z'})).status).toBe(400);
+ const unpinned=await service.request({action:'add',task:task.id,at:'2020-01-01T09:00:00Z'});
+ expect(unpinned.status).toBe(400);expect(await unpinned.json()).toEqual({error:'WorkspaceRevisionRequired'});
  scheduled=true;
  const create=await service.request({action:'add',task:task.id,at:'2020-01-01T09:00:00Z',revision:list.revision});
  expect(create.status).toBe(200);const created=await create.json();
