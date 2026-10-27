@@ -4009,6 +4009,11 @@ pub const Manager = struct {
         return self.alloc.print("Upgraded workspace contracts for future tasks. Active tasks retain their pinned declaration and execution policy. Verified backup: {s}", .{backup});
     }
 
+    pub fn planningDefinitionSnapshot(self: Manager, task: Task) !std.json.Value {
+        const basis = task.model_basis orelse return .null;
+        return model.planningSnapshot(self.alloc, basis, try self.loadDeclaration(basis.revision));
+    }
+
     pub fn definitionSnapshot(self: Manager, task: ?Task) !std.json.Value {
         const basis = if (task) |selected_task| selected_task.model_basis else try self.modelBasis(try self.revision("trunk"));
         if (basis) |pinned| return .{ .object = blk: {

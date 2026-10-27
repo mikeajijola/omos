@@ -317,6 +317,12 @@ Repository checks must follow applicable repository instructions. Commits and
 remote publication are required only when requested or required by those
 instructions. Planning and assessment cannot execute tools.
 
+Planning context includes the pinned capability definitions, resources, and
+realisations. It references the full declaration by revision and hash instead
+of copying transport and record schemas into each planning request. The host
+continues to validate every operation against those schemas. Original requests
+and pending user amendments remain intact within the planning budget.
+
 The execution policy defaults to a progress check after every four completed
 tool batches, a pause after three consecutive stalled checks, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with

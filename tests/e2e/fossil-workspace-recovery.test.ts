@@ -1992,9 +1992,6 @@ sys.exit(result.returncode)
     expect(readFileSync(join(cache, "sessions", selectedSession), "utf8")).toBe(pending.id);
     const events = JSON.parse((await f.run(["fossil", "query", "omos_event", "--json"])).stdout).model_data;
     expect(events.records.some((row: any) => row.data.kind === "session_binding" && row.data.payload.session === selectedSession && row.data.task === pending.id)).toBe(true);
-    if (missingCheckout) {
-      for (const filename of [".fslckout", "_FOSSIL_"]) rmSync(join(tree, filename), { force: true });
-    }
     const calls = inference.counts().actors;
     permit = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
@@ -2945,6 +2942,9 @@ sys.exit(result.returncode)
     mkdirSync(join(tree, "documents"), { recursive: true });
     writeFileSync(join(tree, "documents/uncommitted.txt"), "Retain these interrupted bytes");
     writeFileSync(join(tree, "memory/preference.md"), "An uncommitted host scratch change");
+    if (missingCheckout) {
+      for (const filename of [".fslckout", "_FOSSIL_"]) rmSync(join(tree, filename), { force: true });
+    }
     const calls = inference.counts().actors;
     permit = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
@@ -5940,7 +5940,15 @@ sys.exit(result.returncode)
     blocked = false;
     const correction = "Correction: " + "note ".repeat(2000) + "use green";
     const second = await f.run(["ask", "--resume-id", session, correction, "--json"], {}, 120000);
-    expect(second.code, second.stderr).toBe(0);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(m.revisionPackets).toHaveLength(1);
+    const revisionContext = m.revisionPackets[0].context;
+    expect(revisionContext.originalRequest).toBe(goal);
+    expect(revisionContext.pendingAmendments).toContain(correction);
+    expect(revisionContext.model.projection).toBe("task_planning_capabilities");
+    expect(revisionContext.model.declarationReference.sha256).toBe(revisionContext.model.basis.definition_hash);
+    expect(revisionContext.model.declarationReference.revision).toBe(revisionContext.model.basis.revision);
+    expect(Buffer.byteLength(JSON.stringify(revisionContext))).toBeLessThan(128 * 1024);
     expect(goal.startsWith(m.packets[0].originalRequest)).toBe(true);
     expect(m.packets[0].originalRequestEvidence).toBe("context:original");
     const packet = m.packets.at(-1);

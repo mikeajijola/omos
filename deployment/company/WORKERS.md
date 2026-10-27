@@ -267,6 +267,12 @@ pool. Model calls run outside the company writer boundary. Inspection reports
 `planning_required`, `planning_state`, and the selected planning job. Waiting
 for planning does not consume an actor invocation.
 
+If initial admission is still pending, the coordinator reconciles that retained
+operation before planning or claiming compute. This path requires zero previous
+invocations and no execution record or checkpoint. Native authority and fencing
+checks still apply. An uncertain recovery remains queued for inspection; polling
+does not resend it. Coordinator shutdown cancels and joins this preparation.
+
 The planner preserves the original request and obligations, records concrete
 acceptance criteria, and selects the native task capability. Coding tasks gain
 the host's `coding_validation` and `coding_summary` requirements. A committed

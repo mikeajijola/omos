@@ -239,7 +239,9 @@ export async function runWorkerNative({ launch, control, view, execution, prompt
   } catch (error) {
     stop();
     await closed.catch(() => {});
-    throw error;
+    // Killing the owned child can close its readable stream before the main
+    // consumer joins. Preserve the retention failure that initiated cleanup.
+    throw failure ?? error;
   } finally {
     ending = true;
     clearTimeout(timer); clearTimeout(force); clearTimeout(flushTimer); clearTimeout(inputTimer);

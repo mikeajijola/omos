@@ -13,6 +13,7 @@ import { createWorkerCheckpointer } from "./worker-checkpoint.mjs";
 import { createArchiveHttpControl, createEvaluationHttpControl, createWorkerHttpControl, createActivityHttpControl, createInputHttpControl } from "./worker-http-control.mjs";
 import { runCompanyValidation, validateValidationConfiguration } from "./worker-validation.mjs";
 import { runWorkerNative } from "./worker-native.mjs";
+import { recoverQueuedWorkerAdmission } from "./worker-recovery.mjs";
 
 const fail = code => { throw new Error(code); };
 const hex = value => typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
@@ -222,6 +223,9 @@ export async function createLinuxWorkerBackend({ imageTool, imageToolSha256, lau
     supports(row) {
       const binding = row?.record?.binding;
       return Boolean(identity && binding?.workspace === identity.workspace && binding.actor === identity.actor && binding.grant === identity.grant);
+    },
+    recoverQueued(row, signal) {
+      return recoverQueuedWorkerAdmission(row, { configuration: companyConfiguration, home: companyHome }, signal);
     },
     async recover(row, signal) {
       const job = row.record, binding = job.binding;

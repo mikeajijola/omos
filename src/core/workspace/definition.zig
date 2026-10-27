@@ -148,6 +148,28 @@ pub const Basis = struct {
 };
 pub const Declaration = struct { value: Value, hash: []const u8, semantic: Semantic };
 
+/// Planning selects native task capabilities. Transport and record schemas stay
+/// in the pinned declaration and remain enforced by the host on every operation.
+pub fn planningSnapshot(alloc: Allocator, basis: Basis, declaration: Declaration) !Value {
+    const selected = spec(declaration.value);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, .{
+        .basis = basis,
+        .declarationReference = .{ .path = declaration_path, .revision = basis.revision, .sha256 = declaration.hash },
+        .projection = "task_planning_capabilities",
+        .declaration = .{
+            .apiVersion = field(declaration.value, "apiVersion"),
+            .kind = field(declaration.value, "kind"),
+            .metadata = field(declaration.value, "metadata"),
+            .spec = .{
+                .capabilities = field(selected, "capabilities"),
+                .resources = field(selected, "resources"),
+                .realisations = field(selected, "realisations"),
+            },
+        },
+    }, .{});
+    return (try std.json.parseFromSlice(Value, alloc, bytes, .{})).value;
+}
+
 pub fn field(value: Value, name: []const u8) ?Value {
     return if (value == .object) value.object.get(name) else null;
 }
@@ -642,6 +664,25 @@ pub fn digest(alloc: Allocator, value: Value) ![]const u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(try canonical(alloc, value), &hash, .{});
     return alloc.dupe(u8, &std.fmt.bytesToHex(&hash, .lower));
+}
+
+test "workspace declaration planning references schemas and preserves capability selection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try parse(alloc, seed);
+    const basis: Basis = .{ .definition_hash = declaration.hash, .revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .execution = .{}, .capability = "general_task" };
+    const snapshot = try planningSnapshot(alloc, basis, declaration);
+    try std.testing.expectEqualStrings(declaration.hash, text(field(snapshot, "declarationReference").?, "sha256"));
+    try std.testing.expectEqualStrings(basis.revision, text(field(snapshot, "declarationReference").?, "revision"));
+    try std.testing.expectEqualStrings("general_task", text(field(snapshot, "basis").?, "capability"));
+    const projected = spec(field(snapshot, "declaration").?);
+    for ([_][]const u8{ "capabilities", "resources", "realisations" }) |key| {
+        try std.testing.expectEqualStrings(try canonical(alloc, field(spec(declaration.value), key).?), try canonical(alloc, field(projected, key).?));
+    }
+    try std.testing.expect(field(projected, "operations") == null);
+    try std.testing.expect(field(spec(declaration.value), "operations") != null);
+    try std.testing.expect((try canonical(alloc, snapshot)).len < 8192);
 }
 
 test "workspace declaration execution policy has bounded independent defaults" {

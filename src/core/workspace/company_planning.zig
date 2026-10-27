@@ -74,7 +74,7 @@ fn planUnderLease(original: workspace.Manager, job: jobs.Job, provider: anytype)
     const authority = @import("company_authority.zig");
     const state = try records.decode(authority.State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try authority.liveGrant(state, task.authority.?.grant, io.milliTimestamp()));
-    const packet = try std.json.Stringify.valueAlloc(manager.alloc, .{ .originalRequest = try manager.originalRequest(task), .amendments = task.amendments, .pendingAmendments = task.amendments[@min(task.planned_amendments, task.amendments.len)..], .contract = task.definition, .model = try manager.definitionSnapshot(task), .step = @as(usize, 0), .authority = .{ .scope = "company_task", .paths = grant.paths, .actor_execution = if (job.kind == .completion) "external_proposal_retained" else "not_started" } }, .{});
+    const packet = try std.json.Stringify.valueAlloc(manager.alloc, .{ .originalRequest = try manager.originalRequest(task), .amendments = task.amendments, .pendingAmendments = task.amendments[@min(task.planned_amendments, task.amendments.len)..], .contract = task.definition, .model = try manager.planningDefinitionSnapshot(task), .step = @as(usize, 0), .authority = .{ .scope = "company_task", .paths = grant.paths, .actor_execution = if (job.kind == .completion) "external_proposal_retained" else "not_started" } }, .{});
     var delivery: streams.DeliveryCertainty = .init();
     var evidence: streams.AttemptEvidence = .{};
     var event_context: u8 = 0;

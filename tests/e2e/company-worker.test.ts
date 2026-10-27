@@ -10,6 +10,7 @@ import { createHash, createPublicKey, generateKeyPairSync, sign, verify, randomB
 import { createReadStream } from "node:fs";
 import { createWorkerHttpControl, createEvaluationHttpControl, createRuntimeHttpControl, createArchiveHttpControl, createDesiredHttpControl, createActivityHttpControl, createInputHttpControl } from "../../deployment/company/worker-http-control.mjs";
 import { createWorkerCoordinator } from "../../deployment/company/worker-coordinator.mjs";
+import { initialWorkerAdmission, recoverQueuedWorkerAdmission } from "../../deployment/company/worker-recovery.mjs";
 import { createWorkerSnapshot, selectWorkerRoot, selectWorkerSession } from "../../deployment/company/worker-snapshot.mjs";
 import { createWorkerControl } from "../../deployment/company/worker-control.mjs";
 import { createCompanyClient } from "../../deployment/company/mcp.mjs";
@@ -1526,6 +1527,104 @@ test("worker coordinator resolves lost claim acknowledgements and fences revoked
   await uncertain.close();
 });
 
+test("worker coordinator reconciles initial admission before planning without spending an invocation", async () => {
+  const calls: string[] = [];
+  const current: any = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Answer the question", basis: {}, grant: { actions: ["reconcile"] }, execution: null, task_state: "active", pending_operation: "initial-admission", pending_amendment: false, planning_required: true, publication: null,
+    record: { binding: { view: "view" }, state: "queued", invocations: 0, generation: 0, runtime: null, checkpoint: null, max_runtime_ms: 60000, expires_ms: 0 } };
+  const control = { async call(input) {
+    if (input.change === "inspect") return { ok: true, jobs: [{ ...structuredClone(current), ...(!input.view ? { grant: null } : {}) }], next_offset: null };
+    calls.push(input.change);
+    if (input.change === "plan") { expect(current.pending_operation).toBeNull(); current.planning_required = false; }
+    else if (input.change === "claim") { current.record = { ...current.record, state: "running", invocations: current.record.invocations + 1, runtime: input.execution.runtime, generation: 1, operation: input.operation, expires_ms: Date.now() + 120000 }; current.execution = { runtime: input.execution.runtime, generation: 1 }; }
+    else if (input.change === "finish") { current.record.state = input.outcome; current.record.operation = input.operation; }
+    return { ok: true, jobs: [structuredClone(current)], next_offset: null };
+  } };
+  let actors = 0;
+  const coordinator = createWorkerCoordinator({ control, backend: {
+    async recoverQueued(row) { calls.push("admission"); expect(row.grant.actions).toEqual(["reconcile"]); expect(row.record.invocations).toBe(0); expect(row.execution).toBeNull(); current.pending_operation = null; },
+    async recover() { calls.push("owned-recovery"); current.pending_operation = null; },
+    async run(row) { actors++; expect(row.planning_required).toBe(false); return { outcome: "waiting" }; },
+  } });
+  try {
+    expect((await coordinator.tick()).started).toBe(1); await coordinator.drain();
+    expect(calls).toEqual(["admission", "plan", "claim", "finish"]);
+    expect(current.record.invocations).toBe(1); expect(actors).toBe(1);
+  } finally { await coordinator.close(); }
+});
+
+test("queued admission recovery rejects previous owners and joins cancellation without repeated attempts", async () => {
+  const initial: any = { authority_live: true, pending_operation: "admission", execution: null, record: { binding: { view: "view" }, state: "queued", invocations: 0, generation: 0, runtime: null, checkpoint: null } };
+  expect(initialWorkerAdmission(initial)).toBe(true);
+  expect(initialWorkerAdmission({ ...initial, record: { ...initial.record, checkpoint: undefined } })).toBe(true);
+  for (const changed of [{ execution: { runtime: null, generation: 1 } }, { authority_live: false }, { pending_amendment: true }, { record: { ...initial.record, invocations: 1 } }, { record: { ...initial.record, checkpoint: {} } }, { record: { ...initial.record, runtime: "old-owner" } }]) {
+    const row = { ...initial, ...changed };
+    expect(initialWorkerAdmission(row)).toBe(false);
+    await expect(recoverQueuedWorkerAdmission(row, { configuration: "/must-not-read" })).rejects.toThrow("WorkerRecoveryRequired");
+  }
+  for (const mode of ["uncertain", "cancel", "claimed"]) {
+    let attempts = 0, aborted = false, inspectCount = 0;
+    const control = { async call(input) {
+      expect(input.change).toBe("inspect");
+      if (input.view && mode === "claimed") return { ok: true, jobs: [{ ...structuredClone(initial), execution: { runtime: "other", generation: 1 } }], next_offset: null };
+      inspectCount++;
+      return { ok: true, jobs: [structuredClone(initial)], next_offset: null };
+    } };
+    let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
+    const coordinator = createWorkerCoordinator({ control, backend: {
+      async recoverQueued(_row, signal) { attempts++; entered(); if (mode === "cancel") await new Promise<void>(resolve => signal.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true })); else throw Error("UncertainAdmission"); },
+      async run() { throw Error("An unresolved admission cannot dispatch actor work"); },
+    } });
+    const tick = coordinator.tick();
+    if (mode === "cancel") { await started; await coordinator.close(); }
+    expect((await tick).started).toBe(0);
+    if (mode === "uncertain") { expect((await coordinator.tick()).started).toBe(0); expect(inspectCount).toBeGreaterThan(1); }
+    await coordinator.close();
+    expect(attempts).toBe(mode === "claimed" ? 0 : 1); expect(aborted).toBe(mode === "cancel");
+  }
+});
+
+test("native pre-execution recovery finishes its retained checkpoint before planning and a single actor claim", async () => {
+  const f = fixture();
+  const inference = model(f, () => { throw Error("The recovery cannot call an actor"); });
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const admin = async input => { const file = join(f.home, "initial-admission-owner.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...input })); const result = await f.run(["fossil", "company", file, "--json"]); expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout).model_data; };
+  const company = await admin({ action: "initialize" });
+  const key = await f.run(["fossil", "company-key", "initial-worker", "--json"]); expect(key.code, key.stderr).toBe(0);
+  const actions = ["create_view", "execution", "read", "status", "checkpoint", "submit", "reconcile"];
+  await admin({ action: "grant", revision: company.revision, grant: { id: "initial-worker", actor: "participant", public_key: (JSON.parse(key.stdout).model_data ?? JSON.parse(key.stdout)).public_key, paths: ["documents/team/"], actions, expires_ms: Date.now() + 3600000 } });
+  const service = await startWorkspaceService(f, true, { FX_E2E_FOSSIL_FAULT: "company-checkpoint-committed" });
+  let client, control, coordinator;
+  try {
+    const boot = await (await fetch(service.url + "/v1/company")).json() as any;
+    const config = join(f.home, "initial-worker-client.json"); writeFileSync(config, JSON.stringify({ version: "omos.company-mcp/v1", endpoint: service.url, workspace: boot.workspace, issuer: boot.issuer, epoch: boot.epoch, actor: "participant", grant: "initial-worker", key_handle: "initial-worker", actions }), { mode: 0o600 });
+    client = await createCompanyClient(config, { home: f.home });
+    const call = async (action, input) => client.call("company_workspace", { version: "omos.company/v1", action, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000, ...input });
+    const created = await call("create_view", { revision: boot.revision, objective: "Retain the initial checkpoint before any actor work" }); expect(created.isError, JSON.stringify(created)).not.toBe(true);
+    const { view, revision } = JSON.parse(created.content[0].text);
+    control = createWorkerHttpControl({ endpoint: service.url, workspaceId: boot.workspace, token: service.headers.authorization.slice(7) });
+    const queued = await control.call({ change: "queue", view, operation: crypto.randomUUID(), max_invocations: 1 }); expect(queued.ok, JSON.stringify(queued)).toBe(true);
+    const operation = crypto.randomUUID();
+    const interrupted = await call("checkpoint", { view, revision, operation, path: "documents/team/initial.txt", content: "Retained exactly once before execution" }); expect(interrupted.isError).toBe(true);
+    const retained = (await control.call({ change: "inspect", view })).jobs[0];
+    expect(initialWorkerAdmission(retained), JSON.stringify({ record: retained.record, execution: retained.execution, pending: retained.pending_operation, authority_live: retained.authority_live, interrupted })).toBe(true); expect(retained.pending_operation).toBe(operation);
+    let actors = 0;
+    coordinator = createWorkerCoordinator({ control, backend: {
+      recoverQueued: (row, signal) => recoverQueuedWorkerAdmission(row, { configuration: config, home: f.home }, signal),
+      async run(row) { actors++; expect(row.pending_operation).toBeNull(); expect(row.planning_required).toBe(false); return { outcome: "waiting" }; },
+    } });
+    const deadline = Date.now() + 120000;
+    while (actors === 0 && Date.now() < deadline) { await coordinator.tick(); await coordinator.drain(); if (actors === 0) await Bun.sleep(50); }
+    expect(actors).toBe(1);
+    const final = (await control.call({ change: "inspect", view })).jobs[0];
+    expect(final.record.invocations).toBe(1); expect(final.record.max_invocations).toBe(1); expect(final.pending_operation).toBeNull();
+    expect(inference.counts().actors).toBe(0);
+    expect(f.fossil("cat", "documents/team/initial.txt", "-r", final.view_revision)).toBe("Retained exactly once before execution");
+  } finally {
+    await coordinator?.close(); control?.close(); client?.close(); service.child.kill(); await service.child.exited;
+    expect(await new Response(service.child.stderr).text()).toBe("");
+  }
+}, 180000);
+
 test("worker recovery refreshes native state before dispatch and never replays an actor after submission", async () => {
   const view = "b".repeat(64);
   let current: any;
@@ -2431,7 +2530,7 @@ test("company clients recover a closed bootstrap read without replaying a lost m
   } finally { client.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
 });
 
-test("worker native delivery stops and joins its process when activity retention fails", async () => {
+for (const streamClose of [false, true]) test(`worker native delivery stops and joins its process when activity retention fails${streamClose ? " during stream closure" : ""}`, async () => {
   const source = String.raw`import readline from 'node:readline';
 const input = readline.createInterface({input:process.stdin});
 const send = value => process.stdout.write(JSON.stringify({version:'omos.ui-host/v1',...value})+'\n');
@@ -2439,7 +2538,14 @@ input.on('line',line=>{const request=JSON.parse(line);send({type:'response',id:r
   let child, appends = 0;
   const started = Date.now();
   await expect(runWorkerNative({
-    launch: () => child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] }),
+    launch: () => {
+      child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] });
+      if (streamClose) {
+        const kill = child.kill.bind(child);
+        child.kill = (...args) => { child.stdout.destroy(Error("Premature close")); return kill(...args); };
+      }
+      return child;
+    },
     control: { async call(request) { if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false }; appends++; return { ok: false, uncertain: true, error: "WorkerControlOutcomeUnknown" }; } },
     view: "view", execution: { runtime: "runtime", generation: 1 }, prompt: "Retain the pending request", timeout: 2000,
   })).rejects.toMatchObject({ message: "WorkerActivityRetentionPending", retention: { kind: "activity", action: "append", offset: 0, error: "WorkerControlOutcomeUnknown" } });

@@ -7036,7 +7036,7 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .amendments = turn.task.amendments,
         .pendingAmendments = turn.task.amendments[@min(turn.task.planned_amendments, turn.task.amendments.len)..],
         .contract = turn.task.definition,
-        .model = try turn.manager.definitionSnapshot(turn.task),
+        .model = try turn.manager.planningDefinitionSnapshot(turn.task),
         .step = input.step,
     }, .{});
     const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};

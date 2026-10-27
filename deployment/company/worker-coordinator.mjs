@@ -1,6 +1,7 @@
 // Dispatch policy over native durable jobs. The execution backend must stop all
 // actor processes before resolving run(); actor output never proves acceptance.
 import { randomUUID } from "node:crypto";
+import { initialWorkerAdmission } from "./worker-recovery.mjs";
 
 const fail = code => { throw new Error(code); };
 const diagnosticCode = value => typeof value === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(value) ? value : "Unknown";
@@ -21,6 +22,7 @@ const sameOwner = (row, owned) => row?.record?.state === "running" && row.record
 export function createWorkerCoordinator({ control, backend, concurrency = 1, runtime = randomUUID() }) {
   if (typeof control?.call !== "function" || typeof backend?.run !== "function" || !Number.isSafeInteger(concurrency) || concurrency < 1 || concurrency > 4 || typeof runtime !== "string" || !/^[A-Za-z0-9_.-]{1,128}$/.test(runtime)) fail("InvalidWorkerCoordinator");
   const active = new Map();
+  const admissionAttempts = new Map();
   let closed = false, scanning = false, cursor = 0;
   const inspect = async view => {
     const result = await control.call({ change: "inspect", view });
@@ -111,12 +113,31 @@ export function createWorkerCoordinator({ control, backend, concurrency = 1, run
               await update({ change: "complete", operation: randomUUID(), view, expected_sha256: row.sha256 });
             } else if (row.record.state === "running" && row.record.expires_ms <= Date.now()) {
               await update({ change: "expire", operation: randomUUID(), view, expected_sha256: row.sha256 });
-            } else if (!closed && row.record.state === "queued" && !row.pending_amendment && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function")) {
+            } else if (!closed && row.record.state === "queued" && !row.pending_amendment && row.authority_live && active.size < concurrency && (!row.pending_operation || typeof backend.recover === "function" || (initialWorkerAdmission(row) && typeof backend.recoverQueued === "function"))) {
               if (["queued", "running"].includes(row.review_state)) continue;
               let prepared = row;
-              if (row.planning_required && !row.pending_operation) {
-                if (["queued", "running"].includes(row.planning_state)) continue;
-                prepared = await update({ change: "plan", operation: randomUUID(), view, expected_sha256: row.sha256 });
+              if (!row.pending_operation) admissionAttempts.delete(view);
+              if (initialWorkerAdmission(row) && typeof backend.recoverQueued === "function") {
+                if (admissionAttempts.get(view) === row.pending_operation || admissionAttempts.size >= 1024) continue;
+                // The list contains metadata only. Retrieve the live grant and
+                // recheck the absence of any prior execution before recovery.
+                prepared = await inspect(view);
+                if (!initialWorkerAdmission(prepared) || prepared.pending_operation !== row.pending_operation || closed) continue;
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(new Error("WorkerAdmissionDeadline")), 300000);
+                const entry = { preparation: true, controller, promise: null };
+                admissionAttempts.set(view, prepared.pending_operation);
+                active.set(view, entry);
+                entry.promise = Promise.resolve().then(() => backend.recoverQueued(structuredClone(prepared), controller.signal)).then(() => inspect(view)).catch(() => null).finally(() => { clearTimeout(timer); active.delete(view); });
+                prepared = await entry.promise;
+                // Unknown outcomes stay queued. Do not repeatedly send the
+                // same recovery while polling or spend actor budget on it.
+                if (!prepared || prepared.pending_operation || !prepared.authority_live || prepared.record.state !== "queued" || prepared.pending_amendment || closed) continue;
+                admissionAttempts.delete(view);
+              }
+              if (prepared.planning_required && !prepared.pending_operation) {
+                if (["queued", "running"].includes(prepared.planning_state)) continue;
+                prepared = await update({ change: "plan", operation: randomUUID(), view, expected_sha256: prepared.sha256 });
                 if (closed || prepared.record.state !== "queued" || prepared.planning_required) continue;
               }
               const claimed = await update({ change: "claim", operation: randomUUID(), view, expected_sha256: prepared.sha256, execution: { runtime, generation: prepared.execution?.generation ?? 0 } });
