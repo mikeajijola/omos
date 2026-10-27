@@ -7,15 +7,22 @@ import { spawn } from "node:child_process";
 
 let control, desired, supervisor, actor;
 let stopping = new AbortController();
+let watchdog, diagnosticFile, lastObserved = null, wait = "startup";
+const progress = [];
+const diagnose = async () => {
+  if (diagnosticFile) await fs.writeFile(diagnosticFile, JSON.stringify({ observed_ms: Date.now(), wait, last_observed: lastObserved, progress }), { mode: 0o600 });
+};
 try {
   const settings = JSON.parse(await fs.readFile(process.argv[2], "utf8"));
+  diagnosticFile = settings.diagnosticFile;
   control = createWorkerHttpControl(settings.control);
   if (settings.desiredPolicy) desired = createDesiredHttpControl(settings.control);
   let serverError, started = 0, recoveredArchive = false, recoveredCoding = false, recoveredPartial = false, recoveredCollection = false;
-  const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; }).catch(error => { serverError = error; });
+  const start = () => runWorkerServer({ version: "omos.company-workers/v1", backend: settings.backend, control: settings.control, concurrency: 1, poll_ms: 250, reconciliation: settings.reconciliation === true }, stopping.signal, event => { started += event.started ?? 0; progress.push({ at: Date.now(), ...event }); if (progress.length > 16) progress.shift(); }).catch(error => { serverError = error; });
   supervisor = start();
   if (![360000, 600000].includes(settings.timeoutMs)) throw new Error("FixtureInvocationBudgetInvalid");
   const deadline = Date.now() + settings.timeoutMs;
+  watchdog = setTimeout(() => { void diagnose().catch(() => {}); }, settings.timeoutMs);
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
   let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false, amendedTask = false;
@@ -33,6 +40,7 @@ try {
       if (queued.isError) throw new Error("FixtureHostedRequestFailed");
       requested = true;
     }
+    wait = "owner_inspection";
     const result = await control.call({ change: "inspect", view: settings.view });
     if (!result.ok && result.error === "WorkerControlOutcomeUnknown" && Date.now() < deadline) {
       // Inspection has no effects. A dropped read cannot establish a worker
@@ -48,6 +56,8 @@ try {
     }
     if (result.jobs.length !== 1) throw new Error("FixtureJobInspectionFailed");
     selected = result.jobs[0];
+    lastObserved = { at: Date.now(), state: selected.record.state, invocations: selected.record.invocations, generation: selected.record.generation, note: selected.record.note, checkpoint: selected.record.checkpoint, pending_operation: selected.pending_operation, pending_amendment: selected.pending_amendment, planning_state: selected.planning_state, review_state: selected.review_state, publication: Boolean(selected.publication) };
+    wait = "task_controls";
     if (settings.inputResponse && !inputAnswered && selected.record.state === "running") {
       actor ??= await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
       const invoke = async input => {
@@ -181,9 +191,14 @@ try {
   process.stdout.write(JSON.stringify({ ok: false, error: /^[A-Z][A-Za-z0-9]+$/.test(error.message) ? error.message : "FixtureWorkerFailed", ...(typeof code === "string" && /^[A-Z][A-Za-z0-9]+$/.test(code) ? { control_error: code } : {}), ...(typeof error.transportCode === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(error.transportCode) ? { transport: error.transportCode } : {}) }));
   process.exitCode = 1;
 } finally {
+  clearTimeout(watchdog);
+  wait = "joining_supervisor";
+  await diagnose().catch(() => {});
   stopping.abort();
   if (supervisor) await supervisor;
   if (control) control.close();
   if (desired) desired.close();
   if (actor) actor.close();
+  wait = "closed";
+  await diagnose().catch(() => {});
 }

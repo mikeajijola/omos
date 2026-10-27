@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import shutil
 import stat
 import subprocess
@@ -108,16 +109,31 @@ if spec["action"] == "backend":
     # observes both allowed invocations plus 120 seconds for host review.
     timeout_ms = invocation_count * 240000 + 120000
     configuration = base / "backend.json"
-    configuration.write_text(json.dumps({"backend": backend, "timeoutMs": timeout_ms, "control": settings["control"], "view": settings.get("view"), "desiredPolicy": settings.get("desiredPolicy"), "reconciliation": settings.get("reconciliation", False), "hostedRequest": settings.get("hostedRequest"), "archiveRecovery": settings.get("archiveRecovery", False), "codingRecovery": settings.get("codingRecovery", False), "partialRecovery": settings.get("partialRecovery", False), "retirement": settings.get("retirement", False), "amendment": settings.get("amendment", False), "actorWaitUrl": settings.get("actorWaitUrl"), "inputResponse": settings.get("inputResponse", False)}))
+    diagnostic_file = base / "backend-diagnostic.json"
+    configuration.write_text(json.dumps({"backend": backend, "diagnosticFile": str(diagnostic_file), "timeoutMs": timeout_ms, "control": settings["control"], "view": settings.get("view"), "desiredPolicy": settings.get("desiredPolicy"), "reconciliation": settings.get("reconciliation", False), "hostedRequest": settings.get("hostedRequest"), "archiveRecovery": settings.get("archiveRecovery", False), "codingRecovery": settings.get("codingRecovery", False), "partialRecovery": settings.get("partialRecovery", False), "retirement": settings.get("retirement", False), "amendment": settings.get("amendment", False), "actorWaitUrl": settings.get("actorWaitUrl"), "inputResponse": settings.get("inputResponse", False)}))
     configuration.chmod(0o600)
     assert pathlib.Path(spec["node"]).is_absolute() and pathlib.Path(spec["node"]).name in ("node", "bun")
-    result = subprocess.run([spec["node"], str(repository / "tests/e2e/fixtures/company-worker-linux.mjs"), str(configuration)], capture_output=True, text=True, timeout=timeout_ms / 1000 + 30, env={"PATH": "/usr/bin:/bin", "HOME": str(profile)})
+    arguments = [spec["node"], str(repository / "tests/e2e/fixtures/company-worker-linux.mjs"), str(configuration)]
+    child = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True, env={"PATH": "/usr/bin:/bin", "HOME": str(profile)})
+    timed_out = False
+    try:
+        output, errors = child.communicate(timeout=timeout_ms / 1000 + 30)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            output, errors = child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            output, errors = child.communicate(timeout=5)
+    result = subprocess.CompletedProcess(arguments, 124 if timed_out else child.returncode, output, errors)
     images = [base / "pool" / name for name in os.listdir(base / "pool") if re.fullmatch(r"[0-9a-f]{24}", name)]
     details = []
     for image in images:
         request = json.loads((image / ".omos-worker-image.json").read_text())["request"]
         details.append({field: request.get(field) for field in ("id", "generation", "source_revision")})
-    print(json.dumps({"code": result.returncode, "stdout": result.stdout, "stderr": result.stderr, "images": len(images), "image_details": details}))
+    diagnostic = json.loads(diagnostic_file.read_text()) if diagnostic_file.exists() else None
+    print(json.dumps({"code": result.returncode, "stdout": result.stdout, "stderr": result.stderr, "timed_out": timed_out, "diagnostic": diagnostic, "images": len(images), "image_details": details}))
     sys.exit(0)
 request = spec["request"]
 assert re.fullmatch(r"[0-9a-f]{64}", request["id"])

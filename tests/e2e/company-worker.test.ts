@@ -1889,7 +1889,9 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect(proxyErrors, stderr + stdout).toEqual([]);
     expect(code, stderr + stdout).toBe(0); expect(stderr).toBe("");
-    const result = JSON.parse(stdout), outcome = JSON.parse(result.stdout);
+    const result = JSON.parse(stdout);
+    if (support.private_namespaces) expect(result.code, JSON.stringify(result)).toBe(0);
+    const outcome = JSON.parse(result.stdout);
     if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
