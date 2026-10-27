@@ -7,10 +7,10 @@ import { spawn } from "node:child_process";
 
 let control, desired, supervisor, actor;
 let stopping = new AbortController();
-let watchdog, diagnosticFile, lastObserved = null, wait = "startup";
+let watchdog, diagnosticFile, lastObserved = null, deadlineObservation = null, wait = "startup";
 const progress = [];
 const diagnose = async () => {
-  if (diagnosticFile) await fs.writeFile(diagnosticFile, JSON.stringify({ observed_ms: Date.now(), wait, last_observed: lastObserved, progress }), { mode: 0o600 });
+  if (diagnosticFile) await fs.writeFile(diagnosticFile, JSON.stringify({ observed_ms: Date.now(), wait, last_observed: lastObserved, progress, deadline_observation: deadlineObservation }), { mode: 0o600 });
 };
 try {
   const settings = JSON.parse(await fs.readFile(process.argv[2], "utf8"));
@@ -22,7 +22,7 @@ try {
   supervisor = start();
   if (![360000, 600000].includes(settings.timeoutMs)) throw new Error("FixtureInvocationBudgetInvalid");
   const deadline = Date.now() + settings.timeoutMs;
-  watchdog = setTimeout(() => { void diagnose().catch(() => {}); }, settings.timeoutMs);
+  watchdog = setTimeout(() => { deadlineObservation = structuredClone({ at: Date.now(), wait, last_observed: lastObserved, progress }); void diagnose().catch(() => {}); }, settings.timeoutMs);
   let requested = !settings.hostedRequest;
   if (!requested) actor = await createCompanyClient(settings.backend.companyConfiguration, { home: settings.backend.companyHome });
   let selected, desiredMetAt = 0, inputOffset = 0, inputAnswered = false, interrupted = false, cancelledForRetention = false, retiredHistory = false, amendedTask = false;

@@ -1895,11 +1895,11 @@ for (const scenarioSpec of companyWorkerScenarios) test.skipIf(!support?.kernel_
     if (desiredTask) view = outcome.view;
     const current = (await admin({ action: "workers", worker: { change: "inspect", view } })).jobs[0];
     if (support.private_namespaces) {
-      if ((outcome.state === "waiting" && !failingChecks) || outcome.state === "failed") {
+      if (outcome.state !== (retiring ? "cancelled" : failingChecks ? "waiting" : "completed")) {
         const activity = await client.call("company_workspace", { version: "omos.company/v1", action: "status", entity: "omos_company_activity", view, record_id: String(current.record.generation), offset: 0, limit: 32, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 });
         const page = activity.isError ? null : JSON.parse(activity.content[0].text);
         const operation = current.pending_operation ? await client.call("company_workspace", { version: "omos.company/v1", action: "status", view, outcome: current.pending_operation, operation: crypto.randomUUID(), expires_ms: Date.now() + 120000 }) : null;
-        throw Error(JSON.stringify({ outcome, checkpoint: current.record.checkpoint, execution: current.execution, pending_operation: current.pending_operation, operation, actors: inference.counts().actors, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
+        throw Error(JSON.stringify({ outcome, diagnostic: result.diagnostic, checkpoint: current.record.checkpoint, execution: current.execution, pending_operation: current.pending_operation, operation, actors: inference.counts().actors, host_assessments: host.counts().assessments, amendment_started: amendmentAfterAnswerStarted, amendment_submitted: amendmentAfterAnswerSubmitted, activity: page?.events.map(event => ({ type: event.data.type, code: event.data.code, exit_code: event.data.exit_code })), activity_error: activity.isError === true }));
       }
       expect(result.code, result.stderr + result.stdout).toBe(0); expect(result.stderr).toBe("");
       const collectionRecovery = outcome.recovered_collection ? 1 : 0;
