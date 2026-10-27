@@ -65,7 +65,10 @@ export async function createWorkerBroker({ socket, model, company, companyClient
   if (typeof model.model !== "string" || !model.model || typeof model.handle !== "string" || !model.handle || !Array.isArray(company.actions) || !company.actions.length) failure("InvalidWorkerBroker");
   for (const field of ["workspace", "actor", "grant"]) if (typeof company[field] !== "string" || !company[field]) failure("InvalidWorkerBroker");
   if (companyClient && (!companyClient.scope || companyClient.scope.view !== company.view || companyClient.scope.expiresMs < expiresMs || !["workspace", "actor", "grant"].every(field => companyClient.identity[field] === company[field]) || companyClient.scope.actions.some(action => !company.actions.includes(action)))) failure("InvalidWorkerCompanyClient");
-  if (company.source_revision !== undefined && (!companyClient || !/^[0-9a-f]{64}$/.test(company.source_revision) || !company.actions.includes("read") || !company.actions.includes("discover"))) failure("InvalidWorkerProjection");
+  const executionGeneration = companyClient?.scope?.execution?.generation;
+  const sourceGeneration = company.source_generation === undefined ? executionGeneration : company.source_generation;
+  if (company.source_revision !== undefined && (!companyClient || !/^[0-9a-f]{64}$/.test(company.source_revision) || !Number.isSafeInteger(executionGeneration) || !Number.isSafeInteger(sourceGeneration) || sourceGeneration < 1 || sourceGeneration > executionGeneration || !company.actions.includes("read") || !company.actions.includes("discover"))) failure("InvalidWorkerProjection");
+  if (company.source_revision === undefined && company.source_generation !== undefined) failure("InvalidWorkerProjection");
   let active = 0, requests = 0, projectionRequests = 0;
   const controllers = new Set();
   const server = http.createServer(async (request, response) => {
@@ -92,7 +95,9 @@ export async function createWorkerBroker({ socket, model, company, companyClient
         const data = JSON.parse(result.content[0].text);
         if (data.revision !== company.source_revision || data.read_tracking !== "recorded") return error(409, "WorkerProjectionChanged");
         response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-        return response.end(JSON.stringify({ workspace: company.workspace, view: company.view, revision: company.source_revision, generation: companyClient.scope.execution.generation, data }));
+        // The image's source pin survives execution handoff. The bound client
+        // still authenticates every retrieval with the current execution fence.
+        return response.end(JSON.stringify({ workspace: company.workspace, view: company.view, revision: company.source_revision, generation: sourceGeneration, data }));
       }
       if (request.url === "/company/mcp" && companyClient) {
         if (request.method !== "POST") { response.setHeader("allow", "POST"); return error(405, "WorkerMcpMethodDenied"); }

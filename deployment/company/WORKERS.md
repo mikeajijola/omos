@@ -452,6 +452,10 @@ workspace, view, revision and execution generation for these reads and the
 native service checks current authority on every request. No source tree is
 copied when the logical company view is created.
 
+A retained image keeps its original source generation across execution handoff.
+The broker returns that source pin while its bound company client authenticates
+each retrieval with the current execution generation and authority.
+
 The private `omos_worker_projection` record commits each fetched file's hash,
 size and executable flag together with its bytes. Interrupted fetches can
 resume without restoring later local deletions. Bounds are 10,000 inventory

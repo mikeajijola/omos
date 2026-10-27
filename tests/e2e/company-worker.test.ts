@@ -326,23 +326,26 @@ test.skipIf(!support?.kernel_supported)("Linux workers isolate host content, cre
 }, 240000);
 
 
-test("worker projection reads pin identity and revision without exposing credentials or mutation routes", async () => {
+for (const handedOff of [false, true]) test(`worker projection reads pin identity and revision without exposing credentials or mutation routes${handedOff ? " after execution handoff" : ""}`, async () => {
   const f = fixture(), calls: any[] = [];
   const revision = "a".repeat(64), workspace = "b".repeat(64), view = "c".repeat(64), expiresMs = Date.now() + 60000;
   const companyClient = { identity: { workspace, actor: "worker", grant: "grant" }, scope: { view, expiresMs, execution: { runtime: "runtime", generation: 2 }, actions: ["read", "discover"] }, async call(name, input) {
     calls.push({ name, input }); return { content: [{ text: JSON.stringify({ revision, read_tracking: "recorded", files: [], total: 0, next_offset: null }) }] };
   } };
   const socket = join(f.home, "projection.sock");
-  const broker = await createWorkerBroker({ socket, expiresMs, companyClient, maxRequests: 1, model: { endpoint: "http://127.0.0.1:1/model", handle: "fixture", model: "fixture" }, company: { endpoint: "http://127.0.0.1:1/company", workspace, actor: "worker", grant: "grant", view, source_revision: revision, actions: ["read", "discover"] } });
+  const configuration = { socket, expiresMs, companyClient, maxRequests: 1, model: { endpoint: "http://127.0.0.1:1/model", handle: "fixture", model: "fixture" }, company: { endpoint: "http://127.0.0.1:1/company", workspace, actor: "worker", grant: "grant", view, source_revision: revision, ...(handedOff ? { source_generation: 1 } : {}), actions: ["read", "discover"] } };
+  const broker = await createWorkerBroker(configuration);
   try {
     const first = await local(socket, "/company/projection", { action: "inventory", offset: 0 });
-    expect(first.status).toBe(200); expect(JSON.parse(first.text)).toMatchObject({ workspace, view, revision, generation: 2 });
+    expect(first.status).toBe(200); expect(JSON.parse(first.text)).toMatchObject({ workspace, view, revision, generation: handedOff ? 1 : 2 });
     const second = await local(socket, "/company/projection", { action: "read", path: "documents/team/a.txt", offset: 16384 });
     expect(second.status).toBe(200); expect(calls[1].input).toMatchObject({ version: "omos.company/v2", action: "read", revision, path: "documents/team/a.txt", offset: 16384 });
     expect(calls[1].input.view).toBeUndefined(); expect(calls[1].input.execution).toBeUndefined();
-    for (const input of [{ action: "checkpoint", path: "documents/a" }, { action: "read", path: "documents/a", revision: "d".repeat(64) }, { action: "inventory", view }, { action: "inventory", offset: -1 }]) expect((await local(socket, "/company/projection", input)).status).toBe(400);
+    expect(companyClient.scope.execution.generation).toBe(2);
+    for (const input of [{ action: "checkpoint", path: "documents/a" }, { action: "read", path: "documents/a", revision: "d".repeat(64) }, { action: "inventory", view }, { action: "inventory", generation: 1 }, { action: "inventory", offset: -1 }]) expect((await local(socket, "/company/projection", input)).status).toBe(400);
     expect(calls).toHaveLength(2);
   } finally { await broker.close(); }
+  for (const source_generation of [0, 3, -1, "1", null]) await expect(createWorkerBroker({ ...configuration, company: { ...configuration.company, source_generation } })).rejects.toThrow("InvalidWorkerProjection");
 });
 
 test("host-held company keys bind native worker MCP calls to one view and execution generation", async () => {
