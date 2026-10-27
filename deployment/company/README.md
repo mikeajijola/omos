@@ -215,6 +215,14 @@ Definition and execution-policy reads resolve a moving selector once so both
 come from the same immutable revision. Live authority and publication checks
 still resolve current heads.
 
+The HTTP server also keeps a separate cache of immutable bytes across requests,
+bounded to 128 entries and 2 MiB of keys and content. Repository identities and
+complete revisions remain part of every key. Concurrent readers receive owned
+copies under a lock, so eviction cannot invalidate an active request. A full
+cache discards its disposable entries; restarting the service starts it empty.
+Access checks still apply on every request, including cached content. Neither
+query results nor permission decisions are shared through this cache.
+
 For resumable view updates, call `status` with the view identity and
 `progress_cursor: ""`. Consume `progress.next_cursor` pages, then retain
 `progress.resume_cursor` for the next poll. Each signed request rechecks the

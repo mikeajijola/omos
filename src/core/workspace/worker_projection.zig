@@ -104,6 +104,15 @@ fn body(original: workspace.Manager, source: Source, file: File) ![]const u8 {
     }
 }
 
+/// Canonical reads fetch the same pinned company inputs as filesystem tools.
+/// Personal reads and protected host records require no worker projection.
+pub fn hydrateRead(manager: workspace.Manager, task: workspace.Task, path: []const u8) !void {
+    if (!managed(path) or io.getenv("OMOS_WORKER_BROKER") == null or io.getenv("OMOS_WORKER_PROJECTION") == null) return;
+    const lease = try manager.projectionLease(task);
+    defer lease.release();
+    try hydrate(manager, task, .{ .path = path });
+}
+
 /// The caller holds the projection lease. Each file and its provenance commit
 /// together, so an interrupted fetch resumes without resurrecting later deletes.
 pub fn hydrate(original: workspace.Manager, task: workspace.Task, selection: @import("filesystem_projection.zig").Selection) !void {

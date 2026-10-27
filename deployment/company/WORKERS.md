@@ -442,12 +442,19 @@ external effect. Backends without this recovery interface leave pending jobs
 queued for operator inspection.
 
 Ordinary file tools fetch selected company files into the private Fossil branch
-before materialising them on disk. Skill discovery fetches skill entrypoints;
+before materialising them on disk. Canonical Fossil reads fetch the selected
+input through the same pinned source and commit its bytes and provenance before
+returning it. Already fetched files retain their private changes and deletions.
+Skill discovery fetches skill entrypoints;
 loading a skill fetches its package. A shell can open arbitrary files, so it
 fetches the permitted managed roots before execution. The broker fixes the
 workspace, view, revision and execution generation for these reads and the
 native service checks current authority on every request. No source tree is
 copied when the logical company view is created.
+
+A retained image keeps its original source generation across execution handoff.
+The broker returns that source pin while its bound company client authenticates
+each retrieval with the current execution generation and authority.
 
 The private `omos_worker_projection` record commits each fetched file's hash,
 size and executable flag together with its bytes. Interrupted fetches can
