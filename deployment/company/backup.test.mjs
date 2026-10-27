@@ -32,11 +32,16 @@ async function fixture(t) {
   await fs.writeFile(password, "fixture-backup-password-for-real-repository", {
     mode: 0o600,
   });
+  // CI tool-cache and checkout ancestors may be group-writable. Keep the
+  // production path guard and copy exact fixture executables to private paths.
+  const node = path.join(root, "node");
+  await fs.copyFile(await fs.realpath(process.execPath), node);
+  await fs.chmod(node, 0o700);
   const config = {
     version: "omos.company-backup/v1",
     workspace,
     profile: path.join(root, "profile"),
-    runtime: await fs.realpath(process.execPath),
+    runtime: node,
     fossil: await fs.realpath("/usr/bin/true"),
     restic: "/usr/bin/restic",
     repository: path.join(root, "repository"),
@@ -249,6 +254,17 @@ async function companyFixture(t) {
     process.env.OMOS_BACKUP_NATIVE_BINARY ??
       fileURLToPath(new URL("../../zig-out/bin/fx", import.meta.url)),
   );
+  const privateRuntime = path.join(f.root, "fx");
+  await fs.copyFile(runtime, privateRuntime);
+  await fs.chmod(privateRuntime, 0o700);
+  assert.equal(
+    createHash("sha256")
+      .update(await fs.readFile(privateRuntime))
+      .digest("hex"),
+    createHash("sha256")
+      .update(await fs.readFile(runtime))
+      .digest("hex"),
+  );
   const fossil = await fs.realpath("/usr/bin/fossil");
   const profile = f.config.profile;
   await fs.rm(path.join(profile, ".fx/omos-workspace.json"));
@@ -267,7 +283,7 @@ async function companyFixture(t) {
   const invoke = async (args) =>
     JSON.parse(
       (
-        await promisify(execFile)(runtime, args, {
+        await promisify(execFile)(privateRuntime, args, {
           cwd: f.root,
           env,
           timeout: 60000,
@@ -307,7 +323,7 @@ async function companyFixture(t) {
   const raw = {
     ...JSON.parse(await fs.readFile(f.file, "utf8")),
     workspace: ensured.workspace_id,
-    runtime,
+    runtime: privateRuntime,
     fossil,
     client_key_handles: ["backup-reader"],
     timeout_ms: 150000,
