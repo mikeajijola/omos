@@ -2407,9 +2407,9 @@ input.on('line',line=>{const request=JSON.parse(line);send({type:'response',id:r
   const started = Date.now();
   await expect(runWorkerNative({
     launch: () => child = spawn(process.env.OMOS_E2E_MCP_RUNTIME ?? Bun.which("node") ?? process.execPath, ["--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] }),
-    control: { async call(request) { if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false }; appends++; return { ok: false, uncertain: true }; } },
+    control: { async call(request) { if (request.action === "inspect") return { ok: true, next_offset: 0, ended: false }; appends++; return { ok: false, uncertain: true, error: "WorkerControlOutcomeUnknown" }; } },
     view: "view", execution: { runtime: "runtime", generation: 1 }, prompt: "Retain the pending request", timeout: 2000,
-  })).rejects.toThrow("WorkerActivityRetentionPending");
+  })).rejects.toMatchObject({ message: "WorkerActivityRetentionPending", retention: { kind: "activity", action: "append", offset: 0, error: "WorkerControlOutcomeUnknown" } });
   expect(appends).toBe(2); expect(Date.now() - started).toBeLessThan(5000);
   expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
 }, 10000);
@@ -2851,5 +2851,37 @@ test("worker failure notes retain bounded operation diagnostics without replayin
     } };
     const coordinator = createWorkerCoordinator({ control, backend: { async run() { runs++; throw Object.assign(Error("WorkerCompanyOutcomeUnresolved"), { companyOperation: { action: "submit", operation: "retained-operation", error: unsafe ? "private secret\n" : "CompanyOutcomeUnknown", transport: unsafe ? "/private/credential" : "CompanyHttp409" } }); } } });
     try { await coordinator.tick(); await coordinator.drain(); expect(runs).toBe(1); expect(note).toContain("action=submit; operation=retained-operation"); expect(note).toContain(unsafe ? "error=Unknown; transport=Unknown" : "error=CompanyOutcomeUnknown; transport=CompanyHttp409"); expect(note).not.toContain("private"); expect(note.length).toBeLessThanOrEqual(512); } finally { await coordinator.close(); }
+  }
+});
+
+test("worker archive retention preserves an unresolved position without resending a chunk", async () => {
+  const f = fixture(), filename = join(f.home, "retained-archive.fossil"), bytes = randomBytes(180 * 1024);
+  writeFileSync(filename, bytes);
+  const source = { workspace: "a".repeat(64), task: "b".repeat(64), revision: "c".repeat(64) };
+  for (const action of ["inspect", "chunk"]) {
+    const requests = [];
+    const control = { async call(request) {
+      requests.push(request.action);
+      if (request.action === action) return { ok: false, error: "WorkerControlOutcomeUnknown" };
+      return { ok: true, sha256: createHash("sha256").update(bytes).digest("hex"), bytes: bytes.length, resume_offset: 0, complete: false, archive_id: "d".repeat(64), revision: "e".repeat(64) };
+    } };
+    await expect(retainWorkerArchive({ filename, uid: process.getuid!(), source, view: "f".repeat(64), execution: { runtime: "worker", generation: 1 }, control })).rejects.toMatchObject({ message: "WorkerArchiveRetentionPending", retention: { kind: "archive", action, offset: 0, error: "WorkerControlOutcomeUnknown" } });
+    expect(requests).toEqual(action === "inspect" ? ["inspect"] : ["inspect", "chunk"]);
+    expect(readFileSync(filename).equals(bytes)).toBe(true);
+  }
+});
+
+test("worker failure notes retain bounded activity and archive positions without replaying work", async () => {
+  for (const kind of ["activity", "archive"]) for (const unsafe of [false, true]) {
+    let runs = 0, note;
+    const row = { sha256: "a".repeat(64), authority_live: true, contract: {}, request: "Retain work", basis: {}, grant: {}, execution: null, record: { state: "queued", binding: { view: "view" }, generation: 0, max_runtime_ms: 10000, expires_ms: 0 } };
+    const control = { async call(request) {
+      if (request.change === "claim") { row.record = { ...row.record, state: "running", runtime: request.execution.runtime, generation: 1, expires_ms: Date.now() + 20000 }; row.execution = { runtime: request.execution.runtime, generation: 1 }; }
+      if (request.change === "finish") { note = request.note; row.record.state = request.outcome; }
+      return { ok: true, jobs: [structuredClone(row)], next_offset: null };
+    } };
+    const action = kind === "activity" ? "append" : "chunk";
+    const coordinator = createWorkerCoordinator({ control, backend: { async run() { runs++; throw Object.assign(Error(kind === "activity" ? "WorkerActivityRetentionPending" : "WorkerArchiveRetentionPending"), { retention: { kind, action, offset: 131072, error: unsafe ? "private credential\n" : "WorkerControlOutcomeUnknown" } }); } } });
+    try { await coordinator.tick(); await coordinator.drain(); expect(runs).toBe(1); expect(note).toContain(`retention=${kind}; action=${action}; offset=131072`); expect(note).toContain(unsafe ? "error=Unknown" : "error=WorkerControlOutcomeUnknown"); expect(note).not.toContain("private"); expect(note.length).toBeLessThanOrEqual(512); } finally { await coordinator.close(); }
   }
 });

@@ -9,7 +9,10 @@ function failureNote(error) {
   const operation = error?.companyOperation;
   const details = operation && ["status", "read", "checkpoint", "submit"].includes(operation.action) && typeof operation.operation === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(operation.operation)
     ? ` action=${operation.action}; operation=${operation.operation}; error=${diagnosticCode(operation.error)}; transport=${diagnosticCode(operation.transport)}.` : "";
-  return `${cause}.${details} Inspect the retained isolated checkpoint before resuming.`;
+  const retention = error?.retention;
+  const retained = retention && ["activity", "archive"].includes(retention.kind) && ["inspect", "append", "chunk"].includes(retention.action) && Number.isSafeInteger(retention.offset) && retention.offset >= 0
+    ? ` retention=${retention.kind}; action=${retention.action}; offset=${retention.offset}; error=${diagnosticCode(retention.error)}.` : "";
+  return `${cause}.${details}${retained} Inspect the retained isolated checkpoint before resuming.`;
 }
 const sameOwner = (row, owned) => row?.record?.state === "running" && row.record.runtime === owned.runtime && row.record.generation === owned.generation && row.execution?.runtime === owned.runtime && row.execution.generation === owned.generation;
 

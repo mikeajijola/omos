@@ -149,7 +149,7 @@ try {
       stopping = new AbortController(); supervisor = start();
       continue;
     }
-    if (settings.timeoutMs === 600000 && !recoveredCollection && selected.record.state === "failed" && selected.record.invocations === 2 && selected.record.max_invocations === 3 && ["stopped", "retained"].includes(selected.record.checkpoint?.phase) && /^(WorkerCompanyOutcomeUnresolved|WorkerInvocationDeadline)\./.test(selected.record.note)) {
+    if (settings.timeoutMs === 600000 && !recoveredCollection && selected.record.state === "failed" && selected.record.invocations === 2 && selected.record.max_invocations === 3 && (["stopped", "retained"].includes(selected.record.checkpoint?.phase) || (selected.record.checkpoint?.phase === "running" && /^WorkerActivityRetentionPending\./.test(selected.record.note))) && /^(WorkerCompanyOutcomeUnresolved|WorkerInvocationDeadline|WorkerActivityRetentionPending|WorkerArchiveRetentionPending)\./.test(selected.record.note)) {
       // Exercise the remaining, already-authorized allowance after a bounded
       // collection stop. The outer test still requires the original actor call
       // count, exact file result, archives, validation, and publication receipt.

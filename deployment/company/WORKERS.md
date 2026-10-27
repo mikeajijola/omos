@@ -484,6 +484,13 @@ for its proposed files and retaining its public Fossil export. Runtime
 availability and compute authority are checked
 again when a user requests dispatch.
 
+Activity or archive retention can stop an invocation before collection finishes.
+Its recorded note identifies the retention stage, byte or event offset, and a
+bounded error code. The image and acknowledged records remain retained. An
+operator can requeue the task within its existing invocation allowance; the
+host inspects the retained checkpoint before resuming. This does not reset the
+allowance or replay an uncertain external effect.
+
 ### Retain public worker evidence
 
 Hosted actors cannot submit their own company proposal. After the actor and

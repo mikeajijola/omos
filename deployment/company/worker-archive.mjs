@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 const chunkBytes = 128 * 1024;
 const hash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const fail = code => { throw Error(code); };
+const retentionPending = (action, offset, error) => { throw Object.assign(Error("WorkerArchiveRetentionPending"), { retention: { kind: "archive", action, offset, error: typeof error === "string" && /^[A-Z][A-Za-z0-9_]{0,95}$/.test(error) ? error : "Unknown" } }); };
 
 // Native export publishes a verified repository with an exclusive hard link,
 // then removes its staging alias. A crash between those steps leaves two
@@ -83,15 +84,15 @@ export async function retainWorkerArchive({ filename, uid, source, view, executi
       const selected = { ...source, sha256: digest.digest("hex"), bytes: info.size };
       let retained;
       const resume = await control.call({ version: "omos.company-actor-archive-write/v1", action: "inspect", view, execution, source: selected, offset: 0, content: "" }, signal);
-      if (!resume.ok || resume.sha256 !== selected.sha256 || resume.bytes !== selected.bytes || !Number.isSafeInteger(resume.resume_offset) || resume.resume_offset < 0 || resume.resume_offset > info.size || (resume.resume_offset < info.size && resume.resume_offset % chunkBytes !== 0) || resume.complete !== (resume.resume_offset === info.size) || !hash(resume.archive_id) || !hash(resume.revision)) fail("WorkerArchiveRetentionPending");
+      if (!resume.ok || resume.sha256 !== selected.sha256 || resume.bytes !== selected.bytes || !Number.isSafeInteger(resume.resume_offset) || resume.resume_offset < 0 || resume.resume_offset > info.size || (resume.resume_offset < info.size && resume.resume_offset % chunkBytes !== 0) || resume.complete !== (resume.resume_offset === info.size) || !hash(resume.archive_id) || !hash(resume.revision)) retentionPending("inspect", 0, resume.error ?? "WorkerArchivePositionChanged");
       retained = resume;
       for (let offset = resume.resume_offset; offset < info.size; offset += chunkBytes) {
         const bytes = await read(offset);
         let result;
         try { result = await control.call({ version: "omos.company-actor-archive-write/v1", action: "chunk", view, execution, source: selected, offset, content: bytes.toString("base64") }, signal); }
-        catch { fail("WorkerArchiveRetentionPending"); }
+        catch (error) { retentionPending("chunk", offset, error?.message); }
         const next = offset + bytes.length < info.size ? offset + bytes.length : null;
-        if (!result.ok || result.view !== view || result.sha256 !== selected.sha256 || result.bytes !== selected.bytes || result.offset !== offset || result.next_offset !== next || result.complete !== (next === null) || !hash(result.archive_id) || !hash(result.revision) || (retained && retained.archive_id !== result.archive_id)) fail("WorkerArchiveRetentionPending");
+        if (!result.ok || result.view !== view || result.sha256 !== selected.sha256 || result.bytes !== selected.bytes || result.offset !== offset || result.next_offset !== next || result.complete !== (next === null) || !hash(result.archive_id) || !hash(result.revision) || (retained && retained.archive_id !== result.archive_id)) retentionPending("chunk", offset, result.error ?? "WorkerArchivePositionChanged");
         retained = result;
       }
       const after = await file.stat();
