@@ -845,6 +845,7 @@ describe("CLI work contracts", () => {
     const f = fixture(body => {
       if (isReview(body)) {
         reviews++;
+        expect(body.parallel_tool_calls).toBe(false);
         expect(body.tools.map((tool: any) => tool.function.name)).toEqual([
           "omos_contract_assessment", "omos_review_evidence", "omos_review_checkpoint",
         ]);
