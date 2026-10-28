@@ -184,13 +184,14 @@ describe("portable Fossil agent workspace", () => {
     const invalid = await f.run(["ask", "--resume-id", session, "The detail has changed", "--json"]);
     expect(invalid.code, invalid.stderr).toBe(1);
     expect(m.counts().actors).toBe(1);
+    expect(m.revisionPackets).toHaveLength(8);
     const pending = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(pending.revision_pending).toBe(true);
     expect(pending.definition.obligations.find((o: any) => o.id === "detail").description).toBe("Explain the initial detail");
     valid = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"]);
     expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
-    expect(m.revisionPackets).toHaveLength(2);
+    expect(m.revisionPackets).toHaveLength(9);
     const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(after.definition.version).toBe(pending.definition.version);
     expect(after.revision_pending).toBe(false);

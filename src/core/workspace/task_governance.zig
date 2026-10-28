@@ -126,6 +126,8 @@ pub const ReferenceConversation = struct { messages: []const ReferenceMessage, o
 
 /// Bounded, text-only conversation references. Tool results, host guidance,
 /// replay signatures and images cannot become planning authority here.
+/// Use an operation arena for scratch allocations and the returned message
+/// slice. Message text borrows from history and must not outlive it.
 pub fn referenceConversation(alloc: std.mem.Allocator, history: []const types.ChatMessage) !ReferenceConversation {
     var selected: std.ArrayList(ReferenceMessage) = .empty;
     var remaining: usize = 48 * 1024;

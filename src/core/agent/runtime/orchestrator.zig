@@ -13118,7 +13118,11 @@ fn finishFailedTurnWithNotice(
     notice: []const u8,
     trace_outcome: []const u8,
 ) !void {
-    if (deps.report_failure) |report| report(deps.ctx, trace_outcome);
+    if (std.mem.eql(u8, trace_outcome, "workspace_governance_pending") or
+        std.mem.eql(u8, trace_outcome, "workspace_preparation_pending"))
+    {
+        if (deps.report_failure) |report| report(deps.ctx, trace_outcome);
+    }
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
     if (stop_state.retained_candidate != null) {
