@@ -6910,6 +6910,8 @@ const ContractCandidate = struct {
     api_key: []const u8,
     model: []const u8,
     root_user_context: []const u8,
+    conversation: []const ChatMessage = &.{},
+    usage_owner: ?*runtime_agent.Agent = null,
     turn_id: u64,
     step: usize,
     managed: ?*managed_task.Turn = null,
@@ -7004,6 +7006,7 @@ noinline fn assessCompletionAttempt(
     const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(arena, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
     var attempt_usage: types.Usage = .{};
     defer if (attempt_usage.input_tokens != null or attempt_usage.output_tokens != null) {
+        if (input.usage_owner) |owner| owner.observeUsage(attempt_usage);
         if (deps.report_usage) |report| report(deps.ctx, attempt_usage);
         summary.prepareTokenRequest();
         _ = summary.reconcileTokenRequest(attempt_usage, false);
@@ -7089,7 +7092,21 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .cooperative_pulse = deps.cooperative_transport_pulse,
         .cancel_flag = input.config.cancel_flag,
     };
+    var usage: types.Usage = .{};
+    defer if (usage.input_tokens != null or usage.output_tokens != null) {
+        if (input.usage_owner) |owner| owner.observeUsage(usage);
+        if (deps.report_usage) |report| report(deps.ctx, usage);
+        summary.prepareTokenRequest();
+        _ = summary.reconcileTokenRequest(usage, false);
+    };
+    const repository_context = input.job.context_snapshot.modelVisibleBytes();
     const packet = try std.json.Stringify.valueAlloc(alloc, .{
+        .workspaceRoot = turn.task.project_root,
+        .rootUserContext = @import("review_evidence.zig").View.prefix(input.root_user_context, 8192),
+        .rootUserContextBytes = input.root_user_context.len,
+        .referenceConversation = try task_governance.referenceConversation(alloc, input.conversation),
+        .repositoryContext = @import("review_evidence.zig").View.prefix(repository_context, 16384),
+        .repositoryContextBytes = repository_context.len,
         .originalRequest = try turn.manager.originalRequest(turn.task),
         .amendments = turn.task.amendments,
         .pendingAmendments = turn.task.amendments[@min(turn.task.planned_amendments, turn.task.amendments.len)..],
@@ -7100,16 +7117,15 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};
     const reply = if (planning)
         if (turn.task.revision_pending and turn.task.model_basis != null and turn.task.model_basis.?.capability != null)
-            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal())
+            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
         else
-            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal())
+            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
     else
-        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads);
-    if (deps.report_usage) |report| report(deps.ctx, reply.usage);
-    summary.prepareTokenRequest();
-    _ = summary.reconcileTokenRequest(reply.usage, false);
+        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage });
     return reply;
 }
+
+const governance_pause_notice = "Task planning or progress verification could not finish within its bounded review. Your work and evidence are retained. Continue to resume from the retained work.";
 
 noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate) !bool {
     const turn = input.managed orelse return false;
@@ -7274,7 +7290,11 @@ fn processQueuedPromptLoop(
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     if (managed) |*turn| {
-        _ = try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn });
+        _ = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = 0, .managed = turn }) catch |err| {
+            if (err != error.TaskGovernancePending) return err;
+            try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+            return;
+        };
         job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         if (turn.review_only_candidate) |candidate| {
             try deps.push_system_notice(deps.ctx, "Resuming verification of the retained answer; completed actions will not be repeated.");
@@ -7286,6 +7306,7 @@ fn processQueuedPromptLoop(
                 .api_key = active_api_key,
                 .model = job.model,
                 .root_user_context = root_user_intent_context,
+                .usage_owner = agent,
                 .turn_id = turn_id,
                 .step = 0,
                 .managed = turn,
@@ -7313,7 +7334,12 @@ fn processQueuedPromptLoop(
     }
     if (managed) |*turn| {
         if (turn.task.model_basis != null) {
-            const retained_evidence = try turn.beforeReview(arena, &.{});
+            const retained_evidence = turn.beforeReview(arena, &.{}) catch |err| {
+                try turn.manager.record(turn.task, "invocation_failure", .{ .phase = "source_evidence_preparation", .reason = @errorName(err), .retained = true });
+                if (err == error.Cancelled or err == error.OutOfMemory) return err;
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, try arena.print("Workspace evidence could not be prepared ({s}). Your task is retained. Check the workspace files and repository boundaries before continuing.", .{@errorName(err)}), "workspace_preparation_pending");
+                return;
+            };
             try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
@@ -7466,7 +7492,12 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| {
             try turn.progress(arena, within_turn_suffix.items);
-            if (try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn })) {
+            const revised_plan = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }) catch |err| {
+                if (err != error.TaskGovernancePending) return err;
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+                return;
+            };
+            if (revised_plan) {
                 governance = .{};
                 const retained_evidence = try turn.beforeReview(arena, &.{});
                 try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
@@ -7488,7 +7519,11 @@ fn processQueuedPromptLoop(
             }
             if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
-                const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn }, false);
+                const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false) catch |err| {
+                    if (err != error.TaskGovernancePending) return err;
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+                    return;
+                };
                 const progress = try record_json.decode(task_governance.Progress, arena, reply.raw, .{});
                 for (progress.remaining, 0..) |id, i| {
                     var found = false;
@@ -10022,6 +10057,7 @@ fn processQueuedPromptLoop(
                         .api_key = active_api_key,
                         .model = successful_gateway_model,
                         .root_user_context = root_user_intent_context,
+                        .usage_owner = agent,
                         .turn_id = turn_id,
                         .step = current_step_index,
                     });
@@ -12897,6 +12933,7 @@ fn processQueuedPromptLoop(
                     .api_key = active_api_key,
                     .model = successful_gateway_model,
                     .root_user_context = root_user_intent_context,
+                    .usage_owner = agent,
                     .turn_id = turn_id,
                     .step = current_step_index,
                 });
@@ -13081,6 +13118,7 @@ fn finishFailedTurnWithNotice(
     notice: []const u8,
     trace_outcome: []const u8,
 ) !void {
+    if (deps.report_failure) |report| report(deps.ctx, trace_outcome);
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
     if (stop_state.retained_candidate != null) {

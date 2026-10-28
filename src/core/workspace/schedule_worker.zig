@@ -116,7 +116,7 @@ fn failureState(err: anyerror) scheduling.State {
 
 pub fn errorFromCode(code: ?[]const u8) anyerror {
     const value = code orelse return error.ScheduledRunFailed;
-    for ([_][]const u8{ "contract_blocked", "verification_pending", "workspace_invocation_budget", "workspace_progress_paused", "workspace_publication_pending", "step_limit" }) |pending| {
+    for ([_][]const u8{ "contract_blocked", "verification_pending", "workspace_invocation_budget", "workspace_progress_paused", "workspace_governance_pending", "workspace_preparation_pending", "workspace_publication_pending", "step_limit" }) |pending| {
         if (std.mem.eql(u8, value, pending)) return error.ScheduledContinuationRequired;
     }
     inline for (.{ error.Cancelled, error.WorkspaceExecutionBusy, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition }) |err| {
@@ -222,6 +222,8 @@ test "scheduled execution holds input and ambiguous continuation failures" {
     try std.testing.expectEqual(scheduling.State.waiting, failureState(error.ScheduledInputRequired));
     try std.testing.expectEqual(scheduling.State.failed, failureState(error.InvalidSessionFormat));
     try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("contract_blocked")));
+    try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("workspace_governance_pending")));
+    try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("workspace_preparation_pending")));
 }
 
 test "schedule workers generate an owner accepted by the durable claim fence" {

@@ -197,3 +197,33 @@ describe("portable Fossil agent workspace", () => {
   }, 120000);
 
 });
+
+
+test("follow-up planning retains the referenced specification and repository validation context", async () => {
+  const f = fixture();
+  const spec = "Each weekly recurrence creates a fresh work contract and preserves occurrence evidence.";
+  const validation = "test -s schedule.txt";
+  writeFileSync(join(f.cwd, "AGENTS.md"), `Validate fixture source changes with ${validation}.`);
+  const plans: any[] = [];
+  const commands = ["printf 'recurring\\n' > schedule.txt", validation];
+  const m = model(f, (_body, count) => count === 1 ? { content: spec } : count <= 3 ? {
+    tool_calls: [{ index: 0, id: `implement-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: commands[count - 2], timeout_ms: 10000 } }) } }],
+  } : { content: "Implemented schedule.txt and verified it with the repository check." }, undefined, {
+    plan(packet) {
+      plans.push(packet);
+      return packet.context.originalRequest === "Implement the feature" ? { capability: "coding_task", summary: "Implement the referenced weekly scheduling specification", obligations: [{ id: "weekly_contracts", description: spec }], checks: [validation] } : { capability: "general_task", summary: "Write the requested specification", obligations: [], checks: [] };
+    },
+  });
+  const first = await f.run(["ask", "Write a specification for recurring tasks", "--json"], {}, 120000);
+  expect(first.code, first.stderr).toBe(0);
+  const session = JSON.parse(first.stdout).session_id;
+  const second = await f.run(["ask", "--resume-id", session, "Implement the feature", "--json"], {}, 120000);
+  expect(second.code, second.stderr + second.stdout).toBe(0);
+  expect(m.counts().actors).toBe(4);
+  expect(plans).toHaveLength(2);
+  expect(plans[1].context.referenceConversation.messages.some((message: any) => message.role === "assistant" && message.text === spec)).toBe(true);
+  expect(plans[1].context.rootUserContext).toContain("Write a specification for recurring tasks");
+  expect(plans[1].context.repositoryContext).toContain(validation);
+  expect(plans[1].context.workspaceRoot).toBe(f.cwd);
+  expect(readFileSync(join(f.cwd, "schedule.txt"), "utf8")).toBe("recurring\n");
+}, 120000);
