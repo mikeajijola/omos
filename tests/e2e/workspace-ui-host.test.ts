@@ -1,7 +1,8 @@
 import {afterEach,expect,test} from 'bun:test';
 import {resolve,join} from 'node:path';
-import {existsSync,mkdirSync,readFileSync} from 'node:fs';
+import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
+import {createHash} from 'node:crypto';
 import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
 const clients:NativeClient[]=[];
@@ -160,6 +161,8 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
 
 test('background contracts release the main chat while workers await input and publish independently', async () => {
  const f = fixture(); let answered = false; let workerCalls = 0;
+ const pngBase64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+ const imagePath=join(f.cwd,'reference.png');writeFileSync(imagePath,Buffer.from(pngBase64,'base64'));
  model(f, (body) => {
   const names = body.tools?.map((tool:any) => tool.function?.name) || [];
   if (!names.includes('write_file')) {
@@ -169,9 +172,12 @@ test('background contracts release the main chat while workers await input and p
    return {tool_calls:[{index:0,id:'dispatch-original-contract',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
   }
   workerCalls++;
+  const images=body.messages.flatMap((message:any)=>Array.isArray(message.content)?message.content.filter((part:any)=>part.type==='image_url'):[]);
+  expect(images.some((part:any)=>part.image_url?.url===`data:image/png;base64,${pngBase64}`)).toBe(true);
   if (!answered) return questionCall();
   return {content:'The requested report uses the chosen brief presentation.'};
  });
+ const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));settings.providers.local.model_metadata['fixture-model'].supports_vision=true;writeFileSync(settingsPath,JSON.stringify(settings));
  expect((await f.run(['fossil','init','--json'])).code).toBe(0);
  const native = host(f); const observed:any[] = [];
  native.on('event', (event:any) => observed.push(event));
@@ -182,7 +188,7 @@ test('background contracts release the main chat while workers await input and p
  };
  try {
   const ending = terminal(native,'dispatch-report');
-  await native.request('coordinate',{text:'Prepare the report after I choose its presentation.'},{id:'dispatch-report'});
+  await native.request('coordinate',{text:'Prepare the report using the attached reference after I choose its presentation.',images:[imagePath]},{id:'dispatch-report'});
   const handoffEnd = await ending;
   if (handoffEnd.data.exit_code) console.error(JSON.stringify(observed), native.stderr);
   expect(handoffEnd.data.exit_code).toBe(0);
@@ -190,6 +196,12 @@ test('background contracts release the main chat while workers await input and p
   expect(dispatched).toBeDefined();
   const original = (await native.request('background')).workers[0].record;
   expect(original.state).not.toBe('completed'); expect(original.publication_revision).toBeNull();
+  const repositoryHash=createHash('sha256').update(join(f.cwd,'omos.fossil')).digest('hex');
+  const activation=JSON.parse(readFileSync(join(f.home,'.fx','fossil',repositoryHash,'background','authority',original.operation+'.json'),'utf8'));
+  expect(activation.images).toHaveLength(1);expect(activation.images[0].inline_data).toBeNull();
+  expect(createHash('sha256').update(readFileSync(activation.images[0].snapshot_path)).digest('hex')).toBe(activation.images[0].snapshot_sha256);
+  // Original upload paths are mutable; the worker owns verified snapshot bytes.
+  writeFileSync(imagePath,'The original upload was replaced after handoff.');
   const session = observed.find(e=>e.data.type==='session').data.session_id;
   const running = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.state==='running');
   const input = await until(()=>native.request('background',{action:'events',task:original.task,generation:running.generation}), value=>value.events.some((e:any)=>e.data.type==='input_required'));

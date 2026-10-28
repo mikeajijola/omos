@@ -387,6 +387,12 @@ publication receipt. Permission questions and UI compilation requests stay
 pending until the trusted CLI or browser host responds. The existing synchronous
 subagent tool remains available to workers and direct execution clients.
 
+Image inputs retain their original identities and verified bytes. The handoff
+copies immutable snapshots into private host storage and records references in
+local activation, rather than embedding image payloads in a dispatch record.
+The worker receives its own verified copies, so replacing an original upload or
+closing the main session cannot change its inputs.
+
 Use `omos fossil workers --json` or `/task workers` to inspect dispatches. Trusted
 controls use a JSON request file:
 

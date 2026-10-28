@@ -928,6 +928,21 @@ const AskContext = struct {
         if (self.v2 != null) try image_attachments.inlineCapturedSnapshots(self.alloc, attachments);
     }
 
+    fn inheritBackgroundImages(self: *AskContext, sources: []const ImageAttachment) ![]ImageAttachment {
+        const snapshot_dir = try self.imageSnapshotStorageDir();
+        defer self.alloc.free(snapshot_dir);
+        const images = try self.alloc.alloc(ImageAttachment, sources.len);
+        errdefer self.alloc.free(images);
+        var copied: usize = 0;
+        errdefer for (images[0..copied]) |image| types.freeImageAttachment(self.alloc, image);
+        for (sources, images) |source, *image| {
+            image.* = try image_attachments.copyVerifiedImageAttachmentToDir(self.alloc, source, source.id, snapshot_dir);
+            copied += 1;
+        }
+        if (self.v2 != null) try image_attachments.inlineCapturedSnapshots(self.alloc, images);
+        return images;
+    }
+
     /// Record whether restored history references shell execution handles this
     /// process does not own. Registry membership, not the resume itself,
     /// decides staleness (see session_runtime.detectStaleShellHandles).
@@ -1980,18 +1995,22 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer types.freeImageAttachmentSlice(alloc, restored_image_catalog);
     const restored_image_bounds = try image_attachments.calculate_next_image_id(restored_image_catalog);
 
-    const current_images = try types.dupeImageAttachmentSlice(
-        alloc,
-        if (recovery_checkpoint) |checkpoint|
-            checkpoint.user.images
-        else
-            options.images,
-    );
+    const inherited_images: []const ImageAttachment = if (ctx.deps.ui_host) |ui| if (ui.background_authority) |authority| if (ctx.requested_resume == null) authority.images else &.{} else &.{} else &.{};
+    const current_images = if (inherited_images.len > 0)
+        try ctx.inheritBackgroundImages(inherited_images)
+    else
+        try types.dupeImageAttachmentSlice(
+            alloc,
+            if (recovery_checkpoint) |checkpoint|
+                checkpoint.user.images
+            else
+                options.images,
+        );
     defer types.freeImageAttachmentSlice(alloc, current_images);
     defer if (recovery_checkpoint == null and options.save_session and !ctx.prompt_snapshot_committed) {
         image_attachments.deleteUnreferencedImageSnapshots(current_images, restored_image_catalog);
     };
-    if (recovery_checkpoint == null and current_images.len > 0) {
+    if (recovery_checkpoint == null and current_images.len > 0 and inherited_images.len == 0) {
         try ctx.checkCancellation();
         _ = std.math.add(
             usize,

@@ -21,6 +21,7 @@ pub const Authority = struct {
     root_user_context: []const u8,
     root_user_messages: []const []const u8,
     root_user_evidence_complete: bool,
+    images: []const types.ImageAttachment = &.{},
     source_session: []const u8,
     project_root: []const u8,
     policy_sha256: []const u8,
@@ -109,7 +110,16 @@ pub fn activate(manager: workspace.Manager, entry: background.Record, authority:
         !std.mem.eql(u8, entry.operation, authority.operation) or
         !std.mem.eql(u8, entry.request_sha256, authority.request_sha256)) return error.BackgroundAuthorityMismatch;
     const file_path = try path(manager, "authority", try manager.alloc.print("{s}.json", .{entry.operation}));
-    const bytes = try std.json.Stringify.valueAlloc(manager.alloc, authority, .{});
+    var captured = authority;
+    if (authority.images.len > 0) {
+        const snapshot_dir = try path(manager, "images", entry.operation);
+        const images = try manager.alloc.alloc(types.ImageAttachment, authority.images.len);
+        for (authority.images, images) |source, *image| {
+            image.* = try @import("../images/image_attachments.zig").copyVerifiedImageAttachmentToDir(manager.alloc, source, source.id, snapshot_dir);
+        }
+        captured.images = images;
+    }
+    const bytes = try std.json.Stringify.valueAlloc(manager.alloc, captured, .{});
     write(manager, file_path, bytes) catch |err| switch (err) {
         error.PathAlreadyExists => {
             if (!std.mem.eql(u8, bytes, try read(manager, file_path))) return error.BackgroundAuthorityChanged;

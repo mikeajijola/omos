@@ -148,6 +148,7 @@ pub const Context = struct {
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
     root_user_evidence_complete: bool = false,
+    background_image_catalog: []const types.ImageAttachment = &.{},
     current_turn_messages: []const ChatMessage = &.{},
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
@@ -877,6 +878,7 @@ fn executeRegisteredTool(
     };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     var background_context = ctx;
+    background_context.background_image_catalog = authorized_image_catalog;
     if (ctx.fossil_workspace_available) {
         dispatch_ctx.background_dispatch_ctx = &background_context;
         dispatch_ctx.background_dispatch_fn = dispatchBackgroundContract;
@@ -2238,6 +2240,7 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
         .root_user_context = ctx.root_user_intent_context,
         .root_user_messages = ctx.root_user_messages,
         .root_user_evidence_complete = ctx.root_user_evidence_complete,
+        .images = ctx.background_image_catalog,
         .source_session = session_id,
         .project_root = task.project_root,
         .policy_sha256 = try control.policyDigest(manager, task.project_root),
