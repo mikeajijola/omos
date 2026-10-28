@@ -10,6 +10,8 @@ Supported operations:
 | --- | --- |
 | `initialize` | Inspect the transport version, project and active invocation. |
 | `prompt` | Run a saved native turn with optional session, model, effort and host-resolved images. |
+| `coordinate` | Run the main conversation with read-only inspection and durable handoff of its unchanged contract to an independent worker. |
+| `background` | Inspect workers and bounded event pages, or submit trusted generation-fenced guidance, cancellation, input, validation and resumption controls. |
 | `events`, `session.events` | Retrieve up to 32 retained public events by byte offset. |
 | `cancel`, `steer` | Stop or steer the exact active invocation. |
 | `input` | Resolve an exact pending native question or permission request. |
@@ -24,6 +26,8 @@ Supported operations:
 | `task.resume` | Select retained work with a current task revision fence. Explicit `rebind_project: true` relocates eligible personal work to the host's project and requires fresh source validation. |
 
 A repeated prompt ID must identify the same request. Reconnection reads events; it never starts another invocation. If the native process stops, the external host reports retained partial work and requires explicit continuation.
+
+A coordinated handoff releases the main session's task selection after its checkpoint is durable. It reports delegated work rather than completed obligations. Background workers own independent saved sessions and task leases; only independently verified Fossil publication establishes completion. Worker input and validation decisions belong to the trusted external host. Its main conversation can continue while a worker waits. See [background contract workers](README.md#background-contract-workers) for lifecycle, local activation and recovery semantics.
 
 Complete frontend source belongs under `ui/`. Its manifest pins `omos.ui-source/v1`, `omos.ui-bridge/v1`, `omos.react/v1` and the external compiler identity. The host creates a compilation receipt with version `omos.ui-validation/v1`, status, compiler and bundle identities, and the exact source-file hashes and sizes. Only trusted external host code may answer validation requests. Editable interface code must not have this authority or permission approval authority.
 
