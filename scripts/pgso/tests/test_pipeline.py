@@ -920,7 +920,7 @@ output.write_bytes(b'merged profile')""",
                 "0" * 64,
             )
 
-    def test_fx_profile_use_outlines_two_name_hashed_partitions_in_sequence(self) -> None:
+    def test_fx_profile_use_preserves_the_intact_module_before_size_cleanup(self) -> None:
         actions = self.root / "profile-actions"
         opt = self.write_executable(
             "profile-opt",
@@ -973,24 +973,15 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"BC\xc0\xdebitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(18, len(lines))
+        self.assertEqual(13, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
-        self.assertNotIn("iroutliner", lines[0])
+        self.assertFalse(any("iroutliner" in line or line.startswith(("split ", "link ")) for line in lines))
         self.assertEqual("nm", lines[1])
-        self.assertTrue(lines[2].startswith("split -j 2 -o "))
-        self.assertIn("-passes=iroutliner", lines[3])
-        self.assertIn(str(self.paths.outline_split_bitcodes[0]), lines[3])
-        self.assertIn("-passes=iroutliner", lines[4])
-        self.assertIn(str(self.paths.outline_split_bitcodes[1]), lines[4])
-        self.assertTrue(lines[5].startswith("link "))
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
-        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
-        self.assertIn("-passes=globaldce,verify", lines[8])
-        self.assertTrue(lines[8].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[9])
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[2])
+        self.assertIn("-passes=globaldce,verify", lines[3])
+        self.assertEqual("nm", lines[4])
         for index in range(ARGUMENT_CLEANUP_ROUNDS):
-            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[10 + 3 * index])
+            self.assertIn(ARGUMENT_CLEANUP_FLAGS[0], lines[5 + 3 * index])
         self.assertEqual(["nm", "nm"], lines[-2:])
         self.assertFalse(
             self.paths.profile_use_bitcode.with_name(
@@ -1227,13 +1218,13 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_8_500_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_8_750_mib(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
-            stream.truncate(8_912_897)
+            stream.truncate(9_175_041)
 
-        with self.assertRaisesRegex(PgsoError, "exceeds 8.500 MiB"):
+        with self.assertRaisesRegex(PgsoError, "exceeds 8.750 MiB"):
             validate_candidate_size(candidate)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:

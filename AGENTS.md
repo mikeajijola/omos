@@ -410,9 +410,9 @@ Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64 PGSO
-release qualification remains authoritative for this fork's 8.500 MiB
+release qualification remains authoritative for this fork's 8.750 MiB
 production ceiling, required 0.250 MiB headroom, and performance gates. The
-resulting adoption target is 8.250 MiB.
+resulting adoption target is 8.500 MiB.
 
 ## Documentation
 

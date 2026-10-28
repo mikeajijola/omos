@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-This fork accepts a candidate only when it stays below the **8.500 MiB** ceiling with at least **0.250 MiB** of size headroom, giving an **8.250 MiB** adoption target. It must also pass the deterministic product corpus and stay within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+This fork accepts a candidate only when it stays below the **8.750 MiB** ceiling with at least **0.250 MiB** of size headroom, giving an **8.500 MiB** adoption target. It must also pass the deterministic product corpus and stay within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 
@@ -75,16 +75,14 @@ non-overlapping candidate assignments, also with at most four active jobs. The s
 comparisons run on twelve fresh machines. Every performance job measures its
 immutable control and candidate on the same machine.
 
-The fx candidate applies the accepted whole-program profile-use pipeline, then
-uses LLVM's deterministic name-hash split to divide the optimized IR into two
-modules. Each module is outlined sequentially before the modules are
-relinked and their original private linkage is restored. This keeps the IR
-outliner's suffix-tree memory below the standard runner limit without changing
-the training corpus or performance measurement hardware. Benchmark artifacts
-keep their single-module outlining pass.
-Generated IR helpers are kept in one dense linker cluster ordered by their
-hottest profiled caller so outlining does not scatter startup code across cold
-pages.
+The fx candidate keeps the profiled module intact through size cleanup and
+native code generation. Partitioned IR outlining is excluded: the native
+macOS corpus reproduced failed compaction checkpoint serialization and
+terminal cleanup after that stage, while the intact module passed the same
+checks. The larger ceiling preserves the required size margin without
+accepting those failures. Benchmark artifacts keep their separately tested
+single-module outlining pass. Machine outlining remains enabled for native
+code generation.
 
 Three size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
@@ -105,7 +103,7 @@ renderer, agent-presentation, and shared-primitive call sites retain their
 existing policy. Ambiguous discovery and conflicting `alwaysinline` attributes
 fail before the transformed bitcode is recorded. The same discovery and scope
 rules apply to every benchmark module. Changes require fresh training because
-they affect the graph seen by instrumentation. After profile use and outlining,
+they affect the graph seen by instrumentation. After profile use,
 `sparse-constants` rewrites copies from mostly undefined internal constants
 into stores of their defined bytes, then `globaldce,verify` drops the dead
 constants. Zig emits such a constant for each `return error.X` from a

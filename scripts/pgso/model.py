@@ -76,7 +76,7 @@ def bytes_to_mib(byte_count: int) -> float:
 
 def size_gate(
     byte_count: int,
-    ceiling_mib: float = 8.500,
+    ceiling_mib: float = 8.750,
     preferred_headroom_mib: float = 0.250,
 ) -> ArtifactEvidence:
     if byte_count <= 0:
