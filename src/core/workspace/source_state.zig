@@ -28,18 +28,41 @@ pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []con
         }
         var file = try std.Io.Dir.cwd().openFile(io.getIo(), path, .{ .allow_directory = false, .follow_symlinks = false });
         defer file.close(io.getIo());
-        const bytes = try io.readFileToEnd(alloc, &file, 16 * 1024 * 1024);
-        defer alloc.free(bytes);
-        total += bytes.len;
-        if (total > 256 * 1024 * 1024) return error.SourceStateTooLarge;
-        hashEntry(&hasher, entry.path, .file, @intCast(stat.permissions.toMode() & 0o7777), bytes);
+        const opened = try file.stat(io.getIo());
+        if (opened.size > 256 * 1024 * 1024 - total) return error.SourceStateTooLarge;
+        var content = std.crypto.hash.sha2.Sha256.init(.{});
+        var reader_buffer: [32768]u8 = undefined;
+        var chunk: [32768]u8 = undefined;
+        var reader = file.reader(io.getIo(), &reader_buffer);
+        var bytes: usize = 0;
+        while (true) {
+            const count = try reader.interface.readSliceShort(&chunk);
+            if (count == 0) break;
+            if (count > 256 * 1024 * 1024 - total) return error.SourceStateTooLarge;
+            total += count;
+            bytes += count;
+            content.update(chunk[0..count]);
+        }
+        const after = try file.stat(io.getIo());
+        if (bytes != opened.size or after.size != opened.size or !std.meta.eql(opened.mtime, after.mtime) or after.permissions.toMode() != opened.permissions.toMode()) return error.SourceStateChanged;
+        var content_hash: [32]u8 = undefined;
+        content.final(&content_hash);
+        hashDigest(&hasher, entry.path, .file, @intCast(opened.permissions.toMode() & 0o7777), &content_hash);
     }
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
 }
 
-fn hashEntry(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8, kind: enum(u8) { file, link }, permissions: u16, bytes: []const u8) void {
+const Kind = enum(u8) { file, link };
+
+fn hashEntry(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8, kind: Kind, permissions: u16, bytes: []const u8) void {
+    var content_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &content_hash, .{});
+    hashDigest(hasher, path, kind, permissions, &content_hash);
+}
+
+fn hashDigest(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8, kind: Kind, permissions: u16, content_hash: *const [32]u8) void {
     hasher.update(path);
     hasher.update(&.{ 0, @backingInt(kind) });
     var mode: [2]u8 = undefined;
@@ -47,9 +70,27 @@ fn hashEntry(hasher: *std.crypto.hash.sha2.Sha256, path: []const u8, kind: enum(
     hasher.update(&mode);
     // Fixed-width content digests keep link targets from running into the next
     // path. The kind also distinguishes a link from a file with the same bytes.
-    var content_hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &content_hash, .{});
-    hasher.update(&content_hash);
+    hasher.update(content_hash);
+}
+
+test "source fingerprint streams large files and preserves the aggregate scan budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "large.bin", .{ .read = true });
+    defer file.close(std.testing.io);
+    const chunk: [32768]u8 = @splat('a');
+    for (0..544) |_| try file.writeStreamingAll(std.testing.io, &chunk);
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repository = try std.Io.Dir.path.join(alloc, &.{ root, "omos.fossil" });
+    const before = try fingerprint(alloc, root, repository);
+    try file.writeStreamingAll(std.testing.io, "changed tail");
+    const after = try fingerprint(alloc, root, repository);
+    try std.testing.expect(!std.mem.eql(u8, before, after));
+    try file.setLength(std.testing.io, 256 * 1024 * 1024 + 1);
+    try std.testing.expectError(error.SourceStateTooLarge, fingerprint(alloc, root, repository));
 }
 
 test "source fingerprints frame link targets, file kinds, and permissions" {
