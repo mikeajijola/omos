@@ -293,7 +293,7 @@ const function_schema: schema.FunctionSchema = .{
 };
 const evidence_schema: schema.FunctionSchema = .{
     .name = "omos_review_evidence",
-    .description = "Read-only retrieval within the pinned review manifest. Query exact metadata or relationships, search text, inspect coverage gaps, read original bytes, or list segment assessments. Search previews cannot prove omitted content.",
+    .description = "Read-only retrieval within the pinned review manifest. Query exact metadata or relationships, search text, inspect coverage gaps, read original bytes, or list segment assessments. Record pages are capped at 32 entries; continue with nextOffset. Search previews cannot prove omitted content.",
     .input_schema = .{
         .properties = &.{
             .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "read", "assessments", "query", "search", "related", "coverage" } } },

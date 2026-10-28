@@ -229,7 +229,8 @@ pub const View = struct {
             limit: usize = 16,
         };
         const command = try record_json.decode(Command, alloc, raw, .{});
-        if (command.limit == 0 or command.limit > 32) return error.InvalidEvidenceOffset;
+        if (command.limit == 0) return error.InvalidEvidenceOffset;
+        const limit = @min(command.limit, 32);
         if (command.action == .coverage) {
             const id = command.id orelse return error.InvalidContractEvidence;
             for (self.records, 0..) |record, ordinal| {
@@ -286,7 +287,7 @@ pub const View = struct {
                     std.ascii.findIgnoreCase(value.arguments orelse "", query) == null and
                     std.ascii.findIgnoreCase(record.tool orelse "", query) == null) continue;
             }
-            if (total >= command.offset and rows.items.len < command.limit) try rows.appendSlice(alloc, try self.index(alloc, ordinal, 1));
+            if (total >= command.offset and rows.items.len < limit) try rows.appendSlice(alloc, try self.index(alloc, ordinal, 1));
             total += 1;
         }
         return std.json.Stringify.valueAlloc(alloc, .{ .evidence = rows.items, .total = total, .complete = true, .scope = "pinned_review_manifest", .nextOffset = if (command.offset +| rows.items.len < total) @as(?usize, command.offset + rows.items.len) else null }, .{});
@@ -354,6 +355,53 @@ pub const View = struct {
 
 fn optionalMatch(filter: ?[]const u8, value: ?[]const u8) bool {
     return if (filter) |expected| if (value) |actual| std.mem.eql(u8, expected, actual) else false else true;
+}
+
+test "completion review caps oversized record pages without losing records or inspecting previews" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const content = try alloc.alloc(u8, 3000);
+    @memset(content, 'x');
+    @memcpy(content[0..6], "needle");
+    var evidence: [65]Evidence = undefined;
+    for (&evidence, 0..) |*record, index| record.* = .{
+        .id = try std.fmt.allocPrint(alloc, "record-{d}", .{index}),
+        .tool = "shell",
+        .action_id = "shared-action",
+        .content = content,
+    };
+    for ([_][]const u8{ "query", "search", "related" }) |action| {
+        var view = try View.init(alloc, &evidence);
+        var offset: usize = 0;
+        while (true) {
+            const request = try std.json.Stringify.valueAlloc(alloc, .{
+                .action = action,
+                .query = if (std.mem.eql(u8, action, "related")) @as(?[]const u8, null) else "needle",
+                .id = if (std.mem.eql(u8, action, "related")) @as(?[]const u8, evidence[0].id) else null,
+                .offset = offset,
+                .limit = 50,
+            }, .{});
+            const page_value = (try std.json.parseFromSlice(std.json.Value, alloc, try view.retrieve(alloc, request), .{})).value;
+            const rows = page_value.object.get("evidence").?.array.items;
+            try std.testing.expectEqual(@min(@as(usize, 32), evidence.len - offset), rows.len);
+            try std.testing.expectEqual(@as(i64, evidence.len), page_value.object.get("total").?.integer);
+            for (rows, offset..) |row, index| {
+                try std.testing.expectEqualStrings(evidence[index].id, row.object.get("id").?.string);
+                try std.testing.expect(!row.object.get("complete").?.bool);
+                try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected(evidence[index].id));
+            }
+            offset += rows.len;
+            const next = page_value.object.get("nextOffset").?;
+            if (next == .null) {
+                try std.testing.expectEqual(evidence.len, offset);
+                break;
+            }
+            try std.testing.expectEqual(@as(i64, @intCast(offset)), next.integer);
+        }
+        try std.testing.expectError(error.InvalidEvidenceOffset, view.retrieve(alloc, "{\"action\":\"query\",\"limit\":0}"));
+        try std.testing.expectError(error.InvalidContractEvidence, view.page(alloc, "{\"action\":\"read\",\"id\":\"invented\"}"));
+    }
 }
 
 test "completion review targeted retrieval preserves action relationships and inspection gaps" {
