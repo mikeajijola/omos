@@ -1421,9 +1421,15 @@ pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_
         monitor.join();
     }
     var ui_cfg = cfg;
-    const ui_system = try alloc.print("{s}\n\n{s}", .{
+    const assignment = if (ui.background_authority) |authority|
+        try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.\n</omos_background_assignment>", .{authority.task})
+    else
+        null;
+    defer if (assignment) |text| alloc.free(text);
+    const ui_system = try alloc.print("{s}\n\n{s}{s}", .{
         cfg.prompt_policy.system_prompt,
         "This turn is hosted by the workspace UI. Its running source is the Fossil ui/ tree, not a Git starter template or legacy ui directory. For interface requests, first use fossil_workspace status, then read the exact ui/ source paths from its inventory and write changes with fossil_workspace on the saved task branch. Do not edit omos-ui/template or archived prototypes to change the running interface. Workspace content operations are authorized by the native workspace owner; protected records, permissions, validation and publication remain host-owned. Give concise progress commentary and surface failed tools instead of silently searching unrelated repositories.",
+        assignment orelse "",
     });
     defer alloc.free(ui_system);
     ui_cfg.prompt_policy.system_prompt = ui_system;

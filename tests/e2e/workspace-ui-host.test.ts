@@ -160,18 +160,23 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
 },120000);
 
 test('background contracts release the main chat while workers await input and publish independently', async () => {
- const f = fixture(); let answered = false; let workerCalls = 0;
+ const f = fixture(); let answered = false; let workerCalls = 0; const assignments:string[]=[];
  const pngBase64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
  const imagePath=join(f.cwd,'reference.png');writeFileSync(imagePath,Buffer.from(pngBase64,'base64'));
  model(f, (body) => {
   const names = body.tools?.map((tool:any) => tool.function?.name) || [];
+  const system = body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
   if (!names.includes('write_file')) {
+   expect(system).not.toContain('<omos_background_assignment');
    const user = body.messages.filter((m:any) => m.role === 'user').at(-1)?.content || '';
    if (String(user).includes('still available')) return {content:'The main chat is still available.'};
    expect(names).not.toContain('shell');
    return {tool_calls:[{index:0,id:'dispatch-original-contract',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
   }
   workerCalls++;
+  const assignment=system.match(/<omos_background_assignment task="([a-f0-9]{64})">/);
+  expect(assignment).not.toBeNull();assignments.push(assignment![1]);
+  expect(system).toContain('Complete the remaining implementation, validation and delivery directly');
   const images=body.messages.flatMap((message:any)=>Array.isArray(message.content)?message.content.filter((part:any)=>part.type==='image_url'):[]);
   expect(images.some((part:any)=>part.image_url?.url===`data:image/png;base64,${pngBase64}`)).toBe(true);
   if (!answered) return questionCall();
@@ -223,6 +228,7 @@ test('background contracts release the main chat while workers await input and p
    console.error('background final',JSON.stringify(final),JSON.stringify(diagnostics.filter(e=>['result','error','notice','background_outcome'].includes(e.data.type)).slice(-12)));
   }
   expect(final.state).toBe('completed'); expect(final.task).toBe(original.task);
+  expect(assignments).toEqual([original.task,original.task]);
   expect(final.contract_sha256).toBe(original.contract_sha256); expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
   const tasks = await native.request('snapshot',{action:'fossil.status'});
   expect(tasks.tasks.find((task:any)=>task.id===original.task).state).toBe('accepted');

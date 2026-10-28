@@ -377,6 +377,9 @@ inspection and `fossil_workspace(action="dispatch")`. The browser uses the nativ
 its contract and model basis, to an independent native session. It releases the
 foreground selection, so another message can start a separate task while the
 worker continues. A dispatch acknowledgement does not satisfy the contract.
+The worker receives an explicit host assignment identifying its task and its
+fulfillment role. The original handoff remains recorded evidence; the worker
+performs the remaining work rather than waiting for its own worker record.
 
 One instance host runs at most four workers. It reserves an invocation generation
 before session preparation, so a startup failure cannot reuse an earlier
