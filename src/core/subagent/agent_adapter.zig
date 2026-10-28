@@ -377,7 +377,7 @@ pub fn run(
 fn finalRunOutcome(outcome: ?types.TurnPresentationOutcome) error{ProviderFailed}!execution.RunOutcome {
     return switch (outcome orelse return error.ProviderFailed) {
         .completed => .completed,
-        .failed => error.ProviderFailed,
+        .failed, .delegated => error.ProviderFailed,
         .interrupted, .paused => .paused,
     };
 }

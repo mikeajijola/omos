@@ -7,6 +7,9 @@ const workspace = @import("../workspace/fossil_workspace.zig");
 const interaction = @import("../workspace/ui_session.zig");
 const schedule_worker = @import("../workspace/schedule_worker.zig");
 const scheduling = @import("../workspace/scheduling.zig");
+const background = @import("../workspace/background_contract.zig");
+const background_dispatch = @import("../workspace/background_dispatch.zig");
+const background_control = @import("../workspace/background_control.zig");
 const version = "omos.ui-host/v1";
 const alloc = std.heap.c_allocator;
 
@@ -158,7 +161,12 @@ const Server = struct {
             }
         }
         if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
-        if (std.mem.eql(u8, method, "prompt")) return self.start(arena, id, params, null);
+        if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
+            var coordinated = params;
+            if (coordinated != .object) return error.InvalidPrompt;
+            try coordinated.object.put(arena, "coordinator", .{ .bool = std.mem.eql(u8, method, "coordinate") });
+            return self.start(arena, id, coordinated, null);
+        }
         if (std.mem.eql(u8, method, "events")) return self.events(arena, params);
         if (std.mem.eql(u8, method, "session.events")) {
             const query = try std.json.parseFromValueLeaky(struct { session: []const u8, offset: u64 = 0 }, arena, params, .{});
@@ -185,6 +193,7 @@ const Server = struct {
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
         if (std.mem.eql(u8, method, "schedule")) {
             const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
             if (request.action == .add or request.action == .move or request.action == .cancel) {
@@ -203,7 +212,11 @@ const Server = struct {
     }
 
     fn start(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation) !std.json.Value {
-        const Prompt = struct { text: []const u8 = "", session: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, continue_recovery: bool = false, images: []const []const u8 = &.{} };
+        return self.startWithBackground(arena, id, params, scheduled, null);
+    }
+
+    fn startWithBackground(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation, background_run: ?*BackgroundRun) !std.json.Value {
+        const Prompt = struct { coordinator: bool = false, text: []const u8 = "", session: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, continue_recovery: bool = false, images: []const []const u8 = &.{} };
         const request = try std.json.parseFromValueLeaky(Prompt, arena, params, .{});
         if (request.text.len > 1024 * 1024 or !std.unicode.utf8ValidateSlice(request.text) or std.mem.findScalar(u8, request.text, 0) != null) return error.InvalidPrompt;
         const request_hash = try workspace.hash(arena, try std.json.Stringify.valueAlloc(arena, request, .{}));
@@ -278,14 +291,21 @@ const Server = struct {
         errdefer if (execution_lease) |lease| lease.release();
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
-        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
+        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .coordinator_mode = request.coordinator and background_run == null and scheduled == null and !std.mem.eql(u8, io.getenv("OMOS_COORDINATOR") orelse "", "0"), .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
         if (scheduled) |invocation| {
             job.ui.project_root = invocation.task.project_root;
             job.ui.execution_lease_held = true;
         }
+        if (background_run) |run_context| {
+            const task = try run_context.manager.loadTask(run_context.entry.task);
+            job.ui.project_root = task.project_root;
+            job.ui.background_authority = &run_context.authority;
+            job.ui.session_binding_ctx = run_context;
+            job.ui.session_binding_fn = BackgroundRun.bindSession;
+        }
         try job.ui.emit(.{ .type = "turn_start", .request_hash = request_hash });
         self.job = job;
-        if (scheduled == null) self.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
+        if (scheduled == null and background_run == null) self.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
             self.job = null;
             return err;
         };
@@ -363,6 +383,135 @@ const Server = struct {
         return value(arena, .{ .events = events_list.items, .next_offset = next, .active = if (self.job) |job| std.mem.eql(u8, job.id, query.turn) and !job.finished.load(.acquire) else false });
     }
 };
+
+const BackgroundRun = struct {
+    manager: workspace.Manager,
+    entry: background.Record,
+    authority: background_control.Authority,
+    owner: []const u8,
+    cancel: *std.atomic.Value(bool),
+
+    const Monitor = struct {
+        run_context: *BackgroundRun,
+        ui: *interaction.Host,
+        finished: std.atomic.Value(bool) = .init(false),
+        checked_at: i64 = 0,
+
+        fn loop(self: *Monitor) void {
+            while (!self.finished.load(.acquire)) {
+                if (self.run_context.cancel.load(.acquire)) self.ui.stop();
+                self.poll() catch |err| {
+                    self.ui.emit(.{ .type = "notice", .text = @errorName(err) }) catch {};
+                    self.ui.stop();
+                };
+                io.sleep(100 * std.time.ns_per_ms);
+            }
+        }
+
+        fn poll(self: *Monitor) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var manager = self.run_context.manager;
+            manager.alloc = arena.allocator();
+            // Recheck binding identity without opening a Fossil checkout.
+            _ = (try workspace.configured(manager.alloc)) orelse return error.WorkspaceBindingChanged;
+            if (io.milliTimestamp() - self.checked_at >= 1000) {
+                self.checked_at = io.milliTimestamp();
+                try background_control.verifyLiveAuthority(manager, self.run_context.authority);
+            }
+            const parent = try background_control.path(manager, "controls", "placeholder");
+            var dir = try std.Io.Dir.openDirAbsolute(io.getIo(), std.Io.Dir.path.dirname(parent).?, .{ .iterate = true });
+            defer dir.close(io.getIo());
+            var iterator = dir.iterate();
+            var processed: usize = 0;
+            while (try iterator.next(io.getIo())) |item| {
+                if (item.kind != .file or !std.mem.endsWith(u8, item.name, ".json")) continue;
+                const command = try background_control.loadCommand(manager, try background_control.path(manager, "controls", item.name));
+                if (!std.mem.eql(u8, command.task, self.run_context.authority.task)) continue;
+                if (!try background_control.claimCommand(manager, command)) continue;
+                self.apply(manager, command) catch |err| {
+                    try background_control.finishCommand(manager, command, @errorName(err));
+                    continue;
+                };
+                try background_control.finishCommand(manager, command, null);
+                if (command.action == .answer or command.action == .validation) try self.ui.emit(.{ .type = "input_resolved", .request_id = command.request_id });
+                processed += 1;
+                if (processed == 16) break;
+            }
+        }
+
+        fn apply(self: *Monitor, manager: workspace.Manager, command: background_control.Command) !void {
+            const entry = (try manager.backgroundRecord(command.task)) orelse return error.BackgroundDispatchRequired;
+            if (!std.mem.eql(u8, command.workspace, manager.manifest.id) or entry.state != .running or command.generation != entry.generation or !std.mem.eql(u8, entry.owner.?, self.run_context.owner)) return error.StaleBackgroundOwner;
+            switch (command.action) {
+                .message, .steer => try self.ui.steer(command.text),
+                .cancel => {
+                    var next = entry;
+                    next.cancel_requested = true;
+                    next.updated_ms = io.milliTimestamp();
+                    try manager.saveBackgroundRecord(next, try background_dispatch.digest(manager, entry));
+                    self.ui.stop();
+                },
+                .answer => try self.ui.answer(command.request_id, command.approved, command.answers),
+                .validation => try self.ui.validated(command.request_id, try std.json.Stringify.valueAlloc(manager.alloc, command.receipt orelse return error.MissingReceipt, .{})),
+            }
+        }
+    };
+
+    fn bindSession(raw: *anyopaque, session: []const u8) !void {
+        const self: *BackgroundRun = @ptrCast(@alignCast(raw));
+        try background_control.verifyLiveAuthority(self.manager, self.authority);
+        self.entry = try background_dispatch.bind(self.manager, self.entry, self.owner, session);
+        const task = try self.manager.loadTask(self.entry.task);
+        _ = try self.manager.resumeTask(session, task.id, task.project_root);
+    }
+
+    fn execute(raw: *anyopaque, manager: workspace.Manager, entry: background.Record, authority: background_control.Authority, owner: []const u8, cancel: *std.atomic.Value(bool)) !void {
+        const runner: *Runner = @ptrCast(@alignCast(raw));
+        const journal_dir = try std.Io.Dir.path.join(manager.alloc, &.{ try background_control.directory(manager), "events" });
+        try std.Io.Dir.cwd().createDirPath(io.getIo(), journal_dir);
+        var server: Server = .{ .runner = runner.*, .journal_dir = journal_dir, .repository = manager.repository, .workspace_id = manager.manifest.id };
+        const starting = (try background_dispatch.reserve(manager, entry, owner)) orelse return error.WorkspaceExecutionBusy;
+        var context: BackgroundRun = .{ .manager = manager, .entry = starting, .authority = authority, .owner = owner, .cancel = cancel };
+        const id = try manager.alloc.print("background-{s}-{d}", .{ entry.task, starting.generation });
+        _ = try server.startWithBackground(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = entry.worker_session, .model = authority.model, .effort = authority.effort.label() }), null, &context);
+        const job = server.job orelse return error.BackgroundHostUnavailable;
+        defer job.destroy();
+        var monitor_context: Monitor = .{ .run_context = &context, .ui = &job.ui, .checked_at = io.milliTimestamp() };
+        const monitor = try std.Thread.spawn(.{}, Monitor.loop, .{&monitor_context});
+        job.perform();
+        monitor_context.finished.store(true, .release);
+        monitor.join();
+        if (context.entry.state == .running) {
+            const final = try background_dispatch.finish(manager, context.entry, .{ .owner = owner, .generation = context.entry.generation }, job.error_code orelse if (job.exit_code == 0) "The worker retained unfinished work. Inspect its evidence before resuming." else "The worker stopped before verified publication.");
+            try job.ui.emit(.{ .type = "background_outcome", .record = final, .fulfilled = final.state == .completed });
+        } else {
+            const current = (try manager.backgroundRecord(entry.task)) orelse return error.BackgroundDispatchRequired;
+            const failed = try background.wait(current, .{ .owner = owner, .generation = starting.generation }, job.error_code orelse "The worker stopped during session preparation.", io.milliTimestamp());
+            try manager.saveBackgroundRecord(failed, try background_dispatch.digest(manager, current));
+            try job.ui.emit(.{ .type = "background_outcome", .record = failed, .fulfilled = false });
+        }
+    }
+};
+
+pub fn runBackground(runner: Runner) !void {
+    @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
+    var setup = std.heap.ArenaAllocator.init(alloc);
+    defer setup.deinit();
+    const manager = try workspace.Manager.ensureBound(setup.allocator());
+    const lock_path = try background_control.path(manager, "", "host.lock");
+    var lock = try std.Io.Dir.createFileAbsolute(io.getIo(), lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+    defer lock.close(io.getIo());
+    if (!try lock.tryLock(io.getIo(), .exclusive)) return;
+    defer lock.unlock(io.getIo());
+    std.Io.Dir.deleteFileAbsolute(io.getIo(), try background_control.path(manager, "", "stop")) catch |err| if (err != error.FileNotFound) return err;
+    workspace.configureHostBinding(.{ .repository = manager.repository, .workspace_id = manager.manifest.id });
+    defer workspace.configureHostBinding(null);
+    var executor = runner;
+    var worker: @import("../workspace/background_worker.zig").Worker = .{ .manager = manager, .executor = .{ .context = &executor, .run = BackgroundRun.execute } };
+    defer worker.deinit();
+    try worker.loop();
+}
 
 fn snapshotArgs(arena: std.mem.Allocator, action: []const u8, id: ?[]const u8, entity: ?[]const u8, offset: usize) ![]const [:0]const u8 {
     var result: std.ArrayList([:0]const u8) = .empty;

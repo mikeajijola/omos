@@ -10,6 +10,7 @@ const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_json = @import("../shared/record_json.zig");
 const scheduling = @import("scheduling.zig");
+const background_contract = @import("background_contract.zig");
 const company_publication = @import("company_publication.zig");
 const fossil_manifest = @import("fossil_manifest.zig");
 
@@ -155,7 +156,7 @@ const PortableRegistry = struct {
 };
 const SessionBinding = struct {
     task: []const u8,
-    kind: enum { session_binding } = .session_binding,
+    kind: enum { session_binding, session_unbinding } = .session_binding,
     payload: struct {
         version: []const u8 = "omos.session-binding/v1",
         workspace: []const u8,
@@ -1865,15 +1866,7 @@ pub const Manager = struct {
         const binding: SessionBinding = .{ .task = task.id, .payload = .{ .workspace = self.manifest.id, .session = selected_session } };
         const path = try self.alloc.print("runtime/sessions/{s}.json", .{selected_session});
         try self.validateSessionBinding(binding, path);
-        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
-        var found = false;
-        var lines = std.mem.splitScalar(u8, branches, '\n');
-        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
-            found = true;
-            break;
-        };
-        if (!found) _ = try self.run(null, &.{ "branch", "new", runtime_branch, "trunk", "--nosign", "-R", self.repository });
-        const tree = try self.checkout(runtime_branch);
+        const tree = try self.runtimeCheckout();
         const bytes = try json(self.alloc, binding);
         const destination = try join(self.alloc, tree, path);
         if (!std.mem.eql(u8, bytes, read(self.alloc, destination) catch "")) {
@@ -1881,6 +1874,147 @@ pub const Manager = struct {
             _ = try self.commit(tree, "Record selected workspace task");
         }
         try atomicWrite(self.alloc, try self.sessionPath(session), task.id);
+    }
+
+    fn runtimeCheckoutIfPresent(self: Manager) !?[]const u8 {
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        var found = false;
+        var lines = std.mem.splitScalar(u8, branches, '\n');
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
+            found = true;
+            break;
+        };
+        if (!found) return null;
+        return try self.checkout(runtime_branch);
+    }
+
+    fn runtimeCheckout(self: Manager) ![]const u8 {
+        if (try self.runtimeCheckoutIfPresent()) |tree| return tree;
+        _ = try self.run(null, &.{ "branch", "new", runtime_branch, "trunk", "--nosign", "-R", self.repository });
+        return self.checkout(runtime_branch);
+    }
+
+    /// The runtime branch is portable host history, separate from the candidate
+    /// being assessed. Updating worker status cannot invalidate its assessment.
+    fn runtimeRevisionIfPresent(self: Manager) !?[]const u8 {
+        const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
+        var lines = std.mem.splitScalar(u8, branches, '\n');
+        while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) return try self.revision(runtime_branch);
+        return null;
+    }
+
+    pub fn backgroundRecords(self: Manager, offset: usize) ![]const background_contract.Record {
+        const revision_id = (try self.runtimeRevisionIfPresent()) orelse return &.{};
+        const query = try self.alloc.print("SELECT CAST(content(uuid) AS TEXT) AS entry FROM files_of_checkin('{s}') WHERE filename GLOB 'runtime/background/*.json' ORDER BY filename LIMIT 32 OFFSET {d};", .{ revision_id, offset });
+        const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query });
+        const rows = try parse(self.alloc, []const struct { entry: []const u8 }, if (std.mem.trim(u8, raw, " \t\r\n").len == 0) "[]" else raw);
+        var result: std.ArrayList(background_contract.Record) = .empty;
+        for (rows) |row| {
+            const entry = try parse(self.alloc, background_contract.Record, row.entry);
+            try background_contract.validate(entry);
+            if (!std.mem.eql(u8, entry.workspace, self.manifest.id)) return error.WorkspaceBindingMismatch;
+            try result.append(self.alloc, entry);
+        }
+        return result.toOwnedSlice(self.alloc);
+    }
+
+    pub fn backgroundRecord(self: Manager, task: []const u8) !?background_contract.Record {
+        if (!safeId(task)) return error.InvalidTaskId;
+        const revision_id = (try self.runtimeRevisionIfPresent()) orelse return null;
+        const query = try self.alloc.print("SELECT CAST(content(uuid) AS TEXT) AS entry FROM files_of_checkin('{s}') WHERE filename='runtime/background/{s}.json';", .{ revision_id, task });
+        const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query });
+        const rows = try parse(self.alloc, []const struct { entry: []const u8 }, if (std.mem.trim(u8, raw, " \t\r\n").len == 0) "[]" else raw);
+        if (rows.len == 0) return null;
+        if (rows.len != 1) return error.InvalidBackgroundContract;
+        const entry = try parse(self.alloc, background_contract.Record, rows[0].entry);
+        try background_contract.validate(entry);
+        if (!std.mem.eql(u8, entry.workspace, self.manifest.id) or !std.mem.eql(u8, entry.task, task)) return error.WorkspaceBindingMismatch;
+        return entry;
+    }
+
+    fn backgroundRecordAt(self: Manager, tree: []const u8, task: []const u8) !?background_contract.Record {
+        const path = try self.alloc.print("runtime/background/{s}.json", .{task});
+        const bytes = read(self.alloc, try join(self.alloc, tree, path)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const entry = try parse(self.alloc, background_contract.Record, bytes);
+        try background_contract.validate(entry);
+        if (!std.mem.eql(u8, entry.workspace, self.manifest.id) or !std.mem.eql(u8, entry.task, task)) return error.WorkspaceBindingMismatch;
+        return entry;
+    }
+
+    /// Host-only compare-and-swap. Null expects an absent entry, rather than
+    /// permitting an overwrite. Canonical worker records are never model writes.
+    pub fn saveBackgroundRecord(self: Manager, entry: background_contract.Record, expected_sha256: ?[]const u8) !void {
+        return self.saveBackgroundRecordAndSelection(entry, expected_sha256, null, null);
+    }
+
+    /// Queue and release selection in one canonical commit. A private recovery
+    /// marker repairs the replaceable session cache after a post-commit crash.
+    pub fn saveBackgroundHandoff(self: Manager, entry: background_contract.Record, expected_sha256: []const u8, session: []const u8) !void {
+        if (entry.state != .queued or !std.mem.eql(u8, entry.dispatcher_session, try hash(self.alloc, session))) return error.BackgroundDispatcherChanged;
+        return self.saveBackgroundRecordAndSelection(entry, expected_sha256, session, null);
+    }
+
+    pub fn backgroundOperation(self: Manager, operation: []const u8) !?background_contract.Operation {
+        if (!safeId(operation)) return error.InvalidBackgroundOperation;
+        const lease = try self.writerLease();
+        defer lease.release();
+        const tree = (try self.runtimeCheckoutIfPresent()) orelse return null;
+        return self.backgroundOperationAt(tree, operation);
+    }
+
+    fn backgroundOperationAt(self: Manager, tree: []const u8, operation: []const u8) !?background_contract.Operation {
+        const bytes = read(self.alloc, try join(self.alloc, tree, try self.alloc.print("runtime/background-operations/{s}.json", .{operation}))) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const entry = try parse(self.alloc, background_contract.Operation, bytes);
+        try background_contract.validateOperation(entry);
+        if (!std.mem.eql(u8, entry.workspace, self.manifest.id) or !std.mem.eql(u8, entry.operation, operation)) return error.BackgroundOperationConflict;
+        return entry;
+    }
+
+    pub fn saveBackgroundOperation(self: Manager, entry: background_contract.Record, expected_sha256: []const u8, operation: background_contract.Operation) !void {
+        try background_contract.validateOperation(operation);
+        if (!std.mem.eql(u8, operation.task, entry.task) or !std.mem.eql(u8, operation.workspace, entry.workspace)) return error.BackgroundOperationConflict;
+        return self.saveBackgroundRecordAndSelection(entry, expected_sha256, null, operation);
+    }
+
+    fn saveBackgroundRecordAndSelection(self: Manager, entry: background_contract.Record, expected_sha256: ?[]const u8, session: ?[]const u8, operation: ?background_contract.Operation) !void {
+        try background_contract.validate(entry);
+        if (!std.mem.eql(u8, entry.workspace, self.manifest.id)) return error.WorkspaceBindingMismatch;
+        const lease = try self.writerLease();
+        defer lease.release();
+        const tree = try self.runtimeCheckout();
+        if (try self.backgroundRecordAt(tree, entry.task)) |previous| {
+            const expected = expected_sha256 orelse return error.BackgroundOperationConflict;
+            if (!std.mem.eql(u8, expected, try hash(self.alloc, try json(self.alloc, previous)))) return error.StaleBackgroundRecord;
+        } else if (expected_sha256 != null) return error.StaleBackgroundRecord;
+        if (session) |id| {
+            const selected = (try self.active(id)) orelse return error.SessionSelectionChanged;
+            if (!std.mem.eql(u8, selected.id, entry.task)) return error.SessionSelectionChanged;
+            const binding: SessionBinding = .{ .kind = .session_unbinding, .task = entry.task, .payload = .{ .workspace = self.manifest.id, .session = entry.dispatcher_session } };
+            const binding_path = try self.alloc.print("runtime/sessions/{s}.json", .{entry.dispatcher_session});
+            try self.validateSessionBinding(binding, binding_path);
+            try atomicWrite(self.alloc, try self.alloc.print("{s}.handoff", .{try self.sessionPath(id)}), entry.task);
+            try atomicWrite(self.alloc, try join(self.alloc, tree, binding_path), try json(self.alloc, binding));
+        }
+        if (operation) |receipt| {
+            if (try self.backgroundOperationAt(tree, receipt.operation)) |prior| {
+                if (!std.mem.eql(u8, try json(self.alloc, prior), try json(self.alloc, receipt))) return error.BackgroundOperationConflict;
+                return;
+            }
+            try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("runtime/background-operations/{s}.json", .{receipt.operation})), try json(self.alloc, receipt));
+        }
+        const destination = try join(self.alloc, tree, try self.alloc.print("runtime/background/{s}.json", .{entry.task}));
+        try atomicWrite(self.alloc, destination, try json(self.alloc, entry));
+        _ = try self.commit(tree, "Record background contract execution");
+        if (session) |id| {
+            try remove(try self.sessionPath(id));
+            try remove(try self.alloc.print("{s}.handoff", .{try self.sessionPath(id)}));
+        }
     }
 
     fn restoreSessionBindings(self: Manager) !void {
@@ -1892,7 +2026,10 @@ pub const Manager = struct {
                 const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_branch));
                 try self.validateSessionBinding(binding, path);
                 _ = try self.loadTask(binding.task);
-                try atomicWrite(self.alloc, try join(self.alloc, try join(self.alloc, self.root, "sessions"), binding.payload.session), binding.task);
+                const local = try join(self.alloc, try join(self.alloc, self.root, "sessions"), binding.payload.session);
+                if (binding.kind == .session_unbinding) {
+                    try remove(local);
+                } else try atomicWrite(self.alloc, local, binding.task);
             }
             return;
         };
@@ -1903,6 +2040,18 @@ pub const Manager = struct {
             error.FileNotFound => return null,
             else => return err,
         };
+        const marker = try self.alloc.print("{s}.handoff", .{try self.sessionPath(session)});
+        if (exists(marker)) {
+            const path = try self.alloc.print("runtime/sessions/{s}.json", .{try hash(self.alloc, session)});
+            const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_branch));
+            try self.validateSessionBinding(binding, path);
+            if (binding.kind == .session_unbinding and std.mem.eql(u8, binding.task, id)) {
+                try remove(try self.sessionPath(session));
+                try remove(marker);
+                return null;
+            }
+            try remove(marker);
+        }
         return try self.loadTask(id);
     }
 
@@ -3311,6 +3460,16 @@ pub const Manager = struct {
     const AcceptedTask = struct { id: []const u8, version: u32, source: []const u8, target: []const u8 };
 
     fn verifyFile(self: Manager, path: []const u8, bytes: []const u8, declaration: ?model.Declaration) !void {
+        if (std.mem.startsWith(u8, path, "runtime/background-operations/")) {
+            const operation = try parse(self.alloc, background_contract.Operation, bytes);
+            try background_contract.validateOperation(operation);
+            if (!std.mem.eql(u8, operation.workspace, self.manifest.id) or !std.mem.eql(u8, path, try self.alloc.print("runtime/background-operations/{s}.json", .{operation.operation}))) return error.InvalidWorkspaceFormat;
+        }
+        if (std.mem.startsWith(u8, path, "runtime/background/")) {
+            const entry = try parse(self.alloc, background_contract.Record, bytes);
+            try background_contract.validate(entry);
+            if (!std.mem.eql(u8, entry.workspace, self.manifest.id) or !std.mem.eql(u8, path, try self.alloc.print("runtime/background/{s}.json", .{entry.task}))) return error.InvalidWorkspaceFormat;
+        }
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
         if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
@@ -3444,7 +3603,7 @@ pub const Manager = struct {
                 if (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json")) return unexpectedEntry("checkout inventory", path);
                 if (file.mode == .symlink) return error.WorkspaceSymlinkDenied;
                 const size = lengths.get(path) orelse return error.WorkspaceVerificationFailed;
-                const needs_body = std.mem.startsWith(u8, path, "records/omos_worker_projection/") or std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix) or std.mem.startsWith(u8, path, "company/desired/") or std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix) or std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix) or std.mem.startsWith(u8, path, @import("company_archive.zig").prefix) or std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix) or std.mem.startsWith(u8, path, @import("company_review_resume.zig").prefix) or std.mem.startsWith(u8, path, @import("company_control.zig").prefix) or std.mem.startsWith(u8, path, @import("company_activity.zig").prefix) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
+                const needs_body = std.mem.startsWith(u8, path, "runtime/background-operations/") or std.mem.startsWith(u8, path, "runtime/background/") or std.mem.startsWith(u8, path, "records/omos_worker_projection/") or std.mem.startsWith(u8, path, "runtime/sessions/") or std.mem.startsWith(u8, path, "artifacts/") or std.mem.startsWith(u8, path, "acceptances/") or std.mem.startsWith(u8, path, "history/") or (company and (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix) or std.mem.startsWith(u8, path, "company/desired/") or std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix) or std.mem.eql(u8, path, "authority/state.json") or std.mem.eql(u8, path, @import("company_capabilities.zig").path) or std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix) or std.mem.startsWith(u8, path, @import("company_archive.zig").prefix) or std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix) or std.mem.startsWith(u8, path, @import("company_review_resume.zig").prefix) or std.mem.startsWith(u8, path, @import("company_control.zig").prefix) or std.mem.startsWith(u8, path, @import("company_activity.zig").prefix) or std.mem.startsWith(u8, path, "company/workers/") or std.mem.startsWith(u8, path, "company/execution/") or std.mem.startsWith(u8, path, "company/views/") or std.mem.startsWith(u8, path, "company/operations/") or std.mem.startsWith(u8, path, "company/approvals/") or std.mem.startsWith(u8, path, "company/reads/") or std.mem.startsWith(u8, path, "company/submissions/")));
                 if (!needs_body) continue;
                 var digest = std.crypto.hash.sha2.Sha256.init(.{});
                 digest.update(if (company) "company" else "content");
@@ -4230,6 +4389,20 @@ pub const Manager = struct {
             while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) {
                 const runtime_revision = try self.revision(runtime_branch);
                 for (try self.inventory(runtime_revision)) |path| {
+                    if (std.mem.startsWith(u8, path, "runtime/background-operations/")) {
+                        const receipt = try parse(self.alloc, background_contract.Operation, try self.contentAt(path, runtime_revision));
+                        try background_contract.validateOperation(receipt);
+                        if (task) |selected| if (!std.mem.eql(u8, selected.id, receipt.task)) continue;
+                        try page.add(self, try parse(self.alloc, std.json.Value, try json(self.alloc, .{ .entity = "omos_event", .id = receipt.operation, .data = .{ .kind = "background_control", .task = receipt.task, .payload = receipt }, .source_path = path, .revision = runtime_revision })));
+                        continue;
+                    }
+                    if (std.mem.startsWith(u8, path, "runtime/background/")) {
+                        const entry = try parse(self.alloc, background_contract.Record, try self.contentAt(path, runtime_revision));
+                        try background_contract.validate(entry);
+                        if (task) |selected| if (!std.mem.eql(u8, selected.id, entry.task)) continue;
+                        try page.add(self, try parse(self.alloc, std.json.Value, try json(self.alloc, .{ .entity = "omos_event", .id = try hash(self.alloc, path), .data = .{ .kind = "background_contract", .task = entry.task, .payload = entry }, .source_path = path, .revision = runtime_revision })));
+                        continue;
+                    }
                     if (!std.mem.startsWith(u8, path, "runtime/sessions/")) continue;
                     const binding = try parse(self.alloc, SessionBinding, try self.contentAt(path, runtime_revision));
                     try self.validateSessionBinding(binding, path);

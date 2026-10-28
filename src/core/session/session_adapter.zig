@@ -416,6 +416,21 @@ pub fn commandError(err: anyerror) CommandError {
 /// compaction's summary where it happened (D32). A missing session, a
 /// child, or an id that cannot name one is `error.SessionNotFound`. Caller
 /// owns the result.
+/// Reads only permission state; workers need not hydrate the source transcript.
+pub fn readPermissions(store: *Store, alloc: Allocator, id: []const u8) !session_permission_state.State {
+    var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
+        error.NotFound, error.InvalidArgument => blk: {
+            var legacy = try session_store.Store.initReadOnlyFromHome(alloc, store.home, ".");
+            defer legacy.deinit(alloc);
+            break :blk try legacy.loadPermissionsReadOnly(alloc, id);
+        },
+        else => err,
+    };
+    defer peeked.deinit(alloc);
+    if (peeked.role != .root) return error.SessionNotFound;
+    return if (peeked.state.permissions) |raw| session_codec.decodePermissionState(alloc, raw) else .{};
+}
+
 pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
     var peeked = store.manager.peek(alloc, id) catch |err| return switch (err) {
         error.NotFound, error.InvalidArgument => readV1Session(store, alloc, id),

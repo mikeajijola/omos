@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { init, ensure, request, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
+    action: enum { workers, init, ensure, request, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
@@ -91,14 +91,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
         },
         .cache => if (options.path != null) return error.UnexpectedArgument,
         .request, .company, .@"company-key" => if (options.path == null) return error.MissingPath,
-        .init, .diff, .query, .serve => {},
+        .workers, .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
     if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
     if ((options.realisation != null or options.selections_path != null) and !(options.action == .package and options.package_action == .plan)) return error.UnexpectedArgument;
     if (options.realisation != null and options.selections_path != null) return error.UnexpectedArgument;
     if (options.bindings_path != null and !(options.action == .package and options.package_action == .verify)) return error.UnexpectedArgument;
-    if (offset_seen and options.action != .query) return error.UnexpectedArgument;
+    if (offset_seen and options.action != .query and options.action != .workers) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
     if (options.upgrade_contracts and options.action != .migrate) return error.UnexpectedArgument;
     if (options.action == .serve and options.path != null) _ = std.fmt.parseInt(u16, options.path.?, 10) catch return error.InvalidPort;
@@ -147,6 +147,11 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
         .use => try workspace.Manager.open(alloc, options.path.?),
         else => (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace,
     };
+    if (options.action == .workers) {
+        const api = @import("background_api.zig");
+        const request = if (options.path) |file_path| try @import("../shared/record_json.zig").decode(api.Request, alloc, try readDefinition(alloc, file_path), .{}) else api.Request{ .offset = options.offset };
+        return .{ .api = try api.execute(manager, request) };
+    }
     if (options.action == .request) {
         const raw = try @import("workspace_service.zig").execute(manager, try readDefinition(alloc, options.path.?), false);
         return .{ .api = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{ .allocate = .alloc_always }) };
@@ -154,7 +159,7 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
     var detail: []const u8 = "";
     var model_data: ?std.json.Value = null;
     switch (options.action) {
-        .request => unreachable,
+        .request, .workers => unreachable,
         .company => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try @import("company_service.zig").administer(manager, try readDefinition(alloc, options.path.?)), .{})).value,
         .ensure => detail = "Personal instance initialized or existing workspace retained.",
         .init => {
@@ -232,6 +237,11 @@ pub fn taskCommand(alloc: std.mem.Allocator, session: []const u8, project: []con
     const split = std.mem.findScalar(u8, text, ' ') orelse text.len;
     const action = text[0..split];
     const argument = std.mem.trim(u8, text[split..], " \t");
+    if (std.mem.eql(u8, action, "workers")) {
+        const api = @import("background_api.zig");
+        const request = if (argument.len == 0) api.Request{} else try @import("../shared/record_json.zig").decode(api.Request, alloc, argument, .{});
+        return std.json.Stringify.valueAlloc(alloc, try api.execute(manager, request), .{ .whitespace = .indent_2 });
+    }
     const task = if (std.mem.eql(u8, action, "new"))
         try manager.start(session, project, argument, null)
     else if (std.mem.eql(u8, action, "resume")) blk: {

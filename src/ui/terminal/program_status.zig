@@ -66,7 +66,7 @@ pub const Reporter = struct {
             // A cancelled or paused turn, usually paused by the user during a
             // recovery, waits for the next instruction. The protocol reports
             // that as idle.
-            .interrupted, .paused => .idle,
+            .interrupted, .paused, .delegated => .idle,
         });
     }
 

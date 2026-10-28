@@ -234,7 +234,7 @@ fn Runtime(comptime App: type) type {
                 .completed => .success,
                 .failed => .@"error",
                 // Cancellation already plays the press cue; stay silent here.
-                .interrupted, .paused => return,
+                .interrupted, .paused, .delegated => return,
             };
             enqueue(app, .{ .kind = .turn_end, .cue = cue });
         }

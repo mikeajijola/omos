@@ -3,7 +3,7 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime, dispatch, workers },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
     entity: ?[]const u8 = null,
@@ -28,12 +28,20 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
         ctx.allocator.destroy(parsed);
         return .{ .failure = failure };
     };
+    if (ctx.coordinator_mode) switch (parsed.value.action) {
+        .status, .read, .diff, .history, .definition, .query, .dispatch, .workers => {},
+        else => {
+            parsed.deinit();
+            ctx.allocator.destroy(parsed);
+            return .{ .failure = try ctx.allocator.dupe(u8, "Dispatch the original contract to a background worker before making changes.") };
+        },
+    };
     return .{ .input = .{ .ptr = parsed, .deinit_fn = destroy } };
 }
 
 pub fn readsOnly(input: dispatch.ToolInput) bool {
     return switch (input.as(Parsed).value.action) {
-        .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime => false,
+        .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime, .dispatch => false,
         else => true,
     };
 }
@@ -58,6 +66,15 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
     var cancel = std.atomic.Value(bool).init(false);
     if (input.action == .verify_runtime) manager.operation_control = .{ .cancel = ctx.cancel_flag orelse &cancel, .deadline = .fromNow(@import("../../core/shared/io.zig").getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60000) }) };
     const task = if (ctx.fossil_session_id) |session| try manager.active(session) else null;
+    if (input.action == .workers) {
+        const entries = try manager.backgroundRecords(input.offset);
+        return std.json.Stringify.valueAlloc(alloc, .{ .version = "omos.background-contracts/v1", .workers = entries, .next_offset = if (entries.len == 32) input.offset + entries.len else @as(?usize, null) }, .{});
+    }
+    if (input.action == .dispatch) {
+        if (input.path != null or input.content != null or input.entity != null or input.execution != null or input.revision != null or input.offset != 0) return error.InvalidBackgroundDispatch;
+        const run = ctx.background_dispatch_fn orelse return error.BackgroundHostUnavailable;
+        return run(ctx.background_dispatch_ctx, alloc, ctx.tool_call_id);
+    }
     if (input.action == .status) {
         var snapshot = try manager.snapshot("");
         if (task) |active| snapshot.files = try manager.inventory(active.branch);

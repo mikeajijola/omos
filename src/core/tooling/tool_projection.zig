@@ -13,9 +13,10 @@ pub const Options = struct {
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
     fossil_workspace_available: bool = false,
+    coordinator_mode: bool = false,
 };
 
-const BuildKind = enum { full, read_only };
+const BuildKind = enum { full, read_only, coordinator };
 
 const TestInput = struct {};
 
@@ -507,7 +508,7 @@ fn buildTestModelToolProjectionForRegistry(alloc: Allocator, tools: []const tool
 }
 
 pub fn buildModelToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
-    return buildToolProjection(alloc, tool_set, .full, options);
+    return buildToolProjection(alloc, tool_set, if (options.coordinator_mode) .coordinator else .full, options);
 }
 
 pub fn buildReadOnlyModelToolProjectionForSet(alloc: Allocator, tool_set: tool_set_contract.ToolSet, options: Options) !EffectiveToolProjection {
@@ -523,13 +524,14 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     errdefer guidance_out.deinit();
 
     var first_custom_guidance = true;
+    if (kind == .coordinator) try guidance_out.writer.writeAll("You coordinate background contract workers. Answer brief informational questions using read-only tools. For work requiring changes, external actions, lengthy investigation or verification, call fossil_workspace with action dispatch immediately. This transfers the ORIGINAL pinned contract to an independent worker and frees the main conversation. Dispatch is pending work, never proof of fulfillment. Use workers to inspect retained status. Do not execute the work yourself or claim it completed at handoff.\n");
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
         try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options);
     }
 
-    if (kind == .full) {
+    if (kind != .read_only) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
             try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
@@ -569,7 +571,7 @@ fn appendBuiltinTool(
     }
     try advertised_names.append(alloc, tool.name);
     if (!tool.provider_executed and tool.write_provider_advertisement_fn == null) {
-        try advertised_functions.append(alloc, tool.model_schema);
+        try advertised_functions.append(alloc, if (kind == .coordinator and tool.executor_kind == .fossil_workspace) coordinator_workspace_schema else tool.model_schema);
     }
     if (tool.write_provider_advertisement_fn != null) {
         if (first_custom_guidance.*) {
@@ -601,8 +603,24 @@ fn builtinNamesForKind(kind: BuildKind, tool_set: tool_set_contract.ToolSet) ?[]
     return switch (kind) {
         .full => null,
         .read_only => tool_set.read_only_tool_names,
+        .coordinator => &.{ "read_file", "glob_files", "grep_files", "read_tool_result", "fossil_workspace" },
     };
 }
+
+const coordinator_workspace_schema: model_tool_schema.FunctionSchema = .{
+    .name = "fossil_workspace",
+    .description = "Inspect workspace state or dispatch the original task contract to an independent background worker. A dispatch receipt leaves fulfillment pending.",
+    .input_schema = .{
+        .properties = &.{
+            .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "diff", "history", "definition", "query", "dispatch", "workers" } } },
+            .{ .name = "path", .json_type = .string },
+            .{ .name = "entity", .json_type = .string },
+            .{ .name = "offset", .json_type = .integer },
+        },
+        .required = &.{"action"},
+        .additional_properties = false,
+    },
+};
 
 fn toolNameInSet(names: []const []const u8, needle: []const u8) bool {
     for (names) |name| {
@@ -807,4 +825,32 @@ test "Fossil workspace advertisement requires an explicit host capability" {
     var custom_projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, &.{fossil}, .{});
     defer custom_projection.deinit(std.testing.allocator);
     try std.testing.expect(containsName(custom_projection.advertised_names, "fossil_workspace"));
+}
+
+test "background coordinator exposes inspection without mutation or synchronous delegation" {
+    const alloc = std.testing.allocator;
+    var projection = try buildTestModelToolProjection(alloc, .{ .coordinator_mode = true, .subagent_available = true, .fossil_workspace_available = true, .permission_mode = .yolo });
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "read_file");
+    try expectNotContainsName(projection.advertised_names, "write_file");
+    try expectNotContainsName(projection.advertised_names, "edit_file");
+    try expectNotContainsName(projection.advertised_names, "shell");
+    try expectNotContainsName(projection.advertised_names, "subagent");
+    try std.testing.expect(std.mem.find(u8, projection.custom_guidance, "ORIGINAL pinned contract") != null);
+}
+
+test "background coordinator includes the host workspace tool outside the canonical tool order" {
+    const alloc = std.testing.allocator;
+    var workspace_tool = test_tool_seed;
+    workspace_tool.name = "fossil_workspace";
+    workspace_tool.executor_kind = .fossil_workspace;
+    const tools = [_]tool_dispatch.Tool{ test_read_file, workspace_tool };
+    var projection = try buildTestModelToolProjectionForRegistry(alloc, &tools, .{ .coordinator_mode = true, .fossil_workspace_available = true });
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "fossil_workspace");
+    for (projection.advertised_functions) |function| if (std.mem.eql(u8, function.name, "fossil_workspace")) {
+        try std.testing.expectEqual(@as(usize, 8), function.input_schema.properties[0].shape.?.enum_values.len);
+        return;
+    };
+    return error.TestExpectedEqual;
 }

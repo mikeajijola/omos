@@ -1142,7 +1142,7 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .ui_host => |rest| {
-            if (rest.len != 1 or !std.mem.eql(u8, rest[0], "--stdio")) return error.InvalidUiHostArgs;
+            if (rest.len != 1 or (!std.mem.eql(u8, rest[0], "--stdio") and !std.mem.eql(u8, rest[0], "--background-start") and !std.mem.eql(u8, rest[0], "--background-serve"))) return error.InvalidUiHostArgs;
             const Adapter = struct {
                 config: Config,
                 fn prompt(raw: *anyopaque, args: []const [:0]const u8, ui: *@import("../workspace/ui_session.zig").Host) !u8 {
@@ -1161,7 +1161,12 @@ fn runNonInteractiveWithDeps(
                 }
             };
             var adapter: Adapter = .{ .config = cfg };
-            try @import("ui_host.zig").run(.{ .context = &adapter, .prompt = Adapter.prompt, .snapshot = Adapter.snapshot });
+            if (std.mem.eql(u8, rest[0], "--background-start")) {
+                const manager = try @import("../workspace/fossil_workspace.zig").Manager.ensureBound(alloc);
+                try @import("../workspace/background_control.zig").launchHost(manager);
+            } else if (std.mem.eql(u8, rest[0], "--background-serve")) {
+                try @import("ui_host.zig").runBackground(.{ .context = &adapter, .prompt = Adapter.prompt, .snapshot = Adapter.snapshot });
+            } else try @import("ui_host.zig").run(.{ .context = &adapter, .prompt = Adapter.prompt, .snapshot = Adapter.snapshot });
             return .handled_success;
         },
         .ask => |rest| {

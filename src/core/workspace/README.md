@@ -368,3 +368,58 @@ not replay completed external actions.
 ### Workspace interface source
 
 The optional [workspace UI host](ui-host.md) stores its complete frontend under `ui/`. Native `ui-host --stdio` owns saved turns, approval boundaries, replay and source validation. Agent edits remain on their task branch until independent review and normal Fossil publication succeed. A fresh host compilation receipt covers the exact current UI files and pinned compiler; changed source cannot publish using stale validation. Interface builds and public delivery journals remain disposable cache and operational profile state respectively.
+
+### Background contract workers
+
+Interactive `omos` and `omo` conversations coordinate work through read-only
+inspection and `fossil_workspace(action="dispatch")`. The browser uses the native
+`coordinate` method. Dispatch checkpoints and transfers the original task, with
+its contract and model basis, to an independent native session. It releases the
+foreground selection, so another message can start a separate task while the
+worker continues. A dispatch acknowledgement does not satisfy the contract.
+
+One instance host runs at most four workers. It reserves an invocation generation
+before session preparation, so a startup failure cannot reuse an earlier
+invocation's journal. Each worker owns its task lease,
+filesystem projection, invocation budget and ordinary independent completion
+review. A worker is marked completed only after the host verifies its Fossil
+publication receipt. Permission questions and UI compilation requests stay
+pending until the trusted CLI or browser host responds. The existing synchronous
+subagent tool remains available to workers and direct execution clients.
+
+Use `omos fossil workers --json` or `/task workers` to inspect dispatches. Trusted
+controls use a JSON request file:
+
+```json
+{
+  "action": "cancel",
+  "task": "<task-id>",
+  "generation": 1,
+  "operation": "<unique-64-character-lowercase-hex-id>"
+}
+```
+
+Run `omos fossil workers request.json --json`. Supported controls include
+`steer` with `text`, `input` with `request_id` and `approved` or `answers`,
+`validation` with a compilation `receipt`, and `resume` for retained waiting or
+cancelled work. `events` returns at most 32 events and a resumable byte offset.
+`receipt` identifies whether a control was applied. A claimed control without an
+outcome requires reconciliation and is never replayed automatically. Generation
+checks reject controls for an earlier invocation. If publication finished before
+its worker outcome was delivered, `resume` verifies that existing receipt without
+running another actor. `stop` requests shutdown of the
+local worker host; `host` reports whether it still holds its execution lock.
+
+Dispatch records and session-selection releases are versioned on `omos-runtime`.
+Private activation, permission snapshots and delivery journals stay in the local
+profile. A copied repository does not grant permission to execute its queued
+work. Changes to captured source permissions, relevant configuration or workspace
+binding stop local execution. A changed permission policy requires a newly
+authorized foreground invocation; worker resume preserves its captured authority.
+Credentials
+and provider replay remain outside Fossil.
+
+Set `OMOS_COORDINATOR=0` to use direct foreground execution. The legacy native
+`prompt` method and default `fx ask` interface retain direct execution semantics.
+Company tasks continue to use their existing scoped company-worker service;
+personal dispatch cannot bypass company execution authority.

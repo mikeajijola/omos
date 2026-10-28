@@ -118,6 +118,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn childToolContext(root_context: tool_runtime.Context) tool_runtime.Context {
             var child_context = root_context;
+            child_context.coordinator_mode = false;
             child_context.tracker = null;
             return child_context;
         }
@@ -219,6 +220,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
+                .coordinator_mode = completion_review.coordinatorEnabled(),
                 .fossil_workspace_available = if (comptime @hasDecl(App, "fossilWorkspaceAvailable")) app.fossilWorkspaceAvailable() else false,
                 .workspace_root = workspace.root,
                 .access_scope = workspace.access_scope,
@@ -1334,7 +1336,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_chat_url = gateway_chat_url,
                 .advertised_tool_names = tool_projection.advertised_names,
                 .advertised_functions = tool_projection.advertised_functions,
-                .provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
+                .provider_capabilities = if (completion_review.coordinatorEnabled()) .{} else if (comptime @hasDecl(App, "providerSet"))
                     app.providerSet().select(job.provider).capabilities
                 else if (job.provider == .gateway)
                     .{ .fx_search = true, .vision_fallback = true }
@@ -1347,6 +1349,7 @@ pub fn Runtime(comptime App: type) type {
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .review_enabled = false,
                 .contract_review_enabled = completion_review.enabled(),
+                .coordinator_mode = completion_review.coordinatorEnabled(),
                 .fossil_session_id = if (completion_review.enabled()) app_session_runtime.Runtime(App).activeSessionId(app) else null,
                 .fossil_ephemeral = completion_review.enabled() and app.session_persistence.writable == null,
 

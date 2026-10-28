@@ -157,3 +157,72 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
  expect(retained.schedules[0].state).toBe('waiting');
  expect(provider.counts().actors).toBe(actors);
 },120000);
+
+test('background contracts release the main chat while workers await input and publish independently', async () => {
+ const f = fixture(); let answered = false; let workerCalls = 0;
+ model(f, (body) => {
+  const names = body.tools?.map((tool:any) => tool.function?.name) || [];
+  if (!names.includes('write_file')) {
+   const user = body.messages.filter((m:any) => m.role === 'user').at(-1)?.content || '';
+   if (String(user).includes('still available')) return {content:'The main chat is still available.'};
+   expect(names).not.toContain('shell');
+   return {tool_calls:[{index:0,id:'dispatch-original-contract',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  }
+  workerCalls++;
+  if (!answered) return questionCall();
+  return {content:'The requested report uses the chosen brief presentation.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native = host(f); const observed:any[] = [];
+ native.on('event', (event:any) => observed.push(event));
+ const until = async (read:()=>Promise<any>, predicate:(value:any)=>boolean) => {
+  const deadline = Date.now()+60000; let value:any;
+  do { value = await read(); if(predicate(value)) return value; await Bun.sleep(100); } while(Date.now()<deadline);
+  throw Error(`Background state did not converge: ${JSON.stringify(value)}; ${native.stderr}`);
+ };
+ try {
+  const ending = terminal(native,'dispatch-report');
+  await native.request('coordinate',{text:'Prepare the report after I choose its presentation.'},{id:'dispatch-report'});
+  const handoffEnd = await ending;
+  if (handoffEnd.data.exit_code) console.error(JSON.stringify(observed), native.stderr);
+  expect(handoffEnd.data.exit_code).toBe(0);
+  const dispatched = observed.find(e=>e.data.type==='background_dispatch');
+  expect(dispatched).toBeDefined();
+  const original = (await native.request('background')).workers[0].record;
+  expect(original.state).not.toBe('completed'); expect(original.publication_revision).toBeNull();
+  const session = observed.find(e=>e.data.type==='session').data.session_id;
+  const running = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.state==='running');
+  const input = await until(()=>native.request('background',{action:'events',task:original.task,generation:running.generation}), value=>value.events.some((e:any)=>e.data.type==='input_required'));
+  expect(workerCalls).toBe(1);
+  const endingSecond = terminal(native,'main-while-worker-waits');
+  await native.request('coordinate',{text:'Are you still available?',session},{id:'main-while-worker-waits'});
+  expect((await endingSecond).data.exit_code).toBe(0);
+  expect(observed.some(e=>e.turn==='main-while-worker-waits' && e.data.type==='text_delta' && e.data.text.includes('still available'))).toBe(true);
+  expect((await native.request('background',{action:'show',task:original.task})).state).toBe('running');
+  const required = input.events.find((e:any)=>e.data.type==='input_required').data;
+  await expect(native.request('background',{action:'input',task:original.task,generation:running.generation+1,operation:'b'.repeat(64),request_id:required.request_id,answers:['Brief']})).rejects.toThrow('StaleBackgroundOwner');
+  answered = true;
+  const operation = 'a'.repeat(64);
+  await native.request('background',{action:'input',task:original.task,generation:running.generation,operation,request_id:required.request_id,answers:['Brief']});
+  const final = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.state==='completed'||value.state==='waiting');
+  if (final.state !== 'completed') {
+   let offset=0; const diagnostics:any[]=[];
+   for(let page=0;page<8;page++){const result=await native.request('background',{action:'events',task:original.task,generation:running.generation,offset});diagnostics.push(...result.events);if(result.next_offset===offset)break;offset=result.next_offset;}
+   console.error('background final',JSON.stringify(final),JSON.stringify(diagnostics.filter(e=>['result','error','notice','background_outcome'].includes(e.data.type)).slice(-12)));
+  }
+  expect(final.state).toBe('completed'); expect(final.task).toBe(original.task);
+  expect(final.contract_sha256).toBe(original.contract_sha256); expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  const tasks = await native.request('snapshot',{action:'fossil.status'});
+  expect(tasks.tasks.find((task:any)=>task.id===original.task).state).toBe('accepted');
+  const actorsBeforeRecovery = workerCalls;
+  const reconcile = {action:'resume',task:original.task,generation:running.generation,operation:'c'.repeat(64)};
+  expect((await native.request('background',reconcile)).fulfilled).toBe(true);
+  expect((await native.request('background',reconcile)).already_accepted).toBe(true);
+  await expect(native.request('background',{...reconcile,text:'Changed retry'})).rejects.toThrow('BackgroundOperationConflict');
+  expect(workerCalls).toBe(actorsBeforeRecovery);
+  expect(native.stderr).toBe('');
+ } finally {
+  await native.request('background',{action:'stop'});
+  await until(()=>native.request('background',{action:'host'}), value=>!value.running);
+ }
+},120000);

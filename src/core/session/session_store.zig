@@ -1160,6 +1160,16 @@ pub const Store = struct {
     }
 
     /// Loads a session's full durable state read-only. Caller owns the state.
+    /// Reads saved permission decisions without hydrating conversation history.
+    pub fn loadPermissionsReadOnly(self: Store, alloc: Allocator, session_id: []const u8) !@import("../permissions/session_permission_state.zig").State {
+        var dir = try self.openSessionDir(session_id);
+        defer dir.close();
+        if (try session_log.hasConversationMetadata(alloc, &dir)) return session_log.loadConversationPermissionState(alloc, &dir);
+        var state = try self.loadReadOnly(alloc, session_id);
+        defer state.deinit(alloc);
+        return @import("../permissions/session_permission_state.zig").dupe(alloc, state.permission_state);
+    }
+
     pub fn loadReadOnly(
         self: Store,
         alloc: Allocator,

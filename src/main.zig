@@ -2061,6 +2061,7 @@ const App = struct {
             alloc,
             permission_mode,
             self.permission_engine.rules,
+            @import("core/agent/runtime/completion_review.zig").coordinatorEnabled(),
         );
     }
 
@@ -2074,6 +2075,7 @@ const App = struct {
             alloc,
             permission_mode,
             permission_rules,
+            false,
         );
     }
 
@@ -2082,12 +2084,14 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        coordinator: bool,
     ) !tool_projection.EffectiveToolProjection {
         return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = self.session_persistence.subagent_host != null,
             .fossil_workspace_available = self.fossilWorkspaceAvailable(),
+            .coordinator_mode = coordinator,
         });
     }
 

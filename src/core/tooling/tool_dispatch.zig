@@ -252,9 +252,12 @@ pub const RunCommandBackend = struct {
 
 /// Context shared by core tool dispatch, validation, and execution.
 pub const DispatchContext = struct {
+    coordinator_mode: bool = false,
     allocator: Allocator,
     fossil_session_id: ?[]const u8 = null,
     fossil_workspace_available: bool = false,
+    background_dispatch_ctx: ?*anyopaque = null,
+    background_dispatch_fn: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror![]const u8 = null,
     permission_mode: permission_gate.PermissionMode = .ask,
     permission_decider: ?PermissionDecider = null,
     execution_authority: ?command_admission.ToolExecutionAuthority = null,

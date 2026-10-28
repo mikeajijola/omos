@@ -1,5 +1,6 @@
 const completion_review = @import("../agent/runtime/completion_review.zig");
 const std = @import("std");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
@@ -323,6 +324,7 @@ pub const PromptRunResult = struct {
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     recovery: ?types.RouteRecoveryStatus = null,
     recovery_durable: bool = false,
+    background_json: ?[]u8 = null,
     usage: types.Usage = .{},
 
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
@@ -332,6 +334,7 @@ pub const PromptRunResult = struct {
         if (self.model.len > 0) alloc.free(self.model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
+        if (self.background_json) |bytes| alloc.free(bytes);
         freeToolCallRecords(alloc, self.tool_calls);
     }
 };
@@ -643,6 +646,7 @@ const AskContext = struct {
     mcp_host: ?*mcp_host.Host = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
+    background_json: ?[]u8 = null,
     typed_error_code: ?[]const u8 = null,
     auth_failure: ?auth_runtime.FailureSnapshot = null,
     output_mode: OutputMode = .raw,
@@ -741,7 +745,7 @@ const AskContext = struct {
         const cue: notification_sound.Cue = switch (input.outcome) {
             .completed => .success,
             .failed => .@"error",
-            .interrupted, .paused => return,
+            .interrupted, .paused, .delegated => return,
         };
         self.playNotification(.turn_end, cue);
     }
@@ -778,6 +782,7 @@ const AskContext = struct {
     }
 
     fn deinit(self: *AskContext) void {
+        if (self.background_json) |bytes| self.alloc.free(bytes);
         // Terminals end with this process. Ending them first also releases
         // any subagent still waiting on one.
         self.terminal_client.closeOwnedTerminals();
@@ -1198,6 +1203,8 @@ const AskContext = struct {
             .permission_mode = self.permission_mode,
             .permission_grants = &.{},
             .permission_rules = self.permission_rules,
+            .coordinator_mode = if (self.deps.ui_host) |ui| ui.coordinator_mode else false,
+            .background_authority = if (self.deps.ui_host) |ui| ui.background_authority else null,
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.activeSessionId(),
@@ -1752,6 +1759,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var permission_mode = toCorePermissionMode(startup.permission_mode);
     const mode_id: []const u8 = cfg.mode_registry.default_mode_id;
     if (permission_override) |explicit| permission_mode = explicit;
+    if (options.deps.ui_host) |ui| if (ui.background_authority) |authority| {
+        if (!startup.provider.same_authority(authority.provider)) return error.BackgroundProviderChanged;
+        if (@backingInt(permission_mode) > @backingInt(authority.permission_mode)) permission_mode = authority.permission_mode;
+    };
 
     if (permission_mode == .yolo and !startup.yolo_acknowledged) {
         try emitHeadlessYoloWarning(alloc, options);
@@ -1828,6 +1839,13 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.reviewer_model = startup.review_model;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
+    if (options.deps.ui_host) |ui| if (ui.background_authority) |authority| {
+        const current = try std.json.Stringify.valueAlloc(alloc, ctx.permission_rules, .{});
+        defer alloc.free(current);
+        const captured = try std.json.Stringify.valueAlloc(alloc, authority.permission_rules, .{});
+        defer alloc.free(captured);
+        if (!std.mem.eql(u8, current, captured)) return error.BackgroundPermissionPolicyChanged;
+    };
     ctx.context_enabled = startup.context_enabled;
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
@@ -1991,7 +2009,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ctx.session.snapshotImageCatalog(alloc, current_images);
     defer types.freeImageAttachmentSlice(alloc, authorized_image_catalog);
 
-    if (ctx.deps.ui_host) |ui| try ui.beginSession(ctx.activeSessionId() orelse return error.SessionPersistenceUnavailable);
+    if (ctx.deps.ui_host) |ui| {
+        if (ui.background_authority) |authority| if (ctx.requested_resume == null) {
+            const permission_state: session_permission_state.State = .{ .next_generation = authority.session_generation, .rules = .fromOwnedSlice(@constCast(authority.session_rules)) };
+            const history = try ctx.session.snapshotHistory(alloc);
+            defer types.freeHistoryTurnSlice(alloc, history);
+            try ctx.session.restoreWithPermissionState(alloc, ctx.session.languageSnapshot(), history, permission_state);
+        };
+        try ui.beginSession(ctx.activeSessionId() orelse return error.SessionPersistenceUnavailable);
+    }
     try ctx.checkCancellation();
     ctx.loaded_skills = try options.deps.load_skills(
         alloc,
@@ -2073,16 +2099,21 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
         .fossil_workspace_available = completion_review.enabled(),
+        .coordinator_mode = if (options.deps.ui_host) |ui| ui.coordinator_mode else false,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
     const context_history = try ctx.session.snapshotHistory(alloc);
     defer types.freeHistoryTurnSlice(alloc, context_history);
-    const root_user_intent_context = try auto_classifier_context.buildCanonicalRootUserContext(
-        alloc,
-        owned_prompt,
-        ctx.session.agent.history.items,
-    );
+    const inherited_authority = if (options.deps.ui_host) |ui| ui.background_authority else null;
+    const root_user_intent_context = if (inherited_authority) |authority|
+        try alloc.dupe(u8, authority.root_user_context)
+    else
+        try auto_classifier_context.buildCanonicalRootUserContext(
+            alloc,
+            owned_prompt,
+            ctx.session.agent.history.items,
+        );
     defer alloc.free(root_user_intent_context);
     ctx.active_turn_id = if (recovery_checkpoint) |checkpoint|
         checkpoint.turn_id
@@ -2152,7 +2183,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
-        .provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities,
+        .provider_capabilities = if (options.deps.ui_host != null and options.deps.ui_host.?.coordinator_mode) .{} else cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
@@ -2161,6 +2192,8 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .contract_review_enabled = completion_review.enabled(),
         .ui_host = ctx.deps.ui_host,
         .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
+        .background_worker = inherited_authority != null,
+        .coordinator_mode = if (options.deps.ui_host) |ui| ui.coordinator_mode else false,
         .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
         .fossil_execution_lease_held = cfg.fossil_execution_lease_held,
 
@@ -2185,15 +2218,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             if (writable.external_prompt_origin == .persistent_child) .subagent else .root
         else
             .root,
-        .root_user_messages = if (ctx.writable) |writable|
+        .root_user_messages = if (inherited_authority) |authority| authority.root_user_messages else if (ctx.writable) |writable|
             writable.external_root_user_messages
         else
             &.{},
-        .root_user_evidence_complete = if (ctx.writable) |writable|
+        .root_user_evidence_complete = if (inherited_authority) |authority| authority.root_user_evidence_complete else if (ctx.writable) |writable|
             writable.external_root_user_evidence_complete
         else
             false,
-        .current_prompt_is_root_authority = current_prompt_is_root_authority,
+        .current_prompt_is_root_authority = inherited_authority == null and current_prompt_is_root_authority,
         .context_limits = ctx.context_limits,
         .session_child_capability = session_child_capability,
         .ephemeral_command_replay = if (session_child_capability == null)
@@ -2362,6 +2395,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .recovery = ctx.last_recovery_status,
         // Sessions v2 keeps no recovery checkpoint yet.
         .recovery_durable = ctx.writable != null,
+        .background_json = if (ctx.background_json) |bytes| try alloc.dupe(u8, bytes) else null,
         .usage = ctx.session.agent.turn_usage,
     };
 }
@@ -2423,6 +2457,7 @@ fn finalizeFreshAuthSession(ctx: *AskContext, result: *PromptRunResult) void {
 
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     return .{
+        .background_dispatched = backgroundDispatched,
         .take_steering_boundary = if (ctx.deps.ui_host != null) takeUiSteering else null,
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
@@ -2639,7 +2674,15 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     if (outcome == .failed or outcome == .paused) {
         ctx.failed = true;
     }
-    if (outcome == .completed) discard_restarted_json_preview(ctx);
+    if (outcome == .completed or outcome == .delegated) discard_restarted_json_preview(ctx);
+}
+
+fn backgroundDispatched(raw: *anyopaque, entry: @import("../workspace/background_contract.zig").Record) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw));
+    const bytes = try std.json.Stringify.valueAlloc(ctx.alloc, entry, .{});
+    if (ctx.background_json) |old| ctx.alloc.free(old);
+    ctx.background_json = bytes;
+    if (ctx.deps.ui_host) |ui| try ui.emit(.{ .type = "background_dispatch", .worker = entry });
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -4484,6 +4527,10 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.writeAll(",\"final_output\":");
     try std.json.Stringify.value(result.final_output, .{}, &out.writer);
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
+    if (result.background_json) |bytes| {
+        try out.writer.writeAll(",\"outcome\":\"delegated\",\"background\":");
+        try out.writer.writeAll(bytes);
+    }
     try out.writer.writeAll(",\"model\":");
     try std.json.Stringify.value(result.model, .{}, &out.writer);
     try out.writer.writeAll(",\"resolved_provider\":");

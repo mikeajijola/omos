@@ -113,6 +113,8 @@ test {
 }
 
 pub const Context = struct {
+    coordinator_mode: bool = false,
+    background_authority: ?*const @import("../workspace/background_control.zig").Authority = null,
     fossil_workspace_available: bool = false,
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
@@ -697,6 +699,12 @@ fn executeToolCallInner(
     classification_complete: bool,
     authorized_image_catalog: []const types.ImageAttachment,
 ) !ToolExecutionResult {
+    if (comptime !@import("builtin").target.cpu.arch.isWasm()) {
+        if (ctx.background_authority) |activation| {
+            const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            try @import("../workspace/background_control.zig").verifyLiveAuthority(manager, activation.*);
+        }
+    }
     return switch (try resolveToolDispatchPrelude(
         ctx,
         arena,
@@ -868,6 +876,12 @@ fn executeRegisteredTool(
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
+    var background_context = ctx;
+    if (ctx.fossil_workspace_available) {
+        dispatch_ctx.background_dispatch_ctx = &background_context;
+        dispatch_ctx.background_dispatch_fn = dispatchBackgroundContract;
+        dispatch_ctx.coordinator_mode = ctx.coordinator_mode;
+    }
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
     dispatch_ctx.result_commit_sink = &result_commit_token;
@@ -1181,6 +1195,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
     return .{
         .allocator = arena,
         .fossil_workspace_available = ctx.fossil_workspace_available,
+        .coordinator_mode = ctx.coordinator_mode,
         .fossil_session_id = if (ctx.fossil_workspace_available) ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id else null,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
@@ -2188,6 +2203,62 @@ fn subagentProviderFailure(
         .error_code = error_code,
     }) catch return error.OutOfMemory;
     return .{ .status = .failure, .body = body };
+}
+
+fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []const u8) ![]const u8 {
+    if (comptime @import("builtin").target.cpu.arch.isWasm()) return error.BackgroundHostUnavailable;
+    const ctx: *Context = @ptrCast(@alignCast(raw.?));
+    const session_id = ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id orelse return error.SavedTaskRequired;
+    const workspace = @import("../workspace/fossil_workspace.zig");
+    const dispatch = @import("../workspace/background_dispatch.zig");
+    const control = @import("../workspace/background_control.zig");
+    const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+    const task = (try manager.active(session_id)) orelse return error.SavedTaskRequired;
+    if (try manager.backgroundRecord(task.id)) |existing| {
+        if (existing.worker_session) |worker_session| if (std.mem.eql(u8, worker_session, session_id)) return error.BackgroundWorkerCannotRedispatch;
+    }
+    if (ctx.managed_executions) |executions| {
+        const active = try executions.list(arena);
+        for (active) |item| switch (item.state) {
+            .running, .lost => return error.BackgroundActiveEffectsRequireReconciliation,
+            else => {},
+        };
+    }
+    const entry = try dispatch.prepare(manager, task, session_id, call_id);
+    const state = if (ctx.permission_state_override) |override| override.* else try ctx.session.snapshotPermissionState(arena);
+    try control.activate(manager, entry, .{
+        .workspace = manager.manifest.id,
+        .task = task.id,
+        .operation = entry.operation,
+        .request_sha256 = entry.request_sha256,
+        .permission_mode = ctx.permission_mode,
+        .provider = ctx.provider,
+        .model = ctx.model,
+        .effort = ctx.effort,
+        .root_user_context = ctx.root_user_intent_context,
+        .root_user_messages = ctx.root_user_messages,
+        .root_user_evidence_complete = ctx.root_user_evidence_complete,
+        .source_session = session_id,
+        .project_root = task.project_root,
+        .policy_sha256 = try control.policyDigest(manager, task.project_root),
+        .session_permission_sha256 = try workspace.hash(arena, try @import("../session/session_codec.zig").encodePermissionState(arena, state)),
+        .permission_rules = ctx.permission_rules,
+        .session_rules = state.rules.items,
+        .session_generation = state.next_generation,
+    });
+    try control.ensureHost(manager);
+    const previous = try manager.backgroundRecord(task.id);
+    if (previous == null or previous.?.state == .superseded) try manager.saveBackgroundRecord(entry, if (previous) |old| try dispatch.digest(manager, old) else null);
+    return std.json.Stringify.valueAlloc(arena, .{
+        .version = "omos.background-dispatch-receipt/v1",
+        .task = task.id,
+        .operation = entry.operation,
+        .state = entry.state,
+        .contract_version = entry.contract_version,
+        .contract_sha256 = entry.contract_sha256,
+        .fulfilled = false,
+        .note = "The host prepared an execution handoff. It will checkpoint the original contract and release this conversation before the independent worker starts. Dispatch does not establish task completion.",
+    }, .{});
 }
 
 fn executeSubagentProvider(

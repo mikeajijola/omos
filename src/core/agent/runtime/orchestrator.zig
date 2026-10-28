@@ -221,6 +221,63 @@ fn continue_pending_subagent(
     return true;
 }
 
+noinline fn finishBackgroundHandoff(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    config: Config,
+    job: QueuedPrompt,
+    turn: *managed_task.Turn,
+    finalization: *TurnFinalizationGuard,
+    suffix: *std.ArrayList(ChatMessage),
+    summary: *runtime_telemetry.TurnSummaryAccumulator,
+    trace: *PromptFinishTrace,
+) !bool {
+    if (config.background_worker or config.origin != .root) return false;
+    const background = @import("../../workspace/background_contract.zig");
+    const dispatch = @import("../../workspace/background_dispatch.zig");
+    const control = @import("../../workspace/background_control.zig");
+    const entry = (try turn.manager.backgroundRecord(turn.task.id)) orelse return false;
+    if (entry.state != .prepared) return false;
+    const session = config.fossil_session_id orelse return error.SavedTaskRequired;
+    if (!std.mem.eql(u8, entry.dispatcher_session, try @import("../../workspace/fossil_workspace.zig").hash(arena, session))) return error.BackgroundDispatcherChanged;
+    // Consume authenticated guidance before transferring ownership. A revised
+    // contract supersedes this proposal rather than silently changing its pin.
+    if (try observe_steering_boundary(deps, arena, arena, suffix, job.turn_id, config.origin, .model) == .continued) {
+        var superseded = entry;
+        superseded.state = .superseded;
+        superseded.reason = "Authenticated steering arrived before handoff. Revise the contract and dispatch it again.";
+        superseded.updated_ms = io_mod.milliTimestamp();
+        try turn.manager.saveBackgroundRecord(superseded, try dispatch.digest(turn.manager, entry));
+        return false;
+    }
+    const current = try turn.manager.loadTask(turn.task.id);
+    const contract_hash = try @import("../../workspace/fossil_workspace.zig").hash(arena, try std.json.Stringify.valueAlloc(arena, current.definition, .{}));
+    if (current.definition.version != entry.contract_version or !std.mem.eql(u8, contract_hash, entry.contract_sha256)) {
+        var superseded = entry;
+        superseded.state = .superseded;
+        superseded.updated_ms = io_mod.milliTimestamp();
+        superseded.reason = "Authenticated contract amendments superseded the prepared handoff. Dispatch the current contract with a fresh operation.";
+        try background.validate(superseded);
+        try turn.manager.saveBackgroundRecord(superseded, try dispatch.digest(turn.manager, entry));
+        try suffix.append(arena, .{ .role = .user, .content = superseded.reason, .context_origin = .ordinary });
+        return false;
+    }
+    _ = (try control.activation(turn.manager, entry)) orelse return error.BackgroundActivationRequired;
+    try control.ensureHost(turn.manager);
+    try turn.progress(arena, suffix.items);
+    try turn.manager.record(turn.task, "background_handoff", .{ .operation = entry.operation, .contract_version = entry.contract_version, .contract_sha256 = entry.contract_sha256, .fulfilled = false });
+    try turn.retain();
+    const queued = try dispatch.seal(turn.manager, turn.task, session);
+    if (deps.background_dispatched) |publish| try publish(deps.ctx, queued);
+    const text = try arena.print("Queued task {s} for a background agent. You can keep chatting. The original contract remains pending until independent review and publication pass.", .{queued.task});
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = text });
+    try deps.push_text(deps.ctx, .{ .assistant_rendered = text });
+    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+    try finishCommonAssistantTerminal(deps, finalization, arena, job, suffix.items, summary, .{ .history = text }, .delegated, null, trace, "background_handoff", .{ .role = .assistant, .content = text });
+    return true;
+}
+
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -5460,6 +5517,7 @@ pub fn processAgentPrompt(
             else => .failed,
         } else if (finalization.outcome) |outcome| switch (outcome) {
             .completed => .completed,
+            .delegated => .yielded,
             .interrupted => .interrupted,
             .failed => .failed,
             .paused => .paused,
@@ -7413,6 +7471,7 @@ fn processQueuedPromptLoop(
                 const retained_evidence = try turn.beforeReview(arena, &.{});
                 try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             }
+            if (try finishBackgroundHandoff(deps, arena, config, job, turn, finalization, &within_turn_suffix, &summary_accumulator, &finish_trace)) return;
             job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         }
         if (managed) |*turn| if (turn.task.model_basis) |basis| {
@@ -7517,7 +7576,7 @@ fn processQueuedPromptLoop(
             restore_recovery_source = false;
         }
 
-        var advertised_dynamic_tools = try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
+        var advertised_dynamic_tools = if (config.coordinator_mode) &.{} else try runtime_gateway_step.snapshotDynamicTools(arena, deps, &selected_dynamic_tools);
         var advertised_dynamic_tool_names = try arena.alloc([]const u8, advertised_dynamic_tools.len);
         for (advertised_dynamic_tools, 0..) |tool, index| advertised_dynamic_tool_names[index] = tool.name;
         var stream_result: runtime_gateway_step.StreamResult = undefined;
@@ -12801,6 +12860,7 @@ fn processQueuedPromptLoop(
             );
             return;
         }
+        if (managed) |*turn| if (try finishBackgroundHandoff(deps, arena, config, job, turn, finalization, &within_turn_suffix, &summary_accumulator, &finish_trace)) return;
         if (terminal_provider_completion) {
             const raw_final = completion.content.?;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);

@@ -225,6 +225,7 @@ pub const AgentRuntimeDeps = struct {
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
     wait_for_subagent: ?*const fn (ctx: *anyopaque, turn_id: u64, step_id: u64) anyerror!bool = null,
+    background_dispatched: ?*const fn (*anyopaque, @import("../../workspace/background_contract.zig").Record) anyerror!void = null,
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,

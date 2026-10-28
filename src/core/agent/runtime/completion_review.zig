@@ -28,6 +28,11 @@ pub fn enabled() bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
 }
 
+pub fn coordinatorEnabled() bool {
+    const value = io.getenv("OMOS_COORDINATOR") orelse return named_invocation;
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
 pub fn defaultReviewerModelForProvider(
     provider: model_provider.ProviderId,
     definitions: []const configured_provider.Definition,

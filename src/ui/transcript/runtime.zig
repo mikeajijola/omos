@@ -696,7 +696,7 @@ fn lifecycleFallbackLine(
             "● Tool completion was not reported"),
         .interrupted => lifecycleTerminalLine(alloc, .cancelled, "Tool cancelled"),
         .failed => lifecycleTerminalLine(alloc, .failed, "Tool failed"),
-        .paused => lifecycleLine(alloc, "● Tool state preserved for recovery"),
+        .paused, .delegated => lifecycleLine(alloc, "● Tool state preserved for recovery"),
     };
 }
 
@@ -5720,7 +5720,7 @@ pub const TranscriptRuntime = struct {
             .completed => .completed,
             .interrupted => .cancelled,
             .failed => .failed,
-            .paused => null,
+            .paused, .delegated => null,
         };
         const append_turn_cancellation = finished.outcome == .interrupted and
             self.lifecycle_state.needsTurnCancellationNoticeAfterTurnFinished(

@@ -201,6 +201,7 @@ pub const TurnPresentationOutcome = enum {
     interrupted,
     failed,
     paused,
+    delegated,
 };
 
 pub const TurnFinished = struct {

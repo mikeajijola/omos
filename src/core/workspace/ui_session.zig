@@ -67,6 +67,10 @@ pub const Host = struct {
     session_id: []const u8 = "",
     project_root: ?[]const u8 = null,
     execution_lease_held: bool = false,
+    background_authority: ?*const @import("background_control.zig").Authority = null,
+    coordinator_mode: bool = false,
+    session_binding_ctx: ?*anyopaque = null,
+    session_binding_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
 
     pub fn emit(self: *Host, value: anytype) !void {
         const bytes = try std.json.Stringify.valueAlloc(std.heap.c_allocator, value, .{});
@@ -81,6 +85,7 @@ pub const Host = struct {
     }
 
     pub fn beginSession(self: *Host, id: []const u8) !void {
+        if (self.session_binding_fn) |bind| try bind(self.session_binding_ctx.?, id);
         self.mutex.lockUncancelable(io.getIo());
         self.session_id = id;
         self.mutex.unlock(io.getIo());
