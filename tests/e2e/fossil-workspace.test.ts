@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
@@ -72,6 +72,14 @@ describe("portable Fossil agent workspace", () => {
     expect(m.packets[0].evidence.some((entry: any) => entry.tool === "fossil_workspace" && entry.status === "success")).toBe(true);
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Prefer concise answers.");
     expect(f.fossil("ls", "-r", "trunk")).toContain("acceptances/");
+    const expectedFiles = f.fossil("ls", "-r", "trunk").trim().split("\n");
+    const inventoryHelper = join(f.home, "manifest-inventory-helper.py");
+    const realFossil = Bun.which("fossil")!;
+    writeFileSync(inventoryHelper, `#!/usr/bin/env python3\nimport os, sys\nif 'ls' in sys.argv[1:]:\n    sys.stderr.write('Inventory must not compute commit ages\\n')\n    sys.exit(97)\nos.execv(${JSON.stringify(realFossil)}, [${JSON.stringify(realFossil)}, *sys.argv[1:]])\n`);
+    chmodSync(inventoryHelper, 0o755);
+    const manifestStatus = await f.run(["fossil", "status", "--json"], { OMOS_FOSSIL_BIN: inventoryHelper });
+    expect(manifestStatus.code, manifestStatus.stderr).toBe(0);
+    expect(JSON.parse(manifestStatus.stdout).files).toEqual(expectedFiles);
     expect(status.pending_journals).toBe(0);
     const raw = fixture();
     const rawCopy = join(raw.home, "direct-copy.fossil");

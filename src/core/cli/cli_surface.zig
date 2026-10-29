@@ -1864,7 +1864,7 @@ fn runNonInteractiveWithDeps(
                         const self: *@This() = @ptrCast(@alignCast(raw));
                         const worker = @import("../workspace/schedule_worker.zig");
                         const invocation = try worker.prepare(worker_manager, schedule);
-                        const args = try worker.promptArgs(worker_manager.alloc, invocation.session);
+                        const args = try worker.promptArgs(worker_manager.alloc, invocation.session, invocation.prompt);
                         var scheduled_ui: worker.Headless = .{ .alloc = worker_manager.alloc };
                         scheduled_ui.init(invocation.task.project_root);
                         defer scheduled_ui.ui.deinit();
@@ -1903,6 +1903,27 @@ fn runNonInteractiveWithDeps(
         .schedule => |rest| {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "series")) {
+                const recurring = @import("../workspace/schedule_series.zig");
+                var options = recurring.parseArgs(rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .schedule, "schedule series", err, rest);
+                    return .handled_failure;
+                };
+                const format: output_contracts.OutputFormat = if (options.json) .json else .text;
+                const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena.allocator())) orelse {
+                    try writeLookupFailure(alloc, deps, "schedule series", error.NoFossilWorkspace, format);
+                    return .handled_failure;
+                };
+                if (recurring.mutation(options.request) and options.request.revision == null) options.request.revision = (try manager.scheduleSeriesSnapshot(.{})).revision;
+                const snapshot = manager.scheduleSeriesSnapshot(options.request) catch |err| {
+                    try writeLookupFailure(alloc, deps, "schedule series", err, format);
+                    return .handled_failure;
+                };
+                const rendered = try output_contracts.renderScheduleSeries(alloc, snapshot, format);
+                defer alloc.free(rendered);
+                try writeFormattedOutput(deps, rendered, format);
+                return .handled_success;
+            }
             const scheduling = @import("../workspace/scheduling.zig");
             const options = scheduling.parseArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .schedule, "schedule", err, rest);
