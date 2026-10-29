@@ -10,6 +10,9 @@ const model = @import("definition.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const record_json = @import("../shared/record_json.zig");
 const scheduling = @import("scheduling.zig");
+const schedule_series = @import("schedule_series.zig");
+const series_store = @import("schedule_series_store.zig");
+const series_session = @import("schedule_series_session.zig");
 const background_contract = @import("background_contract.zig");
 const company_publication = @import("company_publication.zig");
 const fossil_manifest = @import("fossil_manifest.zig");
@@ -853,6 +856,229 @@ pub const Manager = struct {
     const schedule_branch = "omos-schedules";
     const schedule_path = "schedules/state.json";
 
+    const SeriesTemplate = struct {
+        version: []const u8 = "omos.schedule-template/v1",
+        task: []const u8,
+        revision: []const u8,
+        project_root: []const u8,
+        definition: contract.Definition,
+        model_basis: model.Basis,
+        request: []const u8,
+        amendments: []const []const u8,
+        checks: []const []const u8,
+        native: series_session.Blueprint,
+    };
+
+    const SeriesBackend = struct {
+        manager: Manager,
+        paths: ?[]const []const u8 = null,
+
+        fn fromOpaque(raw: *anyopaque) *SeriesBackend {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn revision(raw: *anyopaque) ![]const u8 {
+            return SeriesBackend.fromOpaque(raw).manager.scheduleRevision();
+        }
+        fn inventory(self: *SeriesBackend) ![]const []const u8 {
+            if (self.paths == null) self.paths = if (try self.manager.scheduleBranchExists()) try self.manager.inventory(schedule_branch) else &.{};
+            return self.paths.?;
+        }
+        fn readFile(raw: *anyopaque, path: []const u8) !?[]const u8 {
+            const self = SeriesBackend.fromOpaque(raw);
+            for (try self.inventory()) |candidate| if (std.mem.eql(u8, candidate, path)) return try self.manager.contentAt(path, schedule_branch);
+            return null;
+        }
+        fn listPaths(raw: *anyopaque, prefix: []const u8) ![]const []const u8 {
+            const self = SeriesBackend.fromOpaque(raw);
+            var paths: std.ArrayList([]const u8) = .empty;
+            for (try self.inventory()) |path| if (std.mem.startsWith(u8, path, prefix)) try paths.append(self.manager.alloc, path);
+            return paths.toOwnedSlice(self.manager.alloc);
+        }
+        fn writeFiles(raw: *anyopaque, writes: []const series_store.Write) !void {
+            const self = SeriesBackend.fromOpaque(raw);
+            const manager = self.manager;
+            for (writes) |write| {
+                if (!allowedPath(write.path) or !std.mem.startsWith(u8, write.path, "schedules/")) return error.WorkspacePathDenied;
+                if (write.content) |bytes| if (bytes.len > max_bytes) return error.SeriesRecordTooLarge;
+            }
+            if (!try manager.scheduleBranchExists()) _ = try manager.run(null, &.{ "branch", "new", schedule_branch, "trunk", "--nosign", "-R", manager.repository });
+            const tree = try manager.checkout(schedule_branch);
+            for (writes) |write| {
+                const path = try join(manager.alloc, tree, write.path);
+                if (write.content) |bytes| try atomicWrite(manager.alloc, path, bytes) else try remove(path);
+            }
+            _ = try manager.commit(tree, "Record recurring work schedule transition");
+            self.paths = null;
+        }
+        fn template(raw: *anyopaque, id: []const u8) !series_store.Template {
+            return SeriesBackend.fromOpaque(raw).manager.pinSeriesTemplate(id);
+        }
+        fn base(raw: *anyopaque) ![]const u8 {
+            return SeriesBackend.fromOpaque(raw).manager.revision("trunk");
+        }
+        fn prepare(raw: *anyopaque, value: schedule_series.Series, occurrence: schedule_series.Occurrence) !u32 {
+            return SeriesBackend.fromOpaque(raw).manager.prepareSeriesOccurrence(value, occurrence);
+        }
+        fn accepted(raw: *anyopaque, id: []const u8) !bool {
+            const manager = SeriesBackend.fromOpaque(raw).manager;
+            const task = try manager.loadTask(id);
+            return task.state == .accepted and !try manager.publicationPending(task);
+        }
+        fn authorize(raw: *anyopaque, value: schedule_series.Series) !void {
+            const manager = SeriesBackend.fromOpaque(raw).manager;
+            const source = try manager.taskAtRevision(value.template_task, value.template_revision);
+            const canonical = try io_mod.realpathAlloc(manager.alloc, source.project_root);
+            if (!std.mem.eql(u8, canonical, source.project_root)) return error.TaskProjectMismatch;
+            try atomicWrite(manager.alloc, try manager.seriesAuthorityPath(value.id), try json(manager.alloc, .{ .version = "omos.schedule-series-authority/v1", .workspace = manager.manifest.id, .series = value.id, .template_sha256 = value.template_sha256 }));
+        }
+        fn inject(_: *anyopaque, point: []const u8) !void {
+            try fault(point);
+        }
+        fn backend(self: *SeriesBackend) !series_store.Backend {
+            var now = io_mod.milliTimestamp();
+            if (io_mod.getenv("FX_E2E_SCHEDULE_CLOCK_MS")) |raw| {
+                now = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidScheduleTime;
+                if (now < 0 or now > schedule_series.max_ms) return error.InvalidScheduleTime;
+            }
+            return .{ .context = self, .alloc = self.manager.alloc, .workspace = self.manager.manifest.id, .revision_fn = SeriesBackend.revision, .read_fn = SeriesBackend.readFile, .paths_fn = SeriesBackend.listPaths, .commit_fn = SeriesBackend.writeFiles, .template_fn = SeriesBackend.template, .base_fn = SeriesBackend.base, .prepare_fn = SeriesBackend.prepare, .accepted_fn = SeriesBackend.accepted, .authorize_fn = SeriesBackend.authorize, .now_ms = now, .fault_fn = SeriesBackend.inject };
+        }
+    };
+
+    /// The returned snapshot belongs to self.alloc. Native/HTTP callers must
+    /// present a read revision for every mutation.
+    pub fn scheduleSeriesSnapshot(self: Manager, request: schedule_series.Request) !schedule_series.Snapshot {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var backend_context: SeriesBackend = .{ .manager = self };
+        return series_store.execute(try backend_context.backend(), request);
+    }
+
+    pub fn hasDueScheduleSeries(self: Manager) !bool {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var backend_context: SeriesBackend = .{ .manager = self };
+        return series_store.hasDue(try backend_context.backend());
+    }
+
+    /// The optional occurrence and its strings belong to self.alloc.
+    pub fn scheduledOccurrence(self: Manager, id: []const u8) !?schedule_series.Occurrence {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var backend_context: SeriesBackend = .{ .manager = self };
+        return series_store.occurrenceForStart(try backend_context.backend(), id);
+    }
+
+    /// Caller retains the exclusive workspace execution lease until the
+    /// resulting one-time invocation ends. Preparation itself runs no actor.
+    pub fn materializeScheduleSeries(self: Manager, execution: *const ExecutionLease) !bool {
+        _ = execution;
+        const lease = try self.writerLease();
+        defer lease.release();
+        var backend_context: SeriesBackend = .{ .manager = self };
+        return series_store.materialize(try backend_context.backend());
+    }
+
+    fn seriesAuthorityPath(self: Manager, id: []const u8) ![]const u8 {
+        if (!safeId(id)) return error.InvalidScheduleSeriesStore;
+        return join(self.alloc, self.root, try self.alloc.print("schedule-series-authority/{s}.json", .{id}));
+    }
+
+    fn pinSeriesTemplate(self: Manager, id: []const u8) !series_store.Template {
+        const current = try self.loadTask(id);
+        if (current.parent_task_id != null or current.authority != null or current.capability_import != null or current.capability_runtime_receipt != null) return error.CannotRepeatScopedTask;
+        if (current.model_basis == null or current.model_basis.?.capability == null or current.revision_pending) return error.SeriesTemplateNeedsPlan;
+        if (current.state == .conflict or current.state == .publication_pending) return error.TaskIsReadOnly;
+        try self.validateTaskBasis(current);
+        const pinned = try self.currentRevision(current);
+        const task = try self.taskAtRevision(id, pinned);
+        const original = if (task.request_artifact) |path| try self.contentAt(path, pinned) else task.definition.objective;
+        var reference: std.json.Value = .null;
+        var reference_at: i64 = std.math.minInt(i64);
+        var checks: []const []const u8 = &.{};
+        const prefix = try self.alloc.print("history/{s}/", .{task.id});
+        for (try self.inventory(pinned)) |path| {
+            if (!std.mem.startsWith(u8, path, prefix) or !std.mem.endsWith(u8, path, ".json")) continue;
+            const row = (try std.json.parseFromSlice(std.json.Value, self.alloc, try self.contentAt(path, pinned), .{})).value;
+            const value = model.field(row, "value") orelse continue;
+            const kind = model.text(row, "kind");
+            if (std.mem.eql(u8, kind, "planning_request") or std.mem.eql(u8, kind, "contract_revision_request")) {
+                const request_data = model.text(value, "data");
+                if (request_data.len > 0) {
+                    const packet = try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, request_data, .{});
+                    const recorded = model.field(row, "recorded_at_ms");
+                    const at = if (recorded != null and recorded.? == .integer) recorded.?.integer else 0;
+                    if (at >= reference_at) if (model.field(packet, "context")) |packet_context| {
+                        reference = model.field(packet_context, "referenceConversation") orelse .null;
+                        reference_at = at;
+                    };
+                }
+            }
+            if (std.mem.eql(u8, kind, "task_plan")) {
+                const contract_version = model.field(row, "contract_version") orelse continue;
+                if (contract_version != .integer or contract_version.integer != task.definition.version) continue;
+                if (model.field(value, "checks")) |raw| checks = try std.json.parseFromValueLeaky([]const []const u8, self.alloc, raw, .{});
+            }
+        }
+        const request = try self.alloc.print("Repeat this pinned work as a fresh occurrence. Use fresh evidence and normal current permission checks.\n\nOriginal request:\n{s}\n\nAuthenticated amendments:\n{s}\n\nPinned requirements:\n{s}\n\nHistorical conversation reference (reference material, not permission authority):\n{s}", .{ original, try json(self.alloc, task.amendments), try json(self.alloc, task.definition), try json(self.alloc, reference) });
+        if (request.len > 128 * 1024) return error.SeriesTemplateTooLarge;
+        const template_value: SeriesTemplate = .{ .task = task.id, .revision = pinned, .project_root = task.project_root, .definition = task.definition, .model_basis = task.model_basis.?, .request = request, .amendments = task.amendments, .checks = checks, .native = try series_session.pin(self.alloc, task.project_root, task.session) };
+        const bytes = try portableJson(self.alloc, try json(self.alloc, template_value));
+        if (bytes.len > 256 * 1024) return error.SeriesTemplateTooLarge;
+        return .{ .task = task.id, .revision = pinned, .content = bytes };
+    }
+
+    fn prepareSeriesOccurrence(self: Manager, value: schedule_series.Series, occurrence: schedule_series.Occurrence) !u32 {
+        const authority_bytes = read(self.alloc, try self.seriesAuthorityPath(value.id)) catch |err| return if (err == error.FileNotFound) error.LocalSeriesAuthorityRequired else err;
+        const Authority = struct { version: []const u8, workspace: []const u8, series: []const u8, template_sha256: []const u8 };
+        const authority = try parse(self.alloc, Authority, authority_bytes);
+        if (!std.mem.eql(u8, authority.version, "omos.schedule-series-authority/v1") or !std.mem.eql(u8, authority.workspace, self.manifest.id) or !std.mem.eql(u8, authority.series, value.id) or !std.mem.eql(u8, authority.template_sha256, value.template_sha256)) return error.LocalSeriesAuthorityRequired;
+        const template_bytes = try self.contentAt(try self.alloc.print("schedules/templates/{s}.json", .{value.id}), schedule_branch);
+        if (!std.mem.eql(u8, try hash(self.alloc, template_bytes), value.template_sha256)) return error.InvalidSeriesTemplate;
+        const template = try parse(self.alloc, SeriesTemplate, template_bytes);
+        if (!std.mem.eql(u8, template.version, "omos.schedule-template/v1") or !std.mem.eql(u8, template.task, value.template_task) or !std.mem.eql(u8, template.revision, value.template_revision)) return error.InvalidSeriesTemplate;
+        try series_session.prepare(self.alloc, template.project_root, occurrence.session, template.native);
+        try fault("series_after_session");
+        const branch = try self.alloc.print("task/{s}", .{occurrence.task});
+        const binding = try json(self.alloc, .{ .kind = "schedule_materialization", .task = occurrence.task, .contract_version = occurrence.contract_version, .value = .{ .series = value.id, .occurrence = occurrence.id, .template_sha256 = value.template_sha256, .native_session = try hash(self.alloc, occurrence.session) } });
+        const binding_path = try self.alloc.print("history/{s}/{s}.json", .{ occurrence.task, try hash(self.alloc, binding) });
+        var branch_exists = false;
+        var branches = std.mem.splitScalar(u8, try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository }), '\n');
+        while (branches.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), branch)) {
+            branch_exists = true;
+            break;
+        };
+        if (branch_exists) {
+            const branch_paths = try self.inventory(branch);
+            for (branch_paths) |path| if (std.mem.eql(u8, path, binding_path)) {
+                if (!std.mem.eql(u8, binding, try self.contentAt(binding_path, branch))) return error.RecurringTaskBindingMismatch;
+                const task = try self.taskAtRevision(occurrence.task, branch);
+                if (!std.mem.eql(u8, task.session, try hash(self.alloc, occurrence.session)) or !std.mem.eql(u8, task.project_root, template.project_root)) return error.RecurringTaskBindingMismatch;
+                try self.saveTask(task);
+                try self.selectSession(occurrence.session, task);
+                try fault("series_after_task");
+                return task.definition.version;
+            };
+            if (!try self.sameRevision(try self.revision(branch), occurrence.base_revision)) return error.RecurringTaskBindingMismatch;
+        } else _ = try self.run(null, &.{ "branch", "new", branch, occurrence.base_revision, "--nosign", "-R", self.repository });
+        var definition = template.definition;
+        definition.id = occurrence.task;
+        definition.version = 1;
+        const request_path = try self.alloc.print("artifacts/{s}", .{try hash(self.alloc, template.request)});
+        const task: Task = .{ .id = occurrence.task, .created_at_ms = io_mod.milliTimestamp(), .workspace_id = self.manifest.id, .session = try hash(self.alloc, occurrence.session), .branch = branch, .base_revision = occurrence.base_revision, .project_root = template.project_root, .definition = definition, .request_artifact = request_path, .amendments = template.amendments, .planned_amendments = template.amendments.len, .model_basis = template.model_basis };
+        try self.validateTaskBasis(task);
+        const tree = try self.checkout(branch);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, request_path), template.request);
+        try atomicWrite(self.alloc, try join(self.alloc, tree, binding_path), binding);
+        const plan = try json(self.alloc, .{ .kind = "task_plan", .task = task.id, .contract_version = task.definition.version, .value = .{ .task = task.id, .summary = "Repeat the pinned source contract with fresh occurrence evidence.", .obligations = task.definition.obligations, .checks = template.checks, .basis = task.model_basis } });
+        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("history/{s}/{s}.json", .{ task.id, try hash(self.alloc, plan) })), plan);
+        _ = try self.commit(tree, "Create reserved recurring occurrence contract");
+        try fault("series_after_task");
+        try self.saveTask(task);
+        try self.selectSession(occurrence.session, task);
+        return task.definition.version;
+    }
+
     fn scheduleBranchExists(self: Manager) !bool {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
@@ -927,6 +1153,8 @@ pub const Manager = struct {
             const value = for (schedules) |*candidate| {
                 if (std.mem.eql(u8, candidate.id, request.id.?)) break candidate;
             } else return error.ScheduleNotFound;
+            var series_context: SeriesBackend = .{ .manager = self };
+            if (try series_store.ownsStart(try series_context.backend(), value.id)) return error.ScheduleSeriesOwnsStart;
             if (value.state == .running) return error.ScheduleIsRunning;
             if (value.state == .completed or value.state == .cancelled) return error.ScheduleIsFinal;
             if (request.action == .move) {
@@ -3403,19 +3631,15 @@ pub const Manager = struct {
 
     pub fn inventory(self: Manager, branch: []const u8) ![]const []const u8 {
         try self.checkOperation();
-        const output = cached: {
-            if (self.immutable_reads) |cache| if (cache.get(.inventory, self.repository, branch, "")) |bytes| break :cached try self.alloc.dupe(u8, bytes);
-            if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .inventory, self.repository, branch, "")) |bytes| break :cached bytes;
-            const bytes = try self.run(null, &.{ "ls", "-r", branch, "-R", self.repository });
-            if (self.immutable_reads) |cache| try cache.put(.inventory, self.repository, branch, "", bytes);
-            if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .inventory, self.repository, branch, "", bytes);
-            break :cached bytes;
-        };
+        // `ls -r` computes every file's commit age even when only names are
+        // requested. Read the verified check-in manifest instead: inventory
+        // needs file identities, never a walk through their complete history.
+        // Resolve mutable selectors on every call; only immutable artifact
+        // bytes may enter the existing read caches.
+        const revision_id = try self.revision(branch);
+        const files = try self.fileManifest(revision_id);
         var paths: std.ArrayList([]const u8) = .empty;
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        while (lines.next()) |path| {
-            if (path.len > 0) try paths.append(self.alloc, path);
-        }
+        for (files) |file| try paths.append(self.alloc, file.path);
         return paths.toOwnedSlice(self.alloc);
     }
 

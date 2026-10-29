@@ -1,8 +1,8 @@
 # Recurring scheduling specification
 
-Status: proposed. This document replaces the ambiguous recurrence design in
-the scheduling conversation. Recurring scheduling is not implemented by the
-current CLI, native host, HTTP service, or calendar.
+Status: implemented in the recurring scheduling feature. This document defines
+the series and occurrence contract shared by the CLI, native host, HTTP service
+and calendar.
 
 Recurring work uses a series that materializes separate occurrences. Every
 occurrence owns a fresh root contract and saved native session. Accepted
@@ -11,13 +11,20 @@ Resuming an interrupted occurrence uses its retained session and evidence;
 it never creates a replacement run merely because a lease expired.
 
 1. **Persistent identities and compatibility.** Store series and occurrences
-   in `schedules/series-v1.json` on `omos-schedules`, with version
+   on `omos-schedules`, with a small index at `schedules/series-v1.json` and version
    `omos.schedule-series/v1`. Preserve the existing `schedules/state.json` and
    `omos.schedule/v1` format for one-time execution records. Older hosts can
    execute materialized one-time starts but cannot generate or edit a series.
    Native initialization advertises `schedule_series_v1`; clients must check it
    before offering recurrence editing. Unsupported series API versions fail
    explicitly. No migration changes an existing one-time schedule into a series.
+
+   Immutable templates live at `schedules/templates/<series>.json`. Occurrences
+   and series events use separate files under `schedules/occurrences/<series>/`
+   and `schedules/series-events/<series>/`, keeping full history pageable without
+   growing the small index indefinitely. Terminal recurring execution rows are
+   archived in their occurrence records before being removed from the one-time
+   execution store. Ordinary one-time rows remain unchanged.
 
    A series records its ID, rule version, pinned template identity, recurrence
    anchor, next nominal slot, policies, end conditions, materialized count, and
@@ -35,7 +42,10 @@ it never creates a replacement run merely because a lease expired.
    requires an explicit authenticated request to repeat the work. Each run
    receives fresh evidence and the normal current permission checks. Missing
    project access, local authority, model bindings, or native-session storage
-   pauses preparation with a retained reason.
+   pauses preparation with a retained reason. A profile-local marker pins the
+   series and template hash after authenticated creation or resumption. It is
+   never exported with the repository. Scoped, company and imported-capability
+   contracts are rejected as templates in this version.
 
 3. **Crash-safe materialization.** Derive an occurrence key from the series ID,
    rule version, and nominal UTC slot. Under the workspace writer lock, reserve
@@ -107,9 +117,8 @@ it never creates a replacement run merely because a lease expired.
 7. **Edits, pause, and cancellation.** Every mutation requires the revision
    returned by a read. Moving one unclaimed occurrence changes only its actual
    start, preserving its identity and the recurrence anchor. Editing a series
-   changes its rule version. It may replace unclaimed future reservations in
-   one revision-fenced transition; it cannot create a second occurrence for an
-   already materialized slot. Reject moves of running or final occurrences.
+   changes its rule version while preserving the current reservation. It cannot
+   create a second occurrence at or before the last materialized nominal slot. Reject moves of running or final occurrences.
    Rule changes during a running occurrence apply after that occurrence ends.
 
    Pausing prevents generation and dispatch of unclaimed starts, while allowing
@@ -122,7 +131,8 @@ it never creates a replacement run merely because a lease expired.
 8. **Interfaces and calendar.** Add typed series create, inspect, list, update,
    pause, resume, skip, and cancel operations, separate from existing one-time
    schedule requests. The CLI and slash command use `schedule series` with the
-   same operations and revision requirements. The HTTP series endpoint uses
+   same operations. Owner CLI mutations read the current revision if none is
+   supplied; native and HTTP mutations always require the read revision. The HTTP series endpoint uses
    the existing bearer authentication and writable-host requirement. The UI
    bridge allowlists every recurrence field and operation.
 
@@ -135,7 +145,7 @@ it never creates a replacement run merely because a lease expired.
    states the fixed-offset behavior, and shows blockers and end conditions.
 
 9. **Acceptance and execution bounds.** Limit the store to 256 series and
-   materialize at most one occurrence per series per worker tick. Retain the
+   materialize at most one occurrence across the workspace per worker tick. Retain the
    existing workspace execution exclusion, independent assessment, and verified
    publication requirements. Tests must cover count one, count two with distinct
    tasks and sessions, failed and skipped runs, offline coalescing, overlap,
@@ -149,5 +159,6 @@ Implementation belongs in the workspace scheduling and worker modules, with
 typed transport adapters, command specifications, and the existing calendar
 bridge. The deterministic scheduling E2E owner remains
 `tests/e2e/workspace-scheduling.test.ts`; transport and UI tests must exercise
-the same series and occurrence identities. This proposal does not enable any
-recurring execution until those paths and their recovery tests are implemented.
+the same series and occurrence identities. The host advertises the capability
+only through its versioned initialization response. Hosts must remain running
+to materialize and execute due occurrences.

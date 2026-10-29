@@ -318,10 +318,10 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .schedule,
         .token = "schedule",
-        .usage = "schedule [list|show ID|add TASK --at TIME|move ID --at TIME|cancel ID] [--from TIME] [--to TIME] [--revision HASH] [--json]",
-        .summary = "Schedule saved work contracts and inspect their calendar",
+        .usage = "schedule [list|show ID|add TASK --at TIME|move ID --at TIME|cancel ID|series COMMAND] [--from TIME] [--to TIME] [--revision HASH] [--json]",
+        .summary = "Schedule saved work and recurring contracts",
         .options = &.{json_option},
-        .details = &.{ "TIME is RFC 3339 with seconds and an explicit offset, such as 2026-10-23T09:00:00+01:00.", "The persistent workspace host runs due contracts and picks up overdue starts.", "Moving or cancelling a schedule preserves its task and evidence.", "Use --revision to reject a change made against stale calendar state." },
+        .details = &.{ "TIME is RFC 3339 with seconds and an explicit offset, such as 2026-10-23T09:00:00+01:00.", "The persistent workspace host runs due contracts and picks up overdue starts.", "Moving or cancelling a schedule preserves its task and evidence.", "Use --revision to reject a change made against stale calendar state.", "Recurring: series add TASK --at TIME --every 1h|daily|weekly|monthly [--count N] [--until TIME] [--overlap block|skip].", "Calendar rules use fixed offsets. Use --frequency N, --weekdays mon,wed,fri or --month-day 31 with the matching cadence.", "Series controls: list, show ID, update ID, pause ID, resume ID, skip ID, cancel ID; move ID --occurrence OCCURRENCE --at TIME moves one unclaimed start.", "Each occurrence gets a fresh contract and session. Waiting or failed work is retained for explicit continuation, without automatic replay.", "Series mutations read the current revision when --revision is omitted; native and HTTP clients must send a read revision." },
     },
     command_specs.slack_install_spec,
 };

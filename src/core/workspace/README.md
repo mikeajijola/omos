@@ -179,12 +179,57 @@ requirements, with existing evidence available for independent reassessment.
 The workspace UI Calendar displays planned starts, current requirements,
 schedule history, and execution state. Its editor creates, moves, or cancels
 starts with a revision fence. Calendar timestamps display in the browser's
-local timezone; stored execution instants use UTC. Schedules are one-time starts,
-not deadlines or recurring templates.
+local timezone; stored execution instants use UTC.
 
-The [recurring scheduling specification](recurring-scheduling-spec.md) defines
-the proposed series and occurrence contracts. It describes future behavior;
-the current interfaces continue to accept one-time starts only.
+### Repeat work
+
+A recurring series pins a planned root contract as its template. The source
+may already be accepted. Each occurrence creates a fresh contract and native
+session, preserving the source's published results. Permissions, conversation
+history, replay state and credentials are not copied into new sessions.
+
+```sh
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00+01:00' --every daily --count 30
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00Z' --every weekly --weekdays mon,wed,fri
+omos schedule series list --json
+omos schedule series show SERIES_ID --json
+omos schedule series update SERIES_ID --at '2026-11-02T10:00:00Z' --every daily --revision HASH
+omos schedule series pause SERIES_ID
+omos schedule series resume SERIES_ID
+omos schedule series skip SERIES_ID
+omos schedule series move SERIES_ID --occurrence OCCURRENCE_ID --at '2026-11-03T10:00:00Z'
+omos schedule series cancel SERIES_ID
+```
+
+The same commands work through `/schedule`. `--every 30m`, `6h`, `1d` and `2w`
+are fixed UTC durations. Calendar `daily`, `weekly` and `monthly` rules retain
+the explicit offset in `--at`; they do not follow daylight saving changes.
+Use `--frequency N` for calendar multiples and `--month-day 31` to clamp shorter
+months without shifting the following month's day. IANA timezones and cron
+expressions are not supported.
+
+`--count` limits created occurrences from 1 to 10,000; it does not count only
+successful runs. Omit it for an unlimited series. `--until TIMESTAMP` includes
+that nominal start instant. When both are set, the first limit reached ends
+generation. `update` accepts `--clear-count` and `--clear-until`.
+
+Only one occurrence per series can be unresolved. The default `--overlap block`
+waits for running, waiting or failed work. `--overlap skip` records later slots
+as skipped while that occurrence remains unresolved. Neither policy retries
+waiting or failed work: continue its retained conversation or explicitly skip
+it. Missed slots during downtime coalesce into the latest due start. Pausing
+cancels dispatch of unclaimed starts and allows running work to finish.
+
+The host must remain running. Series templates and history are portable, but
+an imported repository cannot grant local execution authority. Preparation
+pauses with a reason until the owner explicitly resumes the series on that
+host. Missing projects or model bindings also pause preparation.
+
+Calendar's **Repeat work** editor offers these rules and controls. Derived
+future slots are labelled projected; they become executable only after the
+host reserves their task and session. See the
+[recurring scheduling specification](recurring-scheduling-spec.md) for storage,
+recovery, paging and execution limits.
 
 ### Calendar service
 
@@ -195,6 +240,17 @@ and an `action` of `list`, `show`, `add`, `move`, or `cancel`. `show`, `move`, a
 `from` and `to`. Mutations require writable service mode and the calendar
 `revision` returned by the previous read. The native UI bridge exposes the same
 operations through its typed `schedule` method.
+
+`POST /v1/schedule-series` uses the same bearer authentication and accepts
+`{ "version": "omos.schedule-series/v1", "workspace": "WORKSPACE_ID", "request": REQUEST }`.
+The native method is `schedule.series`; initialization advertises
+`schedule_series_v1`. Requests use `list`, `show`, `add`, `update`, `pause`,
+`resume`, `skip`, `move` or `cancel`. Every mutation requires a calendar revision
+and writable service mode. A rule contains `cadence`, `every`, `interval_ms`,
+`weekdays_mask` (Monday is bit 0), `month_day` and `offset_minutes`, with only the
+fields appropriate to its cadence populated. `show` and `list` accept bounded
+`from`/`to` projection ranges. Use `cursor` for run history, `events_cursor` for
+series events, and `limit` with the returned revision for subsequent pages.
 
 ## Declare the workspace model
 

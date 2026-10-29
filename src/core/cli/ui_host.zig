@@ -160,7 +160,7 @@ const Server = struct {
                 return error.WorkspaceBindingChanged;
             }
         }
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{"schedule_series_v1"} });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
             var coordinated = params;
             if (coordinated != .object) return error.InvalidPrompt;
@@ -193,6 +193,7 @@ const Server = struct {
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
         if (std.mem.eql(u8, method, "schedule")) {
             const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
@@ -330,7 +331,7 @@ const Server = struct {
             const invocation = try schedule_worker.prepare(manager, schedule);
             const id = try manager.alloc.print("schedule-{s}-{d}", .{ schedule.id, schedule.generation });
             if (!safeId(id)) return error.InvalidTurnId;
-            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = invocation.session }), invocation);
+            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = invocation.prompt, .session = invocation.session }), invocation);
             if (@import("../workspace/definition.zig").field(accepted, "already_accepted")) |retained| {
                 if (retained == .bool and retained.bool) return error.ScheduledTurnAcceptanceUncertain;
             }

@@ -3819,6 +3819,52 @@ pub fn renderSchedules(alloc: std.mem.Allocator, snapshot: @import("../workspace
     return out.toOwnedSlice();
 }
 
+pub fn renderScheduleSeries(alloc: std.mem.Allocator, snapshot: @import("../workspace/schedule_series.zig").Snapshot, format: OutputFormat) ![]u8 {
+    if (format == .json) return std.json.Stringify.valueAlloc(alloc, snapshot, .{});
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("Recurring work: {s}\nRevision: {s}\n", .{ snapshot.workspace, snapshot.revision });
+    if (snapshot.series.len == 0) try out.writer.writeAll("No recurring series.\n");
+    for (snapshot.series) |value| {
+        try out.writer.print("{s}  {s}  {s}\n  Template: {s}\n  Runs created: {d}", .{ value.id, @tagName(value.state), @tagName(value.rule.cadence), value.template_task, value.materialized_count });
+        if (value.max_occurrences) |count| try out.writer.print(" / {d}", .{count});
+        try out.writer.writeAll("\n");
+        if (value.rule.interval_ms) |duration| {
+            try out.writer.print("  Interval: {d} minutes\n", .{@divTrunc(duration, 60_000)});
+        } else {
+            try out.writer.print("  Every: {d}; fixed UTC offset: {d} minutes\n", .{ value.rule.every, value.rule.offset_minutes });
+            if (value.rule.cadence == .weekly) try out.writer.print("  Weekdays mask (Monday bit 0): {d}\n", .{value.rule.weekdays_mask});
+            if (value.rule.month_day) |day| try out.writer.print("  Day of month: {d}\n", .{day});
+        }
+        if (value.next_ms) |next_ms| {
+            const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@divFloor(next_ms, 1000)) };
+            const year_day = epoch.getEpochDay().calculateYearDay();
+            const date = year_day.calculateMonthDay();
+            const time = epoch.getDaySeconds();
+            try out.writer.print("  Next: {d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z\n", .{ year_day.year, @backingInt(date.month), date.day_index + 1, time.getHoursIntoDay(), time.getMinutesIntoHour(), time.getSecondsIntoMinute() });
+        }
+        if (value.reason.len > 0) try out.writer.print("  {s}\n", .{value.reason});
+    }
+    for (snapshot.occurrences) |occurrence| try out.writer.print("  {s}  {s}  task {s}\n", .{ occurrence.id, if (occurrence.outcome) |state| @tagName(state) else @tagName(occurrence.preparation), occurrence.task });
+    for (snapshot.projected) |projection| {
+        try out.writer.print("  Projected {s}: ", .{projection.series});
+        try writeUtcTimestamp(&out.writer, projection.at_ms);
+        try out.writer.writeAll("\n");
+    }
+    for (snapshot.events) |event| {
+        try out.writer.writeAll("  ");
+        try writeUtcTimestamp(&out.writer, event.at_ms);
+        try out.writer.print("  {s}", .{event.kind});
+        if (event.slots > 0) try out.writer.print(" ({d} slots)", .{event.slots});
+        if (event.reason.len > 0) try out.writer.print(": {s}", .{event.reason});
+        try out.writer.writeAll("\n");
+    }
+    if (snapshot.next_cursor) |cursor| try out.writer.print("More occurrences: --cursor {d} --revision {s}\n", .{ cursor, snapshot.revision });
+    if (snapshot.next_event_cursor) |cursor| try out.writer.print("More events: --events-cursor {d} --revision {s}\n", .{ cursor, snapshot.revision });
+    if (snapshot.truncated) try out.writer.writeAll("The requested projection or page was truncated. Narrow the range or request the next page.\n");
+    return out.toOwnedSlice();
+}
+
 pub fn renderFossilCommand(alloc: std.mem.Allocator, reply: @import("../workspace/fossil_commands.zig").Reply, format: OutputFormat) ![]u8 {
     switch (reply) {
         .api => |value| return std.json.Stringify.valueAlloc(alloc, value, .{ .whitespace = if (format == .json) .minified else .indent_2 }),
