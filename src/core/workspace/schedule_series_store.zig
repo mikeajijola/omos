@@ -23,7 +23,8 @@ pub const Backend = struct {
     base_fn: *const fn (*anyopaque) anyerror![]const u8,
     prepare_fn: *const fn (*anyopaque, series.Series, series.Occurrence) anyerror!u32,
     accepted_fn: *const fn (*anyopaque, []const u8) anyerror!bool,
-    authorize_fn: ?*const fn (*anyopaque, series.Series) anyerror!void = null,
+    authorize_fn: ?*const fn (*anyopaque, series.Series, ?[]const u8) anyerror!void = null,
+    authority_fn: ?*const fn (*anyopaque, series.Series) anyerror!void = null,
     now_ms: i64,
     fault_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
 
@@ -150,7 +151,7 @@ pub fn execute(backend: Backend, request: series.Request) !series.Snapshot {
         var nonce: [32]u8 = undefined;
         @import("../shared/io.zig").getIo().random(&nonce);
         var value: series.Series = .{ .id = try digest(backend, &nonce), .template_task = template.task, .template_revision = template.revision, .template_sha256 = try digest(backend, template.content), .rule = request.rule.?, .anchor_ms = anchor, .next_ms = anchor, .until_ms = until, .max_occurrences = request.max_occurrences, .overlap = request.overlap orelse .block };
-        if (backend.authorize_fn) |authorize| try authorize(backend.context, value);
+        if (backend.authorize_fn) |authorize| try authorize(backend.context, value, template.content);
         try writes.append(backend.alloc, .{ .path = try backend.alloc.print("schedules/templates/{s}.json", .{value.id}), .content = template.content });
         try appendEvent(backend, &writes, &value, .{ .at_ms = backend.now_ms, .kind = "created" });
         const all = try backend.alloc.alloc(series.Series, values.len + 1);
@@ -197,7 +198,7 @@ pub fn execute(backend: Backend, request: series.Request) !series.Snapshot {
             },
             .@"resume" => {
                 if (value.state != .paused) return error.InvalidSeriesTransition;
-                if (backend.authorize_fn) |authorize| try authorize(backend.context, value.*);
+                if (backend.authorize_fn) |authorize| try authorize(backend.context, value.*, null);
                 value.state = .active;
                 value.reason = "";
                 if (occurrence) |*item| if (item.preparation == .paused) {
@@ -283,6 +284,18 @@ pub fn occurrenceForStart(backend: Backend, id: []const u8) !?series.Occurrence 
     return null;
 }
 
+/// Recheck local authority immediately before native execution. Inspecting
+/// ownership for calendar edits must still work when authority is absent.
+pub fn executionOccurrence(backend: Backend, id: []const u8) !?series.Occurrence {
+    for ((try load(backend)).series) |value| {
+        if (try activeOccurrence(backend, value)) |occurrence| if (std.mem.eql(u8, occurrence.schedule, id)) {
+            if (backend.authority_fn) |check| try check(backend.context, value);
+            return occurrence;
+        };
+    }
+    return null;
+}
+
 fn advance(value: *series.Series, after: i64) !void {
     value.next_ms = try series.next(value.rule, value.anchor_ms, after);
     if (value.until_ms) |until| if (value.next_ms != null and value.next_ms.? > until) {
@@ -320,8 +333,25 @@ pub fn materialize(backend: Backend) !bool {
         var occurrence = try activeOccurrence(backend, value.*);
         if (occurrence) |*item| if (item.preparation == .prepared) {
             const start = findStart(&starts, item.schedule) orelse return error.InvalidScheduleOccurrence;
-            if (start.state == .scheduled) try backend.fault("series_after_schedule");
             const accepted = try backend.accepted_fn(backend.context, item.task);
+            if (start.state == .scheduled and !accepted) if (backend.authority_fn) |check| {
+                check(backend.context, value.*) catch |err| {
+                    if (err == error.Cancelled or err == error.OutOfMemory) return err;
+                    value.state = .paused;
+                    value.reason = @errorName(err);
+                    start.state = .cancelled;
+                    start.finished_ms = backend.now_ms;
+                    start.reason = value.reason;
+                    try startEvent(backend, start, "series_authority_required");
+                    item.preparation = .paused;
+                    item.reason = value.reason;
+                    try appendOccurrence(backend, &writes, item.*);
+                    try appendEvent(backend, &writes, value, .{ .at_ms = backend.now_ms, .kind = "preparation_paused", .reason = value.reason });
+                    try commit(backend, store, starts, writes.items);
+                    return true;
+                };
+            };
+            if (start.state == .scheduled) try backend.fault("series_after_schedule");
             if (accepted or start.state == .completed or start.state == .cancelled) {
                 // A completed row without an independently published contract
                 // cannot settle an occurrence, even if its store was edited.
@@ -525,6 +555,7 @@ const TestStore = struct {
     revision: u64 = 0,
     now: i64,
     fail: ?[]const u8 = null,
+    authorized: bool = true,
 
     fn init(alloc: Allocator, now: i64) TestStore {
         return .{ .alloc = alloc, .files = .init(alloc), .sessions = .init(alloc), .tasks = .init(alloc), .accepted = .init(alloc), .now = now };
@@ -575,8 +606,11 @@ const TestStore = struct {
     fn acceptedFn(raw: *anyopaque, task: []const u8) !bool {
         return self(raw).accepted.contains(task);
     }
+    fn authorityFn(raw: *anyopaque, _: series.Series) !void {
+        if (!self(raw).authorized) return error.LocalSeriesAuthorityRequired;
+    }
     fn backend(value: *TestStore) Backend {
-        return .{ .context = value, .alloc = value.alloc, .workspace = "workspace", .revision_fn = revisionFn, .read_fn = readFn, .paths_fn = pathsFn, .commit_fn = commitFn, .template_fn = templateFn, .base_fn = baseFn, .prepare_fn = prepareFn, .accepted_fn = acceptedFn, .now_ms = value.now, .fault_fn = faultFn };
+        return .{ .context = value, .alloc = value.alloc, .workspace = "workspace", .revision_fn = revisionFn, .read_fn = readFn, .paths_fn = pathsFn, .commit_fn = commitFn, .template_fn = templateFn, .base_fn = baseFn, .prepare_fn = prepareFn, .accepted_fn = acceptedFn, .authority_fn = authorityFn, .now_ms = value.now, .fault_fn = faultFn };
     }
     fn create(value: *TestStore, count: ?u32) !series.Snapshot {
         return execute(value.backend(), .{ .action = .add, .task = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .at = "2026-10-26T09:00:00Z", .rule = .{ .cadence = .interval, .interval_ms = 60_000 }, .max_occurrences = count, .revision = try revisionFn(value) });
@@ -793,4 +827,46 @@ test "recurring recovery rejects a reservation with substituted native identitie
     try std.testing.expectError(error.InvalidScheduleOccurrence, materialize(store.backend()));
     try std.testing.expectEqual(@as(usize, 0), store.tasks.count());
     try std.testing.expectEqual(@as(usize, 0), store.sessions.count());
+}
+
+test "recurring prepared starts lose dispatch authority on import and resume preserves their identities" {
+    const anchor = try scheduling.parseTimestamp("2026-10-26T09:00:00Z");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var store = TestStore.init(arena.allocator(), anchor);
+    const id = (try store.create(1)).series[0].id;
+    _ = try materialize(store.backend());
+    const start_id = (try loadStarts(store.backend())).schedules[0].id;
+    const task = (try loadStarts(store.backend())).schedules[0].task;
+    store.authorized = false;
+    try std.testing.expectError(error.LocalSeriesAuthorityRequired, executionOccurrence(store.backend(), start_id));
+    try std.testing.expect(try ownsStart(store.backend(), start_id));
+    _ = try materialize(store.backend());
+    const paused = try execute(store.backend(), .{ .action = .show, .id = id });
+    try std.testing.expectEqual(@FieldType(series.Series, "state").paused, paused.series[0].state);
+    try std.testing.expectEqual(scheduling.State.cancelled, (try loadStarts(store.backend())).schedules[0].state);
+    try std.testing.expectEqual(@FieldType(series.Occurrence, "preparation").paused, paused.occurrences[0].preparation);
+    store.authorized = true;
+    _ = try execute(store.backend(), .{ .action = .@"resume", .id = id, .revision = paused.revision });
+    _ = try materialize(store.backend());
+    try std.testing.expectEqual(scheduling.State.scheduled, (try loadStarts(store.backend())).schedules[0].state);
+    try std.testing.expectEqualStrings(task, (try loadStarts(store.backend())).schedules[0].task);
+    try std.testing.expectEqual(@as(usize, 1), store.tasks.count());
+    try std.testing.expectEqual(@as(u32, 1), (try load(store.backend())).series[0].materialized_count);
+}
+
+test "recurring imported verified outcomes settle without granting execution authority" {
+    const anchor = try scheduling.parseTimestamp("2026-10-26T09:00:00Z");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var store = TestStore.init(arena.allocator(), anchor);
+    const id = (try store.create(1)).series[0].id;
+    _ = try materialize(store.backend());
+    try store.accepted.put((try loadStarts(store.backend())).schedules[0].task, {});
+    store.authorized = false;
+    _ = try materialize(store.backend());
+    const result = try execute(store.backend(), .{ .action = .show, .id = id });
+    try std.testing.expectEqual(@FieldType(series.Series, "state").completed, result.series[0].state);
+    try std.testing.expectEqual(scheduling.State.completed, result.occurrences[0].outcome.?);
+    try std.testing.expectEqual(@as(usize, 0), (try loadStarts(store.backend())).schedules.len);
 }

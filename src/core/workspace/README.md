@@ -224,6 +224,10 @@ The host must remain running. Series templates and history are portable, but
 an imported repository cannot grant local execution authority. Preparation
 pauses with a reason until the owner explicitly resumes the series on that
 host. Missing projects or model bindings also pause preparation.
+Prepared starts receive the same local authority check before dispatch.
+Resuming a portable series also verifies its template against the pinned source
+contract; replacing the template payload and its hash cannot authorize different
+work.
 
 Calendar's **Repeat work** editor offers these rules and controls. Derived
 future slots are labelled projected; they become executable only after the

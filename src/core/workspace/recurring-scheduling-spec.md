@@ -46,6 +46,10 @@ it never creates a replacement run merely because a lease expired.
    series and template hash after authenticated creation or resumption. It is
    never exported with the repository. Scoped, company and imported-capability
    contracts are rejected as templates in this version.
+   Check this authority again for already-prepared starts before dispatch and
+   immediately before native execution. Authenticated resumption reconstructs
+   the pinned source template and verifies its hash before granting authority;
+   portable template substitutions cannot replace the source request or contract.
 
 3. **Crash-safe materialization.** Derive an occurrence key from the series ID,
    rule version, and nominal UTC slot. Under the workspace writer lock, reserve

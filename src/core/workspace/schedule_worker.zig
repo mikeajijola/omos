@@ -110,7 +110,7 @@ const Heartbeat = struct {
 
 fn failureState(err: anyerror) scheduling.State {
     return switch (err) {
-        error.Cancelled, error.ExecutionBusy, error.WorkspaceExecutionBusy, error.NativeSessionUnavailable, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ScheduledInputRequired, error.ScheduledContinuationRequired, error.ScheduledTurnAcceptanceUncertain, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition => .waiting,
+        error.Cancelled, error.ExecutionBusy, error.WorkspaceExecutionBusy, error.LocalSeriesAuthorityRequired, error.NativeSessionUnavailable, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ScheduledInputRequired, error.ScheduledContinuationRequired, error.ScheduledTurnAcceptanceUncertain, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition => .waiting,
         else => .failed,
     };
 }

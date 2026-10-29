@@ -1,5 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { resolve, join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { NativeClient } from "./workspace-ui-client.mjs";
 import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
 
@@ -9,17 +12,29 @@ afterEach(async () => {
   cleanupFixtures();
 });
 
-test("recurring exports require fresh local authority and fenced controls retain their occurrence", async () => {
+for (const preparedExport of [false, true]) test(`recurring ${preparedExport ? "prepared" : "unprepared"} exports require fresh local authority and fenced controls retain their occurrence`, async () => {
   const f = fixture();
   const { task, provider } = await savedContract(f);
   const actorCount = provider.counts().actors;
-  const add = await f.run(["schedule", "series", "add", task.id, "--at", "2020-01-01T09:00:00Z", "--every", "1m", "--count", "1", "--json"]);
+  const anchor = preparedExport ? "2099-01-01T09:00:00Z" : "2020-01-01T09:00:00Z";
+  const add = await f.run(["schedule", "series", "add", task.id, "--at", anchor, "--every", "1m", "--count", "1", "--json"]);
   expect(add.code, add.stderr).toBe(0);
   const created = JSON.parse(add.stdout);
   const id = created.series[0].id;
+  let preparedOccurrence: string | undefined;
+  if (preparedExport) {
+    const originalHost = host(f, { FX_E2E_SCHEDULE_CLOCK_MS: String(Date.parse(anchor)) });
+    const original: any = await until(() => originalHost.request("schedule.series", { action: "show", id }), (value: any) => value.occurrences[0]?.preparation === "prepared");
+    preparedOccurrence = original.occurrences[0].id;
+    await originalHost.close(); clients.splice(clients.indexOf(originalHost), 1);
+  }
   const archive = join(f.home, "portable-recurring.fossil");
   expect((await f.run(["fossil", "export", archive, "--json"])).code).toBe(0);
   expect((await f.run(["fossil", "use", archive, "--json"])).code).toBe(0);
+  if (preparedOccurrence) {
+    const due = await f.run(["schedule", "series", "move", id, "--occurrence", preparedOccurrence, "--at", "2020-01-01T09:00:00Z", "--json"]);
+    expect(due.code, due.stderr).toBe(0);
+  }
   const native = host(f, { FX_E2E_SCHEDULE_CLOCK_MS: String(Date.parse("2020-01-01T09:00:00Z")) });
   expect((await native.request("initialize")).capabilities).toContain("schedule_series_v1");
   const paused: any = await until(() => native.request("schedule.series", { action: "show", id }), (value: any) => value.series[0].state === "paused");
@@ -43,6 +58,38 @@ test("recurring exports require fresh local authority and fenced controls retain
   expect(cancelled.occurrences[0].id).toBe(occurrence.id);
   expect(provider.counts().actors).toBe(actorCount);
   expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(2);
+}, 120000);
+
+test("recurring resume rejects portable template content substituted behind its source contract", async () => {
+  const f = fixture();
+  const { task, provider } = await savedContract(f);
+  const created = await f.run(["schedule", "series", "add", task.id, "--at", "2099-01-01T09:00:00Z", "--every", "1h", "--json"]);
+  expect(created.code, created.stderr).toBe(0);
+  const id = JSON.parse(created.stdout).series[0].id;
+  expect((await f.run(["schedule", "series", "pause", id, "--json"])).code).toBe(0);
+  const tree = join(f.home, "untrusted-template");
+  mkdirSync(tree);
+  const admin = (...args: string[]) => {
+    const result = spawnSync("fossil", ["--user", "omos", ...args], { cwd: tree, env: { PATH: process.env.PATH, HOME: f.home, FOSSIL_HOME: f.home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
+    expect(result.status, result.stderr + result.stdout).toBe(0);
+  };
+  admin("open", join(f.cwd, "omos.fossil"), "omos-schedules", "--nosync");
+  const path = join(tree, `schedules/templates/${id}.json`);
+  const template = JSON.parse(readFileSync(path, "utf8"));
+  template.request = "Substituted work that the pinned source contract never requested.";
+  const bytes = JSON.stringify(template);
+  writeFileSync(path, bytes);
+  const indexPath = join(tree, "schedules/series-v1.json");
+  const index = JSON.parse(readFileSync(indexPath, "utf8"));
+  index.series[0].template_sha256 = createHash("sha256").update(bytes).digest("hex");
+  writeFileSync(indexPath, JSON.stringify(index));
+  admin("changes", "--hash");
+  admin("commit", "--nosign", "--no-warnings", "-m", "Fixture substitutes portable template content");
+  const actors = provider.counts().actors;
+  const resumed = await f.run(["schedule", "series", "resume", id, "--json"]);
+  expect(resumed.code, resumed.stderr + resumed.stdout).toBe(1);
+  expect(resumed.stderr + resumed.stdout).toContain("InvalidSeriesTemplate");
+  expect(provider.counts().actors).toBe(actors);
 }, 120000);
 
 test("recurring HTTP reads require bearer authority and read-only hosts cannot mutate series", async () => {

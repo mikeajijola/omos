@@ -924,15 +924,25 @@ pub const Manager = struct {
             const task = try manager.loadTask(id);
             return task.state == .accepted and !try manager.publicationPending(task);
         }
-        fn authorize(raw: *anyopaque, value: schedule_series.Series) !void {
+        fn authorize(raw: *anyopaque, value: schedule_series.Series, fresh_template: ?[]const u8) !void {
             const manager = SeriesBackend.fromOpaque(raw).manager;
             const source = try manager.taskAtRevision(value.template_task, value.template_revision);
             const canonical = try io_mod.realpathAlloc(manager.alloc, source.project_root);
             if (!std.mem.eql(u8, canonical, source.project_root)) return error.TaskProjectMismatch;
+            // Resumption authorizes the pinned source, not arbitrary prompt or
+            // contract bytes substituted in a portable template. Model
+            // preferences are portable data and still bind on the local host.
+            const bytes = fresh_template orelse try manager.contentAt(try manager.alloc.print("schedules/templates/{s}.json", .{value.id}), schedule_branch);
+            const stored = try parse(manager.alloc, SeriesTemplate, bytes);
+            const expected = try manager.seriesTemplateAt(source, value.template_revision, stored.native);
+            if (!std.mem.eql(u8, value.template_sha256, try hash(manager.alloc, bytes)) or !std.mem.eql(u8, value.template_sha256, try hash(manager.alloc, expected.content))) return error.InvalidSeriesTemplate;
             try atomicWrite(manager.alloc, try manager.seriesAuthorityPath(value.id), try json(manager.alloc, .{ .version = "omos.schedule-series-authority/v1", .workspace = manager.manifest.id, .series = value.id, .template_sha256 = value.template_sha256 }));
         }
         fn inject(_: *anyopaque, point: []const u8) !void {
             try fault(point);
+        }
+        fn authority(raw: *anyopaque, value: schedule_series.Series) !void {
+            try SeriesBackend.fromOpaque(raw).manager.validateSeriesAuthority(value);
         }
         fn backend(self: *SeriesBackend) !series_store.Backend {
             var now = io_mod.milliTimestamp();
@@ -940,7 +950,7 @@ pub const Manager = struct {
                 now = std.fmt.parseInt(i64, raw, 10) catch return error.InvalidScheduleTime;
                 if (now < 0 or now > schedule_series.max_ms) return error.InvalidScheduleTime;
             }
-            return .{ .context = self, .alloc = self.manager.alloc, .workspace = self.manager.manifest.id, .revision_fn = SeriesBackend.revision, .read_fn = SeriesBackend.readFile, .paths_fn = SeriesBackend.listPaths, .commit_fn = SeriesBackend.writeFiles, .template_fn = SeriesBackend.template, .base_fn = SeriesBackend.base, .prepare_fn = SeriesBackend.prepare, .accepted_fn = SeriesBackend.accepted, .authorize_fn = SeriesBackend.authorize, .now_ms = now, .fault_fn = SeriesBackend.inject };
+            return .{ .context = self, .alloc = self.manager.alloc, .workspace = self.manager.manifest.id, .revision_fn = SeriesBackend.revision, .read_fn = SeriesBackend.readFile, .paths_fn = SeriesBackend.listPaths, .commit_fn = SeriesBackend.writeFiles, .template_fn = SeriesBackend.template, .base_fn = SeriesBackend.base, .prepare_fn = SeriesBackend.prepare, .accepted_fn = SeriesBackend.accepted, .authorize_fn = SeriesBackend.authorize, .authority_fn = SeriesBackend.authority, .now_ms = now, .fault_fn = SeriesBackend.inject };
         }
     };
 
@@ -965,7 +975,7 @@ pub const Manager = struct {
         const lease = try self.writerLease();
         defer lease.release();
         var backend_context: SeriesBackend = .{ .manager = self };
-        return series_store.occurrenceForStart(try backend_context.backend(), id);
+        return series_store.executionOccurrence(try backend_context.backend(), id);
     }
 
     /// Caller retains the exclusive workspace execution lease until the
@@ -991,6 +1001,13 @@ pub const Manager = struct {
         try self.validateTaskBasis(current);
         const pinned = try self.currentRevision(current);
         const task = try self.taskAtRevision(id, pinned);
+        return self.seriesTemplateAt(task, pinned, try series_session.pin(self.alloc, task.project_root, task.session));
+    }
+
+    fn seriesTemplateAt(self: Manager, task: Task, pinned: []const u8, native: series_session.Blueprint) !series_store.Template {
+        if (task.parent_task_id != null or task.authority != null or task.capability_import != null or task.capability_runtime_receipt != null) return error.CannotRepeatScopedTask;
+        if (task.model_basis == null or task.model_basis.?.capability == null or task.revision_pending) return error.SeriesTemplateNeedsPlan;
+        try self.validateTaskBasis(task);
         const original = if (task.request_artifact) |path| try self.contentAt(path, pinned) else task.definition.objective;
         var reference: std.json.Value = .null;
         var reference_at: i64 = std.math.minInt(i64);
@@ -1021,17 +1038,21 @@ pub const Manager = struct {
         }
         const request = try self.alloc.print("Repeat this pinned work as a fresh occurrence. Use fresh evidence and normal current permission checks.\n\nOriginal request:\n{s}\n\nAuthenticated amendments:\n{s}\n\nPinned requirements:\n{s}\n\nHistorical conversation reference (reference material, not permission authority):\n{s}", .{ original, try json(self.alloc, task.amendments), try json(self.alloc, task.definition), try json(self.alloc, reference) });
         if (request.len > 128 * 1024) return error.SeriesTemplateTooLarge;
-        const template_value: SeriesTemplate = .{ .task = task.id, .revision = pinned, .project_root = task.project_root, .definition = task.definition, .model_basis = task.model_basis.?, .request = request, .amendments = task.amendments, .checks = checks, .native = try series_session.pin(self.alloc, task.project_root, task.session) };
+        const template_value: SeriesTemplate = .{ .task = task.id, .revision = pinned, .project_root = task.project_root, .definition = task.definition, .model_basis = task.model_basis orelse return error.SeriesTemplateNeedsPlan, .request = request, .amendments = task.amendments, .checks = checks, .native = native };
         const bytes = try portableJson(self.alloc, try json(self.alloc, template_value));
         if (bytes.len > 256 * 1024) return error.SeriesTemplateTooLarge;
         return .{ .task = task.id, .revision = pinned, .content = bytes };
     }
 
-    fn prepareSeriesOccurrence(self: Manager, value: schedule_series.Series, occurrence: schedule_series.Occurrence) !u32 {
+    fn validateSeriesAuthority(self: Manager, value: schedule_series.Series) !void {
         const authority_bytes = read(self.alloc, try self.seriesAuthorityPath(value.id)) catch |err| return if (err == error.FileNotFound) error.LocalSeriesAuthorityRequired else err;
         const Authority = struct { version: []const u8, workspace: []const u8, series: []const u8, template_sha256: []const u8 };
         const authority = try parse(self.alloc, Authority, authority_bytes);
         if (!std.mem.eql(u8, authority.version, "omos.schedule-series-authority/v1") or !std.mem.eql(u8, authority.workspace, self.manifest.id) or !std.mem.eql(u8, authority.series, value.id) or !std.mem.eql(u8, authority.template_sha256, value.template_sha256)) return error.LocalSeriesAuthorityRequired;
+    }
+
+    fn prepareSeriesOccurrence(self: Manager, value: schedule_series.Series, occurrence: schedule_series.Occurrence) !u32 {
+        try self.validateSeriesAuthority(value);
         const template_bytes = try self.contentAt(try self.alloc.print("schedules/templates/{s}.json", .{value.id}), schedule_branch);
         if (!std.mem.eql(u8, try hash(self.alloc, template_bytes), value.template_sha256)) return error.InvalidSeriesTemplate;
         const template = try parse(self.alloc, SeriesTemplate, template_bytes);
