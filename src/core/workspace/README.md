@@ -182,6 +182,10 @@ starts with a revision fence. Calendar timestamps display in the browser's
 local timezone; stored execution instants use UTC. Schedules are one-time starts,
 not deadlines or recurring templates.
 
+The [recurring scheduling specification](recurring-scheduling-spec.md) defines
+the proposed series and occurrence contracts. It describes future behavior;
+the current interfaces continue to accept one-time starts only.
+
 ### Calendar service
 
 `POST /v1/schedules` uses the existing workspace service bearer authentication.
@@ -323,6 +327,22 @@ of copying transport and record schemas into each planning request. The host
 continues to validate every operation against those schemas. Original requests
 and pending user amendments remain intact within the planning budget.
 
+Planning also receives the workspace root, gathered repository instructions,
+authenticated root-user context, and bounded earlier conversation text. Earlier
+assistant answers are reference material for follow-ups such as "implement the
+feature"; they cannot authorize actions or establish successful work. Truncated
+references and omitted messages are identified explicitly. The planner leaves
+anticipated checks empty when the applicable validation commands are unknown.
+
+Governance requests sequential reviewer calls. If a provider returns multiple
+read-only evidence lookups, the host services them in order; a decision must
+stand alone. Invalid lookups and malformed decisions receive correction feedback
+within the same eight-call and context budgets. Exact evidence identities and
+full inspection remain required. Repeated invalid responses pause the task with
+`workspace_governance_pending`, preserving actor work and evidence. Response
+metadata, correction reasons, failure diagnostics, and reported usage survive a
+failed review. Credentials and opaque provider replay state are not journaled.
+
 The execution policy defaults to a progress check after every four completed
 tool batches, a pause after three consecutive stalled checks, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with
@@ -345,6 +365,12 @@ provide current validation evidence. A later source edit invalidates that basis.
 Incomplete scans, unreadable or oversized files cannot establish validation.
 Generated files should follow the repository's ignore rules; changes to visible
 generated files also change the source basis.
+The bound Fossil database, its SQLite sidecars, and its timestamped native
+migration backups are excluded as generated host state. Large source files are
+hashed incrementally within the aggregate scan budget. Preparation failures
+retain their reason and pause before actor execution with
+`workspace_preparation_pending`. After installing a newer CLI, restart any
+already-running terminal process to load the new executable before resuming.
 
 ## Migrate an existing workspace
 
