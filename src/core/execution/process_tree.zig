@@ -332,10 +332,11 @@ pub const Tracker = struct {
         var summary: DeliverySummary = .{};
         // Killing a child first can release its parent's wait and let the
         // parent execute another command before its own kill is delivered.
-        // Discovery records ancestors before children, so force-kill in that
-        // order. Graceful termination keeps its child-first cleanup order.
+        // Witness discovery can report descendants before their parents.
+        // Order current parent links before delivering any force-kill.
         const root_first = signal == std.posix.SIG.KILL;
         if (root_first) {
+            self.orderAncestorsFirstWith(Effects);
             if (self.root) |root| self.signalTrackedProcessWith(root, signal, preserved_group, &summary, Effects);
         }
         for (0..self.processes.items.len) |offset| {
@@ -358,6 +359,25 @@ pub const Tracker = struct {
             );
         };
         return summary;
+    }
+
+    fn orderAncestorsFirstWith(self: *Tracker, comptime Effects: type) void {
+        for (0..self.processes.items.len) |index| {
+            var remaining = self.processes.items.len - index;
+            while (remaining > 0) : (remaining -= 1) {
+                const process = self.processes.items[index];
+                const snapshot = Effects.capture(self.alloc, process.pid) catch break;
+                if (!process.identity.eql(snapshot.identity)) break;
+                const parent_index = for (self.processes.items[index + 1 ..], index + 1..) |parent, offset| {
+                    if (parent.pid != snapshot.parent_pid) continue;
+                    if (snapshot.parent_unique_id) |id| if (!identityHasMacOSUniqueId(parent.identity, id)) continue;
+                    break offset;
+                } else break;
+                const parent = self.processes.items[parent_index];
+                std.mem.copyBackwards(TrackedProcess, self.processes.items[index + 1 .. parent_index + 1], self.processes.items[index..parent_index]);
+                self.processes.items[index] = parent;
+            }
+        }
     }
 
     fn signalTrackedProcessWith(
@@ -434,6 +454,7 @@ pub const Tracker = struct {
         var result: CompletionDelivery = .{};
         const root_first = signal == std.posix.SIG.KILL;
         if (root_first) {
+            self.orderAncestorsFirstWith(Effects);
             if (self.root) |root| self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
         }
         for (0..self.processes.items.len) |offset| {
@@ -949,6 +970,10 @@ test "force kill cannot release a waiting ancestor into a delayed effect" {
             return .{ .found = pid };
         }
 
+        fn session(_: std.posix.pid_t) SessionState {
+            return .{ .found = 100 };
+        }
+
         fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
             switch (pid) {
                 10 => root_running = false,
@@ -963,15 +988,19 @@ test "force kill cannot release a waiting ancestor into a delayed effect" {
             }
         }
     };
-    FakeEffects.root_running = true;
-    FakeEffects.child_running = true;
-    FakeEffects.delayed_effect = false;
-    var tracker = Tracker{ .alloc = std.testing.allocator, .root = .{ .pid = 10, .identity = .{ .linux_start_ticks = 10 } } };
-    defer tracker.deinit();
-    for (11..13) |pid| try tracker.processes.append(std.testing.allocator, .{ .pid = @intCast(pid), .identity = .{ .linux_start_ticks = pid } });
-    const delivery = tracker.signalProcessesWith(std.posix.SIG.KILL, null, FakeEffects);
-    try std.testing.expectEqual(@as(usize, 3), delivery.delivered);
-    try std.testing.expect(!FakeEffects.delayed_effect);
+    for ([_][2]std.posix.pid_t{ .{ 11, 12 }, .{ 12, 11 } }) |discovery| {
+        for ([_]bool{ false, true }) |attached_only| {
+            FakeEffects.root_running = true;
+            FakeEffects.child_running = true;
+            FakeEffects.delayed_effect = false;
+            var tracker = Tracker{ .alloc = std.testing.allocator, .root = .{ .pid = 10, .identity = .{ .linux_start_ticks = 10 } } };
+            defer tracker.deinit();
+            for (discovery) |pid| try tracker.processes.append(std.testing.allocator, .{ .pid = pid, .identity = .{ .linux_start_ticks = @intCast(pid) } });
+            const delivery = if (attached_only) tracker.signalAttachedWith(std.posix.SIG.KILL, 100, FakeEffects).delivery else tracker.signalProcessesWith(std.posix.SIG.KILL, null, FakeEffects);
+            try std.testing.expectEqual(@as(usize, 3), delivery.delivered);
+            try std.testing.expect(!FakeEffects.delayed_effect);
+        }
+    }
 }
 
 test "checked signal delivery keeps vanished stale and excluded targets complete" {
