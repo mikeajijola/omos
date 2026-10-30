@@ -374,9 +374,25 @@ fn validateDecision(alloc: std.mem.Allocator, name: []const u8, definition: cont
     const summary = if (revision) |v| v.summary else plan_value.?.summary;
     const obligations = if (revision) |v| v.obligations else plan_value.?.obligations;
     const checks = if (revision) |v| v.checks else plan_value.?.checks;
+    if (!revising and obligations.len > 32) return error.InvalidTaskPlan;
     if ((!std.mem.eql(u8, capability, "general_task") and !std.mem.eql(u8, capability, "coding_task")) or std.mem.trim(u8, summary, " \t\r\n").len == 0 or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
     for (checks) |check| if (std.mem.trim(u8, check, " \t\r\n").len == 0 or check.len > 4096) return error.InvalidTaskPlan;
     _ = try contract.revisedObligations(alloc, definition, obligations, if (revision) |v| v.superseded else &.{});
+}
+
+test "initial planning retains its entry limit when host requirements are echoed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const definition: contract.Definition = .{ .id = "task", .version = 1, .objective = "Explain the request", .obligations = &.{.{ .id = "request_complete", .description = "Fulfil the request" }} };
+    var obligations: [33]contract.Obligation = undefined;
+    obligations[0] = definition.obligations[0];
+    for (obligations[1..], 0..) |*obligation, index| {
+        obligation.* = .{ .id = try alloc.print("detail_{d}", .{index}), .description = "Explain the requested detail" };
+    }
+    const raw = try std.json.Stringify.valueAlloc(alloc, Plan{ .capability = "general_task", .summary = "Explain the request", .obligations = &obligations }, .{});
+    var view = try evidence_mod.View.initWithBacking(alloc, &.{}, &.{});
+    try std.testing.expectError(error.InvalidTaskPlan, validateDecision(alloc, plan_schema.name, definition, &view, &.{}, raw));
 }
 
 test "workspace progress identities preserve canonical evidence hashes" {
