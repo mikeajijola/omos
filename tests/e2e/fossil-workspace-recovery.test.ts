@@ -6240,3 +6240,48 @@ test("workspace governance retains oversized source preparation failures before 
   const failure = governanceJournal(f, task).find((entry: any) => entry.kind === "invocation_failure");
   expect(failure.value.reason).toBe("SourceStateTooLarge");
 }, 120000);
+
+for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", "changed outcome"]) {
+  test(`contract revision recovery handles ${mode} and resumes the saved task`, async () => {
+    const f = fixture();
+    let blocked = true;
+    let revisions = 0;
+    const goal = "Could the agent control its own harness using its CLI";
+    const m = model(f, () => ({ content: "The CLI exposes controls subject to host checks." }), () => blocked ? "blocked" : "met", {
+      plan: { capability: "general_task", summary: "Explain CLI control", obligations: mode === "large unchanged echo"
+        ? Array.from({ length: 32 }, (_, i) => ({ id: `explain_cli_${i}`, description: `Explain CLI control ${i}` }))
+        : [{ id: "explain_cli", description: "Explain CLI control" }], checks: [] },
+      reply(body, packet, phase) {
+        if (phase !== "revise") return;
+        revisions++;
+        const obligations = structuredClone(packet.context.contract.obligations);
+        if (mode === "protected edit" && revisions === 1) obligations[0].description = "Accept unfinished work";
+        if (mode === "protected edit" && revisions === 2) {
+          const feedback = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
+          expect(feedback.at(-1).instruction).toContain("Remove protected requirement 'request_complete' from obligations");
+        }
+        if (mode === "changed outcome") obligations.find((o: any) => o.id === "explain_cli").description = "Explain scheduling only";
+        return { tool_calls: [governanceCall("omos_contract_revision", {
+          capability: "general_task", summary: "Apply the user follow-up", obligations, checks: [],
+          superseded: mode === "changed outcome" ? ["explain_cli"] : [],
+        })] };
+      },
+    });
+    const first = await f.run(["ask", goal, "--json"]);
+    expect(first.code, first.stderr).toBe(1);
+    const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    blocked = false;
+    const followup = mode === "changed outcome" ? "Explain scheduling only instead" : goal + "?";
+    const second = await f.run(["ask", "--resume-id", JSON.parse(first.stdout).session_id, followup, "--json"]);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(revisions).toBe(mode === "protected edit" ? 2 : 1);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.id).toBe(before.id);
+    expect(after.state).toBe("accepted");
+    expect(after.revision_pending).toBe(false);
+    expect(after.definition.obligations[0]).toEqual(before.definition.obligations[0]);
+    if (mode === "changed outcome") expect(after.definition.obligations.find((o: any) => o.id === "explain_cli").description).toBe("Explain scheduling only");
+    else expect(after.definition.obligations).toEqual(before.definition.obligations);
+    expect(m.counts().actors).toBe(2);
+  }, 120000);
+}

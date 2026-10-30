@@ -4536,7 +4536,7 @@ pub const Manager = struct {
         if (!model.nativeCapability(declaration_value, capability)) return error.UnboundCapability;
         const operation = if (std.mem.eql(u8, capability, "coding_task")) "change_code" else "complete_task";
         try model.validateOperation(self.alloc, declaration_value, operation, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .request = try self.originalRequest(current) }), .{})).value, .input);
-        if (obligations.len > 32 or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
+        if ((superseded == null and obligations.len > 32) or summary.len > 4096 or checks.len > 32) return error.InvalidTaskPlan;
         const capability_changed = previous_capability != null and !std.mem.eql(u8, previous_capability.?, capability);
         const recorded_summary = if (capability_changed) try self.alloc.print("Changed capability from {s} to {s} after an authenticated user update: {s}", .{ previous_capability.?, capability, summary }) else summary;
         if (recorded_summary.len > 4096) return error.InvalidTaskPlan;
