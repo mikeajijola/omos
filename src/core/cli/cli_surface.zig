@@ -2810,7 +2810,8 @@ fn runTopLevelMcp(
     }
     if (std.mem.eql(u8, operation, "list")) {
         const connect = rest.len == 2 and std.mem.eql(u8, rest[1], "--connect");
-        if (rest.len != 1 and !connect) {
+        const json_output = rest.len == 2 and std.mem.eql(u8, rest[1], "--json");
+        if (rest.len != 1 and !connect and !json_output) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .mcp);
             return .handled_failure;
         }
@@ -2820,6 +2821,16 @@ fn runTopLevelMcp(
         };
         defer loaded.deinit(alloc);
         try writeConfigDiagnostics(alloc, deps, loaded.startup.config_diagnostics);
+        if (json_output) {
+            const text = if (loaded.runtime) |runtime| rendered: {
+                var snapshot = try runtime.snapshotHealth(alloc, 0);
+                defer snapshot.deinit(alloc);
+                break :rendered try (output_contracts.McpListSnapshot{ .servers = snapshot.servers }).renderJson(alloc);
+            } else try (output_contracts.McpListSnapshot{}).renderJson(alloc);
+            defer alloc.free(text);
+            try writeStdout(deps, text);
+            return .handled_success;
+        }
         const listing = if (loaded.runtime) |runtime| listing: {
             if (connect) {
                 runtime.connectAll(cfg.tool_set.registry);

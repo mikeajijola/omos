@@ -244,3 +244,23 @@ test('background contracts release the main chat while workers await input and p
   await until(()=>native.request('background',{action:'host'}), value=>!value.running);
  }
 },120000);
+
+
+test('native owner settings persist validated defaults and expose MCP inventory', async()=>{
+ const f=fixture();model(f,()=>({content:'Hello.'}));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const before=await native.request('settings');
+ expect(before.settings.length).toBe(14);
+ await expect(native.request('settings',{action:'set',key:'credentials',value:'forbidden'})).rejects.toThrow('UnknownSetting');
+ await expect(native.request('settings',{action:'set',key:'fast_mode',value:'invalid'})).rejects.toThrow('InvalidSettingValue');
+ await native.request('settings',{action:'set',key:'session_titles',value:'off'});
+ await native.request('settings',{action:'set',key:'review_model',value:'fixture-reviewer'});
+ const after=await native.request('settings');
+ expect(after.settings.find((row:any)=>row.key==='session_titles').value).toBe('off');
+ expect(after.review_model).toBe('fixture-reviewer');
+ expect(JSON.parse(readFileSync(join(f.home,'.fx','settings.json'),'utf8')).review_model).toBe('fixture-reviewer');
+ const inventory=await native.request('snapshot',{action:'mcp'});
+ expect(inventory.servers).toBeArray();
+ expect(native.stderr).toBe('');
+},90000);
