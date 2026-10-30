@@ -399,7 +399,9 @@ read-only evidence lookups, the host services them in order; a decision must
 stand alone. Invalid lookups and malformed decisions receive correction feedback
 within the same eight-call and context budgets. Contract revisions preserve the
 existing requirements when a follow-up does not change the requested outcome.
-An exact copy of a retained requirement is ignored; changing or superseding a
+An exact copy of a retained requirement is ignored and does not count toward the
+32 new or changed requirements allowed per revision. Revision requests contain
+at most 100 requirement entries. Changing or superseding a
 host requirement remains invalid. Revision correction feedback identifies protected
 fields instead of requesting unrelated evidence reads. Exact evidence identities
 and full inspection remain required. Repeated invalid responses pause the task with

@@ -6241,14 +6241,16 @@ test("workspace governance retains oversized source preparation failures before 
   expect(failure.value.reason).toBe("SourceStateTooLarge");
 }, 120000);
 
-for (const mode of ["unchanged echo", "protected edit", "changed outcome"]) {
+for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", "changed outcome"]) {
   test(`contract revision recovery handles ${mode} and resumes the saved task`, async () => {
     const f = fixture();
     let blocked = true;
     let revisions = 0;
     const goal = "Could the agent control its own harness using its CLI";
     const m = model(f, () => ({ content: "The CLI exposes controls subject to host checks." }), () => blocked ? "blocked" : "met", {
-      plan: { capability: "general_task", summary: "Explain CLI control", obligations: [{ id: "explain_cli", description: "Explain CLI control" }], checks: [] },
+      plan: { capability: "general_task", summary: "Explain CLI control", obligations: mode === "large unchanged echo"
+        ? Array.from({ length: 32 }, (_, i) => ({ id: `explain_cli_${i}`, description: `Explain CLI control ${i}` }))
+        : [{ id: "explain_cli", description: "Explain CLI control" }], checks: [] },
       reply(body, packet, phase) {
         if (phase !== "revise") return;
         revisions++;
