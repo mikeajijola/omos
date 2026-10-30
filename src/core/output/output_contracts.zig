@@ -601,6 +601,23 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (!wrote_provider) try writer.writeAll("none");
 }
 
+/// Credential-free configured-server inventory for clients that do not connect.
+pub const McpListSnapshot = struct {
+    servers: []const mcp_health.ServerSnapshot = &.{},
+
+    pub fn renderJson(self: McpListSnapshot, alloc: Allocator) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"mcp\",\"servers\":[");
+        for (self.servers, 0..) |server, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try std.json.Stringify.value(.{ .name = server.configured_name, .transport = @tagName(server.transport), .status = @tagName(server.connection) }, .{}, &out.writer);
+        }
+        try out.writer.writeAll("]}");
+        return alloc.dupe(u8, out.written());
+    }
+};
+
 pub const McpLocalSnapshot = struct {
     servers: []const mcp_health.ConfiguredServerSnapshot = &.{},
     configuration_issues: []const mcp_health.ConfigurationIssue = &.{},

@@ -16,6 +16,7 @@ Supported operations:
 | `cancel`, `steer` | Stop or steer the exact active invocation. |
 | `input` | Resolve an exact pending native question or permission request. |
 | `validation` | Return a host compilation receipt for an exact pending source revision request. |
+| `settings` | Read the native preference catalog or apply a typed owner-only preference, directory or permission-rule update. Mutations require an idle foreground turn and apply to future turns. The trusted host must keep this method outside the editable workspace bridge. |
 | `snapshot` | Read an allowlisted native JSON snapshot; arbitrary CLI arguments are unavailable. |
 | `workspace` | Use the revision-pinned read-only workspace service. |
 | `profile.read`, `profile.update` | Read or explicitly replace the local owner's portable profile photo through the host-owned record and image store. |
@@ -40,3 +41,9 @@ Native UI turns identify the Fossil `ui/` tree as the running interface source. 
 The `fossil_workspace` tool uses native workspace ownership and protected-path checks without a second model safety review. Configured permission rules still apply. A saved task is required for mutations; ephemeral sessions remain read-only. The tool cannot overwrite host-owned evidence, assessments or publication receipts. Completion still requires independent verification and native publication.
 
 The UI host initializes an empty personal Fossil instance when no workspace is bound. Profile updates accept a validated base64 PNG, JPEG or WebP up to 512 KiB, or null for removal. They return the content and saved revision. The profile entity must exist in the current declaration. The external UI host owns migration of an old operational photo and retains its original source.
+
+The trusted local browser shell may expose native settings through a separate
+owner panel. Read responses contain preference values and provider names, never
+provider definitions or credentials. Mutations use the native settings store,
+including its validation and atomic persistence. Workspace-authored JavaScript
+can request that the panel open but cannot choose or submit its changes.

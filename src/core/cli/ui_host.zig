@@ -192,6 +192,14 @@ const Server = struct {
             const args = try snapshotArgs(arena, query.action, query.id, query.entity, query.offset);
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
+        if (std.mem.eql(u8, method, "settings")) {
+            const owner_settings = @import("../config/host_settings.zig");
+            const request = try std.json.parseFromValueLeaky(owner_settings.Request, arena, params, .{});
+            if (request.action != .read) if (self.job) |job| {
+                if (!job.finished.load(.acquire)) return error.SettingsBusy;
+            };
+            return parse(arena, try owner_settings.execute(arena, request));
+        }
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
         if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
