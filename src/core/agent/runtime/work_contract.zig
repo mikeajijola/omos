@@ -67,7 +67,14 @@ pub fn revisedObligations(alloc: std.mem.Allocator, current: Definition, replace
         } else false;
         if (!replaced) try result.append(alloc, obligation);
     }
-    for (replacements) |obligation| {
+    for (replacements, 0..) |obligation, index| {
+        for (replacements[0..index]) |previous| if (std.mem.eql(u8, obligation.id, previous.id)) return error.InvalidContractRevision;
+        // A full-contract echo is harmless only when the retained requirement
+        // is byte-for-byte unchanged. Superseded entries still require validation.
+        const unchanged = for (result.items) |previous| {
+            if (std.mem.eql(u8, obligation.id, previous.id) and std.mem.eql(u8, obligation.description, previous.description)) break true;
+        } else false;
+        if (unchanged) continue;
         if (std.mem.startsWith(u8, obligation.id, "request_") or std.mem.startsWith(u8, obligation.id, "coding_")) return error.InvalidContractRevision;
         if (!bounded(obligation.id, 128) or !bounded(obligation.description, 4096)) return error.InvalidContractRevision;
         for (result.items) |previous| if (std.mem.eql(u8, obligation.id, previous.id)) return error.InvalidContractRevision;
@@ -195,4 +202,25 @@ test "work contract revision preserves unaffected obligations and host requireme
         try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{}, ids));
     try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{.{ .id = "sources", .description = "Changed without superseding" }}, &.{}));
     try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{.{ .id = "coding_summary", .description = "Model cannot create host requirements" }}, &.{}));
+}
+
+test "work contract revision accepts unchanged echoes without weakening requirements" {
+    const alloc = std.testing.allocator;
+    const definition: Definition = .{ .id = "task", .version = 3, .objective = "Explain the CLI", .obligations = &.{
+        .{ .id = "request_complete", .description = "Fulfil the request" },
+        .{ .id = "explain_cli", .description = "Explain the CLI" },
+        .{ .id = "coding_validation", .description = "Validate changed source" },
+    } };
+    const echoed = try revisedObligations(alloc, definition, definition.obligations, &.{});
+    defer alloc.free(echoed);
+    try std.testing.expectEqualDeep(definition.obligations, echoed);
+    const revised = try revisedObligations(alloc, definition, &.{ definition.obligations[0], .{ .id = "explain_cli", .description = "Explain scheduling" }, definition.obligations[2] }, &.{"explain_cli"});
+    defer alloc.free(revised);
+    try std.testing.expectEqual(@as(usize, 3), revised.len);
+    try std.testing.expectEqualStrings("Explain scheduling", revised[2].description);
+    for ([_][]const u8{ "request_complete", "coding_validation" }) |id| {
+        try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{.{ .id = id, .description = "Weakened" }}, &.{}));
+        try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, definition.obligations, &.{id}));
+    }
+    try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, &.{ definition.obligations[0], definition.obligations[0] }, &.{}));
 }

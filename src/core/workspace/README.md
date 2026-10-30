@@ -397,8 +397,12 @@ anticipated checks empty when the applicable validation commands are unknown.
 Governance requests sequential reviewer calls. If a provider returns multiple
 read-only evidence lookups, the host services them in order; a decision must
 stand alone. Invalid lookups and malformed decisions receive correction feedback
-within the same eight-call and context budgets. Exact evidence identities and
-full inspection remain required. Repeated invalid responses pause the task with
+within the same eight-call and context budgets. Contract revisions preserve the
+existing requirements when a follow-up does not change the requested outcome.
+An exact copy of a retained requirement is ignored; changing or superseding a
+host requirement remains invalid. Revision correction feedback identifies protected
+fields instead of requesting unrelated evidence reads. Exact evidence identities
+and full inspection remain required. Repeated invalid responses pause the task with
 `workspace_governance_pending`, preserving actor work and evidence. Response
 metadata, correction reasons, failure diagnostics, and reported usage survive a
 failed review. Credentials and opaque provider replay state are not journaled.
