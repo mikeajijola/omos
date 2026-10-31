@@ -132,7 +132,7 @@ pub fn select(draft: Draft, observations: []const Evidence, result: classificati
 // evidence. Chronological budget consumption hid later contradictions entirely.
 fn classifierEvidence(alloc: std.mem.Allocator, observations: []const Evidence) ![]const Evidence {
     const selected = try alloc.dupe(Evidence, observations);
-    const per_item = @min(2048, 12288 / @max(1, observations.len));
+    const per_item = @min(2048, 8192 / @max(1, observations.len));
     for (selected) |*item| {
         const text = prefix(item.text, per_item);
         item.omitted_bytes += item.text.len - text.len;
@@ -299,6 +299,6 @@ test "lookup checkpoint budgets preserve late and uncited observations" {
         classifier_bytes += classifier.text.len;
     }
     try std.testing.expect(actor_bytes <= 64 * 1024);
-    try std.testing.expect(classifier_bytes <= 12288);
+    try std.testing.expect(classifier_bytes <= 8192);
     try std.testing.expectEqualStrings("e19", selected[19].id);
 }
