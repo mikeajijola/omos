@@ -7151,7 +7151,7 @@ fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
-    config: Config,
+    original_config: Config,
     borrowed_job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
@@ -7174,6 +7174,7 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    var config = original_config;
     var job = borrowed_job;
     var request_capabilities = initial_request_capabilities;
     var tool_image_capabilities_resolved = false;
@@ -7239,15 +7240,93 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
+    defer if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.fossil_session_id) |session_id| if (!config.fossil_ephemeral) {
+            if (@import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |bound| {
+                if (bound) |manager| @import("../../workspace/conversations.zig").retain(manager, session_id) catch |err| {
+                    debug_trace.logf("workspace", "conversation projection pending error={s}", .{@errorName(err)});
+                    deps.push_system_notice(deps.ctx, "The conversation is saved locally, but its readable workspace projection could not be updated.") catch {};
+                };
+            } else |_| {}
+        };
+    };
+    var retrieval_turn = false;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and @import("../../workspace/classification.zig").configured()) {
+            const routing = @import("../../workspace/request_routing.zig");
+            var decision = try routing.decide(arena, job.prompt, history_messages.items, config.cancel_flag);
+            const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
+            if (decision.route == .unresolved) {
+                try deps.push_system_notice(deps.ctx, "Resolving this request against the conversation...");
+                const active = try manager.active(config.fossil_session_id.?);
+                const context = try std.json.Stringify.valueAlloc(arena, .{
+                    .latest_message = @import("review_evidence.zig").View.prefix(job.prompt, 8192),
+                    .message_bytes = job.prompt.len,
+                    .conversation = try task_governance.referenceConversation(arena, history_messages.items),
+                    .active_task = if (active) |task| task.id else @as(?[]const u8, null),
+                    .active_task_state = if (active) |task| @tagName(task.state) else @as(?[]const u8, null),
+                    .classifier = decision,
+                }, .{});
+                var delivery: agent_stream_provider.DeliveryCertainty = .init();
+                var attempt: agent_stream_provider.AttemptEvidence = .{};
+                var event_context: u8 = 0;
+                const resolution = routing.resolve(arena, deps.agent_stream_provider, .{
+                    .observer = deps.observer,
+                    .credential = activeCredentialLease(job.api_key, job),
+                    .model = job.model,
+                    .retry_count = 0,
+                    .messages = &.{},
+                    .tool_choice = .required,
+                    .provider_options = .{},
+                    .trace_ctx = .{ .turn_id = turn_id },
+                    .content_capture_limit = 8192,
+                    .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(20000) }),
+                    .delivery = &delivery,
+                    .attempt_evidence = &attempt,
+                    .events = .{ .context = &event_context, .emit_fn = discardContractEvent },
+                    .cooperative_pulse = deps.cooperative_transport_pulse,
+                    .cancel_flag = config.cancel_flag,
+                }, context) catch |err| blk: {
+                    if (err == error.Cancelled or err == error.OutOfMemory) return err;
+                    break :blk null;
+                };
+                if (resolution) |resolved| {
+                    decision.resolution = resolved;
+                    decision.route = resolved.route;
+                    if (deps.report_usage) |report| report(deps.ctx, resolved.usage);
+                    agent.observeUsage(resolved.usage);
+                    summary_accumulator_ptr.prepareTokenRequest();
+                    _ = summary_accumulator_ptr.reconcileTokenRequest(resolved.usage, false);
+                }
+            }
+            retrieval_turn = decision.route != .work;
+            if (retrieval_turn) {
+                config.contract_review_enabled = false;
+                config.coordinator_mode = true;
+                config.initial_dynamic_tools = &.{};
+                config.provider_capabilities.fx_search = false;
+                config.agent_step_limit = if (config.agent_step_limit == 0) 6 else @min(config.agent_step_limit, 6);
+                config.step_limit_notice = "This lookup reached its inspection limit. The retained sources may be incomplete; narrow the question or request a deeper investigation.";
+                var names: std.ArrayList([]const u8) = .empty;
+                var functions: std.ArrayList(@import("../../tooling/model_tool_schema.zig").FunctionSchema) = .empty;
+                for (config.advertised_tool_names) |name| if (routing.readTool(name)) try names.append(arena, name);
+                for (config.advertised_functions) |function| if (routing.readTool(function.name)) try functions.append(arena, function);
+                config.advertised_tool_names = names.items;
+                config.advertised_functions = functions.items;
+                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. For factual workspace questions start directly with workspace_content search, then query or read the relevant sources. Do not spend calls on catalog, attention or conversation history unless the question concerns those. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. If the requested outcome needs changes, explain the routing mismatch and ask the user to clarify the action. If evidence is absent or coverage incomplete, say so." });
+            }
+            try manager.retainRoutingDecision(config.fossil_session_id.?, job.prompt, decision);
+        }
+    }
     var execution_lease: ?@import("../../workspace/fossil_workspace.zig").ExecutionLease = null;
     defer if (execution_lease) |lease| lease.release();
     if (comptime !builtin.target.cpu.arch.isWasm()) {
-        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
+        if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
             const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
             execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
         }
     }
-    var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (config.fossil_session_id != null and !config.fossil_ephemeral)
+    var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (!retrieval_turn and config.fossil_session_id != null and !config.fossil_ephemeral)
         try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
     else
         null;
@@ -7441,6 +7520,8 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        const retrieval_final = retrieval_turn and !agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        if (retrieval_final) try stable_prefix.append(arena, .{ .role = .system, .content = "The bounded lookup has reached its final response. Answer now from the source evidence already gathered. Cite the relevant paths and distinguish verified facts from inference. If evidence is insufficient, state precisely what remains unknown; do not claim that missing search results prove absence." });
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
@@ -7882,7 +7963,7 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
-            const tool_choice: types.ToolChoice = if (governance.finalizing)
+            const tool_choice: types.ToolChoice = if (governance.finalizing or retrieval_final)
                 .none
             else if (recovery_strategy == .reconcile_tool)
                 .none
@@ -7906,7 +7987,7 @@ fn processQueuedPromptLoop(
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
-            if (governance.finalizing) request_data.tools = .{};
+            if (governance.finalizing or retrieval_final) request_data.tools = .{};
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
@@ -9602,6 +9683,9 @@ fn processQueuedPromptLoop(
             completion.tool_calls,
         ) else .{ .calls = completion.tool_calls, .removed = 0 };
         completion.tool_calls = filtered_provider_calls.calls;
+        if (retrieval_turn) for (completion.tool_calls) |call| {
+            if (!@import("../../workspace/request_routing.zig").readTool(call.name)) return error.ReadOnlyRoutingViolation;
+        };
         if (filtered_provider_calls.removed > 0) {
             debug_trace.eventf(
                 "agent",

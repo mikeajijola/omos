@@ -7,6 +7,10 @@ an empty personal instance automatically when no repository is bound.
 `omos fossil ensure --json` performs the same bootstrap without importing
 existing sessions.
 
+See [conversation and content capabilities](CAPABILITIES.md) for retrieval,
+request classification, public chat history, and the attention feed shared by
+the CLI, workspace UI, local MCP adapter, and agent tools.
+
 Managed turns checkpoint changes in the task's projected `memory/`, `skills/`,
 `documents/`, `artifacts/`, and `ui/` directories. The host hashes local files
 through fixed-size buffers and retains their metadata while identifying

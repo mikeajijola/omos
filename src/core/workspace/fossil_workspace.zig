@@ -2145,7 +2145,7 @@ pub const Manager = struct {
 
     /// The runtime branch is portable host history, separate from the candidate
     /// being assessed. Updating worker status cannot invalidate its assessment.
-    fn runtimeRevisionIfPresent(self: Manager) !?[]const u8 {
+    pub fn runtimeRevisionIfPresent(self: Manager) !?[]const u8 {
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
         while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), runtime_branch)) return try self.revision(runtime_branch);
@@ -2197,6 +2197,42 @@ pub const Manager = struct {
     /// permitting an overwrite. Canonical worker records are never model writes.
     pub fn saveBackgroundRecord(self: Manager, entry: background_contract.Record, expected_sha256: ?[]const u8) !void {
         return self.saveBackgroundRecordAndSelection(entry, expected_sha256, null, null);
+    }
+
+    /// Host-owned diagnostic records are portable workspace history, not
+    /// permissions, task obligations or actor-editable evidence.
+    pub fn retainRoutingDecision(self: Manager, session: []const u8, message: []const u8, decision: anytype) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        const tree = try self.runtimeCheckout();
+        const routing_record = try json(self.alloc, .{ .version = "omos.routing-record/v1", .session = session, .message_sha256 = try hash(self.alloc, message), .at_ms = io_mod.milliTimestamp(), .decision = decision, .authority = "advisory" });
+        const path = try self.alloc.print("runtime/routing/{s}/{s}.json", .{ try hash(self.alloc, session), try hash(self.alloc, routing_record) });
+        try atomicWrite(self.alloc, try join(self.alloc, tree, path), routing_record);
+        _ = try self.commit(tree, "Record conversation routing decision");
+    }
+
+    pub fn retainAttentionEvent(self: Manager, turn: []const u8, cursor: usize, event: std.json.Value) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        const tree = try self.runtimeCheckout();
+        const bytes = try portableValue(self.alloc, try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, try json(self.alloc, .{ .version = "omos.attention-event/v1", .turn = turn, .cursor = cursor, .at_ms = io_mod.milliTimestamp(), .event = event, .authority = "historical_host_event_not_live_approval" }), .{}));
+        const path = try self.alloc.print("runtime/attention/{s}/{d}.json", .{ try hash(self.alloc, turn), cursor });
+        try atomicWrite(self.alloc, try join(self.alloc, tree, path), bytes);
+        _ = try self.commit(tree, "Retain human attention event");
+    }
+
+    pub fn retainConversation(self: Manager, session: []const u8, projection: std.json.Value) !void {
+        const bytes = try portableValue(self.alloc, projection);
+        if (bytes.len > 8 * 1024 * 1024) return error.ConversationProjectionTooLarge;
+        const lease = try self.writerLease();
+        defer lease.release();
+        const tree = try self.runtimeCheckout();
+        const path = try join(self.alloc, tree, try self.alloc.print("runtime/conversations/{s}.json", .{try hash(self.alloc, session)}));
+        if (read(self.alloc, path)) |previous| {
+            if (std.mem.eql(u8, previous, bytes)) return;
+        } else |err| if (err != error.FileNotFound) return err;
+        try atomicWrite(self.alloc, path, bytes);
+        _ = try self.commit(tree, "Retain readable conversation history");
     }
 
     /// Queue and release selection in one canonical commit. A private recovery
@@ -3675,6 +3711,50 @@ pub const Manager = struct {
             if (task.state == .accepted and try self.publicationPending(task)) pending_delivery = true;
         }
         return .{ .repository = self.repository, .workspace_id = self.manifest.id, .trunk_revision = try self.revision("trunk"), .tasks = all, .files = try self.inventory("trunk"), .pending_journals = pending, .publication = if (pending_publication) "pending" else if (pending_delivery) "pending_delivery" else if (pending > 0) "local_pending" else "checkpointed", .detail = detail };
+    }
+
+    pub fn retrievalArtifact(self: Manager, identity: []const u8) ![]const u8 {
+        const bytes = try self.immutableArtifact(identity);
+        try fossil_manifest.verifyObject(identity, bytes);
+        return bytes;
+    }
+
+    /// Core-only SQL against verified content, never against the repository.
+    /// The caller constructs queries from validated identifiers and literals.
+    pub fn retrievalDatabase(self: Manager, identity: []const u8, bytes: []const u8, sql: []const u8) ![]const u8 {
+        try fossil_manifest.verifyObject(identity, bytes);
+        const directory = try self.alloc.print("{s}/retrieval-v1", .{self.root});
+        try mkdir(directory);
+        const path = try self.alloc.print("{s}/{s}.sqlite", .{ directory, identity });
+        try atomicWrite(self.alloc, path, bytes);
+        const query = try self.alloc.print("PRAGMA trusted_schema=OFF; {s}", .{sql});
+        const result = try self.run(null, &.{ "sql", "--no-repository", "--readonly", "-init", "/dev/null", "-batch", "-json", path, query });
+        if (std.mem.trim(u8, result, " \n\r\t").len == 0) return error.DatabaseQueryFailed;
+        return result;
+    }
+
+    pub const RetrievalObject = struct { artifact: []const u8, bytes: []const u8 };
+
+    pub fn retrievalObjects(self: Manager, identities: []const []const u8) ![]const RetrievalObject {
+        if (identities.len == 0 or identities.len > 32) return error.InvalidRetrievalBatch;
+        var query: std.Io.Writer.Allocating = .init(self.alloc);
+        try query.writer.writeAll("SELECT uuid AS artifact, hex(content(uuid)) AS encoded FROM blob WHERE uuid IN (");
+        for (identities, 0..) |identity, i| {
+            if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
+            if (i > 0) try query.writer.writeByte(',');
+            try query.writer.print("'{s}'", .{identity});
+        }
+        try query.writer.writeAll(") AND size <= 65536;");
+        const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query.written() });
+        const rows = try parse(self.alloc, []const struct { artifact: []const u8, encoded: []const u8 }, if (std.mem.trim(u8, raw, " \r\n\t").len == 0) "[]" else raw);
+        var result: std.ArrayList(RetrievalObject) = .empty;
+        for (rows) |row| {
+            const bytes = try self.alloc.alloc(u8, row.encoded.len / 2);
+            _ = try std.fmt.hexToBytes(bytes, row.encoded);
+            try fossil_manifest.verifyObject(row.artifact, bytes);
+            try result.append(self.alloc, .{ .artifact = row.artifact, .bytes = bytes });
+        }
+        return result.items;
     }
 
     fn immutableArtifact(self: Manager, identity: []const u8) ![]const u8 {

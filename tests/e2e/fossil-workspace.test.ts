@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
@@ -132,8 +133,13 @@ describe("portable Fossil agent workspace", () => {
     expect(first.code).toBe(1);
     const session = JSON.parse(first.stdout).session_id;
     const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const attentionRequest = join(f.home, "attention.json");
+    writeFileSync(attentionRequest, JSON.stringify({ action: "attention" }));
+    const attention = async () => JSON.parse((await f.run(["fossil", "capabilities", attentionRequest, "--json"])).stdout);
+    expect((await attention()).items).toContainEqual(expect.objectContaining({ task: before.id, kind: "work_waiting", actionable: false }));
     blocked = false;
     expect((await f.run(["ask", "--resume-id", session, "The detail is blue", "--json"])).code).toBe(0);
+    expect((await attention()).items.some((item: any) => item.task === before.id)).toBe(false);
     const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     expect(after.id).toBe(before.id);
     expect(after.branch).toBe(before.branch);
@@ -235,4 +241,174 @@ test("follow-up planning retains the referenced specification and repository val
   expect(plans[1].context.repositoryContext).toContain(validation);
   expect(plans[1].context.workspaceRoot).toBe(f.cwd);
   expect(readFileSync(join(f.cwd, "schedule.txt"), "utf8")).toBe("recurring\n");
+}, 120000);
+
+describe("shared workspace capabilities", () => {
+  test("classifies explicit choices through the native CLI and rejects invented labels", async () => {
+    const f = fixture();
+    let invented = false;
+    const received: any[] = [];
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const input = await request.json() as any;
+      received.push(input);
+      return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: invented ? "invented" : "retrieval", confidence: 0.9, probabilities: { retrieval: 0.9, work: 0.1 } } } });
+    } });
+    try {
+      const request = join(f.home, "classification.json");
+      writeFileSync(request, JSON.stringify({ state: { text: "What was our last application?" }, questions: [{ id: "route", instructions: "Choose", choices: [{ label: "retrieval", description: "Read existing content" }, { label: "work", description: "Change state" }] }] }));
+      const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` };
+      const result = await f.run(["fossil", "classify", request, "--json"], env);
+      expect(result.code, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ advisory: true, decisions: [{ choice: "retrieval" }] });
+      expect(received[0].questions.route.criteria).toEqual({ retrieval: "Read existing content", work: "Change state" });
+      invented = true;
+      expect((await f.run(["fossil", "classify", request, "--json"], env)).code).toBe(1);
+    } finally { server.stop(true); }
+  });
+
+  test("retrieval routes inspect sources without creating or assessing a task", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+      return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "retrieval", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.99, work: 0.003, unresolved: 0.004 } } } });
+    } });
+    const toolSets: string[][] = [];
+    const m = model(f, (body, count) => {
+      toolSets.push(body.tools.map((tool: any) => tool.function.name));
+      return count === 1 ? { tool_calls: [{ index: 0, id: "lookup", type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "search", retrieval: { query: "application" } }) } }] } : { content: "No confirmed application is present in the searched sources." };
+    });
+    try {
+      const result = await f.run(["ask", "What was the last job we applied to?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+      expect(result.code, result.stderr + result.stdout).toBe(0);
+      expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
+      for (const names of toolSets) {
+        expect(names).toContain("classify");
+        expect(names).toContain("workspace_content");
+        expect(names).not.toContain("shell");
+        expect(names).not.toContain("fossil_workspace");
+      }
+      expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
+      expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/routing/");
+      expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/conversations/");
+    } finally { server.stop(true); }
+  }, 120000);
+
+  test("search reads immutable sources and structured queries sort application records", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, (_body, count) => count === 1 ? { tool_calls: [{ index: 0, id: "save", type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path: "documents/applications.json", content: JSON.stringify([{ company: "Earlier", submitted: "2026-01-01", state: "sent" }, { company: "Draft", submitted: "2026-03-01", state: "draft" }, { company: "Later €", submitted: "2026-02-01", state: "sent" }]) }) } }] } : { content: "Saved the supplied application records." });
+    expect((await f.run(["ask", "Save the supplied records", "--json"])).code).toBe(0);
+    const request = join(f.home, "capabilities.json");
+    async function call(input: object) {
+      writeFileSync(request, JSON.stringify(input));
+      const result = await f.run(["fossil", "capabilities", request, "--json"]);
+      expect(result.code, result.stderr).toBe(0);
+      return JSON.parse(result.stdout);
+    }
+    const found = await call({ action: "search", retrieval: { query: "applications" } });
+    const hit = found.hits.find((item: any) => item.path === "documents/applications.json");
+    expect(hit).toBeDefined();
+    const source = await call({ action: "read", retrieval: { path: hit.path, revision: hit.revision } });
+    expect(source.text).toContain("Later €");
+    const result = await call({ action: "query", retrieval: { path: hit.path, revision: hit.revision, filters: [{ field: "state", equals: "sent" }], order_by: "submitted", limit: 1 } });
+    expect(result.records[0].record.company).toBe("Later €");
+    expect(result.total).toBe(2);
+    expect(result.next_offset).toBe(1);
+  }, 120000);
+});
+
+test("read routing refuses an unexpected execution call", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "retrieval", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.99, work: 0.003, unresolved: 0.004 } } } });
+  } });
+  model(f, () => ({ tool_calls: [{ index: 0, id: "forbidden", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "touch unexpected-action.txt" } }) } }] }));
+  try {
+    const result = await f.run(["ask", "Find existing records", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+    expect(result.code).not.toBe(0);
+    expect(existsSync(join(f.cwd, "unexpected-action.txt"))).toBe(false);
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
+  } finally { server.stop(true); }
+}, 120000);
+
+test("uncertain classification resolves against the ongoing conversation before planning", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "unresolved", confidence: 0.3, probabilities: { conversation: 0.25, retrieval: 0.25, work: 0.2, unresolved: 0.3 } } } });
+  } });
+  const contexts: any[] = [];
+  const m = model(f, (body) => {
+    if (body.tools.some((tool: any) => tool.function.name === "omos_request_route")) {
+      contexts.push(JSON.parse(body.messages.find((message: any) => message.role === "user").content));
+      return { tool_calls: [{ index: 0, id: `route-${contexts.length}`, type: "function", function: { name: "omos_request_route", arguments: JSON.stringify({ route: "conversation", reason: "The user is discussing the existing application history." }) } }] };
+    }
+    return { content: "We are discussing application history; no application has been sent by this conversation." };
+  });
+  try {
+    const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` };
+    const first = await f.run(["ask", "Explain the application history", "--json"], env);
+    expect(first.code, first.stderr + first.stdout).toBe(0);
+    const session = JSON.parse(first.stdout).session_id;
+    const second = await f.run(["ask", "--resume-id", session, "Yes, explain that", "--json"], env);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(contexts).toHaveLength(2);
+    expect(JSON.stringify(contexts[1].conversation)).toContain("application history");
+    expect(m.counts().assessments).toBe(0);
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
+  } finally { server.stop(true); }
+}, 120000);
+
+test("SQLite retrieval lists schema and filters pinned records without executing supplied SQL", async () => {
+  const f = fixture();
+  const databasePath = join(f.home, "applications.sqlite");
+  const db = new Database(databasePath);
+  db.exec("CREATE TABLE applications(id INTEGER PRIMARY KEY, company TEXT, submitted TEXT, status TEXT); INSERT INTO applications VALUES (1,'Earlier','2026-01-01','submitted'),(2,'Later','2026-02-01','submitted'),(3,'Draft','2026-03-01','draft'); CREATE VIEW dangerous AS SELECT readfile('/private') AS data;");
+  db.close();
+  const original = readFileSync(databasePath);
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const quoted = "'" + databasePath.replaceAll("'", "'\\''") + "'";
+  model(f, (body, count) => {
+    if (count !== 1) return { content: "Retained the supplied SQLite application records." };
+    const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
+    const match = context.match(/"workingDirectory":("(?:[^"\\]|\\.)*")/);
+    expect(match).not.toBeNull();
+    const cwd = JSON.parse(match![1]);
+    return { tool_calls: [{ index: 0, id: "import-records", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", cwd, command: `mkdir -p documents && cp ${quoted} documents/applications.sqlite`, timeout_ms: 10000 } }) } }] };
+  });
+  const saved = await f.run(["ask", "Retain the supplied SQLite application records in documents/applications.sqlite", "--json"]);
+  expect(saved.code, saved.stderr + saved.stdout).toBe(0);
+  const request = join(f.home, "query.json");
+  async function call(retrieval: object) {
+    writeFileSync(request, JSON.stringify({ action: "query", retrieval: { path: "documents/applications.sqlite", ...retrieval } }));
+    const result = await f.run(["fossil", "capabilities", request, "--json"]);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    return JSON.parse(result.stdout);
+  }
+  const schema = await call({});
+  expect(schema.tables).toEqual(["applications"]);
+  const selected = await call({ revision: schema.revision, entity: "applications", filters: [{ field: "status", equals: "submitted" }], order_by: "submitted", limit: 1 });
+  expect(selected.records[0].record.company).toBe("Later");
+  expect(selected.total).toBe(2);
+  expect(selected.next_offset).toBe(1);
+  const injected = await call({ revision: schema.revision, entity: "applications", filters: [{ field: "status", equals: "submitted'; DROP TABLE applications;--" }] });
+  expect(injected.total).toBe(0);
+  expect((await call({ revision: schema.revision, entity: "applications" })).total).toBe(3);
+  expect(readFileSync(databasePath)).toEqual(original);
+}, 120000);
+
+test("bounded retrieval reserves its final step for an evidence-based answer", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+    return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "retrieval", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.99, work: 0.003, unresolved: 0.004 } } } });
+  } });
+  const m = model(f, (body, count) => body.tools?.length ? { tool_calls: [{ index: 0, id: `lookup-${count}`, type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "search", retrieval: { query: "application" } }) } }] } : { content: "The inspected sources do not establish a submitted application." });
+  try {
+    const result = await f.run(["ask", "Find the last application", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(result.stdout).toContain("The inspected sources do not establish a submitted application.");
+    expect(m.counts()).toEqual({ actors: 6, assessments: 0 });
+  } finally { server.stop(true); }
 }, 120000);

@@ -22,6 +22,7 @@ export function fixture() {
     HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1",
     FX_SKIP_ONBOARDING: "1", FX_CONTRACT_REVIEW: "1", FX_E2E_FOSSIL_FAULT: undefined,
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
+    OMOS_CLASSIFIER_URL: undefined, OMOS_CLASSIFIER_TOKEN: undefined, OMOS_CLASSIFIER_MODEL: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined, OMOS_FOSSIL_BIN: undefined,
   };
   const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 60000) => {

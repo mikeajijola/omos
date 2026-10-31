@@ -603,7 +603,7 @@ fn builtinNamesForKind(kind: BuildKind, tool_set: tool_set_contract.ToolSet) ?[]
     return switch (kind) {
         .full => null,
         .read_only => tool_set.read_only_tool_names,
-        .coordinator => &.{ "read_file", "glob_files", "grep_files", "read_tool_result", "fossil_workspace" },
+        .coordinator => &.{ "classify", "workspace_content", "read_file", "glob_files", "grep_files", "read_tool_result", "fossil_workspace" },
     };
 }
 

@@ -24,6 +24,8 @@ const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const fossil_workspace_impl = @import("../tools/session/fossil_workspace.zig");
+const workspace_content_impl = @import("../tools/session/workspace_content.zig");
+const classify_impl = @import("../tools/session/classify.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -872,7 +874,91 @@ pub const fossil_workspace = ToolSpec{
     .irreversible_fn = fossil_workspace_impl.irreversible,
 };
 
+pub const classify = ToolSpec{
+    .name = "classify",
+    .description = "Ask the configured decision model bounded choice questions about supplied state. Include relevant context and describe each choice. Uncertain decisions require further reasoning, not automatic action. No endpoint or model override is accepted.",
+    .model_schema = .{
+        .name = "classify",
+        .description = "Ask the configured decision model bounded choice questions about supplied state. Include relevant context and describe each choice. Uncertain decisions require further reasoning, not automatic action. No endpoint or model override is accepted.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "state", .json_type = .object, .description = "Relevant message, recent context and candidate records. Do not include unrelated content." },
+                .{ .name = "questions", .json_type = .array, .shape = &.{ .array_objects = &.{
+                    .properties = &.{
+                        .{ .name = "id", .json_type = .string },
+                        .{ .name = "instructions", .json_type = .string },
+                        .{ .name = "choices", .json_type = .array, .shape = &.{ .array_objects = &.{
+                            .properties = &.{ .{ .name = "label", .json_type = .string }, .{ .name = "description", .json_type = .string } },
+                            .required = &.{ "label", "description" },
+                            .additional_properties = false,
+                        } } },
+                    },
+                    .required = &.{ "id", "instructions", "choices" },
+                    .additional_properties = false,
+                } } },
+            },
+            .required = &.{ "state", "questions" },
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .host,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Classifying",
+    .completed_action_label = "Classified",
+    .decode = classify_impl.decode,
+    .call = classify_impl.call,
+    .reads_only_fn = classify_impl.readsOnly,
+    .irreversible_fn = classify_impl.irreversible,
+};
+
+pub const workspace_content = ToolSpec{
+    .name = "workspace_content",
+    .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
+    .model_schema = .{
+        .name = "workspace_content",
+        .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation" } } },
+                .{ .name = "session", .json_type = .string },
+                .{ .name = "offset", .json_type = .integer },
+                .{ .name = "retrieval", .json_type = .object, .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "query", .json_type = .string },
+                        .{ .name = "path", .json_type = .string },
+                        .{ .name = "revision", .json_type = .string },
+                        .{ .name = "runtime_revision", .json_type = .string },
+                        .{ .name = "pointer", .json_type = .string, .description = "Slash-separated field path to the JSON array when querying a document." },
+                        .{ .name = "order_by", .json_type = .string },
+                        .{ .name = "descending", .json_type = .boolean },
+                        .{ .name = "filters", .json_type = .array, .shape = &.{ .array_objects = &.{ .properties = &.{ .{ .name = "field", .json_type = .string }, .{ .name = "equals", .json_type = .string } }, .required = &.{ "field", "equals" }, .additional_properties = false } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "offset", .json_type = .integer },
+                        .{ .name = "limit", .json_type = .integer },
+                        .{ .name = "entity", .json_type = .string },
+                    },
+                    .additional_properties = false,
+                } } },
+            },
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .host,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Retrieving workspace content",
+    .completed_action_label = "Retrieved workspace content",
+    .decode = workspace_content_impl.decode,
+    .call = workspace_content_impl.call,
+    .reads_only_fn = workspace_content_impl.readsOnly,
+    .irreversible_fn = workspace_content_impl.irreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
+    classify,
+    workspace_content,
     fossil_workspace,
     glob_files,
     grep_files,
@@ -896,6 +982,8 @@ pub const all = [_]tool_dispatch.Tool{
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
 pub const advertisement_order = [_][]const u8{
+    "classify",
+    "workspace_content",
     "read_file",
     "glob_files",
     "grep_files",
@@ -914,6 +1002,8 @@ pub const advertisement_order = [_][]const u8{
 };
 
 pub const read_only_tool_names = [_][]const u8{
+    "classify",
+    "workspace_content",
     "read_file",
     "glob_files",
     "grep_files",
@@ -981,7 +1071,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "9f90fc07dfb140d7aea5de77c1295f16bbc8481ef9f05bf1445a492f8e067bb1",
+        "112b966748ffc1fcc49531c9e87ff1eea1c39dbb54c572beb04807f526414df2",
         &actual_hex,
     );
 }
@@ -1020,6 +1110,8 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
+        "classify",
+        "workspace_content",
         "fossil_workspace",
         "glob_files",
         "grep_files",
@@ -1805,6 +1897,8 @@ test "built-in registry uses executable web_fetch implementation" {
 
 test "built-in read-only tool set matches plan inspection tools" {
     const expected_names = [_][]const u8{
+        "classify",
+        "workspace_content",
         "read_file",
         "glob_files",
         "grep_files",
