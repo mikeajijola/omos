@@ -935,7 +935,7 @@ pub const workspace_content = ToolSpec{
                         .{ .name = "filters", .json_type = .array, .shape = &.{ .array_objects = &.{ .properties = &.{ .{ .name = "field", .json_type = .string }, .{ .name = "equals", .json_type = .string } }, .required = &.{ "field", "equals" }, .additional_properties = false } } },
                         .{ .name = "task", .json_type = .string },
                         .{ .name = "offset", .json_type = .integer },
-                        .{ .name = "limit", .json_type = .integer },
+                        .{ .name = "limit", .json_type = .integer, .description = "Search/query result count, 1 to 32 (default 10). Omit for read: reads return up to 16384 bytes; continue with next_offset." },
                         .{ .name = "entity", .json_type = .string },
                     },
                     .additional_properties = false,
@@ -1071,7 +1071,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "112b966748ffc1fcc49531c9e87ff1eea1c39dbb54c572beb04807f526414df2",
+        "86d0f070603e965055b3de3448f0417d79eef255cd752991c5295f2ed0bd6bb4",
         &actual_hex,
     );
 }

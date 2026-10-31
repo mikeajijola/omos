@@ -57,7 +57,9 @@ Unchanged artifacts reuse their entries and new artifacts are indexed on demand.
 A read always verifies the original object. Search reports coverage gaps for
 binary files, PDFs without extracted text, and text above the indexing limit.
 An empty result with incomplete coverage is not proof that no matching record
-exists. Read chunks preserve UTF-8 boundaries.
+exists. Search and query limits are result counts from 1 to 32. Omit `limit` for
+reads: each read returns up to 16,384 bytes and preserves UTF-8 boundaries. Use
+the returned `next_offset` to continue reading.
 
 ## Classify explicit choices
 
@@ -120,7 +122,7 @@ Use `conversations` to list chats and `conversation` with `session` to read publ
 turns. Saved turns project their public history into
 `runtime/conversations/<session-hash>.json` on `omos-runtime`. Provider replay,
 credentials, and recovery payloads stay in the private profile. A retained
-projection can be read after moving the Fossil repository to another machine;
+projection can be read from another working directory or after moving the Fossil repository to another machine;
 it does not restore the private execution session or grant permission to resume
 work. Large histories are paginated.
 

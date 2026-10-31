@@ -26,7 +26,15 @@ fn project(manager: workspace.Manager, session: ?[]const u8, offset: usize, limi
             else => return err,
         };
         defer detail.deinit(alloc);
-        if (detail.summary.workspace_root == null or !std.mem.eql(u8, root, detail.summary.workspace_root.?)) return error.ConversationWorkspaceMismatch;
+        if (detail.summary.workspace_root == null or !std.mem.eql(u8, root, detail.summary.workspace_root.?)) {
+            // A portable projection belongs to this Fossil workspace even if
+            // a local session with the same ID now belongs to another cwd.
+            // Never expose that other directory's unretained local history.
+            return retained(manager, id, offset, limit) catch |err| switch (err) {
+                error.SessionNotFound => error.ConversationWorkspaceMismatch,
+                else => err,
+            };
+        }
         var turns: std.ArrayList(std.json.Value) = .empty;
         const start = @min(offset, detail.state.history.len);
         const end = @min(start + limit, detail.state.history.len);
