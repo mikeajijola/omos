@@ -293,6 +293,12 @@ describe("shared workspace capabilities", () => {
       const conversationPath = f.fossil("ls", "-r", "omos-runtime").split("\n").find((path: string) => path.startsWith("runtime/conversations/"))!;
       const retained = JSON.parse(f.fossil("cat", conversationPath, "-r", "omos-runtime"));
       expect(JSON.stringify(retained.turns)).toContain("No confirmed application is present in the searched sources.");
+      const again = await f.run(["ask", "Read the application history again", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+      expect(again.code, again.stderr).toBe(0);
+      const paths = f.fossil("ls", "-r", "omos-runtime").split("\n");
+      expect(paths.filter((path: string) => path.startsWith("runtime/conversations/"))).toHaveLength(2);
+      expect(JSON.parse(f.fossil("cat", conversationPath, "-r", "omos-runtime"))).toEqual(retained);
+      expect(paths).toContain("workspace.json");
     } finally { server.stop(true); }
   }, 120000);
 

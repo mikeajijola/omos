@@ -696,7 +696,13 @@ pub const Manager = struct {
 
     // Only protected control records use this path. Explicit commit filenames
     // preserve every absent base file; generic addremove/commit is forbidden.
-    fn commitCompanyFiles(self: Manager, current: ?[]const u8, files: []const CompanyFile) !struct { revision: []const u8, tree: ?[]const u8 = null } {
+    const SparseCommit = struct { revision: []const u8, tree: ?[]const u8 = null };
+
+    fn commitCompanyFiles(self: Manager, current: ?[]const u8, files: []const CompanyFile) !SparseCommit {
+        return self.commitSparseFiles(current, files, company_branch, "company-scratch", "Record company operation outcome");
+    }
+
+    fn commitSparseFiles(self: Manager, current: ?[]const u8, files: []const CompanyFile, branch: []const u8, scratch: []const u8, message: []const u8) !SparseCommit {
         const base = current orelse try self.revision("trunk");
         const before = try self.fileManifest(base);
         var changed: std.ArrayList(CompanyFile) = .empty;
@@ -710,7 +716,7 @@ pub const Manager = struct {
             try changed.append(self.alloc, file);
         }
         if (changed.items.len == 0) return .{ .revision = base };
-        const tree = try join(self.alloc, self.root, "company-scratch");
+        const tree = try join(self.alloc, self.root, scratch);
         if (exists(tree)) {
             // A successful transaction removes its scratch tree. Anything left
             // is interrupted or independently edited, including local DB state.
@@ -719,13 +725,13 @@ pub const Manager = struct {
             try std.Io.Dir.rename(std.Io.Dir.cwd(), tree, std.Io.Dir.cwd(), try self.alloc.print("{s}.recovery-{s}", .{ tree, std.fmt.bytesToHex(&nonce, .lower) }), io_mod.getIo());
         }
         try mkdir(tree);
-        _ = try self.run(tree, &.{ "open", "--keep", "--nosync", self.repository, if (current == null) "trunk" else company_branch });
+        _ = try self.run(tree, &.{ "open", "--keep", "--nosync", self.repository, if (current == null) "trunk" else branch });
         if (!std.mem.eql(u8, base, try self.fullRevision(tree, "current"))) return error.WorkspaceRevisionChanged;
         var add: std.ArrayList([]const u8) = .empty;
         try add.appendSlice(self.alloc, &.{ "add", "--" });
         var commit_args: std.ArrayList([]const u8) = .empty;
-        try commit_args.appendSlice(self.alloc, &.{ "commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", "Record company operation outcome" });
-        if (current == null) try commit_args.appendSlice(self.alloc, &.{ "--branch", company_branch });
+        try commit_args.appendSlice(self.alloc, &.{ "commit", "--hash", "--nosync", "--nosign", "--no-verify", "--no-warnings", "-m", message });
+        if (current == null) try commit_args.appendSlice(self.alloc, &.{ "--branch", branch });
         for (changed.items) |file| {
             var parent = try contentParent(self.alloc, tree, file.path);
             defer parent.close(io_mod.getIo());
@@ -733,7 +739,7 @@ pub const Manager = struct {
             try add.append(self.alloc, file.path);
             try commit_args.append(self.alloc, file.path);
         }
-        try fault("company-sparse-written");
+        if (std.mem.eql(u8, branch, company_branch)) try fault("company-sparse-written");
         _ = try self.run(tree, add.items);
         _ = try self.run(tree, commit_args.items);
         const revision_id = try self.fullRevision(tree, "current");
@@ -749,7 +755,7 @@ pub const Manager = struct {
             try fossil_manifest.verifyObject(saved.artifact orelse return error.WorkspaceVerificationFailed, expected.content);
             if (!std.mem.eql(u8, expected.content, try self.contentAt(expected.path, revision_id))) return error.WorkspaceVerificationFailed;
         }
-        try fault("company-sparse-commit-verified");
+        if (std.mem.eql(u8, branch, company_branch)) try fault("company-sparse-commit-verified");
         return .{ .revision = revision_id, .tree = tree };
     }
 
@@ -2199,40 +2205,35 @@ pub const Manager = struct {
         return self.saveBackgroundRecordAndSelection(entry, expected_sha256, null, null);
     }
 
+    /// Retain only the requested host record. A sparse checkout avoids hashing
+    /// unrelated documents and execution history for each conversation update.
+    fn retainRuntimeFile(self: Manager, path: []const u8, bytes: []const u8, message: []const u8) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        const files = [_]CompanyFile{.{ .path = path, .content = bytes }};
+        const result = try self.commitSparseFiles(try self.runtimeRevisionIfPresent(), &files, runtime_branch, "runtime-record-scratch", message);
+        if (result.tree) |tree| try self.cleanCompanyTree(tree, &files);
+    }
+
     /// Host-owned diagnostic records are portable workspace history, not
     /// permissions, task obligations or actor-editable evidence.
     pub fn retainRoutingDecision(self: Manager, session: []const u8, message: []const u8, decision: anytype) !void {
-        const lease = try self.writerLease();
-        defer lease.release();
-        const tree = try self.runtimeCheckout();
         const routing_record = try json(self.alloc, .{ .version = "omos.routing-record/v1", .session = session, .message_sha256 = try hash(self.alloc, message), .at_ms = io_mod.milliTimestamp(), .decision = decision, .authority = "advisory" });
         const path = try self.alloc.print("runtime/routing/{s}/{s}.json", .{ try hash(self.alloc, session), try hash(self.alloc, routing_record) });
-        try atomicWrite(self.alloc, try join(self.alloc, tree, path), routing_record);
-        _ = try self.commit(tree, "Record conversation routing decision");
+        try self.retainRuntimeFile(path, routing_record, "Record conversation routing decision");
     }
 
     pub fn retainAttentionEvent(self: Manager, turn: []const u8, cursor: usize, event: std.json.Value) !void {
-        const lease = try self.writerLease();
-        defer lease.release();
-        const tree = try self.runtimeCheckout();
         const bytes = try portableValue(self.alloc, try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, try json(self.alloc, .{ .version = "omos.attention-event/v1", .turn = turn, .cursor = cursor, .at_ms = io_mod.milliTimestamp(), .event = event, .authority = "historical_host_event_not_live_approval" }), .{}));
         const path = try self.alloc.print("runtime/attention/{s}/{d}.json", .{ try hash(self.alloc, turn), cursor });
-        try atomicWrite(self.alloc, try join(self.alloc, tree, path), bytes);
-        _ = try self.commit(tree, "Retain human attention event");
+        try self.retainRuntimeFile(path, bytes, "Retain human attention event");
     }
 
     pub fn retainConversation(self: Manager, session: []const u8, projection: std.json.Value) !void {
         const bytes = try portableValue(self.alloc, projection);
         if (bytes.len > 8 * 1024 * 1024) return error.ConversationProjectionTooLarge;
-        const lease = try self.writerLease();
-        defer lease.release();
-        const tree = try self.runtimeCheckout();
-        const path = try join(self.alloc, tree, try self.alloc.print("runtime/conversations/{s}.json", .{try hash(self.alloc, session)}));
-        if (read(self.alloc, path)) |previous| {
-            if (std.mem.eql(u8, previous, bytes)) return;
-        } else |err| if (err != error.FileNotFound) return err;
-        try atomicWrite(self.alloc, path, bytes);
-        _ = try self.commit(tree, "Retain readable conversation history");
+        const path = try self.alloc.print("runtime/conversations/{s}.json", .{try hash(self.alloc, session)});
+        try self.retainRuntimeFile(path, bytes, "Retain readable conversation history");
     }
 
     /// Queue and release selection in one canonical commit. A private recovery
