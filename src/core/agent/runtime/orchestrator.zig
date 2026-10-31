@@ -7929,7 +7929,7 @@ fn processQueuedPromptLoop(
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            const request_messages = if (retrieval_final) try @import("../../workspace/request_routing.zig").answerMessages(overlay_arena, job.prompt, image_projection.messages) else try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
             }

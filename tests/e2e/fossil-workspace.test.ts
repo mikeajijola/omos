@@ -290,6 +290,9 @@ describe("shared workspace capabilities", () => {
       expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
       expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/routing/");
       expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/conversations/");
+      const conversationPath = f.fossil("ls", "-r", "omos-runtime").split("\n").find((path: string) => path.startsWith("runtime/conversations/"))!;
+      const retained = JSON.parse(f.fossil("cat", conversationPath, "-r", "omos-runtime"));
+      expect(JSON.stringify(retained.turns)).toContain("No confirmed application is present in the searched sources.");
     } finally { server.stop(true); }
   }, 120000);
 
