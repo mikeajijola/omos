@@ -135,6 +135,9 @@ strategy. Proposed actions use the ordinary tool admission and permission path.
 When a candidate is available, the host asks the configured classifier to choose
 `deliver`, `continue`, or `clarify` using the question, recent conversation,
 candidate, proposed actions, and bounded observations, including uncited results.
+Each observation receives a share of the evidence budget so older results cannot
+consume the entire budget before newer results arrive. Omitted bytes remain
+explicit. Candidates must be ready-to-send answers rather than progress reports.
 Unknown or failed source references prevent early delivery. The selected choice
 must have probability at least 0.65 and exceed alternatives by at least 0.15.
 These thresholds are policy defaults, not calibrated correctness guarantees.

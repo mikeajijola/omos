@@ -879,7 +879,7 @@ pub const lookup_checkpoint_schema: @import("../core/tooling/model_tool_schema.z
     .name = "omos_lookup_step",
     .description = "Provide a provisional answer and the next reads that could materially improve it. The host decides whether to deliver, continue or ask the supplied clarification.",
     .input_schema = .{ .properties = &.{
-        .{ .name = "answer", .json_type = .string, .description = "Concise provisional answer, at most 4096 UTF-8 bytes. Put human-readable source paths here, not in sources.", .bounds = &.{ .max_length = 4096 } },
+        .{ .name = "answer", .json_type = .string, .description = "Ready-to-send answer, not progress or plans, at most 4096 UTF-8 bytes. Empty until a useful answer is supported. Put human-readable source paths here, not in sources.", .bounds = &.{ .max_length = 4096 } },
         .{ .name = "sources", .json_type = .array, .description = "Host observation IDs only, such as e0 and e1. Never file paths, citations, or explanations. Use an empty array when no observation is cited.", .bounds = &.{ .max_items = 8 }, .shape = &.{ .array_values = .{ .json_type = .string } } },
         .{ .name = "limitations", .json_type = .array, .description = "At most eight material limitations, each at most 512 UTF-8 bytes.", .bounds = &.{ .max_items = 8 }, .shape = &.{ .array_values = .{ .json_type = .string } } },
         .{ .name = "clarification", .json_type = .string, .description = "A necessary question for the user, at most 1024 UTF-8 bytes; otherwise empty.", .bounds = &.{ .max_length = 1024 } },
