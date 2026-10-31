@@ -8008,7 +8008,9 @@ fn processQueuedPromptLoop(
             };
             if (governance.finalizing or retrieval_final) request_data.tools = .{};
             if (checkpoint_step) {
-                request_data.tools = .{ .additional_functions = &.{@import("../../../builtins/tools.zig").lookup_checkpoint_schema} };
+                const checkpoint_functions = try overlay_arena.alloc(@import("../../tooling/model_tool_schema.zig").FunctionSchema, 1);
+                checkpoint_functions[0] = try lookup_checkpoint.functionSchema(overlay_arena, lookup_observations);
+                request_data.tools = .{ .additional_functions = checkpoint_functions };
                 request_data.tool_choice = .required;
                 request_data.provider_options.parallel_tool_calls = false;
             }
@@ -9708,7 +9710,7 @@ fn processQueuedPromptLoop(
             if (types.classifyProviderCompletion(completion) == .completed and types.authoritativeToolAdmission(completion) == .admitted) {
                 const draft = lookup_checkpoint.decode(arena, completion.tool_calls, config.advertised_tool_names) catch |err| {
                     if (err == error.OutOfMemory or err == error.Cancelled) return err;
-                    lookup_state.feedback = try arena.print("Invalid checkpoint: {s}. Return one complete omos_lookup_step using only available read tools. No proposed actions were executed.", .{@errorName(err)});
+                    lookup_state.feedback = try arena.print("Invalid checkpoint: {s}. Return one complete omos_lookup_step using only available read tools. sources must contain only observation IDs such as e0, never paths. Keep answer under 4096 UTF-8 bytes, use at most 8 sources and 8 short limitations, and propose at most 4 actions. No proposed actions were executed.", .{@errorName(err)});
                     try lookup_state.records.append(arena, .{ .step = step, .draft = null, .decision = .{ .reason = lookup_state.feedback } });
                     continue :agent_steps_loop;
                 };

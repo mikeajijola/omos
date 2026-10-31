@@ -68,6 +68,19 @@ pub fn messages(alloc: std.mem.Allocator, question: []const u8, history: []const
     return result;
 }
 
+pub fn functionSchema(alloc: std.mem.Allocator, observations: []const Evidence) !schemas.FunctionSchema {
+    var function = @import("../../builtins/tools.zig").lookup_checkpoint_schema;
+    const properties = try alloc.dupe(schemas.Property, function.input_schema.properties);
+    var ids: std.ArrayList([]const u8) = .empty;
+    for (observations) |item| if (item.succeeded) try ids.append(alloc, item.id);
+    const shape = try alloc.create(schemas.PropertyShape);
+    shape.* = .{ .array_values = .{ .json_type = .string, .enum_values = ids.items } };
+    properties[1].shape = shape;
+    properties[1].bounds = if (ids.items.len == 0) &.{ .max_items = 0 } else &.{ .max_items = 8 };
+    function.input_schema.properties = properties;
+    return function;
+}
+
 pub fn decode(alloc: std.mem.Allocator, calls: []const types.ToolCall, allowed: []const []const u8) !Draft {
     if (calls.len != 1 or !std.mem.eql(u8, calls[0].name, name) or calls[0].argument_integrity != .valid or calls[0].provider_result != null or calls[0].provenance == .provider_executed or types.authoritativeToolAdmission(.{ .tool_calls = calls }) != .admitted) return error.InvalidLookupCheckpoint;
     if (calls[0].arguments_json.len > 48 * 1024) return error.LookupCheckpointTooLarge;
@@ -241,4 +254,19 @@ test "lookup checkpoint recent conversation survives intervening tool results" {
     const context = try recentContext(alloc, &history, 2, 512);
     try std.testing.expectEqual(@as(usize, 1), context.items.len);
     try std.testing.expectEqualStrings("Only include submitted applications.", context.items[0].text);
+}
+
+test "lookup checkpoint schema offers only successful observation IDs and exposes limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const schema = try functionSchema(alloc, &test_evidence);
+    const source_property = schema.input_schema.properties[1];
+    try std.testing.expectEqualStrings("e0", source_property.shape.?.array_values.enum_values[0]);
+    try std.testing.expectEqual(@as(u32, 8), source_property.bounds.?.max_items);
+    try std.testing.expectEqual(@as(u32, 4), schema.input_schema.properties[4].bounds.?.max_items);
+    var failed = test_evidence;
+    failed[0].succeeded = false;
+    const empty = try functionSchema(alloc, &failed);
+    try std.testing.expectEqual(@as(u32, 0), empty.input_schema.properties[1].bounds.?.max_items);
 }

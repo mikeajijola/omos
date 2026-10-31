@@ -294,6 +294,10 @@ describe("shared workspace capabilities", () => {
     const toolSets: string[][] = [];
     const m = model(f, (body, count) => {
       toolSets.push(body.tools.map((tool: any) => tool.function.name));
+      const checkpointSchema = body.tools[0].function.parameters;
+      expect(checkpointSchema.properties.next_actions.maxItems).toBe(4);
+      if (count % 2 === 1) expect(checkpointSchema.properties.sources.maxItems).toBe(0);
+      else expect(checkpointSchema.properties.sources.items.enum).toEqual(["e0"]);
       const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
       expect(packet.available_tools.map((tool: any) => tool.name)).toContain("workspace_content");
       return count % 2 === 1 ? lookupStep("", [], [lookupSearch]) : lookupStep("No confirmed application is present in the searched sources.", ["e0"], [lookupSearch]);
