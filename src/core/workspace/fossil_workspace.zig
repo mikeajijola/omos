@@ -2229,6 +2229,12 @@ pub const Manager = struct {
         try self.retainRuntimeFile(path, bytes, "Retain human attention event");
     }
 
+    pub fn retainLookupDecisions(self: Manager, session: []const u8, message: []const u8, decisions: anytype) !void {
+        const bytes = try json(self.alloc, .{ .version = "omos.lookup-record/v1", .session = session, .message_sha256 = try hash(self.alloc, message), .at_ms = io_mod.milliTimestamp(), .decisions = decisions, .authority = "advisory_not_evidence_or_permission" });
+        const path = try self.alloc.print("runtime/lookups/{s}/{s}.json", .{ try hash(self.alloc, session), try hash(self.alloc, bytes) });
+        try self.retainRuntimeFile(path, bytes, "Retain lookup stopping decisions");
+    }
+
     pub fn retainConversation(self: Manager, session: []const u8, projection: std.json.Value) !void {
         const bytes = try portableValue(self.alloc, projection);
         if (bytes.len > 8 * 1024 * 1024) return error.ConversationProjectionTooLarge;

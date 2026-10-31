@@ -1,5 +1,6 @@
 const work_contract = @import("work_contract.zig");
 const task_governance = @import("../../workspace/task_governance.zig");
+const lookup_checkpoint = @import("../../workspace/lookup_checkpoint.zig");
 const record_json = @import("../../shared/record_json.zig");
 const managed_task = @import("../../workspace/managed_task.zig");
 const completion_review = @import("completion_review.zig");
@@ -7174,6 +7175,7 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    @setEvalBranchQuota(4000);
     var config = original_config;
     var job = borrowed_job;
     var request_capabilities = initial_request_capabilities;
@@ -7251,6 +7253,19 @@ fn processQueuedPromptLoop(
         };
     };
     var retrieval_turn = false;
+    var lookup_state: lookup_checkpoint.State = .{};
+    const lookup_checkpoints_enabled = if (comptime builtin.target.cpu.arch.isWasm()) false else @import("../../workspace/classification.zig").lookupConfigured();
+    defer if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (lookup_state.records.items.len > 0 and !config.fossil_ephemeral) {
+            if (config.fossil_session_id) |session_id| {
+                if (@import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |bound| {
+                    if (bound) |manager| manager.retainLookupDecisions(session_id, job.prompt, lookup_state.records.items) catch {
+                        deps.push_system_notice(deps.ctx, "The lookup finished, but its stopping-decision record could not be retained in the workspace.") catch {};
+                    };
+                } else |_| {}
+            }
+        }
+    };
     if (comptime !builtin.target.cpu.arch.isWasm()) {
         if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and @import("../../workspace/classification.zig").configured()) {
             const routing = @import("../../workspace/request_routing.zig");
@@ -7313,7 +7328,7 @@ fn processQueuedPromptLoop(
                 for (config.advertised_functions) |function| if (routing.readTool(function.name)) try functions.append(arena, function);
                 config.advertised_tool_names = names.items;
                 config.advertised_functions = functions.items;
-                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. For factual workspace questions start directly with workspace_content search, then query or read the relevant sources. Do not spend calls on catalog, attention or conversation history unless the question concerns those. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. If the requested outcome needs changes, explain the routing mismatch and ask the user to clarify the action. If evidence is absent or coverage incomplete, say so." });
+                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. Choose the evidence needed to answer the user's question. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. If evidence is absent or coverage incomplete, say so." });
             }
             try manager.retainRoutingDecision(config.fossil_session_id.?, job.prompt, decision);
         }
@@ -7521,6 +7536,8 @@ fn processQueuedPromptLoop(
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
         const retrieval_final = retrieval_turn and !agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        const checkpoint_step = retrieval_turn and lookup_checkpoints_enabled and !retrieval_final;
+        const lookup_observations = if (checkpoint_step) try lookup_checkpoint.evidence(arena, within_turn_suffix.items) else &.{};
         if (retrieval_final) try stable_prefix.append(arena, .{ .role = .system, .content = "The bounded lookup has reached its final response. Answer now from the source evidence already gathered. Cite the relevant paths and distinguish verified facts from inference. If evidence is insufficient, state precisely what remains unknown; do not claim that missing search results prove absence." });
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
@@ -7653,6 +7670,7 @@ fn processQueuedPromptLoop(
             compacted_suffix_len,
         );
         var gateway_instructions = provider_prompt.instructions;
+        if (checkpoint_step) try gateway_instructions.append(arena, .{ .role = .system, .content = lookup_checkpoint.instructions });
         var gateway_messages = provider_prompt.messages;
         const initial_decision_pending = recovery_strategy == .continue_after_confirmed_tool;
         last_gateway_message_count = gateway_instructions.items.len + gateway_messages.items.len +
@@ -7676,6 +7694,7 @@ fn processQueuedPromptLoop(
             .step_id = step_ctx.step_id,
             .response_language_expected = response_language_expectation,
             .response_language_hold_until_completion = response_language_hold_until_completion,
+            .hold_checkpoint = checkpoint_step,
             .provisional_statuses = .{
                 .presentation_group_id = presentation_group_id,
             },
@@ -7929,7 +7948,7 @@ fn processQueuedPromptLoop(
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = if (retrieval_final) try @import("../../workspace/request_routing.zig").answerMessages(overlay_arena, job.prompt, image_projection.messages) else try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            const request_messages = if (checkpoint_step) try lookup_checkpoint.messages(overlay_arena, job.prompt, image_projection.messages, lookup_observations, config.advertised_functions, lookup_state.feedback) else if (retrieval_final) try @import("../../workspace/request_routing.zig").answerMessages(overlay_arena, job.prompt, image_projection.messages) else try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
             }
@@ -7988,6 +8007,11 @@ fn processQueuedPromptLoop(
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             if (governance.finalizing or retrieval_final) request_data.tools = .{};
+            if (checkpoint_step) {
+                request_data.tools = .{ .additional_functions = &.{@import("../../../builtins/tools.zig").lookup_checkpoint_schema} };
+                request_data.tool_choice = .required;
+                request_data.provider_options.parallel_tool_calls = false;
+            }
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
@@ -9194,7 +9218,7 @@ fn processQueuedPromptLoop(
             };
 
             var attempt_completion = response_completion;
-            const response_language_candidate = if (stream_ctx.raw_text.items.len > 0)
+            const response_language_candidate = if (checkpoint_step) "" else if (stream_ctx.raw_text.items.len > 0)
                 stream_ctx.raw_text.items
             else if (attempt_completion.content) |content|
                 content
@@ -9658,7 +9682,7 @@ fn processQueuedPromptLoop(
         defer if (stream_result_set) stream_result.deinit(arena);
 
         var completion = streamCompletion(stream_result);
-        const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
+        var provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
             // Later requests borrow these turn-arena bytes after response cleanup.
             stream_result.completed.completion.provider_state_json = null;
             break :replay .{ .source = .{ .provider = job.provider, .model = gateway_model }, .parts_json = parts };
@@ -9674,6 +9698,44 @@ fn processQueuedPromptLoop(
                         std.math.maxInt(usize),
                     )),
                 });
+            }
+        }
+        if (checkpoint_step) {
+            // Checkpoints are host control data. Each subsequent model request
+            // receives a plain evidence packet, never a fabricated provider replay.
+            stream_ctx.raw_text.clearRetainingCapacity();
+            provider_replay = null;
+            if (types.classifyProviderCompletion(completion) == .completed and types.authoritativeToolAdmission(completion) == .admitted) {
+                const draft = lookup_checkpoint.decode(arena, completion.tool_calls, config.advertised_tool_names) catch |err| {
+                    if (err == error.OutOfMemory or err == error.Cancelled) return err;
+                    lookup_state.feedback = try arena.print("Invalid checkpoint: {s}. Return one complete omos_lookup_step using only available read tools. No proposed actions were executed.", .{@errorName(err)});
+                    try lookup_state.records.append(arena, .{ .step = step, .draft = null, .decision = .{ .reason = lookup_state.feedback } });
+                    continue :agent_steps_loop;
+                };
+                const decision = try lookup_checkpoint.assess(arena, &lookup_state, job.prompt, try std.mem.concat(arena, ChatMessage, &.{ history_messages.items, within_turn_suffix.items }), draft, lookup_observations, config.cancel_flag);
+                try lookup_state.records.append(arena, .{ .step = step, .draft = draft, .decision = decision, .observations = lookup_observations });
+                lookup_state.feedback = decision.reason;
+                if (decision.outcome != .continue_lookup) {
+                    const answer_text = try lookup_checkpoint.answer(arena, draft, decision.outcome);
+                    const answer_language = response_language.decide(.{ .expected = response_language_expectation, .candidate = response_language.evidence(answer_text) });
+                    if (answer_language == .retry_once or answer_language == .fail_without_commit) {
+                        lookup_state.feedback = "The answer used a different language from the user's request. Return a corrected checkpoint in the requested language.";
+                        lookup_state.records.items[lookup_state.records.items.len - 1].decision = .{ .reason = "response_language_mismatch" };
+                        continue :agent_steps_loop;
+                    }
+                    completion.tool_calls = &.{};
+                    completion.content = answer_text;
+                    completion.finish_reason = .stop;
+                    try stream_ctx.publishCheckpointAnswer(answer_text);
+                } else {
+                    if (draft.next_actions.len == 0) {
+                        lookup_state.feedback = try arena.print("{s}. The answer was not selected for delivery. Supply a supported answer, a necessary clarification, or a concrete next read addressing the material gap. Do not invent evidence.", .{decision.reason});
+                        continue :agent_steps_loop;
+                    }
+                    completion.tool_calls = try lookup_checkpoint.toolCalls(arena, draft, step);
+                    completion.content = null;
+                    completion.finish_reason = .tool_calls;
+                }
             }
         }
         const tool_admission = types.authoritativeToolAdmission(completion);
@@ -9719,7 +9781,7 @@ fn processQueuedPromptLoop(
                 completion.finish_reason = .stop;
             }
         }
-        const current_partial_assistant = if (stream_ctx.raw_text.items.len > 0)
+        const current_partial_assistant = if (stream_ctx.hold_checkpoint) "" else if (stream_ctx.raw_text.items.len > 0)
             stream_ctx.raw_text.items
         else if (completion.content) |content|
             content

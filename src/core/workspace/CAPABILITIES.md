@@ -116,6 +116,43 @@ existing contracts. Classification remains available as the `classify` tool to
 ordinary, coordinator, read-only, background, and child agent tool projections,
 subject to the normal permission rules.
 
+## Stop a lookup when its answer is sufficient
+
+Enable stopping checkpoints by selecting a host-owned lookup model with
+`OMOS_LOOKUP_CLASSIFIER_MODEL` or `lookup_model` in `~/.fx/classifier.json`.
+This model uses the same endpoint; request routing and the public `classify` tool
+continue to use `OMOS_CLASSIFIER_MODEL` or `model`. Choose a lookup model evaluated
+on supported answers, contradictions, incomplete coverage, and clarifications.
+Without this setting, read-only turns keep the ordinary bounded loop.
+
+With stopping checkpoints enabled, read-only turns propose an answer before
+requesting more reads. Each intermediate
+step uses the host-consumed `omos_lookup_step` contract: an answer, source IDs,
+limitations, an optional clarification, and proposed tool arguments with the
+material gap each action would resolve. The agent chooses the investigation
+strategy. Proposed actions use the ordinary tool admission and permission path.
+
+When a candidate is available, the host asks the configured classifier to choose
+`deliver`, `continue`, or `clarify` using the question, recent conversation,
+candidate, proposed actions, and bounded observations, including uncited results.
+Unknown or failed source references prevent early delivery. The selected choice
+must have probability at least 0.65 and exceed alternatives by at least 0.15.
+These thresholds are policy defaults, not calibrated correctness guarantees.
+
+`deliver` publishes the existing answer and its limitations without another actor
+call. `clarify` publishes the supplied question. `continue` executes admitted
+reads and returns their results to the next step. Provisional prose stays hidden
+until selected. If the classifier fails, further stopping checks are disabled for
+that turn; the existing bounded loop reserves its final step for an answer that
+states remaining uncertainty. Classification adds a request, so early stopping
+must be evaluated against both answer quality and total latency.
+
+Saved decisions and provisional answers are readable under `runtime/lookups/`
+on `omos-runtime`. They are advisory diagnostics, not source evidence, execution
+permission, or publication receipts. CLI, UI, and MCP conversations hosted by the
+native loop share this behavior. Direct search and classification calls retain
+their existing request contracts.
+
 ## Conversations and attention
 
 Use `conversations` to list chats and `conversation` with `session` to read public
@@ -139,7 +176,7 @@ omit possibly stale approvals.
 Readable input and resolution events live under `runtime/attention/`. These are
 historical records, not live approval authority. Routing diagnostics live under
 `runtime/routing/`. Search includes these runtime projections. `--no-save` turns
-do not retain conversation or routing projections.
+do not retain conversation, routing, or lookup projections.
 
 ## Surface mapping
 

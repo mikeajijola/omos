@@ -23,10 +23,11 @@ const Configuration = struct {
     endpoint: []const u8,
     model: []const u8 = "laya:en",
     token: ?[]const u8 = null,
+    lookup_model: ?[]const u8 = null,
 };
 
 fn configuration(alloc: std.mem.Allocator) !Configuration {
-    if (io.getenv("OMOS_CLASSIFIER_URL")) |endpoint| return .{ .endpoint = endpoint, .model = io.getenv("OMOS_CLASSIFIER_MODEL") orelse "laya:en", .token = io.getenv("OMOS_CLASSIFIER_TOKEN") };
+    if (io.getenv("OMOS_CLASSIFIER_URL")) |endpoint| return .{ .endpoint = endpoint, .model = io.getenv("OMOS_CLASSIFIER_MODEL") orelse "laya:en", .token = io.getenv("OMOS_CLASSIFIER_TOKEN"), .lookup_model = io.getenv("OMOS_LOOKUP_CLASSIFIER_MODEL") };
     const home = io.getenv("HOME") orelse return error.ClassifierNotConfigured;
     const path = try alloc.print("{s}/.fx/classifier.json", .{home});
     var file = std.Io.Dir.openFileAbsolute(io.getIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -38,7 +39,9 @@ fn configuration(alloc: std.mem.Allocator) !Configuration {
     if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0) return error.UnsafeClassifierConfiguration;
     const config = try std.json.parseFromSliceLeaky(Configuration, alloc, try io.readFileToEnd(alloc, &file, 16384), .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, config.version, "omos.classifier/v1")) return error.UnsupportedClassifierConfiguration;
-    return config;
+    var resolved = config;
+    if (io.getenv("OMOS_LOOKUP_CLASSIFIER_MODEL")) |model| resolved.lookup_model = model;
+    return resolved;
 }
 
 pub fn configured() bool {
@@ -46,6 +49,13 @@ pub fn configured() bool {
     defer arena.deinit();
     _ = configuration(arena.allocator()) catch return false;
     return true;
+}
+
+pub fn lookupConfigured() bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const config = configuration(arena.allocator()) catch return false;
+    return if (config.lookup_model) |model| model.len > 0 else false;
 }
 
 pub fn validate(request: Request) !void {
@@ -65,10 +75,19 @@ pub fn validate(request: Request) !void {
 /// All result storage belongs to the caller's request arena. Endpoint and model
 /// are owner configuration, never model-supplied tool arguments.
 pub fn execute(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool)) !Result {
+    return executeConfigured(alloc, request, cancel, false);
+}
+
+/// Stopping uses a separately selected host model; agent arguments cannot select it.
+pub fn executeLookup(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool)) !Result {
+    return executeConfigured(alloc, request, cancel, true);
+}
+
+fn executeConfigured(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool), lookup: bool) !Result {
     try validate(request);
     const config = try configuration(alloc);
     const endpoint = config.endpoint;
-    const model = config.model;
+    const model = if (lookup) config.lookup_model orelse return error.LookupClassifierNotConfigured else config.model;
     const token = config.token;
     const body = try encode(alloc, request, model);
     defer alloc.free(body);
@@ -127,6 +146,10 @@ fn text(value: std.json.Value) ![]const u8 {
 }
 
 fn decode(alloc: std.mem.Allocator, request: Request, raw: std.json.Value, elapsed_ms: i64) !Result {
+    if (raw == .object) if (raw.object.get("state_truncated")) |truncated| {
+        if (truncated != .bool) return error.InvalidClassifierResponse;
+        if (truncated.bool) return error.ClassificationInputRejected;
+    };
     const answers = try field(raw, "answers");
     if (answers != .object or answers.object.count() != request.questions.len) return error.InvalidClassifierResponse;
     const decisions = try alloc.alloc(Decision, request.questions.len);
@@ -198,4 +221,6 @@ test "classification rejects duplicate choices and malformed model answers" {
     try std.testing.expectError(error.InvalidClassifierResponse, decode(alloc, request, invalid, 0));
     const duplicate: Request = .{ .state = request.state, .questions = &.{.{ .id = "route", .instructions = "Choose", .choices = &.{ .{ .label = "same", .description = "one" }, .{ .label = "same", .description = "two" } } }} };
     try std.testing.expectError(error.DuplicateClassificationChoice, validate(duplicate));
+    try invalid.object.put(alloc, "state_truncated", .{ .bool = true });
+    try std.testing.expectError(error.ClassificationInputRejected, decode(alloc, request, invalid, 0));
 }

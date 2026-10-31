@@ -7,6 +7,23 @@ import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace
 
 afterEach(cleanupFixtures);
 
+function lookupStep(answer = "", sources: string[] = [], next_actions: object[] = [], clarification = "") {
+  return { tool_calls: [{ index: 0, id: "checkpoint", type: "function", function: {
+    name: "omos_lookup_step", arguments: JSON.stringify({ answer, sources, limitations: [], clarification, next_actions }),
+  } }] };
+}
+const lookupSearch = { tool: "workspace_content", arguments: JSON.stringify({ action: "search", retrieval: { query: "application" } }), resolves: "Find recorded applications." };
+function classifierReply(choice: "deliver" | "continue" | "clarify" = "deliver") {
+  return Response.json({ model: "fixture-classifier", answers: { stop: { type: "choice", choice, confidence: 0.99,
+    probabilities: Object.fromEntries(["deliver", "continue", "clarify"].map(label => [label, label === choice ? 0.99 : 0.005])),
+  } } });
+}
+function routeReply(choice = "retrieval") {
+  return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice, confidence: 0.99,
+    probabilities: Object.fromEntries(["conversation", "retrieval", "work", "unresolved"].map(label => [label, label === choice ? 0.99 : 0.01 / 3])),
+  } } });
+}
+
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
   test("a progress finalize decision still passes the independent completion gate", async () => {
@@ -256,7 +273,7 @@ describe("shared workspace capabilities", () => {
     try {
       const request = join(f.home, "classification.json");
       writeFileSync(request, JSON.stringify({ state: { text: "What was our last application?" }, questions: [{ id: "route", instructions: "Choose", choices: [{ label: "retrieval", description: "Read existing content" }, { label: "work", description: "Change state" }] }] }));
-      const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` };
+      const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" };
       const result = await f.run(["fossil", "classify", request, "--json"], env);
       expect(result.code, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toMatchObject({ advisory: true, decisions: [{ choice: "retrieval" }] });
@@ -269,27 +286,32 @@ describe("shared workspace capabilities", () => {
   test("retrieval routes inspect sources without creating or assessing a task", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
-      return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "retrieval", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.99, work: 0.003, unresolved: 0.004 } } } });
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const body = await request.json() as any;
+      if (body.questions.stop) expect(body.model).toBe("fixture-lookup");
+      return body.questions.stop ? classifierReply() : routeReply();
     } });
     const toolSets: string[][] = [];
     const m = model(f, (body, count) => {
       toolSets.push(body.tools.map((tool: any) => tool.function.name));
-      return count === 1 ? { tool_calls: [{ index: 0, id: "lookup", type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "search", retrieval: { query: "application" } }) } }] } : { content: "No confirmed application is present in the searched sources." };
+      const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+      expect(packet.available_tools.map((tool: any) => tool.name)).toContain("workspace_content");
+      return count % 2 === 1 ? lookupStep("", [], [lookupSearch]) : lookupStep("No confirmed application is present in the searched sources.", ["e0"], [lookupSearch]);
     });
     try {
-      const result = await f.run(["ask", "What was the last job we applied to?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+      const result = await f.run(["ask", "What was the last job we applied to?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
       expect(result.code, result.stderr + result.stdout).toBe(0);
       expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
       for (const names of toolSets) {
-        expect(names).toContain("classify");
-        expect(names).toContain("workspace_content");
-        expect(names).not.toContain("shell");
-        expect(names).not.toContain("fossil_workspace");
+        expect(names).toEqual(["omos_lookup_step"]);
       }
       expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
       expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/routing/");
       expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/conversations/");
+      const lookupPath = f.fossil("ls", "-r", "omos-runtime").split("\n").find((path: string) => path.startsWith("runtime/lookups/"))!;
+      const checkpoint = JSON.parse(f.fossil("cat", lookupPath, "-r", "omos-runtime"));
+      expect(checkpoint.authority).toBe("advisory_not_evidence_or_permission");
+      expect(checkpoint.decisions.map((item: any) => item.decision.outcome)).toEqual(["continue_lookup", "deliver"]);
       const conversationPath = f.fossil("ls", "-r", "omos-runtime").split("\n").find((path: string) => path.startsWith("runtime/conversations/"))!;
       const retained = JSON.parse(f.fossil("cat", conversationPath, "-r", "omos-runtime"));
       expect(JSON.stringify(retained.turns)).toContain("No confirmed application is present in the searched sources.");
@@ -298,7 +320,7 @@ describe("shared workspace capabilities", () => {
       const portable = await runFx(["fossil", "capabilities", portableRequest, "--json"], { cwd: f.home, env: f.env });
       expect(portable.code, portable.stderr).toBe(0);
       expect(JSON.parse(portable.stdout)).toMatchObject({ authority: "retained_conversation_context", resumable: false, turns: retained.turns });
-      const again = await f.run(["ask", "Read the application history again", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+      const again = await f.run(["ask", "Read the application history again", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
       expect(again.code, again.stderr).toBe(0);
       const paths = f.fossil("ls", "-r", "omos-runtime").split("\n");
       expect(paths.filter((path: string) => path.startsWith("runtime/conversations/"))).toHaveLength(2);
@@ -339,7 +361,7 @@ test("read routing refuses an unexpected execution call", async () => {
   } });
   model(f, () => ({ tool_calls: [{ index: 0, id: "forbidden", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: "touch unexpected-action.txt" } }) } }] }));
   try {
-    const result = await f.run(["ask", "Find existing records", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+    const result = await f.run(["ask", "Find existing records", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
     expect(result.code).not.toBe(0);
     expect(existsSync(join(f.cwd, "unexpected-action.txt"))).toBe(false);
     expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(0);
@@ -349,7 +371,8 @@ test("read routing refuses an unexpected execution call", async () => {
 test("uncertain classification resolves against the ongoing conversation before planning", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init"])).code).toBe(0);
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if ((await request.json() as any).questions.stop) return classifierReply();
     return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "unresolved", confidence: 0.3, probabilities: { conversation: 0.25, retrieval: 0.25, work: 0.2, unresolved: 0.3 } } } });
   } });
   const contexts: any[] = [];
@@ -358,10 +381,10 @@ test("uncertain classification resolves against the ongoing conversation before 
       contexts.push(JSON.parse(body.messages.find((message: any) => message.role === "user").content));
       return { tool_calls: [{ index: 0, id: `route-${contexts.length}`, type: "function", function: { name: "omos_request_route", arguments: JSON.stringify({ route: "conversation", reason: "The user is discussing the existing application history." }) } }] };
     }
-    return { content: "We are discussing application history; no application has been sent by this conversation." };
+    return lookupStep("We are discussing application history; no application has been sent by this conversation.");
   });
   try {
-    const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` };
+    const env = { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" };
     const first = await f.run(["ask", "Explain the application history", "--json"], env);
     expect(first.code, first.stderr + first.stdout).toBe(0);
     const session = JSON.parse(first.stdout).session_id;
@@ -415,14 +438,100 @@ test("SQLite retrieval lists schema and filters pinned records without executing
 test("bounded retrieval reserves its final step for an evidence-based answer", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init"])).code).toBe(0);
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() {
+  let stopCalls = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if ((await request.json() as any).questions.stop) { stopCalls++; return new Response("unavailable", { status: 503 }); }
     return Response.json({ model: "fixture-classifier", answers: { route: { type: "choice", choice: "retrieval", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.99, work: 0.003, unresolved: 0.004 } } } });
   } });
-  const m = model(f, (body, count) => body.tools?.length ? { tool_calls: [{ index: 0, id: `lookup-${count}`, type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "search", retrieval: { query: "application" } }) } }] } : { content: "The inspected sources do not establish a submitted application." });
+  const m = model(f, (body, count) => body.tools?.length ? lookupStep(count === 1 ? "" : "An unverified candidate", count === 1 ? [] : ["e0"], [lookupSearch]) : { content: "The inspected sources do not establish a submitted application." });
   try {
-    const result = await f.run(["ask", "Find the last application", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+    const result = await f.run(["ask", "Find the last application", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(result.stdout).toContain("The inspected sources do not establish a submitted application.");
+    expect(stopCalls).toBe(1);
     expect(m.counts()).toEqual({ actors: 6, assessments: 0 });
+  } finally { server.stop(true); }
+}, 120000);
+
+test("lookup checkpoint continues for a material gap and delivers without an extra actor call", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const packets: any[] = [];
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as any;
+    if (!body.questions.stop) return routeReply();
+    packets.push(body.state);
+    return classifierReply(packets.length === 1 ? "continue" : "deliver");
+  } });
+  const m = model(f, (_body, count) => ({ ...lookupStep(count === 1 ? "" : count === 2 ? "A candidate still needs checking." : "The searched sources do not establish a submitted application.", count === 1 ? [] : ["e0"], [lookupSearch]), content: "PRIVATE PROVISIONAL TEXT" }));
+  try {
+    const result = await f.run(["ask", "Find the latest application", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 3, assessments: 0 });
+    expect(packets).toHaveLength(2);
+    expect(packets[0].proposed_actions[0].resolves).toBe(lookupSearch.resolves);
+    expect(packets[1].observations).toHaveLength(2);
+    expect(packets[1].observations.map((item: any) => item.id)).toEqual(["e0", "e1"]);
+    expect(result.stdout).toContain("The searched sources do not establish a submitted application.");
+    expect(result.stdout).not.toContain("PRIVATE PROVISIONAL TEXT");
+    expect(result.stdout).not.toContain("A candidate still needs checking.");
+  } finally { server.stop(true); }
+}, 120000);
+
+test("lookup checkpoint asks necessary clarification without executing proposed reads", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    return (await request.json() as any).questions.stop ? classifierReply("clarify") : routeReply();
+  } });
+  const m = model(f, () => lookupStep("", [], [lookupSearch], "Which application do you mean?"));
+  try {
+    const result = await f.run(["ask", "What happened to that application?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 1, assessments: 0 });
+    expect(result.stdout).toContain("Which application do you mean?");
+  } finally { server.stop(true); }
+}, 120000);
+
+test("lookup checkpoint rejects a proposed write before recovering to clarification", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  let checks = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    if (!(await request.json() as any).questions.stop) return routeReply();
+    checks++;
+    return classifierReply("clarify");
+  } });
+  const m = model(f, (body, count) => {
+    if (count === 1) return lookupStep("", [], [{ tool: "shell", arguments: JSON.stringify({ request: { action: "run", command: "touch unexpected-action.txt" } }), resolves: "Change a file" }]);
+    const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+    expect(packet.host_feedback).toContain("ReadOnlyRoutingViolation");
+    expect(packet.observations).toHaveLength(0);
+    return lookupStep("", [], [], "Which application do you mean?");
+  });
+  try {
+    const result = await f.run(["ask", "What happened to that application?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
+    expect(checks).toBe(1);
+    expect(existsSync(join(f.cwd, "unexpected-action.txt"))).toBe(false);
+  } finally { server.stop(true); }
+}, 120000);
+
+test("read routing keeps its ordinary loop when no stopping model is selected", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    expect((await request.json() as any).questions.stop).toBeUndefined();
+    return routeReply();
+  } });
+  const m = model(f, (body, count) => {
+    expect(body.tools.map((tool: any) => tool.function.name)).not.toContain("omos_lookup_step");
+    return count === 1 ? { tool_calls: [{ index: 0, id: "lookup", type: "function", function: { name: "workspace_content", arguments: lookupSearch.arguments } }] } : { content: "No submitted application is established by these sources." };
+  });
+  try {
+    const result = await f.run(["ask", "Find the latest application", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}` });
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
   } finally { server.stop(true); }
 }, 120000);

@@ -4937,6 +4937,7 @@ test {
     _ = @import("core/workspace/workspace_client.zig");
     _ = @import("core/workspace/review_spool.zig");
     _ = @import("core/workspace/record_query.zig");
+    _ = @import("core/workspace/lookup_checkpoint.zig");
     _ = @import("core/workspace/object_cache.zig");
     _ = @import("core/workspace/fossil_commands.zig");
     _ = @import("core/workspace/ui_session.zig");

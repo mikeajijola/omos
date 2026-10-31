@@ -85,6 +85,8 @@ pub const StreamChunkContext = struct {
     response_language_expected: ?response_language.Script = null,
     response_language_accepted: bool = false,
     response_language_hold_until_completion: bool = false,
+    /// Host-interpreted lookup checkpoints are never assistant prose.
+    hold_checkpoint: bool = false,
     response_language_next_probe_bytes: usize = 5,
 
     fn markModelOutput(self: *StreamChunkContext) void {
@@ -134,6 +136,7 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn beginRecoveryAttempt(self: *StreamChunkContext) !void {
+        if (self.hold_checkpoint) self.raw_text.clearRetainingCapacity();
         if (self.response_language_staging()) {
             self.drop_staged_response_language_candidate();
         }
@@ -167,15 +170,18 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn accepted_source(self: *const StreamChunkContext) []const u8 {
+        if (self.hold_checkpoint) return "";
         return if (self.response_language_staging()) "" else self.raw_text.items;
     }
 
     pub fn accepted_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (self.hold_checkpoint) return "";
         if (self.response_language_staging()) return "";
         return if (self.raw_text.items.len > 0) self.raw_text.items else fallback;
     }
 
     pub fn interruption_source_or(self: *const StreamChunkContext, fallback: []const u8) []const u8 {
+        if (self.hold_checkpoint) return "";
         if (!self.response_language_staging()) {
             if (self.raw_text.items.len > 0) return self.raw_text.items;
             return if (fallback.len > 0) fallback else self.interrupted_source.items;
@@ -187,6 +193,7 @@ pub const StreamChunkContext = struct {
     }
 
     pub fn accept_staged_response_language(self: *StreamChunkContext) !void {
+        if (self.hold_checkpoint) return;
         if (!self.response_language_staging()) return;
         self.response_language_accepted = true;
         try publishAssistantChunkResolved(self, self.raw_text.items);
@@ -212,6 +219,14 @@ pub const StreamChunkContext = struct {
     fn response_language_staging(self: *const StreamChunkContext) bool {
         return self.response_language_expected != null and
             !self.response_language_accepted;
+    }
+
+    pub fn publishCheckpointAnswer(self: *StreamChunkContext, source: []const u8) !void {
+        self.raw_text.clearRetainingCapacity();
+        self.hold_checkpoint = false;
+        self.response_language_accepted = true;
+        try streamAssistantChunk(self, source);
+        try flushAssistantStream(self);
     }
 
     /// Restores durable partial source before a restarted turn sends anything.
@@ -360,6 +375,7 @@ fn streamAssistantChunk(stream_ctx: *StreamChunkContext, chunk: []const u8) !voi
     if (chunk.len == 0) return;
     const alloc = stream_ctx.alloc;
     try stream_ctx.raw_text.appendSlice(alloc, chunk);
+    if (stream_ctx.hold_checkpoint) return;
     if (stream_ctx.response_language_staging()) {
         if (stream_ctx.response_language_hold_until_completion) return;
         if (stream_ctx.raw_text.items.len >= stream_ctx.response_language_next_probe_bytes) {
@@ -460,6 +476,7 @@ fn publishAssistantChunkResolved(stream_ctx: *StreamChunkContext, chunk: []const
 }
 
 pub fn flushAssistantStream(stream_ctx: *StreamChunkContext) !void {
+    if (stream_ctx.hold_checkpoint) return;
     if (stream_ctx.response_language_staging()) return;
     if (!stream_ctx.hooks.render_assistant_text) return;
     const alloc = stream_ctx.alloc;
@@ -2254,4 +2271,22 @@ test "emitProviderLengthNotice ignores non-length finish reasons" {
     try emitProviderLengthNotice(&hooks, arena_state.allocator(), .completed);
 
     try std.testing.expectEqual(@as(usize, 0), capture.notices.items.len);
+}
+
+test "lookup checkpoint hides provisional prose including interruption and publishes only selected answer" {
+    const alloc = std.testing.allocator;
+    var capture = StreamCapture{};
+    defer capture.deinit(alloc);
+    var hook_set = capture.hooks();
+    var ctx = StreamChunkContext{ .hooks = &hook_set, .turn_id = 1, .alloc = alloc, .hold_checkpoint = true };
+    defer ctx.deinit();
+    try streamAssistantChunk(&ctx, "Unverified provisional prose.");
+    try flushAssistantStream(&ctx);
+    try std.testing.expectEqual(@as(usize, 0), capture.text_calls);
+    try std.testing.expectEqualStrings("", ctx.accepted_source());
+    try std.testing.expectEqualStrings("", ctx.accepted_source_or("fallback draft"));
+    try std.testing.expectEqualStrings("", ctx.interruption_source_or("fallback draft"));
+    try ctx.publishCheckpointAnswer("Supported answer.");
+    try std.testing.expectEqualStrings("Supported answer.", ctx.accepted_source());
+    try std.testing.expect(capture.text_calls > 0);
 }

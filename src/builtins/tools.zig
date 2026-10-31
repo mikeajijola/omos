@@ -874,6 +874,23 @@ pub const fossil_workspace = ToolSpec{
     .irreversible_fn = fossil_workspace_impl.irreversible,
 };
 
+// Host-consumed checkpoint, not an executable tool or an authority grant.
+pub const lookup_checkpoint_schema: @import("../core/tooling/model_tool_schema.zig").FunctionSchema = .{
+    .name = "omos_lookup_step",
+    .description = "Provide a provisional answer and the next reads that could materially improve it. The host decides whether to deliver, continue or ask the supplied clarification.",
+    .input_schema = .{ .properties = &.{
+        .{ .name = "answer", .json_type = .string },
+        .{ .name = "sources", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "limitations", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "clarification", .json_type = .string },
+        .{ .name = "next_actions", .json_type = .array, .shape = &.{ .array_objects = &.{ .properties = &.{
+            .{ .name = "tool", .json_type = .string, .shape = &.{ .enum_values = &.{ "workspace_content", "read_tool_result", "classify" } } },
+            .{ .name = "arguments", .json_type = .string, .description = "JSON object encoded as a string, using the supplied tool schema." },
+            .{ .name = "resolves", .json_type = .string, .description = "The material gap this action could resolve." },
+        }, .required = &.{ "tool", "arguments", "resolves" }, .additional_properties = false } } },
+    }, .required = &.{ "answer", "sources", "limitations", "clarification", "next_actions" }, .additional_properties = false },
+};
+
 pub const classify = ToolSpec{
     .name = "classify",
     .description = "Ask the configured decision model bounded choice questions about supplied state. Include relevant context and describe each choice. Uncertain decisions require further reasoning, not automatic action. No endpoint or model override is accepted.",
