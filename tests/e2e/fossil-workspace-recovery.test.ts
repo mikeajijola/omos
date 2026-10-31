@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, realpathSync, rmSync, copyFileSync, chmodSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, realpathSync, rmSync, copyFileSync, chmodSync, renameSync, truncateSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
@@ -5316,7 +5316,8 @@ sys.exit(result.returncode)
     } });
     const result = await f.run(["ask", "Save the policy and inspect the workspace for useful follow-up information", "--json"], {}, 90000);
     expect(result.code).toBe(1);
-    expect(checks).toBe(1);
+    expect(checks).toBe(8);
+    expect(result.stderr).toContain("could not finish within its bounded review");
     expect(m.counts().actors).toBe(4);
     expect(m.counts().assessments).toBe(0);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
@@ -6121,3 +6122,166 @@ sys.exit(result.returncode)
     expect(readFileSync(join(session, "session.json"), "utf8")).toContain("must-not-export");
   }, 30000);
 });
+
+
+function governanceCall(name: string, args: object, index = 0) {
+  return { index, id: `review-${index}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
+}
+
+function governanceJournal(f: ReturnType<typeof fixture>, task: any) {
+  const query = `SELECT content(uuid) AS raw FROM files_of_checkin('task/${task.id}') WHERE filename GLOB 'history/${task.id}/*'`;
+  return JSON.parse(f.fossil("sql", "--readonly", "-init", "/dev/null", "-batch", "-json", query)).map((row: any) => JSON.parse(row.raw));
+}
+
+for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
+  test(`workspace governance recovers from ${mode} without replaying actor work`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    let progressCalls = 0;
+    const parallel: unknown[] = [];
+    const feedback: any[] = [];
+    const m = model(f, (_body, count) => count <= 4 ? {
+      tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })],
+    } : { content: "The workspace kind is omos." }, undefined, {
+      reply(body, packet, phase) {
+        if (phase !== "progress") return;
+        progressCalls++;
+        parallel.push(body.parallel_tool_calls);
+        feedback.push(...body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content)));
+        const evidence = packet.evidence.find((entry: any) => entry.id.startsWith("execution:"));
+        if (progressCalls === 1) {
+          const id = mode === "shortened evidence ID" ? evidence.id.slice(0, evidence.id.lastIndexOf(":tool:")) : evidence.id;
+          const first = governanceCall("omos_review_evidence", { action: "read", id });
+          return { tool_calls: mode === "shortened evidence ID" ? [first] : [first, governanceCall("omos_review_evidence", { action: "read", id }, 1)] };
+        }
+        if (mode === "shortened evidence ID" && progressCalls === 2) return { tool_calls: [governanceCall("omos_review_evidence", { action: "read", id: evidence.id })] };
+        return { tool_calls: [governanceCall("omos_progress_assessment", { outcome: "finalize", meaningful: true, evidence: [evidence.id], remaining: ["request_complete"], note: "Inspected the workspace evidence." })] };
+      },
+    });
+    const result = await f.run(["ask", "Identify the workspace kind after inspecting it", "--json"], {}, 120000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 5, assessments: 1 });
+    expect(progressCalls).toBe(mode === "shortened evidence ID" ? 3 : 2);
+    expect(parallel.every(value => value === false)).toBe(true);
+    if (mode === "shortened evidence ID") expect(feedback.some(value => value.error_code === "InvalidContractEvidence")).toBe(true);
+    else expect(feedback.filter(value => value.fullyInspected === true)).toHaveLength(2);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).toBe("accepted");
+    const journal = governanceJournal(f, task);
+    expect(journal.some((entry: any) => entry.kind === "governance_response")).toBe(true);
+    expect(journal.some((entry: any) => entry.kind === "governance_failure")).toBe(false);
+  }, 120000);
+}
+
+test("workspace governance pauses with rejected response diagnostics and usage after bounded corrections", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  let progressCalls = 0;
+  const m = model(f, () => ({ tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] }), undefined, {
+    usage: { prompt_tokens: 23, completion_tokens: 7, total_tokens: 30 },
+    reply(_body, _packet, phase) {
+      if (phase !== "progress") return;
+      progressCalls++;
+      return { tool_calls: [governanceCall("omos_progress_assessment", { outcome: "finalize", meaningful: false, evidence: [], remaining: ["invented_obligation"], note: "This ID is not in the contract." })] };
+    },
+  });
+  const result = await f.run(["ask", "Inspect the workspace before answering", "--json"], {}, 120000);
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("could not finish within its bounded review");
+  expect(result.stdout + result.stderr).toContain("work and evidence are retained");
+  expect(JSON.parse(result.stdout).error).toBe("workspace_governance_pending");
+  expect(progressCalls).toBe(8);
+  expect(m.counts()).toEqual({ actors: 4, assessments: 0 });
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("paused");
+  const journal = governanceJournal(f, task);
+  const failure = JSON.parse(journal.find((entry: any) => entry.kind === "governance_failure").value.data);
+  expect(failure.reason).toBe("TaskGovernancePending");
+  expect(failure.last_reason).toBe("InvalidTaskGovernance");
+  expect(failure.calls).toBe(8);
+  expect(failure.usage.input_tokens).toBe(184);
+  expect(failure.usage.output_tokens).toBe(56);
+  expect(JSON.parse(result.stdout).usage.input_tokens).toBe(299);
+  expect(JSON.parse(result.stdout).usage.output_tokens).toBe(91);
+  expect(journal.filter((entry: any) => entry.kind === "governance_response" && JSON.parse(entry.value.data).phase === "omos_progress_assessment")).toHaveLength(8);
+}, 120000);
+
+test("workspace governance corrects malformed plans before actor execution", async () => {
+  const f = fixture();
+  let plans = 0;
+  const m = model(f, () => ({ content: "Answered the question." }), undefined, {
+    reply(body, _packet, phase) {
+      if (phase !== "plan") return;
+      expect(body.parallel_tool_calls).toBe(false);
+      plans++;
+      if (plans === 1) return { tool_calls: [governanceCall("omos_task_plan", { capability: "invented", summary: "Invalid capability", obligations: [], checks: [] })] };
+    },
+  });
+  const result = await f.run(["ask", "Answer the question", "--json"], {}, 120000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(plans).toBe(2);
+  expect(m.counts().actors).toBe(1);
+}, 120000);
+
+test("workspace governance retains oversized source preparation failures before actor execution", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  writeFileSync(join(f.cwd, "large.bin"), "");
+  truncateSync(join(f.cwd, "large.bin"), 256 * 1024 * 1024 + 1);
+  const m = model(f, () => ({ content: "Must not execute" }), undefined, { plan: { capability: "coding_task", summary: "Implement the request", obligations: [], checks: [] } });
+  const result = await f.run(["ask", "Implement the requested source change", "--json"], {}, 120000);
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("Workspace evidence could not be prepared");
+  expect(result.stdout + result.stderr).toContain("SourceStateTooLarge");
+  expect(m.counts().actors).toBe(0);
+  expect(JSON.parse(result.stdout).error).toBe("workspace_preparation_pending");
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("paused");
+  const failure = governanceJournal(f, task).find((entry: any) => entry.kind === "invocation_failure");
+  expect(failure.value.reason).toBe("SourceStateTooLarge");
+}, 120000);
+
+for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", "changed outcome"]) {
+  test(`contract revision recovery handles ${mode} and resumes the saved task`, async () => {
+    const f = fixture();
+    let blocked = true;
+    let revisions = 0;
+    const goal = "Could the agent control its own harness using its CLI";
+    const m = model(f, () => ({ content: "The CLI exposes controls subject to host checks." }), () => blocked ? "blocked" : "met", {
+      plan: { capability: "general_task", summary: "Explain CLI control", obligations: mode === "large unchanged echo"
+        ? Array.from({ length: 32 }, (_, i) => ({ id: `explain_cli_${i}`, description: `Explain CLI control ${i}` }))
+        : [{ id: "explain_cli", description: "Explain CLI control" }], checks: [] },
+      reply(body, packet, phase) {
+        if (phase !== "revise") return;
+        revisions++;
+        const obligations = structuredClone(packet.context.contract.obligations);
+        if (mode === "protected edit" && revisions === 1) obligations[0].description = "Accept unfinished work";
+        if (mode === "protected edit" && revisions === 2) {
+          const feedback = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
+          expect(feedback.at(-1).instruction).toContain("Remove protected requirement 'request_complete' from obligations");
+        }
+        if (mode === "changed outcome") obligations.find((o: any) => o.id === "explain_cli").description = "Explain scheduling only";
+        return { tool_calls: [governanceCall("omos_contract_revision", {
+          capability: "general_task", summary: "Apply the user follow-up", obligations, checks: [],
+          superseded: mode === "changed outcome" ? ["explain_cli"] : [],
+        })] };
+      },
+    });
+    const first = await f.run(["ask", goal, "--json"]);
+    expect(first.code, first.stderr).toBe(1);
+    const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    blocked = false;
+    const followup = mode === "changed outcome" ? "Explain scheduling only instead" : goal + "?";
+    const second = await f.run(["ask", "--resume-id", JSON.parse(first.stdout).session_id, followup, "--json"]);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(revisions).toBe(mode === "protected edit" ? 2 : 1);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.id).toBe(before.id);
+    expect(after.state).toBe("accepted");
+    expect(after.revision_pending).toBe(false);
+    expect(after.definition.obligations[0]).toEqual(before.definition.obligations[0]);
+    if (mode === "changed outcome") expect(after.definition.obligations.find((o: any) => o.id === "explain_cli").description).toBe("Explain scheduling only");
+    else expect(after.definition.obligations).toEqual(before.definition.obligations);
+    expect(m.counts().actors).toBe(2);
+  }, 120000);
+}

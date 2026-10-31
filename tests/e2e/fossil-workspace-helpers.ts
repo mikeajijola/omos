@@ -22,6 +22,7 @@ export function fixture() {
     HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1",
     FX_SKIP_ONBOARDING: "1", FX_CONTRACT_REVIEW: "1", FX_E2E_FOSSIL_FAULT: undefined,
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
+    OMOS_CLASSIFIER_URL: undefined, OMOS_CLASSIFIER_TOKEN: undefined, OMOS_CLASSIFIER_MODEL: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined, OMOS_FOSSIL_BIN: undefined,
   };
   const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 60000) => {
@@ -31,13 +32,13 @@ export function fixture() {
   };
   const fossil = (...args: string[]) => {
     const result = spawnSync("fossil", [...args, "-R", join(cwd, "omos.fossil")], { env: { PATH: process.env.PATH, HOME: home, FOSSIL_HOME: home, XDG_CONFIG_HOME: home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr + result.stdout).toBe(0);
     return result.stdout;
   };
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -55,7 +56,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         const decision = planning ? (typeof governance.plan === "function" ? await governance.plan(packet) : governance.plan) ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
           : revising ? governance.revise?.(packet) ?? { capability: packet.context.model.basis?.capability ?? "general_task", summary: "Retain requirements with the supplied clarification", obligations: [], checks: [], superseded: [] }
           : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
-        delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
+        delta = governance.reply?.(body, packet, planning ? "plan" : revising ? "revise" : "progress") ?? { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
         reason = "tool_calls";
       } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;

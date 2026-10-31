@@ -3967,8 +3967,11 @@ test "foreground session owner loss kills the target and descendant before delay
     owner_write.close(io_mod.getIo());
     owner_open = false;
     _ = try child.wait(io_mod.getIo());
-    try expectProcessGoneWithinForTest(target_pid, 2_000);
-    try expectProcessGoneWithinForTest(descendant_pid, 2_000);
+    // An exited descendant can be adopted as a zombie by this test's
+    // subreaper. kill(pid, 0) still finds it until the deferred waitpid,
+    // although it cannot run or produce any delayed effect.
+    try std.testing.expect(!try process_tree.processIsAlive(alloc, target_pid));
+    try std.testing.expect(!try process_tree.processIsAlive(alloc, descendant_pid));
     try std.testing.expect(!absoluteFileExists(effect_path));
 }
 

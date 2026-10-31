@@ -6910,6 +6910,8 @@ const ContractCandidate = struct {
     api_key: []const u8,
     model: []const u8,
     root_user_context: []const u8,
+    conversation: []const ChatMessage = &.{},
+    usage_owner: ?*runtime_agent.Agent = null,
     turn_id: u64,
     step: usize,
     managed: ?*managed_task.Turn = null,
@@ -7004,6 +7006,7 @@ noinline fn assessCompletionAttempt(
     const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(arena, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
     var attempt_usage: types.Usage = .{};
     defer if (attempt_usage.input_tokens != null or attempt_usage.output_tokens != null) {
+        if (input.usage_owner) |owner| owner.observeUsage(attempt_usage);
         if (deps.report_usage) |report| report(deps.ctx, attempt_usage);
         summary.prepareTokenRequest();
         _ = summary.reconcileTokenRequest(attempt_usage, false);
@@ -7089,7 +7092,21 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .cooperative_pulse = deps.cooperative_transport_pulse,
         .cancel_flag = input.config.cancel_flag,
     };
+    var usage: types.Usage = .{};
+    defer if (usage.input_tokens != null or usage.output_tokens != null) {
+        if (input.usage_owner) |owner| owner.observeUsage(usage);
+        if (deps.report_usage) |report| report(deps.ctx, usage);
+        summary.prepareTokenRequest();
+        _ = summary.reconcileTokenRequest(usage, false);
+    };
+    const repository_context = input.job.context_snapshot.modelVisibleBytes();
     const packet = try std.json.Stringify.valueAlloc(alloc, .{
+        .workspaceRoot = turn.task.project_root,
+        .rootUserContext = @import("review_evidence.zig").View.prefix(input.root_user_context, 8192),
+        .rootUserContextBytes = input.root_user_context.len,
+        .referenceConversation = try task_governance.referenceConversation(alloc, input.conversation),
+        .repositoryContext = @import("review_evidence.zig").View.prefix(repository_context, 16384),
+        .repositoryContextBytes = repository_context.len,
         .originalRequest = try turn.manager.originalRequest(turn.task),
         .amendments = turn.task.amendments,
         .pendingAmendments = turn.task.amendments[@min(turn.task.planned_amendments, turn.task.amendments.len)..],
@@ -7100,16 +7117,15 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};
     const reply = if (planning)
         if (turn.task.revision_pending and turn.task.model_basis != null and turn.task.model_basis.?.capability != null)
-            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal())
+            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
         else
-            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal())
+            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
     else
-        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads);
-    if (deps.report_usage) |report| report(deps.ctx, reply.usage);
-    summary.prepareTokenRequest();
-    _ = summary.reconcileTokenRequest(reply.usage, false);
+        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage });
     return reply;
 }
+
+const governance_pause_notice = "Task planning or progress verification could not finish within its bounded review. Your work and evidence are retained. Continue to resume from the retained work.";
 
 noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate) !bool {
     const turn = input.managed orelse return false;
@@ -7135,7 +7151,7 @@ fn processQueuedPromptLoop(
     deps: *const AgentRuntimeDeps,
     semantic_presentation: ?runtime_assistant_stream.SemanticPresentationSink,
     lifecycle: LifecycleContext,
-    config: Config,
+    original_config: Config,
     borrowed_job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
@@ -7158,6 +7174,7 @@ fn processQueuedPromptLoop(
     stop_state: *CommonStopState,
     agent: *runtime_agent.Agent,
 ) !void {
+    var config = original_config;
     var job = borrowed_job;
     var request_capabilities = initial_request_capabilities;
     var tool_image_capabilities_resolved = false;
@@ -7223,15 +7240,93 @@ fn processQueuedPromptLoop(
                 job.history,
             ),
     };
+    defer if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.fossil_session_id) |session_id| if (!config.fossil_ephemeral) {
+            if (@import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |bound| {
+                if (bound) |manager| @import("../../workspace/conversations.zig").retain(manager, session_id) catch |err| {
+                    debug_trace.logf("workspace", "conversation projection pending error={s}", .{@errorName(err)});
+                    deps.push_system_notice(deps.ctx, "The conversation is saved locally, but its readable workspace projection could not be updated.") catch {};
+                };
+            } else |_| {}
+        };
+    };
+    var retrieval_turn = false;
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and @import("../../workspace/classification.zig").configured()) {
+            const routing = @import("../../workspace/request_routing.zig");
+            var decision = try routing.decide(arena, job.prompt, history_messages.items, config.cancel_flag);
+            const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
+            if (decision.route == .unresolved) {
+                try deps.push_system_notice(deps.ctx, "Resolving this request against the conversation...");
+                const active = try manager.active(config.fossil_session_id.?);
+                const context = try std.json.Stringify.valueAlloc(arena, .{
+                    .latest_message = @import("review_evidence.zig").View.prefix(job.prompt, 8192),
+                    .message_bytes = job.prompt.len,
+                    .conversation = try task_governance.referenceConversation(arena, history_messages.items),
+                    .active_task = if (active) |task| task.id else @as(?[]const u8, null),
+                    .active_task_state = if (active) |task| @tagName(task.state) else @as(?[]const u8, null),
+                    .classifier = decision,
+                }, .{});
+                var delivery: agent_stream_provider.DeliveryCertainty = .init();
+                var attempt: agent_stream_provider.AttemptEvidence = .{};
+                var event_context: u8 = 0;
+                const resolution = routing.resolve(arena, deps.agent_stream_provider, .{
+                    .observer = deps.observer,
+                    .credential = activeCredentialLease(job.api_key, job),
+                    .model = job.model,
+                    .retry_count = 0,
+                    .messages = &.{},
+                    .tool_choice = .required,
+                    .provider_options = .{},
+                    .trace_ctx = .{ .turn_id = turn_id },
+                    .content_capture_limit = 8192,
+                    .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(20000) }),
+                    .delivery = &delivery,
+                    .attempt_evidence = &attempt,
+                    .events = .{ .context = &event_context, .emit_fn = discardContractEvent },
+                    .cooperative_pulse = deps.cooperative_transport_pulse,
+                    .cancel_flag = config.cancel_flag,
+                }, context) catch |err| blk: {
+                    if (err == error.Cancelled or err == error.OutOfMemory) return err;
+                    break :blk null;
+                };
+                if (resolution) |resolved| {
+                    decision.resolution = resolved;
+                    decision.route = resolved.route;
+                    if (deps.report_usage) |report| report(deps.ctx, resolved.usage);
+                    agent.observeUsage(resolved.usage);
+                    summary_accumulator_ptr.prepareTokenRequest();
+                    _ = summary_accumulator_ptr.reconcileTokenRequest(resolved.usage, false);
+                }
+            }
+            retrieval_turn = decision.route != .work;
+            if (retrieval_turn) {
+                config.contract_review_enabled = false;
+                config.coordinator_mode = true;
+                config.initial_dynamic_tools = &.{};
+                config.provider_capabilities.fx_search = false;
+                config.agent_step_limit = if (config.agent_step_limit == 0) 6 else @min(config.agent_step_limit, 6);
+                config.step_limit_notice = "This lookup reached its inspection limit. The retained sources may be incomplete; narrow the question or request a deeper investigation.";
+                var names: std.ArrayList([]const u8) = .empty;
+                var functions: std.ArrayList(@import("../../tooling/model_tool_schema.zig").FunctionSchema) = .empty;
+                for (config.advertised_tool_names) |name| if (routing.readTool(name)) try names.append(arena, name);
+                for (config.advertised_functions) |function| if (routing.readTool(function.name)) try functions.append(arena, function);
+                config.advertised_tool_names = names.items;
+                config.advertised_functions = functions.items;
+                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. For factual workspace questions start directly with workspace_content search, then query or read the relevant sources. Do not spend calls on catalog, attention or conversation history unless the question concerns those. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. If the requested outcome needs changes, explain the routing mismatch and ask the user to clarify the action. If evidence is absent or coverage incomplete, say so." });
+            }
+            try manager.retainRoutingDecision(config.fossil_session_id.?, job.prompt, decision);
+        }
+    }
     var execution_lease: ?@import("../../workspace/fossil_workspace.zig").ExecutionLease = null;
     defer if (execution_lease) |lease| lease.release();
     if (comptime !builtin.target.cpu.arch.isWasm()) {
-        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
+        if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
             const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
             execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
         }
     }
-    var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (config.fossil_session_id != null and !config.fossil_ephemeral)
+    var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (!retrieval_turn and config.fossil_session_id != null and !config.fossil_ephemeral)
         try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
     else
         null;
@@ -7274,7 +7369,11 @@ fn processQueuedPromptLoop(
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     if (managed) |*turn| {
-        _ = try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = 0, .managed = turn });
+        _ = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = 0, .managed = turn }) catch |err| {
+            if (err != error.TaskGovernancePending) return err;
+            try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+            return;
+        };
         job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         if (turn.review_only_candidate) |candidate| {
             try deps.push_system_notice(deps.ctx, "Resuming verification of the retained answer; completed actions will not be repeated.");
@@ -7286,6 +7385,7 @@ fn processQueuedPromptLoop(
                 .api_key = active_api_key,
                 .model = job.model,
                 .root_user_context = root_user_intent_context,
+                .usage_owner = agent,
                 .turn_id = turn_id,
                 .step = 0,
                 .managed = turn,
@@ -7313,7 +7413,12 @@ fn processQueuedPromptLoop(
     }
     if (managed) |*turn| {
         if (turn.task.model_basis != null) {
-            const retained_evidence = try turn.beforeReview(arena, &.{});
+            const retained_evidence = turn.beforeReview(arena, &.{}) catch |err| {
+                try turn.manager.record(turn.task, "invocation_failure", .{ .phase = "source_evidence_preparation", .reason = @errorName(err), .retained = true });
+                if (err == error.Cancelled or err == error.OutOfMemory) return err;
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, try arena.print("Workspace evidence could not be prepared ({s}). Your task is retained. Check the workspace files and repository boundaries before continuing.", .{@errorName(err)}), "workspace_preparation_pending");
+                return;
+            };
             try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
@@ -7415,6 +7520,8 @@ fn processQueuedPromptLoop(
     var restore_recovery_source = job.recovery_checkpoint != null;
     var step: usize = 0;
     agent_steps_loop: while (agent_steps.allowsStep(config.agent_step_limit, step)) : (step += 1) {
+        const retrieval_final = retrieval_turn and !agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        if (retrieval_final) try stable_prefix.append(arena, .{ .role = .system, .content = "The bounded lookup has reached its final response. Answer now from the source evidence already gathered. Cite the relevant paths and distinguish verified facts from inference. If evidence is insufficient, state precisely what remains unknown; do not claim that missing search results prove absence." });
         current_step_index = step + 1;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
@@ -7466,7 +7573,12 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| {
             try turn.progress(arena, within_turn_suffix.items);
-            if (try planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn })) {
+            const revised_plan = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }) catch |err| {
+                if (err != error.TaskGovernancePending) return err;
+                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+                return;
+            };
+            if (revised_plan) {
                 governance = .{};
                 const retained_evidence = try turn.beforeReview(arena, &.{});
                 try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
@@ -7488,7 +7600,11 @@ fn processQueuedPromptLoop(
             }
             if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
-                const reply = try governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .turn_id = turn_id, .step = step, .managed = turn }, false);
+                const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false) catch |err| {
+                    if (err != error.TaskGovernancePending) return err;
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+                    return;
+                };
                 const progress = try record_json.decode(task_governance.Progress, arena, reply.raw, .{});
                 for (progress.remaining, 0..) |id, i| {
                     var found = false;
@@ -7813,7 +7929,7 @@ fn processQueuedPromptLoop(
                 break :native projection.messages;
             } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
+            const request_messages = if (retrieval_final) try @import("../../workspace/request_routing.zig").answerMessages(overlay_arena, job.prompt, image_projection.messages) else try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{image_projection.messages.len});
             }
@@ -7847,7 +7963,7 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
-            const tool_choice: types.ToolChoice = if (governance.finalizing)
+            const tool_choice: types.ToolChoice = if (governance.finalizing or retrieval_final)
                 .none
             else if (recovery_strategy == .reconcile_tool)
                 .none
@@ -7871,7 +7987,7 @@ fn processQueuedPromptLoop(
                 .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
-            if (governance.finalizing) request_data.tools = .{};
+            if (governance.finalizing or retrieval_final) request_data.tools = .{};
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
@@ -9567,6 +9683,9 @@ fn processQueuedPromptLoop(
             completion.tool_calls,
         ) else .{ .calls = completion.tool_calls, .removed = 0 };
         completion.tool_calls = filtered_provider_calls.calls;
+        if (retrieval_turn) for (completion.tool_calls) |call| {
+            if (!@import("../../workspace/request_routing.zig").readTool(call.name)) return error.ReadOnlyRoutingViolation;
+        };
         if (filtered_provider_calls.removed > 0) {
             debug_trace.eventf(
                 "agent",
@@ -10022,6 +10141,7 @@ fn processQueuedPromptLoop(
                         .api_key = active_api_key,
                         .model = successful_gateway_model,
                         .root_user_context = root_user_intent_context,
+                        .usage_owner = agent,
                         .turn_id = turn_id,
                         .step = current_step_index,
                     });
@@ -12897,6 +13017,7 @@ fn processQueuedPromptLoop(
                     .api_key = active_api_key,
                     .model = successful_gateway_model,
                     .root_user_context = root_user_intent_context,
+                    .usage_owner = agent,
                     .turn_id = turn_id,
                     .step = current_step_index,
                 });
@@ -13081,6 +13202,11 @@ fn finishFailedTurnWithNotice(
     notice: []const u8,
     trace_outcome: []const u8,
 ) !void {
+    if (std.mem.eql(u8, trace_outcome, "workspace_governance_pending") or
+        std.mem.eql(u8, trace_outcome, "workspace_preparation_pending"))
+    {
+        if (deps.report_failure) |report| report(deps.ctx, trace_outcome);
+    }
     try deps.push_text(deps.ctx, .{ .operational = notice });
     try deps.push_text(deps.ctx, .{ .operational = "\n" });
     if (stop_state.retained_candidate != null) {

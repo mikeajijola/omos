@@ -32,6 +32,7 @@ const Job = struct {
     journal: std.Io.File,
     position: u64 = 0,
     cursor: usize = 0,
+    attention_seen: bool = false,
 
     fn emit(raw: *anyopaque, data: []const u8) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
@@ -69,6 +70,22 @@ const Job = struct {
             try io.writeFileAtomic(alloc, index_path, index_bytes);
         }
         try output(line);
+        const kind = model.text(parsed.value, "type");
+        const attention = std.mem.eql(u8, kind, "input_required") or std.mem.eql(u8, kind, "input_resolved");
+        if (attention or (self.attention_seen and std.mem.eql(u8, kind, "turn_end"))) {
+            self.attention_seen = true;
+            var saved = true;
+            for (self.args) |arg| if (std.mem.eql(u8, arg, "--no-save")) {
+                saved = false;
+            };
+            if (saved) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                if (workspace.Manager.bound(arena.allocator())) |bound| {
+                    if (bound) |manager| manager.retainAttentionEvent(self.id, self.cursor, parsed.value) catch {};
+                } else |_| {}
+            }
+        }
     }
 
     fn run(self: *Job) void {
@@ -77,6 +94,7 @@ const Job = struct {
     }
 
     fn perform(self: *Job) void {
+        defer self.journal.unlock(io.getIo());
         defer if (self.execution_lease) |lease| {
             lease.release();
             self.execution_lease = null;
@@ -160,7 +178,7 @@ const Server = struct {
                 return error.WorkspaceBindingChanged;
             }
         }
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{"schedule_series_v1"} });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
             var coordinated = params;
             if (coordinated != .object) return error.InvalidPrompt;
@@ -184,6 +202,7 @@ const Server = struct {
             const job = self.job orelse return error.NoActiveTurn;
             if (!std.mem.eql(u8, control.turn, job.id)) return error.StaleTurn;
             if (std.mem.eql(u8, method, "cancel")) job.ui.stop() else if (std.mem.eql(u8, method, "steer")) try job.ui.steer(control.text) else if (std.mem.eql(u8, method, "validation")) try job.ui.validated(control.request_id, try std.json.Stringify.valueAlloc(arena, control.receipt orelse return error.MissingReceipt, .{})) else try job.ui.answer(control.request_id, control.approved, control.answers);
+            if (std.mem.eql(u8, method, "input")) try job.ui.emit(.{ .type = "input_resolved", .request_id = control.request_id });
             return value(arena, .{ .accepted = true });
         }
         if (std.mem.eql(u8, method, "snapshot")) {
@@ -192,7 +211,16 @@ const Server = struct {
             const args = try snapshotArgs(arena, query.action, query.id, query.entity, query.offset);
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
+        if (std.mem.eql(u8, method, "settings")) {
+            const owner_settings = @import("../config/host_settings.zig");
+            const request = try std.json.parseFromValueLeaky(owner_settings.Request, arena, params, .{});
+            if (request.action != .read) if (self.job) |job| {
+                if (!job.finished.load(.acquire)) return error.SettingsBusy;
+            };
+            return parse(arena, try owner_settings.execute(arena, request));
+        }
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
         if (std.mem.eql(u8, method, "schedule")) {
             const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
@@ -274,6 +302,7 @@ const Server = struct {
             journal.close(io.getIo());
             std.Io.Dir.deleteFileAbsolute(io.getIo(), path) catch {};
         }
+        try journal.lock(io.getIo(), .exclusive);
         const owned_id = try alloc.dupe(u8, id);
         errdefer alloc.free(owned_id);
         const owned_hash = try alloc.dupe(u8, request_hash);
@@ -330,7 +359,7 @@ const Server = struct {
             const invocation = try schedule_worker.prepare(manager, schedule);
             const id = try manager.alloc.print("schedule-{s}-{d}", .{ schedule.id, schedule.generation });
             if (!safeId(id)) return error.InvalidTurnId;
-            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = invocation.session }), invocation);
+            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = invocation.prompt, .session = invocation.session }), invocation);
             if (@import("../workspace/definition.zig").field(accepted, "already_accepted")) |retained| {
                 if (retained == .bool and retained.bool) return error.ScheduledTurnAcceptanceUncertain;
             }

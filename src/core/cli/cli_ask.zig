@@ -2536,6 +2536,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
+        .report_failure = reportFailure,
     };
 }
 
@@ -2638,6 +2639,11 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     const writable = if (ctx.writable) |*value| value else return;
     if (usage.input_tokens) |input| writable.state.total_input_tokens = input;
     if (usage.output_tokens) |output| writable.state.total_output_tokens = output;
+}
+
+fn reportFailure(raw_ctx: *anyopaque, code: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.typed_error_code = code;
 }
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

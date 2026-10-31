@@ -32,10 +32,11 @@ pub const Scheduler = struct {
         defer arena.deinit();
         var manager = self.manager;
         manager.alloc = arena.allocator();
-        if (!try manager.hasDueSchedules()) return;
+        if (!try manager.hasDueSchedules() and !try manager.hasDueScheduleSeries()) return;
         if (self.executor.available) |available| if (!available(self.executor.context)) return;
         const lease = (try manager.tryExecutionLease()) orelse return;
         defer lease.release();
+        _ = try manager.materializeScheduleSeries(&lease);
         const schedule = (try manager.claimSchedule(owner)) orelse return;
         var heartbeat: Heartbeat = .{ .manager = self.manager, .schedule = schedule, .host_stopping = &self.stopping };
         var monitor: ?std.Thread = try std.Thread.spawn(.{}, Heartbeat.loop, .{&heartbeat});
@@ -109,14 +110,14 @@ const Heartbeat = struct {
 
 fn failureState(err: anyerror) scheduling.State {
     return switch (err) {
-        error.Cancelled, error.ExecutionBusy, error.WorkspaceExecutionBusy, error.NativeSessionUnavailable, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ScheduledInputRequired, error.ScheduledContinuationRequired, error.ScheduledTurnAcceptanceUncertain, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition => .waiting,
+        error.Cancelled, error.ExecutionBusy, error.WorkspaceExecutionBusy, error.LocalSeriesAuthorityRequired, error.NativeSessionUnavailable, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ScheduledInputRequired, error.ScheduledContinuationRequired, error.ScheduledTurnAcceptanceUncertain, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition => .waiting,
         else => .failed,
     };
 }
 
 pub fn errorFromCode(code: ?[]const u8) anyerror {
     const value = code orelse return error.ScheduledRunFailed;
-    for ([_][]const u8{ "contract_blocked", "verification_pending", "workspace_invocation_budget", "workspace_progress_paused", "workspace_publication_pending", "step_limit" }) |pending| {
+    for ([_][]const u8{ "contract_blocked", "verification_pending", "workspace_invocation_budget", "workspace_progress_paused", "workspace_governance_pending", "workspace_preparation_pending", "workspace_publication_pending", "step_limit" }) |pending| {
         if (std.mem.eql(u8, value, pending)) return error.ScheduledContinuationRequired;
     }
     inline for (.{ error.Cancelled, error.WorkspaceExecutionBusy, error.TaskProjectMismatch, error.WorkspaceMergeConflict, error.WorkspaceRecoveryRequired, error.WorkspaceBindingMismatch, error.StaleExecutionPolicy, error.UnboundCapability, error.ModelRequestsBlocked, error.MissingCredentials, error.StaleWorkContract, error.StaleWorkspaceDefinition }) |err| {
@@ -128,6 +129,7 @@ pub fn errorFromCode(code: ?[]const u8) anyerror {
 pub const Invocation = struct {
     task: workspace.Task,
     session: []const u8,
+    prompt: []const u8 = "continue",
 };
 
 /// Resolves the saved native session without putting private runtime state in Fossil.
@@ -137,6 +139,14 @@ pub fn prepare(manager: workspace.Manager, schedule: scheduling.Schedule) !Invoc
     try manager.validateTaskBasis(task);
     var store = try sessions.Store.initReadOnly(manager.alloc, task.project_root);
     defer store.deinit(manager.alloc);
+    if (try manager.scheduledOccurrence(schedule.id)) |occurrence| {
+        if (!std.mem.eql(u8, occurrence.task, task.id) or !std.mem.eql(u8, task.session, try workspace.hash(manager.alloc, occurrence.session))) return error.RecurringTaskBindingMismatch;
+        var native = store.loadReadOnly(manager.alloc, occurrence.session) catch |err| return if (err == error.SessionNotFound or err == error.FileNotFound) error.NativeSessionUnavailable else err;
+        defer native.deinit(manager.alloc);
+        const fresh = native.history.len == 0 and native.recovery_checkpoint == null;
+        _ = try manager.resumeTask(occurrence.session, task.id, task.project_root);
+        return .{ .task = task, .session = try manager.alloc.dupe(u8, occurrence.session), .prompt = if (fresh) try manager.originalRequest(task) else "continue" };
+    }
     var candidates = try store.list(manager.alloc);
     defer {
         for (candidates.items) |*candidate| candidate.deinit(manager.alloc);
@@ -155,9 +165,9 @@ pub fn prepare(manager: workspace.Manager, schedule: scheduling.Schedule) !Invoc
 
 /// Arguments retain the saved session and let the normal runtime recover publication.
 /// The caller owns the arguments and strings through alloc.
-pub fn promptArgs(alloc: std.mem.Allocator, session: []const u8) ![]const [:0]const u8 {
+pub fn promptArgs(alloc: std.mem.Allocator, session: []const u8, prompt: []const u8) ![]const [:0]const u8 {
     const args = try alloc.alloc([:0]const u8, 6);
-    const values = [_][]const u8{ "--json", "--prompt-permissions", "--resume-id", session, "--", "continue" };
+    const values = [_][]const u8{ "--json", "--prompt-permissions", "--resume-id", session, "--", prompt };
     var count: usize = 0;
     errdefer {
         for (args[0..count]) |arg| alloc.free(arg);
@@ -222,6 +232,8 @@ test "scheduled execution holds input and ambiguous continuation failures" {
     try std.testing.expectEqual(scheduling.State.waiting, failureState(error.ScheduledInputRequired));
     try std.testing.expectEqual(scheduling.State.failed, failureState(error.InvalidSessionFormat));
     try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("contract_blocked")));
+    try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("workspace_governance_pending")));
+    try std.testing.expectEqual(scheduling.State.waiting, failureState(errorFromCode("workspace_preparation_pending")));
 }
 
 test "schedule workers generate an owner accepted by the durable claim fence" {

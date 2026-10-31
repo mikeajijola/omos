@@ -71,6 +71,6 @@
   { "file": "web-search-permission-progress.test.ts", "weight": 11 },
   { "file": "yolo-permission-mode.test.ts", "weight": 29 },
   { "file": "workspace-ui-host.test.ts", "weight": 150 },
-  { "file": "workspace-scheduling.test.ts", "weight": 60 },
+  { "file": "workspace-scheduling.test.ts", "weight": 540 },
   { "file": "company-worker.test.ts", "weight": 2700 }
 ]

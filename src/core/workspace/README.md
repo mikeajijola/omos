@@ -7,6 +7,10 @@ an empty personal instance automatically when no repository is bound.
 `omos fossil ensure --json` performs the same bootstrap without importing
 existing sessions.
 
+See [conversation and content capabilities](CAPABILITIES.md) for retrieval,
+request classification, public chat history, and the attention feed shared by
+the CLI, workspace UI, local MCP adapter, and agent tools.
+
 Managed turns checkpoint changes in the task's projected `memory/`, `skills/`,
 `documents/`, `artifacts/`, and `ui/` directories. The host hashes local files
 through fixed-size buffers and retains their metadata while identifying
@@ -179,8 +183,61 @@ requirements, with existing evidence available for independent reassessment.
 The workspace UI Calendar displays planned starts, current requirements,
 schedule history, and execution state. Its editor creates, moves, or cancels
 starts with a revision fence. Calendar timestamps display in the browser's
-local timezone; stored execution instants use UTC. Schedules are one-time starts,
-not deadlines or recurring templates.
+local timezone; stored execution instants use UTC.
+
+### Repeat work
+
+A recurring series pins a planned root contract as its template. The source
+may already be accepted. Each occurrence creates a fresh contract and native
+session, preserving the source's published results. Permissions, conversation
+history, replay state and credentials are not copied into new sessions.
+
+```sh
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00+01:00' --every daily --count 30
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00Z' --every weekly --weekdays mon,wed,fri
+omos schedule series list --json
+omos schedule series show SERIES_ID --json
+omos schedule series update SERIES_ID --at '2026-11-02T10:00:00Z' --every daily --revision HASH
+omos schedule series pause SERIES_ID
+omos schedule series resume SERIES_ID
+omos schedule series skip SERIES_ID
+omos schedule series move SERIES_ID --occurrence OCCURRENCE_ID --at '2026-11-03T10:00:00Z'
+omos schedule series cancel SERIES_ID
+```
+
+The same commands work through `/schedule`. `--every 30m`, `6h`, `1d` and `2w`
+are fixed UTC durations. Calendar `daily`, `weekly` and `monthly` rules retain
+the explicit offset in `--at`; they do not follow daylight saving changes.
+Use `--frequency N` for calendar multiples and `--month-day 31` to clamp shorter
+months without shifting the following month's day. IANA timezones and cron
+expressions are not supported.
+
+`--count` limits created occurrences from 1 to 10,000; it does not count only
+successful runs. Omit it for an unlimited series. `--until TIMESTAMP` includes
+that nominal start instant. When both are set, the first limit reached ends
+generation. `update` accepts `--clear-count` and `--clear-until`.
+
+Only one occurrence per series can be unresolved. The default `--overlap block`
+waits for running, waiting or failed work. `--overlap skip` records later slots
+as skipped while that occurrence remains unresolved. Neither policy retries
+waiting or failed work: continue its retained conversation or explicitly skip
+it. Missed slots during downtime coalesce into the latest due start. Pausing
+cancels dispatch of unclaimed starts and allows running work to finish.
+
+The host must remain running. Series templates and history are portable, but
+an imported repository cannot grant local execution authority. Preparation
+pauses with a reason until the owner explicitly resumes the series on that
+host. Missing projects or model bindings also pause preparation.
+Prepared starts receive the same local authority check before dispatch.
+Resuming a portable series also verifies its template against the pinned source
+contract; replacing the template payload and its hash cannot authorize different
+work.
+
+Calendar's **Repeat work** editor offers these rules and controls. Derived
+future slots are labelled projected; they become executable only after the
+host reserves their task and session. See the
+[recurring scheduling specification](recurring-scheduling-spec.md) for storage,
+recovery, paging and execution limits.
 
 ### Calendar service
 
@@ -191,6 +248,17 @@ and an `action` of `list`, `show`, `add`, `move`, or `cancel`. `show`, `move`, a
 `from` and `to`. Mutations require writable service mode and the calendar
 `revision` returned by the previous read. The native UI bridge exposes the same
 operations through its typed `schedule` method.
+
+`POST /v1/schedule-series` uses the same bearer authentication and accepts
+`{ "version": "omos.schedule-series/v1", "workspace": "WORKSPACE_ID", "request": REQUEST }`.
+The native method is `schedule.series`; initialization advertises
+`schedule_series_v1`. Requests use `list`, `show`, `add`, `update`, `pause`,
+`resume`, `skip`, `move` or `cancel`. Every mutation requires a calendar revision
+and writable service mode. A rule contains `cadence`, `every`, `interval_ms`,
+`weekdays_mask` (Monday is bit 0), `month_day` and `offset_minutes`, with only the
+fields appropriate to its cadence populated. `show` and `list` accept bounded
+`from`/`to` projection ranges. Use `cursor` for run history, `events_cursor` for
+series events, and `limit` with the returned revision for subsequent pages.
 
 ## Declare the workspace model
 
@@ -323,6 +391,28 @@ of copying transport and record schemas into each planning request. The host
 continues to validate every operation against those schemas. Original requests
 and pending user amendments remain intact within the planning budget.
 
+Planning also receives the workspace root, gathered repository instructions,
+authenticated root-user context, and bounded earlier conversation text. Earlier
+assistant answers are reference material for follow-ups such as "implement the
+feature"; they cannot authorize actions or establish successful work. Truncated
+references and omitted messages are identified explicitly. The planner leaves
+anticipated checks empty when the applicable validation commands are unknown.
+
+Governance requests sequential reviewer calls. If a provider returns multiple
+read-only evidence lookups, the host services them in order; a decision must
+stand alone. Invalid lookups and malformed decisions receive correction feedback
+within the same eight-call and context budgets. Contract revisions preserve the
+existing requirements when a follow-up does not change the requested outcome.
+An exact copy of a retained requirement is ignored and does not count toward the
+32 new or changed requirements allowed per revision. Revision requests contain
+at most 100 requirement entries. Changing or superseding a
+host requirement remains invalid. Revision correction feedback identifies protected
+fields instead of requesting unrelated evidence reads. Exact evidence identities
+and full inspection remain required. Repeated invalid responses pause the task with
+`workspace_governance_pending`, preserving actor work and evidence. Response
+metadata, correction reasons, failure diagnostics, and reported usage survive a
+failed review. Credentials and opaque provider replay state are not journaled.
+
 The execution policy defaults to a progress check after every four completed
 tool batches, a pause after three consecutive stalled checks, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with
@@ -345,6 +435,12 @@ provide current validation evidence. A later source edit invalidates that basis.
 Incomplete scans, unreadable or oversized files cannot establish validation.
 Generated files should follow the repository's ignore rules; changes to visible
 generated files also change the source basis.
+The bound Fossil database, its SQLite sidecars, and its timestamped native
+migration backups are excluded as generated host state. Large source files are
+hashed incrementally within the aggregate scan budget. Preparation failures
+retain their reason and pause before actor execution with
+`workspace_preparation_pending`. After installing a newer CLI, restart any
+already-running terminal process to load the new executable before resuming.
 
 ## Migrate an existing workspace
 

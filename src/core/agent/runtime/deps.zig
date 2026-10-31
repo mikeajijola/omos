@@ -296,6 +296,8 @@ pub const AgentRuntimeDeps = struct {
     /// content failures as permission rejections.
     record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
+    /// A host-owned terminal code, valid until the turn result is consumed.
+    report_failure: ?*const fn (ctx: *anyopaque, code: []const u8) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker
