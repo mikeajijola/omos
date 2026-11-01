@@ -174,6 +174,11 @@ worker lease retains an interrupted schedule for inspection and continuation;
 it does not automatically replay potentially completed external effects.
 Reschedule retained waiting work explicitly after resolving its blocker.
 
+Planning and progress reviews use the task's pinned response and attempt timeouts.
+The inference allowance begins after evidence collection and the initial journal
+write. Planning and contract revision expose only their decision tool; progress
+review can page through evidence, starting with a bounded manifest of 16 records.
+
 Authenticated user updates mark a contract revision pending. The independent
 planner can replace affected obligations while preserving unrelated obligations
 and host requirements. The host records old and new contract versions and the

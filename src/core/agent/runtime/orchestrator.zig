@@ -7086,7 +7086,6 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .provider_options = .{},
         .trace_ctx = .{ .turn_id = input.turn_id },
         .content_capture_limit = work_contract.max_bytes,
-        .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60_000) }),
         .delivery = &delivery,
         .attempt_evidence = &attempt,
         .events = .{ .context = &context, .emit_fn = discardContractEvent },
@@ -7116,13 +7115,14 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .step = input.step,
     }, .{});
     const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};
+    const review_policy = if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{};
     const reply = if (planning)
         if (turn.task.revision_pending and turn.task.model_basis != null and turn.task.model_basis.?.capability != null)
-            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
+            try task_governance.revise(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage, .policy = review_policy })
         else
-            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage })
+            try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage, .policy = review_policy })
     else
-        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage });
+        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage, .policy = review_policy });
     return reply;
 }
 

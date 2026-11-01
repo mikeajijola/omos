@@ -201,6 +201,38 @@ describe("portable Fossil agent workspace", () => {
     expect(revision.value.amendments).toEqual([update]);
   }, 120000);
 
+  test("contract revision recovers from protected requirement edits without an empty evidence tool", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let revised = false, revisionCalls = 0;
+    const m = model(f, () => ({ content: revised ? "Updated the requested detail." : "Waiting for the detail." }), () => revised ? "met" : "blocked", {
+      plan: { capability: "general_task", summary: "Explain the detail", obligations: [{ id: "detail", description: "Explain the initial detail" }], checks: [] },
+      reply: (body, _packet, phase) => {
+        if (phase === "progress") return;
+        expect(body.tools.map((t: any) => t.function.name)).toEqual([phase === "plan" ? "omos_task_plan" : "omos_contract_revision"]);
+        if (phase !== "revise") return;
+        revisionCalls++;
+        const args = revisionCalls === 1
+          ? { capability: "general_task", summary: "Update detail", obligations: [{ id: "request_complete", description: "Weakened host requirement" }], superseded: [], checks: [] }
+          : { capability: "general_task", summary: "Update only the requested detail", obligations: [{ id: "detail", description: "Explain the changed detail" }], superseded: ["detail"], checks: [] };
+        if (revisionCalls === 2) expect(body.messages.at(-1).content).toContain("Remove protected requirement");
+        return { tool_calls: [{ index: 0, id: `revision-${revisionCalls}`, type: "function", function: { name: "omos_contract_revision", arguments: JSON.stringify(args) } }] };
+      },
+    });
+    const first = await f.run(["ask", "Explain a detail after I provide it", "--json"]);
+    const session = JSON.parse(first.stdout).session_id;
+    const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    revised = true;
+    const result = await f.run(["ask", "--resume-id", session, "The detail has changed", "--json"]);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(revisionCalls).toBe(2);
+    expect(m.counts().actors).toBe(2);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.revision_pending).toBe(false);
+    expect(after.definition.obligations.find((o: any) => o.id === "request_complete")).toEqual(before.definition.obligations.find((o: any) => o.id === "request_complete"));
+    expect(after.definition.obligations.find((o: any) => o.id === "detail").description).toBe("Explain the changed detail");
+  }, 120000);
+
   test("an invalid revision pauses before the actor and can resume from the retained user update", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
