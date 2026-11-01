@@ -595,7 +595,16 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         if (input.journal) |journal| try journal.record("review_assessment", call.arguments_json);
         var decision = try work_contract.assess(alloc, definition, call.arguments_json);
         errdefer alloc.free(decision.feedback);
-        try verifyReferences(alloc, call.arguments_json, evidence);
+        verifyReferences(alloc, call.arguments_json, evidence) catch |err| switch (err) {
+            error.InvalidContractEvidence => {
+                const rejection = "{\"accepted\":false,\"reason\":\"Invalid evidence citation. Copy the complete id exactly from the evidence manifest, including every suffix; action_id is not an evidence id. Failed tool results cannot support a met obligation. Correct the assessment using successful inspected evidence, or retain a pending assessment.\"}";
+                if (input.journal) |journal| try journal.record("review_citation_rejected", rejection);
+                try appendExchange(alloc, &messages, completion, input, request.model, rejection);
+                alloc.free(decision.feedback);
+                continue;
+            },
+            else => return err,
+        };
         const assessment = try record_json.parse(work_contract.Assessment, alloc, call.arguments_json, .{});
         defer assessment.deinit();
         var unread: std.ArrayList([]const u8) = .empty;

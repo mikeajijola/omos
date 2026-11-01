@@ -26,6 +26,27 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
+  test("completion review corrects a shortened execution citation without repeating the action", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Prefer concise answers.") : { content: "Saved the preference." }, packet => {
+      if (++reviews > 1) {
+        expect(packet.currentInspections.at(-1).accepted).toBe(false);
+        expect(packet.currentInspections.at(-1).reason).toContain("complete id");
+        return "met";
+      }
+      const record = packet.evidence.find((item: any) => item.kind === "tool" && item.status === "success");
+      return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status: "met", evidence: [`execution:${record.action_id}`], note: "Saved" })),
+      } };
+    });
+    const result = await f.run(["ask", "Remember that I prefer concise answers", "--json"]);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 2, assessments: 2 });
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+  }, 120000);
+
   test("a progress finalize decision still passes the independent completion gate", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
