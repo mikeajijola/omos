@@ -7328,7 +7328,7 @@ fn processQueuedPromptLoop(
                 for (config.advertised_functions) |function| if (routing.readTool(function.name)) try functions.append(arena, function);
                 config.advertised_tool_names = names.items;
                 config.advertised_functions = functions.items;
-                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. Choose the evidence needed to answer the user's question. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. If evidence is absent or coverage incomplete, say so." });
+                try stable_prefix.append(arena, .{ .role = .system, .content = "This is a bounded read-only conversation turn. Choose the evidence needed to answer the user's question. Cite source paths and distinguish confirmed actions from drafts or claims. Do not create or change tasks. For questions about background work, use workspace_content background list/show/events and follow event cursors. Running means execution is active, not that the requested outcome has advanced. Checkpoints and tool counts alone never establish progress or completed external actions. workspace_governance_pending means a review did not finish; it does not mean execution completed or that approval is all that remains. In-flight events are visible before publication. Report confirmed outcomes, current activity, and blockers separately. If evidence is absent or coverage incomplete, say so." });
             }
             try manager.retainRoutingDecision(config.fossil_session_id.?, job.prompt, decision);
         }

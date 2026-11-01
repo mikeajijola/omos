@@ -177,7 +177,11 @@ Reschedule retained waiting work explicitly after resolving its blocker.
 Planning and progress reviews use the task's pinned response and attempt timeouts.
 The inference allowance begins after evidence collection and the initial journal
 write. Planning and contract revision expose only their decision tool; progress
-review can page through evidence, starting with a bounded manifest of 16 records.
+review can page through evidence, starting with the latest 16 records. The final
+reserved calls expose only the decision tool. A review can report no demonstrated
+progress without paging through unrelated history. Work prompts include the pinned
+execution policy and a reference to the full model declaration instead of copying
+the full declaration into every actor step.
 
 Authenticated user updates mark a contract revision pending. The independent
 planner can replace affected obligations while preserving unrelated obligations

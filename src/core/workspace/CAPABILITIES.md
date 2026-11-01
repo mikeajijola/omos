@@ -192,6 +192,15 @@ do not retain conversation, routing, or lookup projections.
 | Pending human inputs | `attention` | Needs you | `omos_attention` | `workspace_content` |
 | Conversation history | `conversations`, `conversation` | Chats | `omos_conversations`, `omos_conversation` | `workspace_content` |
 
+Agent loops can inspect background work with `workspace_content` using
+`{"action":"background","background":{"action":"list"}}`. Use `show` or
+`events` with a task ID, and follow `next_offset` for additional events.
+These operations read in-flight work before publication. The agent schema exposes
+only `host`, `list`, `show`, `events`, and `receipt`; mutation still requires
+operator authority. A running worker or a checkpoint is not evidence that an
+external action succeeded. `workspace_governance_pending` means a review did not
+finish, not that the requested work is complete.
+
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,
 event polling, steering, and cancellation through the native conversation host.

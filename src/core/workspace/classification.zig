@@ -29,6 +29,7 @@ const Configuration = struct {
 fn configuration(alloc: std.mem.Allocator) !Configuration {
     if (io.getenv("OMOS_CLASSIFIER_URL")) |endpoint| return .{ .endpoint = endpoint, .model = io.getenv("OMOS_CLASSIFIER_MODEL") orelse "laya:en", .token = io.getenv("OMOS_CLASSIFIER_TOKEN"), .lookup_model = io.getenv("OMOS_LOOKUP_CLASSIFIER_MODEL") };
     const home = io.getenv("HOME") orelse return error.ClassifierNotConfigured;
+    if (!std.Io.Dir.path.isAbsolute(home)) return error.ClassifierNotConfigured;
     const path = try alloc.print("{s}/.fx/classifier.json", .{home});
     var file = std.Io.Dir.openFileAbsolute(io.getIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return error.ClassifierNotConfigured,

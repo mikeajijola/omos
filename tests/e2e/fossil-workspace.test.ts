@@ -26,6 +26,32 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
+  test("status lookups expose read-only worker evidence without planning a task", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const body = await request.json() as any;
+      return body.questions.stop ? classifierReply() : routeReply();
+    } });
+    const m = model(f, (body, count) => {
+      const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
+      const content = packet.available_tools.find((tool: any) => tool.name === "workspace_content");
+      expect(content.parameters.properties.action.enum).toContain("background");
+      expect(content.parameters.properties.background.properties.action.enum).toEqual(["host", "list", "show", "events", "receipt"]);
+      if (count === 1) return lookupStep("", [], [{ tool: "workspace_content", arguments: JSON.stringify({ action: "background", background: { action: "list" } }), resolves: "Find the worker and its current state." }]);
+      expect(packet.observations[0].succeeded).toBe(true);
+      expect(JSON.parse(packet.observations[0].text).workers).toEqual([]);
+      return lookupStep("No background workers are recorded in this workspace.", ["e0"]);
+    });
+    try {
+      const result = await f.run(["ask", "How is the background work going?", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${server.port}`, OMOS_LOOKUP_CLASSIFIER_MODEL: "fixture-lookup" });
+      expect(result.code, result.stderr + result.stdout).toBe(0);
+      expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
+      expect(result.stderr).not.toContain("Planning against");
+      expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toEqual([]);
+    } finally { server.stop(true); }
+  }, 120000);
+
   test("completion review corrects a shortened execution citation without repeating the action", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -98,7 +124,15 @@ describe("portable Fossil agent workspace", () => {
   test("keeps task content on a branch until reviewed and automatically publishes it", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    const m = model(f, (_body, count) => count === 1 ? writeMemory("Prefer concise answers.") : { content: "Saved and verified the preference." });
+    const m = model(f, (body, count) => {
+      const context = body.messages.map((message: any) => message.content ?? "").join("\n").match(/<omos_workspace_data>\n(.*?)\nOrdinary/s);
+      expect(context).not.toBeNull();
+      const packet = JSON.parse(context![1]);
+      expect(packet.model.basis.execution.review.max_calls).toBe(8);
+      expect(packet.model.declaration).toBeUndefined();
+      expect(context![1].length).toBeLessThan(16000);
+      return count === 1 ? writeMemory("Prefer concise answers.") : { content: "Saved and verified the preference." };
+    });
     const result = await f.run(["ask", "Remember that I prefer concise answers", "--json"]);
     expect(result.code).toBe(0);
     expect(result.stderr).not.toContain("fx:");

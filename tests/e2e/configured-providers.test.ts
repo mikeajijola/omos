@@ -830,7 +830,7 @@ describe("CLI work contracts", () => {
     return body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment");
   }
   function assessment(body: any, status: string, evidence?: string[]) {
-    const packet = JSON.parse(body.messages.at(-1).content);
+    const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
     return toolCompletion(body.model, "omos_contract_assessment", {
       contractId: packet.contract.id, version: packet.contract.version,
       obligations: [{ id: "request_complete", status,

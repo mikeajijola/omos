@@ -937,7 +937,18 @@ pub const workspace_content = ToolSpec{
         .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation", "background" } } },
+                .{ .name = "background", .json_type = .object, .description = "Inspect workers and their live event evidence without waiting for publication. Running and checkpoint counts are not proof of progress. workspace_governance_pending means review failed to finish, not that work completed. Read events before reporting outcomes; follow next_offset until coverage is complete.", .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "host", "list", "show", "events", "receipt" } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "generation", .json_type = .integer },
+                        .{ .name = "offset", .json_type = .integer },
+                        .{ .name = "operation", .json_type = .string },
+                    },
+                    .required = &.{"action"},
+                    .additional_properties = false,
+                } } },
                 .{ .name = "session", .json_type = .string },
                 .{ .name = "offset", .json_type = .integer },
                 .{ .name = "retrieval", .json_type = .object, .shape = &.{ .object = &.{

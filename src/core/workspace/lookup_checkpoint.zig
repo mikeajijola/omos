@@ -183,7 +183,7 @@ pub fn answer(alloc: std.mem.Allocator, draft: Draft, outcome: Outcome) ![]const
     return out.toOwnedSlice();
 }
 
-fn testResult(choice: []const u8) classification.Result {
+fn testResult(comptime choice: []const u8) classification.Result {
     return .{ .model = "fixture", .elapsed_ms = 1, .decisions = &.{.{ .question = "stop", .choice = choice, .confidence = 0.95, .probabilities = &.{ .{ .label = "deliver", .probability = 0.95 }, .{ .label = "continue", .probability = 0.03 }, .{ .label = "clarify", .probability = 0.02 } } }} };
 }
 
