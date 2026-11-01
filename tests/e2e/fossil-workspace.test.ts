@@ -36,8 +36,8 @@ describe("portable Fossil agent workspace", () => {
     const m = model(f, (body, count) => {
       const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
       const content = packet.available_tools.find((tool: any) => tool.name === "workspace_content");
-      expect(content.parameters.properties.action.enum).toContain("background");
-      expect(content.parameters.properties.background.properties.action.enum).toEqual(["host", "list", "show", "events", "receipt"]);
+      expect(content.inputSchema.properties.action.enum).toContain("background");
+      expect(content.inputSchema.properties.background.properties.action.enum).toEqual(["host", "list", "show", "events", "receipt"]);
       if (count === 1) return lookupStep("", [], [{ tool: "workspace_content", arguments: JSON.stringify({ action: "background", background: { action: "list" } }), resolves: "Find the worker and its current state." }]);
       expect(packet.observations[0].succeeded).toBe(true);
       expect(JSON.parse(packet.observations[0].text).workers).toEqual([]);
