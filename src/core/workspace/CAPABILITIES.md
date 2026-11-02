@@ -208,3 +208,47 @@ Start it with `--operator` only for a trusted human-operated client that needs
 protected input and background mutation controls. Classification output never
 changes that authority. The signed company MCP transport retains its separate
 company scope and grants.
+
+## Contract continuity across channels
+
+Use `{"action":"contracts","contracts":{"action":"list"}}` to inspect the
+personal contract queue. `status` and `context` take a task ID. Context contains
+the contract, verified status, and at most eight recent channel-message excerpts;
+full messages remain in the workspace. Omit the task to read the bounded shared
+conversation context. Channel dispatch supplies its retained excerpts to routing
+and the agent as historical data. `resolve` takes message text and optional
+`task` or `reply_to` references. A duplicate human request returns the retained
+status and a choice to inspect, continue, or start separate work. It never
+silently drops the request or approves execution.
+
+Trusted clients use `receive` with `destination`, `message_id`, and `text`.
+Identical transport retransmissions reuse their receipt; conflicting contents for
+the same identity are rejected. `command` takes the returned message `key` and a
+`choice` of `status`, `resume`, `amend`, or `new`. Execution requests are retained
+before dispatch through the native host. Private local activation binds the exact
+request; restoring portable records alone does not authorize execution. `commands`
+exposes queued, accepted,
+and blocked requests. Accepted dispatch is not contract completion.
+
+`subscribe` and `unsubscribe` take a task and destination. The interval is
+`interval_seconds`, between 60 and 2592000; `notify_changes` also requests an
+update on state or verified outcome changes. A trusted host invokes `tick` in
+bounded pages. `outbox` exposes durable updates. External adapters claim a
+delivery before sending and acknowledge it with their claim and provider receipt.
+An uncertain send keeps its claim for reconciliation. Workspace feed deliveries
+use destination `{"channel":"ui","address":"owner"}` and become readable when
+committed. Only a verified publication supplies a completed outcome; activity
+and checkpoints do not establish an application count.
+
+These records live under `runtime/communications/` on `omos-runtime`. Credentials
+and activation of external adapters stay private to the host. Agent
+`workspace_content` exposes read-only contract operations; communication mutations
+require operator authority. Company-authorized contracts continue through the
+signed company execution path rather than this personal adapter.
+
+The companion UI repository provides `bin/host.mjs`, a shared local Unix-socket
+host, `bin/channel.mjs` for terminal conversations, and optional Telegram and
+WhatsApp adapters. Its `docs/channels.md` documents startup, credentials, routing,
+and delivery recovery. Set `OMOS_HOST_SOCKET` on UI and MCP clients to join that
+host. The native interactive CLI retains its existing direct runtime; use the
+channel CLI when sharing the socket.

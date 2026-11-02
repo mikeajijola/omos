@@ -26,6 +26,83 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
+  test("contract communications retain cross-channel messages and fence scheduled deliveries", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    model(f, (_body, count) => count === 1 ? writeMemory("Prefer concise updates.") : { content: "Saved the preference." });
+    const prompt = "Save my preference for concise updates";
+    const saved = await f.run(["ask", prompt, "--json"]);
+    expect(saved.code, saved.stderr).toBe(0);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    const requestFile = join(f.home, "communication-request.json");
+    const call = async (contracts: any, success = true) => {
+      writeFileSync(requestFile, JSON.stringify({ action: "contracts", contracts }));
+      const result = await f.run(["fossil", "capabilities", requestFile, "--json"]);
+      if (success) { expect(result.code, result.stderr).toBe(0); return JSON.parse(result.stdout); }
+      expect(result.code).not.toBe(0); return result.stderr + result.stdout;
+    };
+    const destination = { channel: "telegram", address: "owner" };
+    const first = await call({ action: "receive", destination, message_id: "1", text: prompt });
+    expect(first.retransmission).toBe(false);
+    expect(first.resolution.kind).toBe("duplicate");
+    expect(first.resolution.message).toContain("continue");
+    expect((await call({ action: "receive", destination, message_id: "1", text: prompt })).retransmission).toBe(true);
+    expect(await call({ action: "receive", destination, message_id: "1", text: "different content" }, false)).toContain("ChannelMessageConflict");
+    const other = await call({ action: "receive", destination: { channel: "whatsapp", address: "owner" }, message_id: "1", text: "How did it go?", reply_to: first.key });
+    expect(other.resolution.task).toBe(task.id);
+    expect(other.key).not.toBe(first.key);
+    const context = await call({ action: "context", task: task.id });
+    expect(context.recent_messages).toHaveLength(2);
+    expect(context.status.published).toBe(true);
+    for (let index = 2; index < 11; index++) await call({ action: "receive", destination, message_id: String(index), task: task.id, text: `Status question ${index}` });
+    const bounded = await call({ action: "context", task: task.id });
+    expect(bounded.recent_messages).toHaveLength(8);
+    expect(bounded.older_messages).toBe(true);
+    expect(bounded.recent_messages.at(-1).text).toBe("Status question 10");
+    const shared = await call({ action: "context" });
+    expect(shared.recent_messages).toHaveLength(8);
+    expect(shared.older_messages).toBe(true);
+    const queued = await call({ action: "command", key: first.key, choice: "new" });
+    expect(queued.command.state).toBe("queued");
+    expect((await call({ action: "command", key: first.key, choice: "new" })).already_accepted).toBe(true);
+    expect(await call({ action: "command", key: first.key, choice: "resume" }, false)).toContain("ChannelCommandConflict");
+    expect((await call({ action: "commands" })).items).toHaveLength(1);
+    await call({ action: "subscribe", task: task.id, destination, interval_seconds: 60 });
+    expect((await call({ action: "tick" })).queued).toBe(1);
+    expect((await call({ action: "tick" })).queued).toBe(0);
+    const delivery = (await call({ action: "outbox" })).items[0];
+    expect(delivery.record.text).toContain("verified publication");
+    expect(await call({ action: "acknowledge", key: delivery.key, receipt: "external-1" }, false)).toContain("DeliveryClaimRequired");
+    await call({ action: "claim", key: delivery.key, receipt: "adapter-1" });
+    expect(await call({ action: "claim", key: delivery.key, receipt: "adapter-2" }, false)).toContain("DeliveryAlreadyClaimed");
+    await call({ action: "acknowledge", key: delivery.key, claim: "adapter-1", receipt: "external-1" });
+    expect((await call({ action: "acknowledge", key: delivery.key, claim: "adapter-1", receipt: "external-1" })).already_acknowledged).toBe(true);
+    await call({ action: "unsubscribe", task: task.id, destination });
+    expect((await call({ action: "subscriptions" })).items[0].record.enabled).toBe(false);
+    const reply = await call({ action: "reply", key: first.key, text: "The existing contract is completed." });
+    expect((await call({ action: "reply", key: first.key, text: "A retried transport response" })).already_queued).toBe(true);
+    await call({ action: "claim", key: reply.key, receipt: "uncertain-adapter" });
+    await call({ action: "delivery_failure", key: reply.key, claim: "uncertain-adapter" });
+    const uncertain = (await call({ action: "outbox" })).items.find((item: any) => item.key === reply.key);
+    expect(uncertain.record.error_note).toContain("no automatic resend");
+    expect(uncertain.record.delivered_ms).toBeNull();
+    expect(await call({ action: "claim", key: reply.key, receipt: "retry-adapter" }, false)).toContain("DeliveryAlreadyClaimed");
+    const uiDestination = { channel: "ui", address: "owner" };
+    await call({ action: "subscribe", task: task.id, destination: uiDestination, interval_seconds: 60 });
+    expect((await call({ action: "tick" })).queued).toBe(1);
+    const feed = (await call({ action: "outbox" })).items.find((item: any) => item.record.destination.channel === "ui");
+    expect(feed.record.delivered_ms).toBeNumber();
+    const cancelledDestination = { channel: "telegram", address: "cancelled" };
+    await call({ action: "subscribe", task: task.id, destination: cancelledDestination, interval_seconds: 60 });
+    await call({ action: "tick" });
+    await call({ action: "unsubscribe", task: task.id, destination: cancelledDestination });
+    const cancelled = (await call({ action: "outbox" })).items.find((item: any) => item.record.destination.address === "cancelled");
+    expect(cancelled.record.cancelled).toBe(true);
+    expect(await call({ action: "claim", key: cancelled.key, receipt: "late-adapter" }, false)).toContain("DeliveryCancelled");
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks).toHaveLength(1);
+    expect(f.fossil("ls", "-r", "omos-runtime")).toContain("runtime/communications/");
+  }, 240000);
+
   test("status lookups expose read-only worker evidence without planning a task", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

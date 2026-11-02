@@ -9,6 +9,7 @@ const schedule_worker = @import("../workspace/schedule_worker.zig");
 const scheduling = @import("../workspace/scheduling.zig");
 const background = @import("../workspace/background_contract.zig");
 const background_dispatch = @import("../workspace/background_dispatch.zig");
+const channels = @import("../workspace/contract_channels.zig");
 const background_control = @import("../workspace/background_control.zig");
 const version = "omos.ui-host/v1";
 const alloc = std.heap.c_allocator;
@@ -33,6 +34,7 @@ const Job = struct {
     position: u64 = 0,
     cursor: usize = 0,
     attention_seen: bool = false,
+    channel_session: ?[]const u8 = null,
 
     fn emit(raw: *anyopaque, data: []const u8) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
@@ -61,6 +63,7 @@ const Job = struct {
         if (std.mem.eql(u8, @import("../workspace/definition.zig").text(parsed.value, "type"), "session")) {
             const session = @import("../workspace/definition.zig").text(parsed.value, "session_id");
             if (!safeSessionId(session)) return error.InvalidSessionId;
+            if (std.mem.startsWith(u8, self.id, "command-") and self.channel_session == null) self.channel_session = try alloc.dupe(u8, session);
             const digest = try workspace.hash(alloc, session);
             defer alloc.free(digest);
             const index_path = try alloc.print("{s}/session-{s}.json", .{ self.server.journal_dir, digest });
@@ -104,6 +107,15 @@ const Job = struct {
             self.ui.emit(.{ .type = "error", .code = @errorName(err) }) catch {};
             break :blk @as(u8, 1);
         };
+        if (self.channel_session) |session| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            if (workspace.Manager.bound(arena.allocator())) |bound| {
+                if (bound) |manager| channels.bindCommand(manager, self.id, session) catch |err| {
+                    self.ui.emit(.{ .type = "channel_binding_pending", .code = @errorName(err), .command = self.id }) catch {};
+                };
+            } else |_| {}
+        }
         self.exit_code = exit;
         self.ui.emit(.{ .type = "turn_end", .exit_code = exit }) catch {};
     }
@@ -116,6 +128,8 @@ const Job = struct {
         alloc.free(self.id);
         alloc.free(self.request_hash);
         if (self.error_code) |code| alloc.free(code);
+        if (self.channel_session) |session| alloc.free(session);
+        if (self.ui.channel_context) |context| alloc.free(context);
         if (self.execution_lease) |lease| lease.release();
         alloc.destroy(self);
     }
@@ -178,7 +192,7 @@ const Server = struct {
                 return error.WorkspaceBindingChanged;
             }
         }
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{"schedule_series_v1"} });
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1" } });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
             var coordinated = params;
             if (coordinated != .object) return error.InvalidPrompt;
@@ -222,6 +236,19 @@ const Server = struct {
         const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
         if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
+        if (std.mem.eql(u8, method, "channel.dispatch")) {
+            const query = try std.json.parseFromValueLeaky(struct { key: []const u8 }, arena, params, .{});
+            const command = try channels.loadCommand(manager, query.key);
+            if (command.state != .queued) return value(arena, command);
+            const result = self.dispatchChannel(arena, manager, query.key, command) catch |err| {
+                if (err == error.TurnInProgress or err == error.WorkspaceExecutionBusy or err == error.WorkspaceBusy) return value(arena, .{ .state = "queued", .message = "Your request is retained and waiting for the current planning turn to finish." });
+                try channels.finishCommand(manager, query.key, null, @errorName(err));
+                return value(arena, .{ .state = "blocked", .reason = @errorName(err), .message = "This request needs attention. Its work and evidence are retained." });
+            };
+            try channels.finishCommand(manager, query.key, result, null);
+            return value(arena, .{ .state = "accepted", .result = result });
+        }
+        if (std.mem.eql(u8, method, "contracts")) return @import("../workspace/contract_channels.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/contract_channels.zig").Request, arena, params, .{}), true);
         if (std.mem.eql(u8, method, "schedule")) {
             const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
             if (request.action == .add or request.action == .move or request.action == .cancel) {
@@ -241,6 +268,25 @@ const Server = struct {
 
     fn start(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation) !std.json.Value {
         return self.startWithBackground(arena, id, params, scheduled, null);
+    }
+
+    fn dispatchChannel(self: *Server, arena: std.mem.Allocator, manager: workspace.Manager, key: []const u8, command: channels.Command) !std.json.Value {
+        try channels.authorizeCommand(manager, key, command);
+        if (command.background_request) |request| return @import("../workspace/background_api.zig").execute(manager, request);
+        if (self.job) |active| if (!std.mem.eql(u8, active.id, key)) return error.TurnInProgress;
+        // An existing journal is reconciled by start's request hash before any
+        // session selection can mutate retained work after a restart.
+        const journal_path = try arena.print("{s}/{s}.ndjson", .{ self.journal_dir, key });
+        const previous = std.Io.Dir.openFileAbsolute(io.getIo(), journal_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (previous) |file| file.close(io.getIo());
+        if (previous == null) if (command.session) |session| {
+            const task = try manager.loadTask(command.task orelse return error.MissingTaskId);
+            _ = try manager.resumeTask(session, task.id, task.project_root);
+        };
+        return self.start(arena, key, try value(arena, .{ .coordinator = true, .text = command.text, .session = command.session }), null);
     }
 
     fn startWithBackground(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation, background_run: ?*BackgroundRun) !std.json.Value {
@@ -321,6 +367,11 @@ const Server = struct {
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
         job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .coordinator_mode = request.coordinator and background_run == null and scheduled == null and !std.mem.eql(u8, io.getenv("OMOS_COORDINATOR") orelse "", "0"), .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
+        if (std.mem.startsWith(u8, id, "command-")) {
+            const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            const command = try channels.loadCommand(manager, id);
+            job.ui.channel_context = try std.json.Stringify.valueAlloc(alloc, command.recent_context, .{});
+        }
         if (scheduled) |invocation| {
             job.ui.project_root = invocation.task.project_root;
             job.ui.execution_lease_held = true;

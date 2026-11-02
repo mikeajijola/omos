@@ -1,6 +1,6 @@
 import {afterEach,expect,test} from 'bun:test';
 import {resolve,join} from 'node:path';
-import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {existsSync,mkdirSync,readFileSync,writeFileSync,readdirSync,unlinkSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {NativeClient} from './workspace-ui-client.mjs';
@@ -264,3 +264,38 @@ test('native owner settings persist validated defaults and expose MCP inventory'
  expect(inventory.servers).toBeArray();
  expect(native.stderr).toBe('');
 },90000);
+
+
+test('channel commands survive a host restart and dispatch once through governed execution',async()=>{
+ const f=fixture();const provider=model(f,(body)=>{expect(body.messages.some((message:any)=>typeof message.content==='string'&&message.content.includes('Retained channel context data follows'))).toBe(true);return {content:'Hello from the retained contract queue.'}});
+ expect((await f.run(['fossil','init'])).code).toBe(0);
+ const first=host(f);
+ const received=await first.request('contracts',{action:'receive',destination:{channel:'cli',address:'owner'},message_id:'one',text:'Say hello from the shared workspace'});
+ const command=await first.request('contracts',{action:'command',key:received.key,choice:'new'});
+ expect(command.command.state).toBe('queued');
+ await first.close();clients.splice(clients.indexOf(first),1);
+ const second=host(f);
+ const retained=await second.request('contracts',{action:'commands'});
+ expect(retained.items[0].key).toBe(command.key);
+ const observed:any[]=[];second.on('event',(event:any)=>observed.push(event));
+ const roots=readdirSync(join(f.home,'.fx','fossil'));
+ const activation=roots.map(root=>join(f.home,'.fx','fossil',root,'channel-activations',command.key)).find(existsSync)!;
+ expect(activation).toBeString();unlinkSync(activation);
+ const inactive=await second.request('channel.dispatch',{key:command.key});
+ expect(inactive.state).toBe('blocked');expect(inactive.reason).toBe('ChannelActivationRequired');expect(provider.counts().actors).toBe(0);
+ const activated=await second.request('contracts',{action:'command',key:received.key,choice:'new'});
+ expect(activated.command.state).toBe('queued');
+ const ending=terminal(second,command.key);
+ const dispatched=await second.request('channel.dispatch',{key:command.key});
+ expect(dispatched.state).toBe('accepted');
+ const ended=await ending;if(ended.data.exit_code)console.error(JSON.stringify(observed),second.stderr);expect(ended.data.exit_code).toBe(0);
+ const calls=provider.counts().actors;
+ const replay=await second.request('channel.dispatch',{key:command.key});
+ expect(replay.state).toBe('accepted');expect(provider.counts().actors).toBe(calls);
+ const commands=await second.request('contracts',{action:'commands'});
+ const task=commands.items[0].record.task;expect(task).toBeString();
+ const followup=await second.request('contracts',{action:'receive',destination:{channel:'telegram',address:'owner'},message_id:'two',text:'How did it go?',reply_to:received.key});
+ expect(followup.resolution.task).toBe(task);
+ expect(followup.resolution.status.published).toBe(true);
+ expect(second.stderr).toBe('');
+},180000);

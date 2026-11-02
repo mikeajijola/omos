@@ -2215,6 +2215,49 @@ pub const Manager = struct {
         if (result.tree) |tree| try self.cleanCompanyTree(tree, &files);
     }
 
+    pub const CommunicationWrite = struct { key: []const u8, expected: ?[]const u8 = null, content: []const u8 };
+
+    fn communicationPath(self: Manager, key: []const u8) ![]const u8 {
+        if (key.len == 0 or key.len > 128) return error.InvalidCommunicationKey;
+        for (key) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.InvalidCommunicationKey;
+        return self.alloc.print("runtime/communications/{s}.json", .{key});
+    }
+
+    pub fn communication(self: Manager, key: []const u8) !?[]const u8 {
+        const revision_id = (try self.runtimeRevisionIfPresent()) orelse return null;
+        return self.communicationAt(key, revision_id);
+    }
+
+    fn communicationAt(self: Manager, key: []const u8, revision_id: []const u8) !?[]const u8 {
+        const path = try self.communicationPath(key);
+        for (try self.fileManifest(revision_id)) |file| {
+            if (std.mem.eql(u8, file.path, path)) return try self.retrievalArtifact(file.artifact orelse return error.MissingArtifact);
+        }
+        return null;
+    }
+
+    /// Inference and transport happen outside this transaction. Message receipts,
+    /// subscriptions and outbox entries commit together under a short writer lease.
+    pub fn saveCommunications(self: Manager, writes: []const CommunicationWrite) !void {
+        if (writes.len == 0 or writes.len > 8) return error.InvalidCommunicationBatch;
+        const lease = try self.writerLease();
+        defer lease.release();
+        const revision_id = try self.runtimeRevisionIfPresent();
+        var files: std.ArrayList(CompanyFile) = .empty;
+        for (writes, 0..) |item, i| {
+            if (item.content.len > 65536) return error.CommunicationTooLarge;
+            for (writes[0..i]) |previous| if (std.mem.eql(u8, previous.key, item.key)) return error.DuplicateCommunicationKey;
+            const previous = if (revision_id) |rev| try self.communicationAt(item.key, rev) else null;
+            if (previous) |bytes| {
+                const expected = item.expected orelse return error.CommunicationConflict;
+                if (!std.mem.eql(u8, expected, try hash(self.alloc, bytes))) return error.CommunicationConflict;
+            } else if (item.expected != null) return error.CommunicationConflict;
+            try files.append(self.alloc, .{ .path = try self.communicationPath(item.key), .content = item.content });
+        }
+        const result = try self.commitSparseFiles(revision_id, files.items, runtime_branch, "communications-scratch", "Retain contract communications");
+        if (result.tree) |tree| try self.cleanCompanyTree(tree, files.items);
+    }
+
     /// Host-owned diagnostic records are portable workspace history, not
     /// permissions, task obligations or actor-editable evidence.
     pub fn retainRoutingDecision(self: Manager, session: []const u8, message: []const u8, decision: anytype) !void {

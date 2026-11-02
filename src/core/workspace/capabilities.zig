@@ -8,10 +8,11 @@ const background = @import("background_api.zig");
 
 pub const Request = struct {
     version: []const u8 = "omos.capabilities/v1",
-    action: enum { catalog, classify, search, read, query, attention, conversations, conversation, background },
+    action: enum { catalog, classify, search, read, query, attention, conversations, conversation, background, contracts },
     classification: ?classification.Request = null,
     retrieval: ?retrieval.Request = null,
     background: ?background.Request = null,
+    contracts: ?@import("contract_channels.zig").Request = null,
     session: ?[]const u8 = null,
     offset: usize = 0,
 };
@@ -19,7 +20,7 @@ pub const Request = struct {
 pub fn execute(alloc: std.mem.Allocator, request: Request, trusted_operator: bool, cancel: ?*std.atomic.Value(bool)) !std.json.Value {
     if (!std.mem.eql(u8, request.version, "omos.capabilities/v1")) return error.UnsupportedCapabilitiesVersion;
     if (request.action == .conversation and request.session == null) return error.SessionIdRequired;
-    if (request.action == .catalog) return value(alloc, .{ .version = "omos.capabilities/v1", .operations = &[_][]const u8{ "classify", "search", "read", "query", "attention", "conversations", "conversation", "background" }, .classification_configured = classification.configured(), .classification_advisory = true });
+    if (request.action == .catalog) return value(alloc, .{ .version = "omos.capabilities/v1", .operations = &[_][]const u8{ "classify", "search", "read", "query", "attention", "conversations", "conversation", "background", "contracts" }, .classification_configured = classification.configured(), .classification_advisory = true });
     if (request.action == .classify) return value(alloc, try classification.execute(alloc, request.classification orelse return error.MissingClassificationRequest, cancel));
     var manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
     var stopped = std.atomic.Value(bool).init(false);
@@ -43,6 +44,7 @@ pub fn execute(alloc: std.mem.Allocator, request: Request, trusted_operator: boo
             };
             break :blk try background.execute(manager, input);
         },
+        .contracts => try @import("contract_channels.zig").execute(manager, request.contracts orelse return error.MissingContractRequest, trusted_operator),
         .attention => try @import("attention.zig").snapshot(manager, request.offset),
         .conversations, .conversation => try @import("conversations.zig").execute(manager, request.session, request.offset),
     };

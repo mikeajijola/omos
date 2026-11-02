@@ -937,7 +937,18 @@ pub const workspace_content = ToolSpec{
         .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation", "background" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation", "background", "contracts" } } },
+                .{ .name = "contracts", .json_type = .object, .description = "Resolve a message against retained contracts across channels, or inspect status and scheduled updates. Repeated user requests require a visible choice, never silent suppression. Routing does not grant execution or approval authority.", .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "status", "context", "resolve", "subscriptions", "outbox", "commands" } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "text", .json_type = .string },
+                        .{ .name = "reply_to", .json_type = .string },
+                        .{ .name = "offset", .json_type = .integer },
+                    },
+                    .required = &.{"action"},
+                    .additional_properties = false,
+                } } },
                 .{ .name = "background", .json_type = .object, .description = "Inspect workers and their live event evidence without waiting for publication. Running and checkpoint counts are not proof of progress. workspace_governance_pending means review failed to finish, not that work completed. Read events before reporting outcomes; follow next_offset until coverage is complete.", .shape = &.{ .object = &.{
                     .properties = &.{
                         .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "host", "list", "show", "events", "receipt" } } },
@@ -1099,7 +1110,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "5ff39de1589d72ce5ad0c9d63141dfd2d1098cf21ec2dd7202000e5fbec8b4ed",
+        "e893eb49b258a02c2619d6a45a264c8b4063b858fe4db5dfd669f749a518c11b",
         &actual_hex,
     );
 }

@@ -495,7 +495,7 @@ test "workspace governance planning excludes empty evidence reads and uses confi
             }
             const calls = try alloc.alloc(types.ToolCall, 1);
             calls[0] = .{ .id = try alloc.dupe(u8, "decision"), .name = try alloc.dupe(u8, if (self.calls == 1) "omos_review_evidence" else "omos_task_plan"), .arguments_json = try alloc.dupe(u8, if (self.calls == 1) "{\"action\":\"list\"}" else "{\"capability\":\"general_task\",\"summary\":\"Explain the detail\",\"obligations\":[],\"checks\":[]}") };
-            return .{ .completed = .{ .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
+            return .{ .completed = .{ .ownership = .owned, .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -539,7 +539,7 @@ test "workspace progress prioritizes recent evidence and reserves a decision cal
             try std.testing.expectEqual(@as(usize, if (deciding) 1 else 2), request.tools.additional_functions.len);
             const calls = try alloc.alloc(types.ToolCall, 1);
             calls[0] = .{ .id = try alloc.dupe(u8, "review"), .name = try alloc.dupe(u8, if (deciding) "omos_progress_assessment" else "omos_review_evidence"), .arguments_json = try alloc.dupe(u8, if (deciding) "{\"outcome\":\"continue_work\",\"meaningful\":false,\"evidence\":[],\"remaining\":[\"request_complete\"],\"note\":\"Use the requested external capability next.\"}" else "{\"action\":\"list\",\"offset\":0,\"limit\":1}") };
-            return .{ .completed = .{ .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
+            return .{ .completed = .{ .ownership = .owned, .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
         }
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
