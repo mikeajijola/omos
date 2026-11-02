@@ -422,6 +422,16 @@ and full inspection remain required. Repeated invalid responses pause the task w
 metadata, correction reasons, failure diagnostics, and reported usage survive a
 failed review. Credentials and opaque provider replay state are not journaled.
 
+Transient reviewer timeouts and service failures retry within the pinned call,
+attempt, and deadline limits. Provider throttling defers the check without an
+immediate retry. If a periodic progress assessor remains unavailable, the host
+records `progress_review_deferred` and continues the existing contract until
+the next progress interval. This records neither meaningful progress nor a
+stall and does not reset previous stall counts. Actor-step limits, permissions,
+and independent completion verification still apply. Planning and contract
+revision require a valid assessment before execution starts or requirements
+change; malformed assessments cannot use the unavailable-service fallback.
+
 The execution policy defaults to a progress check after every four completed
 tool batches, a pause after three consecutive stalled checks, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with

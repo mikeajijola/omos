@@ -25,6 +25,12 @@ pub const State = struct {
     finalizing: bool = false,
     pause_reason: ?[]const u8 = null,
 
+    /// An unavailable assessor establishes neither progress nor a stall. Retry
+    /// at the next interval without changing the contract or completion gate.
+    pub fn deferUnavailable(self: *State) void {
+        self.assessed_batches = self.batches;
+    }
+
     pub noinline fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
         return self.observeWithBacking(alloc, result, records, policy, &.{});
     }
@@ -221,6 +227,8 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
     var usage: types.Usage = .{};
     var calls: usize = 0;
     var last_reason: []const u8 = "";
+    var unavailable = false;
+    var transport_failures: usize = 0;
     defer {
         tracking.usage = usage;
         tracking.calls = calls;
@@ -266,7 +274,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
         if (try review_budget.serializedBytes(alloc, messages.items) > policy.max_context_bytes) return error.TaskGovernancePending;
         if (std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(io.getIo(), .awake), .gte, deadline)) {
             last_reason = "ReviewAttemptDeadline";
-            return error.TaskGovernancePending;
+            return if (unavailable) error.TaskGovernanceUnavailable else error.TaskGovernancePending;
         }
         if (policy.max_tokens) |limit| if ((usage.input_tokens orelse 0) +| (usage.output_tokens orelse 0) >= limit) {
             last_reason = "ReviewTokenBudget";
@@ -279,13 +287,32 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
         calls += 1;
         var result = gateway.streamModelCompletion(provider, alloc, request) catch |err| {
             last_reason = @errorName(err);
+            unavailable = transientTransportError(err);
+            if (unavailable) {
+                transport_failures += 1;
+                try journal.record("governance_transport_retry", try std.json.Stringify.valueAlloc(alloc, .{ .phase = function.name, .call = calls, .reason = last_reason, .retrying = transport_failures < policy.max_attempts }, .{}));
+                if (transport_failures < policy.max_attempts) continue;
+                return error.TaskGovernanceUnavailable;
+            }
             return if (err == error.Cancelled or err == error.OutOfMemory) err else error.TaskGovernancePending;
         };
         defer result.deinit(alloc);
         if (result != .completed) {
             last_reason = @tagName(result.failed.kind);
+            unavailable = switch (result.failed.kind) {
+                .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout => true,
+                else => false,
+            };
+            if (unavailable) {
+                transport_failures += 1;
+                // Respect provider throttling by deferring, rather than hammering
+                // a rate-limited endpoint with immediate retries.
+                if (result.failed.kind != .rate_limited and transport_failures < policy.max_attempts) continue;
+                return error.TaskGovernanceUnavailable;
+            }
             return error.TaskGovernancePending;
         }
+        unavailable = false;
         const completion = result.completed.completion;
         inline for (.{ "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens" }) |key| if (@field(completion.usage, key)) |n| {
             @field(usage, key) = (@field(usage, key) orelse 0) +| n;
@@ -346,7 +373,75 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
             try messages.append(alloc, .{ .role = .tool, .tool_call_id = try alloc.dupe(u8, call.id), .tool_name = try alloc.dupe(u8, call.name), .tool_result_status = if (failure != null) .failure else .success, .content = content });
         }
     }
-    return error.TaskGovernancePending;
+    return if (unavailable) error.TaskGovernanceUnavailable else error.TaskGovernancePending;
+}
+
+fn transientTransportError(err: anyerror) bool {
+    return switch (err) {
+        error.Timeout, error.ConnectionTimedOut, error.ConnectionResetByPeer, error.ConnectionRefused, error.NetworkUnreachable => true,
+        else => false,
+    };
+}
+
+test "workspace governance retries transient reviewer timeouts within the pinned attempt limit" {
+    const Fake = struct {
+        calls: usize = 0,
+        always_timeout: bool = false,
+        fn record(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+        fn stream(raw: ?*anyopaque, alloc: std.mem.Allocator, request: streams.ModelRequest) !streams.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.calls += 1;
+            if (self.always_timeout or self.calls == 1) return error.Timeout;
+            const calls = try alloc.alloc(types.ToolCall, 1);
+            calls[0] = .{ .id = try alloc.dupe(u8, "plan"), .name = try alloc.dupe(u8, "omos_task_plan"), .arguments_json = try alloc.dupe(u8, "{\"capability\":\"general_task\",\"summary\":\"Explain\",\"obligations\":[],\"checks\":[]}") };
+            return .{ .completed = .{ .ownership = .owned, .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fake: Fake = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery: streams.DeliveryCertainty = .init();
+    var attempt: streams.AttemptEvidence = .{};
+    var event_context: u8 = 0;
+    const request: streams.ModelRequest = .{
+        .credential = .{ .direct = .{ .secret_bytes = "fixture" } },
+        .model = "fixture",
+        .retry_count = 0,
+        .messages = &.{},
+        .tool_choice = .required,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt,
+        .events = .{ .context = &event_context, .emit_fn = discard },
+        .cancel_flag = &cancel,
+    };
+    const definition: contract.Definition = .{ .id = "task", .version = 1, .objective = "Explain", .obligations = &.{.{ .id = "request_complete", .description = "Explain" }} };
+    const packet = try std.json.Stringify.valueAlloc(alloc, .{ .contract = definition }, .{});
+    const provider: streams.Provider = .{ .context = &fake, .stream_fn = Fake.stream };
+    const journal: review.Journal = .{ .context = &event_context, .record_fn = Fake.record };
+    _ = try plan(alloc, provider, request, .gateway, packet, journal, .{});
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake = .{ .always_timeout = true };
+    try std.testing.expectError(error.TaskGovernanceUnavailable, plan(alloc, provider, request, .gateway, packet, journal, .{}));
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+    cancel.store(true, .seq_cst);
+    try std.testing.expectError(error.Cancelled, plan(alloc, provider, request, .gateway, packet, journal, .{}));
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "unavailable progress assessment preserves stall history and completion requirements" {
+    var state: State = .{ .batches = 8, .assessed_batches = 4, .stalls = 2 };
+    state.deferUnavailable();
+    try std.testing.expectEqual(@as(usize, 8), state.assessed_batches);
+    try std.testing.expectEqual(@as(usize, 2), state.stalls);
+    try std.testing.expect(!state.finalizing);
+    try std.testing.expect(state.pause_reason == null);
+    try std.testing.expectEqual(@as(usize, 0), state.seen.count());
 }
 
 fn earlierDeadline(deadline: std.Io.Clock.Timestamp, other: ?std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {

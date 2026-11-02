@@ -74,6 +74,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         delta = await actor(body, ++actors, request.signal);
         if ((delta as any).tool_calls) reason = "tool_calls";
       }
+      if (delta instanceof Response) return delta;
       const chunks: object[] = [
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta, finish_reason: null }] },
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: reason }] },

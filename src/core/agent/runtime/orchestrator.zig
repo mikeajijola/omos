@@ -7126,7 +7126,7 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
     return reply;
 }
 
-const governance_pause_notice = "Task planning or progress verification could not finish within its bounded review. Your work and evidence are retained. Continue to resume from the retained work.";
+const governance_pause_notice = "The task requirements could not be validated by the review service. Work is retained, but execution cannot start or change its contract until those requirements are validated.";
 
 noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate) !bool {
     const turn = input.managed orelse return false;
@@ -7397,7 +7397,7 @@ fn processQueuedPromptLoop(
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     if (managed) |*turn| {
         _ = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = 0, .managed = turn }) catch |err| {
-            if (err != error.TaskGovernancePending) return err;
+            if (err != error.TaskGovernancePending and err != error.TaskGovernanceUnavailable) return err;
             try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
             return;
         };
@@ -7603,7 +7603,7 @@ fn processQueuedPromptLoop(
         if (managed) |*turn| {
             try turn.progress(arena, within_turn_suffix.items);
             const revised_plan = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }) catch |err| {
-                if (err != error.TaskGovernancePending) return err;
+                if (err != error.TaskGovernancePending and err != error.TaskGovernanceUnavailable) return err;
                 try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
                 return;
             };
@@ -7627,11 +7627,17 @@ fn processQueuedPromptLoop(
                 governance.finalizing = true;
                 try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
             }
-            if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) {
+            if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) progress_check: {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
                 const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false) catch |err| {
+                    if (err == error.TaskGovernanceUnavailable) {
+                        try turn.manager.record(turn.task, "progress_review_deferred", .{ .step = step, .reason = "review_service_unavailable", .progress_verified = false, .completion_review_required = true });
+                        governance.deferUnavailable();
+                        try deps.push_system_notice(deps.ctx, "The progress reviewer is temporarily unavailable. Continuing the existing contract; completion still requires verification.");
+                        break :progress_check;
+                    }
                     if (err != error.TaskGovernancePending) return err;
-                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The progress reviewer returned no valid assessment. Work is retained for diagnosis; no completion has been claimed.", "workspace_governance_pending");
                     return;
                 };
                 const progress = try record_json.decode(task_governance.Progress, arena, reply.raw, .{});

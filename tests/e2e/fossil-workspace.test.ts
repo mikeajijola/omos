@@ -26,6 +26,46 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
+  test("an unavailable progress reviewer defers the check without replaying work or bypassing completion", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let progressCalls = 0;
+    const provider = model(f, (_body, count) => count <= 4 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all four checkpoints." }, undefined, {
+      reply: (_body, _packet, phase) => {
+        if (phase !== "progress") return;
+        progressCalls++;
+        return Response.json({ error: { message: "Reviewer temporarily unavailable" } }, { status: 503 });
+      },
+    });
+    const result = await f.run(["ask", "Save four sequential preference checkpoints", "--json"], {}, 150000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(progressCalls).toBeGreaterThanOrEqual(3);
+    expect(provider.counts().actors).toBe(5);
+    expect(provider.counts().assessments).toBeGreaterThan(0);
+    expect(JSON.parse(result.stdout).final_output).toBe("Saved all four checkpoints.");
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).toBe("accepted");
+  }, 180000);
+
+  test("an unavailable planner cannot start actor work without a validated contract", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let planningCalls = 0;
+    const provider = model(f, () => ({ content: "Must not execute" }), undefined, {
+      reply: (_body, _packet, phase) => {
+        if (phase !== "plan") return;
+        planningCalls++;
+        return Response.json({ error: { message: "Planner temporarily unavailable" } }, { status: 503 });
+      },
+    });
+    const result = await f.run(["ask", "Save a preference", "--json"], {}, 150000);
+    expect(result.code).not.toBe(0);
+    expect(planningCalls).toBeGreaterThanOrEqual(3);
+    expect(provider.counts().actors).toBe(0);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).not.toBe("accepted");
+  }, 180000);
+
   test("contract communications retain cross-channel messages and fence scheduled deliveries", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
