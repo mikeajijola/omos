@@ -47,6 +47,46 @@ describe("portable Fossil agent workspace", () => {
     expect(task.state).toBe("accepted");
   }, 180000);
 
+  test("reused evidence is reconciled without overriding useful continuation", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let retainedId = "";
+    let corrections = 0;
+    const steps = new Set<number>();
+    const provider = model(f, (_body, count) => count <= 16 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all sixteen checkpoints." }, undefined, {
+      reply: (body, packet, phase) => {
+        if (phase !== "progress") return;
+        steps.add(packet.context.step);
+        expect(packet.progressContext.newEvidenceCount).toBeGreaterThan(0);
+        expect(packet.progressContext.newEvidenceIds.length).toBeLessThanOrEqual(16);
+        if (steps.size > 1) {
+          expect(packet.progressContext.previousAssessment.meaningful).toBe(true);
+          expect(packet.progressContext.consecutiveNoProgress).toBe(0);
+        }
+        retainedId ||= packet.evidence.find((entry: any) => entry.kind === "tool" && entry.status === "success").id;
+        const results = body.messages.filter((message: any) => message.role === "tool");
+        const corrected = results.some((message: any) => message.content.includes("ProgressReassessmentRequired"));
+        if (corrected) corrections++;
+        const name = results.length === 0 ? "omos_review_evidence" : "omos_progress_assessment";
+        const args = results.length === 0 ? { action: "read", id: retainedId } : {
+          outcome: "continue_work", meaningful: true, evidence: [retainedId],
+          remaining: packet.context.contract.obligations.map((obligation: any) => obligation.id),
+          note: `Continue the remaining checkpoints after step ${packet.context.step}.`,
+          ...(corrected ? { reassessment: "The retained write result establishes the supported operation; apply it to the next checkpoint rather than repeating the previous checkpoint." } : {}),
+        };
+        return { tool_calls: [{ index: 0, id: `review-${results.length}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] };
+      },
+    });
+    const result = await f.run(["ask", "Save sixteen sequential preference checkpoints", "--json"], {}, 240000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(steps.size).toBe(4);
+    expect(corrections).toBe(3);
+    expect(provider.counts().actors).toBe(17);
+    expect(provider.counts().assessments).toBeGreaterThan(0);
+    expect(JSON.parse(result.stdout).final_output).toBe("Saved all sixteen checkpoints.");
+    expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+  }, 270000);
+
   test("an unavailable planner cannot start actor work without a validated contract", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);

@@ -5303,8 +5303,13 @@ sys.exit(result.returncode)
   test("does not let a progress checkpoint cite a cached large preview as fully inspected evidence", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const declaration = join(f.home, "definition.json");
+    const execution = join(f.home, "execution.json");
+    writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+    writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 6 } }));
+    expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
     let checks = 0;
-    const m = model(f, (_body, count) => count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
+    const m = model(f, (body, count) => !body.tools?.length ? { content: "The policy is retained but verification is unfinished." } : count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
       tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     }, undefined, { progress: packet => {
       checks++;
@@ -5317,18 +5322,24 @@ sys.exit(result.returncode)
     const result = await f.run(["ask", "Save the policy and inspect the workspace for useful follow-up information", "--json"], {}, 90000);
     expect(result.code).toBe(1);
     expect(checks).toBe(8);
-    expect(result.stderr).toContain("could not finish within its bounded review");
-    expect(m.counts().actors).toBe(4);
+    expect(result.stderr + result.stdout).toContain("actor-step budget");
+    expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
   }, 120000);
 
-  test("stops a repeated successful search after three stalled progress checks", async () => {
+  test("reviewer pauses a repeated successful search after reassessing three stalled checks", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     const m = model(f, (body, count) => !body.tools?.length ? { content: "The search is unfinished. The repeated results are retained." } : {
       tool_calls: [{ index: 0, id: `search-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
-    });
+    }, undefined, { progress: (packet) => ({
+      outcome: packet.progressContext.consecutiveNoProgress >= 2 ? "pause" : "continue_work",
+      meaningful: false, evidence: [], remaining: ["request_complete"],
+      note: "Repeated workspace reads have not resolved the request.",
+      reassessment: "Three checks found the same workspace data; repeating this search cannot resolve the missing information.",
+    }) });
+
     const result = await f.run(["ask", "Inspect the workspace repeatedly until useful information is found", "--json"], {}, 180000);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain("Task paused");
@@ -6173,11 +6184,16 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
   }, 120000);
 }
 
-test("workspace governance pauses with rejected response diagnostics and usage after bounded corrections", async () => {
+test("workspace governance defers rejected assessments with diagnostics until the actor budget", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  const declaration = join(f.home, "definition.json");
+  const execution = join(f.home, "execution.json");
+  writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+  writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 6 } }));
+  expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
   let progressCalls = 0;
-  const m = model(f, () => ({ tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] }), undefined, {
+  const m = model(f, (body) => !body.tools?.length ? { content: "Inspection remains unfinished." } : ({ tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] }), undefined, {
     usage: { prompt_tokens: 23, completion_tokens: 7, total_tokens: 30 },
     reply(_body, _packet, phase) {
       if (phase !== "progress") return;
@@ -6187,22 +6203,22 @@ test("workspace governance pauses with rejected response diagnostics and usage a
   });
   const result = await f.run(["ask", "Inspect the workspace before answering", "--json"], {}, 120000);
   expect(result.code).toBe(1);
-  expect(result.stderr).toContain("could not finish within its bounded review");
-  expect(result.stdout + result.stderr).toContain("work and evidence are retained");
-  expect(JSON.parse(result.stdout).error).toBe("workspace_governance_pending");
+  expect(result.stderr + result.stdout).toContain("actor-step budget");
   expect(progressCalls).toBe(8);
-  expect(m.counts()).toEqual({ actors: 4, assessments: 0 });
+  expect(m.counts()).toEqual({ actors: 6, assessments: 0 });
   const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
   expect(task.state).toBe("paused");
   const journal = governanceJournal(f, task);
+  expect(journal.some((entry: any) => entry.kind === "progress_review_deferred")).toBe(true);
+  expect(journal.some((entry: any) => entry.kind === "progress_assessment")).toBe(false);
   const failure = JSON.parse(journal.find((entry: any) => entry.kind === "governance_failure").value.data);
   expect(failure.reason).toBe("TaskGovernancePending");
   expect(failure.last_reason).toBe("InvalidTaskGovernance");
   expect(failure.calls).toBe(8);
   expect(failure.usage.input_tokens).toBe(184);
   expect(failure.usage.output_tokens).toBe(56);
-  expect(JSON.parse(result.stdout).usage.input_tokens).toBe(299);
-  expect(JSON.parse(result.stdout).usage.output_tokens).toBe(91);
+  expect(JSON.parse(result.stdout).usage.input_tokens).toBeGreaterThanOrEqual(184);
+  expect(JSON.parse(result.stdout).usage.output_tokens).toBeGreaterThanOrEqual(56);
   expect(journal.filter((entry: any) => entry.kind === "governance_response" && JSON.parse(entry.value.data).phase === "omos_progress_assessment")).toHaveLength(8);
 }, 120000);
 

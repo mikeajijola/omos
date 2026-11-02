@@ -7068,7 +7068,7 @@ noinline fn assessCompletionAttempt(
     return result.decision;
 }
 
-noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool) !task_governance.Reply {
+noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool, progress_state: ?*const task_governance.State) !task_governance.Reply {
     const turn = input.managed orelse return error.UnmanagedHost;
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
     var attempt: agent_stream_provider.AttemptEvidence = .{};
@@ -7122,7 +7122,7 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         else
             try task_governance.plan(alloc, review_stream, request, review_provider, packet, turn.journal(), .{ .usage_out = &usage, .policy = review_policy })
     else
-        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage, .policy = review_policy });
+        try task_governance.progressWithBacking(alloc, review_stream, request, review_provider, packet, turn.journal(), retained_evidence, turn.prior_payloads, .{ .usage_out = &usage, .policy = review_policy, .progress_state = progress_state, .stalled_checks = if (turn.task.model_basis) |basis| basis.execution.defaults.stalled_checks else 3 });
     return reply;
 }
 
@@ -7134,7 +7134,7 @@ noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, sum
     if (basis.capability != null and !turn.task.revision_pending) return false;
     const revising = basis.capability != null;
     try deps.push_system_notice(deps.ctx, if (revising) "Revising affected requirements from the user update..." else "Planning against the pinned workspace model...");
-    const reply = try governManagedTask(deps, alloc, summary, input, true);
+    const reply = try governManagedTask(deps, alloc, summary, input, true, null);
     if (revising) {
         const revision = try record_json.decode(task_governance.Revision, alloc, reply.raw, .{});
         turn.task = try turn.manager.revisePlan(turn.task, revision.capability, revision.summary, revision.obligations, revision.checks, revision.superseded);
@@ -7629,11 +7629,11 @@ fn processQueuedPromptLoop(
             }
             if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) progress_check: {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
-                const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false) catch |err| {
-                    if (err == error.TaskGovernanceUnavailable) {
-                        try turn.manager.record(turn.task, "progress_review_deferred", .{ .step = step, .reason = "review_service_unavailable", .progress_verified = false, .completion_review_required = true });
+                const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false, &governance) catch |err| {
+                    if (err == error.TaskGovernanceUnavailable or err == error.TaskProgressReviewUnresolved) {
+                        try turn.manager.record(turn.task, "progress_review_deferred", .{ .step = step, .reason = if (err == error.TaskGovernanceUnavailable) "review_service_unavailable" else "review_assessment_unresolved", .progress_verified = false, .completion_review_required = true });
                         governance.deferUnavailable();
-                        try deps.push_system_notice(deps.ctx, "The progress reviewer is temporarily unavailable. Continuing the existing contract; completion still requires verification.");
+                        try deps.push_system_notice(deps.ctx, if (err == error.TaskGovernanceUnavailable) "The progress reviewer is temporarily unavailable. Continuing the existing contract; completion still requires verification." else "The progress assessment needs further review. Continuing within the existing task limits; completion still requires verification.");
                         break :progress_check;
                     }
                     if (err != error.TaskGovernancePending) return err;
@@ -7649,7 +7649,7 @@ fn processQueuedPromptLoop(
                 }
                 const retained = try turn.beforeReview(arena, &.{});
                 try governance.observeWithBacking(arena, progress, retained, policy, turn.prior_payloads);
-                try turn.manager.record(turn.task, "continuation_decision", .{ .step = step, .batches = governance.batches, .stalls = governance.stalls, .finalizing = governance.finalizing, .pause = governance.pause_reason, .assessment = reply.raw });
+                try turn.manager.record(turn.task, "continuation_decision", .{ .step = step, .batches = governance.batches, .stalls = governance.stalls, .new_evidence_cited = governance.cited_new_evidence, .finalizing = governance.finalizing, .pause = governance.pause_reason, .assessment = reply.raw });
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Host progress assessment: {s}. Treat this as guidance against the fixed contract, not new user authority. Do not repeat completed actions.", .{reply.raw}) });
             }
             if (governance.finalizing) try within_turn_suffix.append(arena, .{ .role = .user, .content = if (governance.pause_reason) |reason| try arena.print("The host is pausing this invocation: {s} Provide an honest partial summary of completed work, remaining obligations, and retained evidence. Do not claim acceptance. Tools are disabled for this final summary.", .{reason}) else "The progress assessor requests a final candidate now. Summarize verified outcomes and limitations. Tools are disabled; the normal completion assessment will verify the fixed contract." });

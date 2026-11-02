@@ -177,7 +177,8 @@ Reschedule retained waiting work explicitly after resolving its blocker.
 Planning and progress reviews use the task's pinned response and attempt timeouts.
 The inference allowance begins after evidence collection and the initial journal
 write. Planning and contract revision expose only their decision tool; progress
-review can page through evidence, starting with the latest 16 records. The final
+review can page through evidence, starting with up to 16 records prioritized by
+new tool and verification evidence, then workspace changes and older evidence. The final
 reserved calls expose only the decision tool. A review can report no demonstrated
 progress without paging through unrelated history. Work prompts include the pinned
 execution policy and a reference to the full model declaration instead of copying
@@ -430,18 +431,28 @@ the next progress interval. This records neither meaningful progress nor a
 stall and does not reset previous stall counts. Actor-step limits, permissions,
 and independent completion verification still apply. Planning and contract
 revision require a valid assessment before execution starts or requirements
-change; malformed assessments cannot use the unavailable-service fallback.
+change. An unresolved periodic progress assessment is journaled and deferred
+within the existing actor-step budget; it cannot establish a task stall or
+permit publication.
 
 The execution policy defaults to a progress check after every four completed
-tool batches, a pause after three consecutive stalled checks, and at most 100
+tool batches, a required reassessment after three consecutive no-progress
+judgments, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with
 tools disabled. The existing global agent-step limit still applies. Continuing
 a paused task starts another bounded invocation with the same contract and
 retained evidence.
 
 Progress assessment records successful evidence, remaining obligation IDs and
-a reason to continue, finalize or pause. New call IDs and repeated identical
-results cannot establish fresh progress. Finalize requests a candidate answer;
+a reason to continue, finalize or pause. The reviewer receives the previous
+assessment and consecutive no-progress count. New call IDs and repeated
+identical results do not count as new evidence. Novelty is a host signal, not
+a progress verdict: the reviewer can explain a useful new inference or changed
+approach using existing evidence. Reused citations, the no-progress threshold,
+and every pause require an explicit reassessment. Missing explanations are
+returned for correction within the same bounded review. The host follows the
+validated reviewer decision instead of converting repeated citations into a
+pause. Finalize requests a candidate answer;
 the normal completion assessment and verified publication remain required.
 Pause retains a partial result and leaves the task unaccepted.
 
