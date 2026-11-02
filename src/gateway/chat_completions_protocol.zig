@@ -605,7 +605,10 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
             try std.json.Stringify.value(function.name, .{}, writer);
             try writer.writeAll(",\"description\":");
-            try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description);
+            switch (function.schema) {
+                .builtin => try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description),
+                .dynamic => try std.json.Stringify.value(function.description, .{}, writer),
+            }
             try writer.writeAll(",\"parameters\":");
             switch (function.schema) {
                 .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
@@ -1921,7 +1924,8 @@ test "chat completions nested builtin additional and dynamic tool wire" {
     defer dynamic_schema.deinit();
     var request = test_tool_request();
     request.tools.additional_functions = &.{.{ .name = "permission_decision", .description = "Decide." }};
-    request.tools.selected_dynamic = &.{.{ .name = "mcp_docs", .description = "Find docs.", .input_schema = dynamic_schema.value }};
+    const complete_description = text_utils.repeat("d", 9000) ++ " TOOL_DESCRIPTION_TAIL " ++ text_utils.repeat("i", 8000) ++ " SERVER_INSTRUCTION_TAIL";
+    request.tools.selected_dynamic = &.{.{ .name = "mcp_docs", .description = complete_description, .input_schema = dynamic_schema.value }};
     const body = try build_request(alloc, request, .{});
     defer alloc.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1940,6 +1944,7 @@ test "chat completions nested builtin additional and dynamic tool wire" {
     const nested = shell.get("parameters").?.object.get("properties").?.object.get("request").?.object;
     try std.testing.expectEqualStrings("command", nested.get("required").?.array.items[0].string);
     try std.testing.expectEqualStrings("mcp_docs", tools[3].object.get("function").?.object.get("name").?.string);
+    try std.testing.expectEqualStrings(complete_description, tools[3].object.get("function").?.object.get("description").?.string);
     var reducer = try Reducer.init(alloc, request, .{});
     defer reducer.deinit();
     try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"mcp-1\",\"function\":{\"name\":\"mcp_docs\",\"arguments\":\"{\\\"query\\\":\\\"zig\\\"}\"}}]}}]}");

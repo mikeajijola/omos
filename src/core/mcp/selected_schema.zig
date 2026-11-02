@@ -53,7 +53,7 @@ pub const AlwaysLoaded = struct {
             .selected, .rejected => |value| value,
         };
         if (projection == .rejected or payload.model_output.len > b.remaining) {
-            if (projection == .selected) b.omitted += 1;
+            b.omitted += 1;
             projection.deinit(alloc);
             return;
         }
@@ -68,7 +68,7 @@ pub const AlwaysLoaded = struct {
     /// Hands the tools over, with a notice when the budget left any out.
     pub fn finish(b: *AlwaysLoaded, alloc: Allocator) !AlwaysLoadedTools {
         const notice = if (b.omitted > 0) try alloc.print(
-            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
+            "[context] {d} always-loaded MCP tool{s} could not load complete schemas within the context limits and stay discoverable through capability_search",
             .{ b.omitted, if (b.omitted == 1) "" else "s" },
         ) else null;
         errdefer if (notice) |value| alloc.free(value);
@@ -79,57 +79,37 @@ pub const AlwaysLoaded = struct {
 pub fn project(alloc: Allocator, tool: McpTool, server_instructions: ?[]const u8, limits: context_limits.Values) !tool_mcp_runtime.ToolSchemaResult {
     const instruction_limit = limits.mcp_server_instructions_bytes;
     const observed = if (server_instructions) |value| value.len else 0;
-    const instructions = if (server_instructions) |value| value[0..context_limits.lineSafePrefixLength(value, instruction_limit.effectiveBytes())] else null;
-    const truncated = if (instructions) |value| value.len < observed else false;
-    const schema = try buildToolSchemaJsonWithLimitMarker(alloc, tool, instructions, truncated, observed, instruction_limit);
-    var schema_owned = true;
-    errdefer if (schema_owned) alloc.free(schema);
-    const limit = limits.mcp_selected_schema_bytes;
-    if (schema.len > limit.effectiveBytes()) {
-        const schema_bytes = schema.len;
-        alloc.free(schema);
-        schema_owned = false;
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        try out.writer.writeAll("{\"context_limit_rejection\":{\"name\":\"mcp_selected_schema_bytes\",\"tool\":");
-        try model_context_encoding.writeJsonScalar(alloc, &out.writer, tool.prefixed_name);
-        try out.writer.print(",\"action\":\"rejected\",\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":\"{s}\",\"override\":\"--context-limit mcp_selected_schema_bytes=BYTES|off\"}}}}", .{ schema_bytes, limit.effectiveBytes(), limit.source.label() });
-        const output = try out.toOwnedSlice();
-        errdefer alloc.free(output);
-        return .{ .rejected = .{ .model_output = output, .notice = try renderSchemaNotice(alloc, tool.prefixed_name, "rejected", schema_bytes, limit, "mcp_selected_schema_bytes") } };
-    }
-    return .{ .selected = .{ .model_output = schema, .notice = if (truncated) try renderSchemaNotice(alloc, tool.prefixed_name, "instructions truncated", observed, instruction_limit, "mcp_server_instructions_bytes") else null } };
-}
-
-fn buildToolSchemaJsonWithLimitMarker(
-    alloc: Allocator,
-    tool: McpTool,
-    instructions: ?[]const u8,
-    instructions_truncated: bool,
-    instruction_observed_bytes: usize,
-    limit: context_limits.Resolved,
-) ![]u8 {
+    // A selected tool must carry complete usage instructions. Discovery owns
+    // previews; execution either receives the complete schema or a rejection.
+    if (observed > instruction_limit.effectiveBytes())
+        return reject(alloc, tool.prefixed_name, observed, instruction_limit, "mcp_server_instructions_bytes");
     const encoded_description = try encodeScalarAlloc(alloc, tool.description);
     defer alloc.free(encoded_description);
-    const encoded_instructions = if (instructions) |text| try encodeScalarAlloc(alloc, text) else null;
+    const encoded_instructions = if (server_instructions) |text| try encodeScalarAlloc(alloc, text) else null;
     defer if (encoded_instructions) |text| alloc.free(text);
-    const merged_description = if (instructions != null)
-        if (instructions_truncated)
-            try alloc.print(
-                "{s}\n\nServer instructions: {s}\n<context_limit name=\"mcp_server_instructions_bytes\" action=\"truncated\" observed_bytes=\"{d}\" effective_bytes=\"{d}\" source=\"{s}\" override=\"--context-limit mcp_server_instructions_bytes=BYTES|off\" />",
-                .{ encoded_description, encoded_instructions.?, instruction_observed_bytes, limit.effectiveBytes(), limit.source.label() },
-            )
-        else
-            try alloc.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions.? })
+    const description = if (encoded_instructions) |text|
+        try alloc.print("{s}\n\nServer instructions: {s}", .{ encoded_description, text })
     else
         try alloc.dupe(u8, encoded_description);
-    defer alloc.free(merged_description);
-    return model_tool_schema.dynamicFunctionSchemaJsonAlloc(
-        alloc,
-        tool.prefixed_name,
-        merged_description,
-        tool.input_schema_json,
-    );
+    defer alloc.free(description);
+    const schema = try model_tool_schema.dynamicFunctionSchemaJsonAlloc(alloc, tool.prefixed_name, description, tool.input_schema_json);
+    const limit = limits.mcp_selected_schema_bytes;
+    if (schema.len > limit.effectiveBytes()) {
+        defer alloc.free(schema);
+        return reject(alloc, tool.prefixed_name, schema.len, limit, "mcp_selected_schema_bytes");
+    }
+    return .{ .selected = .{ .model_output = schema, .notice = null } };
+}
+
+fn reject(alloc: Allocator, name: []const u8, observed: usize, limit: context_limits.Resolved, limit_name: []const u8) !tool_mcp_runtime.ToolSchemaResult {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.print("{{\"context_limit_rejection\":{{\"name\":\"{s}\",\"tool\":", .{limit_name});
+    try model_context_encoding.writeJsonScalar(alloc, &out.writer, name);
+    try out.writer.print(",\"action\":\"rejected\",\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":\"{s}\",\"override\":\"--context-limit {s}=BYTES|off\",\"reason\":\"Complete tool instructions must fit before this tool can be selected; no partial executable schema was loaded.\"}}}}", .{ observed, limit.effectiveBytes(), limit.source.label(), limit_name });
+    const output = try out.toOwnedSlice();
+    errdefer alloc.free(output);
+    return .{ .rejected = .{ .model_output = output, .notice = try renderSchemaNotice(alloc, name, "rejected (complete instructions required)", observed, limit, limit_name) } };
 }
 
 fn renderSchemaNotice(
@@ -149,4 +129,25 @@ fn renderSchemaNotice(
         .{ action, observed_bytes, limit.effectiveBytes(), limit.source.label(), limit_name },
     );
     return try out.toOwnedSlice();
+}
+
+test "MCP always-loaded tools report instruction rejections instead of disappearing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var limits: context_limits.Values = .{};
+    limits.mcp_server_instructions_bytes = .{ .value = .{ .bytes = 4 }, .source = .user_workspace };
+    var loaded = AlwaysLoaded.init(limits);
+    const tool: McpTool = .{
+        .original_name = "echo",
+        .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
+        .description = try alloc.dupe(u8, "Echo"),
+        .input_schema_json = try alloc.dupe(u8, "{}"),
+        .tags = &.{},
+    };
+    try loaded.add(alloc, tool, "Complete instructions", undefined, limits);
+    var result = try loaded.finish(alloc);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.tools.len);
+    try std.testing.expect(result.notice != null);
 }
