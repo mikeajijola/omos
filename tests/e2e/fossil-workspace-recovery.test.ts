@@ -5060,9 +5060,15 @@ sys.exit(result.returncode)
   test("verifies a retained answer on the server without replaying actor work", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    let permit = false;
-    const m = model(f, () => ({ content: "The retained answer can be reviewed independently." }), packet => permit ? "met" : {
+    let permit = false, truncated = false;
+    const m = model(f, () => ({ content: "The retained answer can be reviewed independently." }), packet => {
+      if (permit && !truncated) {
+        truncated = true;
+        return new Response('data: {"id":"server-review","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } });
+      }
+      return permit ? "met" : {
       name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["invented"], note: "Fixture forces retained review failure" }] },
+      };
     });
     const first = await f.run(["ask", "Give a short informational answer", "--json"]);
     expect(first.code).toBe(1);
@@ -5100,6 +5106,7 @@ sys.exit(result.returncode)
       }
       expect(completed, existsSync(f.env.FX_TRACE_LOG) ? readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-4000) : "").toMatchObject({ state: "published", generation: 1 });
       expect(m.counts().actors).toBe(actorCount);
+      expect(truncated).toBe(true);
       expect(m.packets.at(-1).contract.objective).toBe(task.definition.objective);
       const repaired = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
       expect(repaired.state).toBe("accepted");
@@ -5774,6 +5781,40 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("review-payloads");
   }, 180000);
 
+  test.each(["length", "incomplete", "missing-tool"])("recovers a %s reviewer response and publishes without replaying completed actions", async failure => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Saved once before review recovery.") : { content: "The preference is saved." }, () => {
+      if (++reviews !== 1) return "met";
+      // Even a plausible assessment must not be accepted from a length-ended
+      // stream. The next review must run without repeating the actor's write.
+      const prefix = 'data: {"id":"interrupted-review","choices":[{"index":0,"delta":{"content":"incomplete assessment"},"finish_reason":null}]}\n\n';
+      const end = failure === "incomplete" ? "" : `data: ${JSON.stringify({id:"interrupted-review",choices:[{index:0,delta:{},finish_reason:failure === "length" ? "length" : "stop"}]})}\n\ndata: [DONE]\n\n`;
+      return new Response(prefix + end, { headers: { "content-type": "text/event-stream" } });
+    });
+    const result = await f.run(["ask", "Save the preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(reviews).toBeGreaterThan(1);
+    expect(m.counts().actors).toBe(2);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Saved once before review recovery.");
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks[0].state).toBe("accepted");
+  }, 120000);
+
+  test("exhausts incomplete reviewer retries without accepting a partial answer or repeating actor work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, () => ({ content: "Retain this answer for later verification." }), () => new Response('data: {"id":"always-truncated","choices":[{"index":0,"delta":{"content":"unfinished"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } }));
+    const result = await f.run(["ask", "Give a short informational answer", "--json"], {}, 90000);
+    expect(result.code).toBe(1);
+    expect(result.stderr + result.stdout).toContain("Verification is pending");
+    expect(m.counts().actors).toBe(1);
+    expect(m.counts().assessments).toBeLessThanOrEqual(24);
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks[0].state).toBe("paused");
+  }, 120000);
+
   test("continues a failed review from its retained candidate without repeating actor work", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -5789,8 +5830,14 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const actual = JSON.parse(first.stdout).session_id;
     expect(session).toBe(createHash("sha256").update(actual).digest("hex"));
     permit = true;
-    const resumed = await f.run(["ask", "--resume-id", actual, "continue", "--json"]);
+    let classifierCalls = 0;
+    const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { classifierCalls++; return new Response("unavailable", { status: 503 }); } });
+    let resumed: Awaited<ReturnType<typeof f.run>>;
+    try {
+      resumed = await f.run(["ask", "--resume-id", actual, "continue", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${classifier.port}`, OMOS_CLASSIFIER_MODEL: "fixture-classifier" });
+    } finally { classifier.stop(true); }
     expect(resumed.code, resumed.stderr).toBe(0);
+    expect(classifierCalls).toBe(0);
     expect(resumed.stdout).toContain("A retained answer.");
     expect(m.counts().actors).toBe(1);
   }, 60000);

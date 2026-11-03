@@ -538,13 +538,15 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         out.* = usage;
     };
     var local_tokens: u64 = 0;
+    var response_tokens: u32 = 8192;
     const token_spent = input.token_spent orelse &local_tokens;
     const attempt_deadline = input.request.deadline orelse std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(input.policy.attempt_timeout_ms) });
     for (0..input.policy.max_calls) |call_index| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        request.max_output_tokens = response_tokens;
         if (input.policy.max_tokens) |limit| {
             if (token_spent.* >= limit) return error.ContractReviewPending;
-            request.max_output_tokens = @intCast(@min(@as(u64, 8192), limit - token_spent.*));
+            request.max_output_tokens = @intCast(@min(@as(u64, response_tokens), limit - token_spent.*));
         }
         if (try review_budget.serializedBytes(alloc, messages.items) > input.policy.max_context_bytes) return error.ContractReviewPending;
         const response_deadline = std.Io.Clock.Timestamp.fromNow(io.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(input.policy.response_timeout_ms) });
@@ -558,6 +560,18 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
             // A model ignoring the reserved-call advertisement remains rejected.
             // Preserve verification rather than executing or aliasing its call.
             if (err == error.InvalidToolName and remaining <= input.policy.reserved_calls) return error.ContractReviewPending;
+            if (err == error.OutputTruncated or err == error.IncompleteStream or err == error.RequiredToolMissing) {
+                // Review has no actor executor. Discard the incomplete response,
+                // retaining only inspections already validated by the host.
+                // Each retry consumes a call within the original deadline.
+                if (input.journal) |journal| try journal.record("review_response_retry", try std.json.Stringify.valueAlloc(alloc, .{ .call = call_index + 1, .reason = @errorName(err), .partial_response_discarded = true }, .{}));
+                // The failed stream does not expose authoritative usage. Do not
+                // silently renew an explicitly configured token allowance.
+                if (input.policy.max_tokens != null or remaining <= 1) return error.ContractReviewPending;
+                if (err == error.OutputTruncated) response_tokens = @min(response_tokens * 2, 32768);
+                try messages.append(alloc, .{ .role = .user, .content = "The host discarded your incomplete review response. No assessment or tool call from it was accepted. Continue from the evidence already inspected above. Return one concise tool call only, with short factual notes; do not repeat completed actor actions." });
+                continue;
+            }
             return err;
         };
         defer result.deinit(alloc);

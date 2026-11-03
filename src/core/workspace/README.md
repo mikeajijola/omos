@@ -97,6 +97,22 @@ A review attempt permits at most eight auxiliary model calls under one deadline.
 Exhausting the review budget retains the answer, evidence, and review records.
 Continuing a task with a retained failed-review candidate starts with verification.
 The actor resumes only when assessment identifies useful remaining work.
+Incomplete reviewer responses are discarded and retried within the same call
+and time allowance. Truncated responses receive a larger output allowance, up
+to 32,768 tokens, while validated evidence inspections remain available. When
+an explicit token budget is configured and a failed stream provides no usage,
+verification remains pending rather than silently renewing that budget.
+
+An active background host can recover abandoned workers after a host restart.
+It retains the task and session and acquires a new execution generation. The
+worker must inspect retained evidence and reconcile uncertain external outcomes
+before repeating an action. Recovery is bounded by the pinned stalled-check
+allowance; cancellation, conflicts and blocked tasks are not overridden.
+Pending verification with a retained candidate can also be retried automatically,
+bounded by the pinned review attempt allowance. These recoveries are counted in
+the background record. Verified publication is reconciled without replaying the
+actor. A stopped host still needs to be started by its owning application or
+service supervisor.
 
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.

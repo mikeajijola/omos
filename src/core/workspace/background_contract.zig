@@ -18,6 +18,7 @@ pub const Record = struct {
     owner: ?[]const u8 = null,
     generation: u64 = 0,
     invocations: u32 = 0,
+    recoveries: u32 = 0,
     cancel_requested: bool = false,
     publication_revision: ?[]const u8 = null,
     updated_ms: i64,
@@ -163,6 +164,17 @@ pub fn resumeRecord(previous: Record, now: i64) !Record {
     return next;
 }
 
+/// Recovery advances ownership through the normal queue. It never invokes a
+/// retained tool call and cannot override cancellation or an exhausted budget.
+pub fn recover(previous: Record, limit: usize, now: i64) !Record {
+    try validate(previous);
+    if (previous.cancel_requested or previous.state != .waiting or previous.recoveries >= limit) return error.BackgroundRecoveryUnavailable;
+    var next = try resumeRecord(previous, now);
+    next.recoveries += 1;
+    next.reason = "Recovering retained work; inspect uncertain outcomes before repeating any external action.";
+    return next;
+}
+
 pub fn didNotStart(previous: Record, reason: []const u8, now: i64) !Record {
     try validate(previous);
     if (previous.state != .queued) return error.InvalidBackgroundTransition;
@@ -231,6 +243,25 @@ test "background recovery reconciles an existing publication without another inv
     try std.testing.expectEqual(paused.invocations, reconciled.invocations);
     try std.testing.expectEqual(paused.generation, reconciled.generation);
     try std.testing.expectError(error.InvalidBackgroundTransition, reconcilePublished(paused, "success", 5));
+}
+
+test "automatic recovery preserves the session and cannot override cancellation or its budget" {
+    const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prepared: Record = .{ .workspace = hash, .task = hash, .operation = hash, .request_sha256 = hash, .dispatcher_session = hash, .contract_version = 1, .contract_sha256 = hash, .updated_ms = 1 };
+    const running = try claim(try seal(prepared, hash, 2), hash, "retained-session", 3);
+    const waiting = try wait(running, .{ .owner = hash, .generation = 1 }, "Interrupted", 4);
+    const recovered = try recover(waiting, 1, 5);
+    try std.testing.expectEqual(State.queued, recovered.state);
+    try std.testing.expectEqualStrings("retained-session", recovered.worker_session.?);
+    try std.testing.expectEqual(@as(u32, 1), recovered.recoveries);
+    const restarted = try claim(recovered, hash, "retained-session", 6);
+    try std.testing.expectEqual(@as(u64, 2), restarted.generation);
+    try std.testing.expectError(error.StaleBackgroundOwner, wait(restarted, .{ .owner = hash, .generation = 1 }, "Late result", 7));
+    const exhausted = try wait(restarted, .{ .owner = hash, .generation = 2 }, "Interrupted again", 7);
+    try std.testing.expectError(error.BackgroundRecoveryUnavailable, recover(exhausted, 1, 8));
+    var cancelled = waiting;
+    cancelled.cancel_requested = true;
+    try std.testing.expectError(error.BackgroundRecoveryUnavailable, recover(cancelled, 3, 8));
 }
 
 test "background startup failures consume their invocation identity before another retry" {

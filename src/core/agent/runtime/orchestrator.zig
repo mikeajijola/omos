@@ -7279,7 +7279,13 @@ fn processQueuedPromptLoop(
                 history_messages = .fromOwnedSlice(augmented);
                 route_history = augmented;
             };
-            var decision: routing.Decision = if (@import("../../workspace/classification.zig").configured())
+            // "continue" is the existing retained-task resume command. An
+            // advisory classifier must not turn it into a read-only chat and
+            // strand the pending review or publication behind another model call.
+            const selected_task = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, job.prompt, " \t\r\n"), "continue")) try manager.active(config.fossil_session_id.?) else null;
+            var decision: routing.Decision = if (selected_task != null and selected_task.?.state != .accepted)
+                .{ .route = .work, .reason = "explicit_contract_continuation" }
+            else if (@import("../../workspace/classification.zig").configured())
                 try routing.decide(arena, job.prompt, route_history, config.cancel_flag)
             else
                 .{ .route = .work, .reason = "classifier_not_configured" };

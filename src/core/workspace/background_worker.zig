@@ -87,8 +87,32 @@ pub const Worker = struct {
                 if (entry.state == .running or entry.state == .starting) {
                     const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse continue;
                     defer lease.release();
-                    const abandoned = try domain.wait(entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "The worker host stopped. Inspect retained work and resume explicitly; uncertain effects were not replayed.", io.milliTimestamp());
+                    var task = try manager.loadTask(entry.task);
+                    if (task.state == .publication_pending or task.state == .accepted) {
+                        if (try manager.publicationPending(task)) _ = try manager.retryPublication(task);
+                        task = try manager.loadTask(entry.task);
+                        if (task.state == .accepted and entry.state == .running) {
+                            _ = try dispatch.finish(manager, entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "Recovered verified publication.");
+                            continue;
+                        }
+                    }
+                    var abandoned = try domain.wait(entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "The worker host stopped. Retained work requires recovery; uncertain effects were not replayed.", io.milliTimestamp());
+                    const limit = if (task.model_basis) |basis| basis.execution.defaults.stalled_checks else 3;
+                    if (entry.worker_session != null and task.state != .blocked and task.state != .conflict and task.state != .accepted and task.state != .publication_pending)
+                        abandoned = domain.recover(abandoned, limit, io.milliTimestamp()) catch abandoned;
                     try manager.saveBackgroundRecord(abandoned, try dispatch.digest(manager, entry));
+                    continue;
+                }
+                if (entry.state == .waiting and !entry.cancel_requested and io.milliTimestamp() - entry.updated_ms >= 5000 and
+                    (std.mem.eql(u8, entry.reason, "verification_pending") or std.mem.eql(u8, entry.reason, "OutputTruncated") or std.mem.eql(u8, entry.reason, "ContractReviewPending") or std.mem.eql(u8, entry.reason, "Timeout") or std.mem.eql(u8, entry.reason, "IncompleteStream") or std.mem.eql(u8, entry.reason, "RequiredToolMissing")))
+                {
+                    const task = try manager.loadTask(entry.task);
+                    const limit = if (task.model_basis) |basis| basis.execution.review.max_attempts else 1;
+                    if (task.model_basis) |basis| if (basis.execution.review.max_tokens != null) continue;
+                    if (task.state != .blocked and task.state != .conflict and try manager.retainedReviewCandidate(task) != null) {
+                        const recovered = domain.recover(entry, limit, io.milliTimestamp()) catch continue;
+                        try manager.saveBackgroundRecord(recovered, try dispatch.digest(manager, entry));
+                    }
                     continue;
                 }
                 if (entry.state != .queued) continue;

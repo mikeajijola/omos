@@ -38,7 +38,7 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | Response | { name: string; args: object } | Promise<string | Response | { name: string; args: object }>, governance: { reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -65,6 +65,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         packet.inspections = [...(packet.previousInspections ?? []), ...packet.currentInspections];
         packets.push(packet);
         const status = await assess?.(packet) ?? "met";
+        if (status instanceof Response) return status;
         const evidence = packet.evidence.filter((item: any) => item.complete && (item.kind === "candidate" || item.status === "success")).map((item: any) => item.id);
         delta = { tool_calls: [{ index: 0, id: `assessment-${assessments}`, type: "function", function: {
           name: typeof status === "string" ? "omos_contract_assessment" : status.name, arguments: JSON.stringify(typeof status === "string" ? { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" })) } : status.args),
