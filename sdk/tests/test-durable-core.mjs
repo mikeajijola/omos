@@ -376,6 +376,20 @@ test("a prompt to another agent's session runs on that session's agent", async (
 });
 
 if (durabilityKind === "local") {
+  test("local agents initialize one fresh store concurrently without reading a partial version file", async () => {
+    for (let round = 0; round < 4; round += 1) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-start-"));
+      dirs.push(dir);
+      const agents = Array.from({ length: 4 }, (_, index) => createTaggedAgent({ durability: local({ dir }), name: `worker${index}`, tag: `worker${index}` }));
+      try {
+        const outputs = await Promise.all(agents.map((agent, index) => textOf(agent.session().prompt(`worker${index}`))));
+        outputs.forEach((output, index) => assert.equal(output.text, `worker${index}-0 worker${index}-1 worker${index}-2`));
+      } finally {
+        await Promise.all(agents.map(agent => agent.close()));
+      }
+    }
+  });
+
   // local() makes each agent a World of its own, which delivers only the
   // messages it queued, as world-local does.
   test("agents on one durability, each on a World of its own, still send each other's prompts on", async () => {
@@ -691,15 +705,14 @@ test("a cancel for a turn whose engine cannot open is not retried forever", asyn
   await agent.close();
 });
 
-// Engines that open, except during a 1.5 s outage that starts once engine
-// `after` has opened.
+// Keep the outage active until the test has observed the failed turn. A timed
+// outage can expire before that observation on a busy runner.
 function outageAfter(after) {
-  const outage = { until: Infinity };
-  const opens = (n) => {
-    if (n === after) outage.until = Date.now() + 1500;
-    return n <= after || Date.now() >= outage.until;
+  let recovered = false;
+  return {
+    opens: (n) => n <= after || recovered,
+    over: () => { recovered = true; },
   };
-  return { opens, over: () => sleep(Math.max(0, outage.until - Date.now()) + 50) };
 }
 
 test("an outage while a stuck turn is cancelled does not halt the session", async () => {

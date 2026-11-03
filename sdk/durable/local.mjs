@@ -7,6 +7,19 @@ import { createWorld } from "@workflow/world-local";
 import { world } from "./world.mjs";
 
 const host = hostname();
+const starting = new Map();
+
+function startLocalWorld(store, start) {
+  // world-local writes its version file in place during initialization. Two
+  // agents opening the same local store can otherwise observe the empty file
+  // between creation and write. Serialize initialization in this process;
+  // each agent still owns its own World and queue after startup.
+  const pending = (starting.get(store) ?? Promise.resolve()).catch(() => {}).then(start);
+  starting.set(store, pending);
+  const release = () => { if (starting.get(store) === pending) starting.delete(store); };
+  pending.then(release, release);
+  return pending;
+}
 
 /**
  * `dir` is where the sessions live. Workers on this machine hold a session
@@ -16,10 +29,16 @@ const host = hostname();
  */
 export function local({ dir, maxDurationMs, reserveMs } = {}) {
   if (dir !== undefined && (typeof dir !== "string" || dir.length === 0)) throw new TypeError("local() dir must be a path");
-  return world(() => createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false }), {
+  const store = `local:${dir === undefined ? "" : resolve(dir)}`;
+  return world(() => {
+    const owned = createWorld({ ...(dir === undefined ? {} : { dataDir: dir }), recoverActiveRuns: false });
+    const start = owned.start.bind(owned);
+    owned.start = () => startLocalWorld(store, start);
+    return owned;
+  }, {
     name: "local",
     // Each folder is a store of its own.
-    store: `local:${dir === undefined ? "" : resolve(dir)}`,
+    store,
     livenessKnown: true,
     // world-local keeps its queue in memory, so a message dies with the process.
     queueDurable: false,
