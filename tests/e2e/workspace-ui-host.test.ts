@@ -192,6 +192,24 @@ test('background contracts release the main chat while workers await input and p
   throw Error(`Background state did not converge: ${JSON.stringify(value)}; ${native.stderr}`);
  };
  try {
+  // A foreground Fossil operation may hold the command lease longer than the
+  // worker's 30-second bounded wait. The same host must survive and dispatch
+  // the following contract once the lease becomes available.
+  const slowStart=join(f.home,'slow-host-start');writeFileSync(slowStart,'delay');
+  const fossilWrapper=join(f.home,'slow-fossil');
+  const realFossil=Bun.which('fossil');expect(realFossil).not.toBeNull();
+  writeFileSync(fossilWrapper,`#!/usr/bin/env python3\nimport os,sys,time\nif os.path.exists(${JSON.stringify(slowStart)}) and 'cat' in sys.argv:\n time.sleep(6)\nos.execv(${JSON.stringify(realFossil)},[${JSON.stringify(realFossil)}]+sys.argv[1:])\n`,{mode:0o755});
+  try {
+   expect((await f.run(['ui-host','--background-start'],{OMOS_FOSSIL_BIN:fossilWrapper})).code).toBe(0);
+  } finally { unlinkSync(slowStart); }
+  const rootHash=createHash('sha256').update(join(f.cwd,'omos.fossil')).digest('hex');
+  const commandLock=join(f.home,'.fx','fossil',rootHash,'command.lock');
+  const blocker=Bun.spawn(['python3','-u','-c',"import fcntl,sys,time\nwith open(sys.argv[1],'r+') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n print('locked',flush=True)\n time.sleep(36)\n",commandLock],{stdout:'pipe',stderr:'pipe'});
+  try {
+   expect(await new Response(blocker.stdout).text()).toBe('locked\n');
+   expect(await blocker.exited).toBe(0);
+   expect((await native.request('background',{action:'host'})).running).toBe(true);
+  } finally { blocker.kill(); await blocker.exited; }
   const ending = terminal(native,'dispatch-report');
   await native.request('coordinate',{text:'Prepare the report using the attached reference after I choose its presentation.',images:[imagePath]},{id:'dispatch-report'});
   const handoffEnd = await ending;
@@ -243,7 +261,7 @@ test('background contracts release the main chat while workers await input and p
   await native.request('background',{action:'stop'});
   await until(()=>native.request('background',{action:'host'}), value=>!value.running);
  }
-},120000);
+},180000);
 
 
 test('native owner settings persist validated defaults and expose MCP inventory', async()=>{

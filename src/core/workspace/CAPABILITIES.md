@@ -201,6 +201,12 @@ operator authority. A running worker or a checkpoint is not evidence that an
 external action succeeded. `workspace_governance_pending` means a review did not
 finish, not that the requested work is complete.
 
+Background host startup allows 45 seconds for the child to validate the workspace
+binding and acquire its host lock. If a queue scan reaches the workspace command
+lease timeout, the host retains its worker slots and retries on its normal polling
+cadence. Existing workers keep their execution identities while foreground
+commits finish.
+
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,
 event polling, steering, and cancellation through the native conversation host.

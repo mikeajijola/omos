@@ -132,7 +132,13 @@ pub const Worker = struct {
                 defer arena.deinit();
                 _ = (try workspace.configured(arena.allocator())) orelse return error.WorkspaceBindingChanged;
             }
-            try self.tick(&owner);
+            self.tick(&owner) catch |err| switch (err) {
+                // Foreground commits may outlast the bounded writer-lease wait.
+                // Keep ownership of the host and retry the queue scan on the
+                // normal cadence; claimed workers retain their own slots.
+                error.WorkspaceBusy => {},
+                else => return err,
+            };
             // Canonical scans are bounded by a host cadence, never tied to
             // animation frames or individual model tokens.
             io.sleep(std.time.ns_per_s);
