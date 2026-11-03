@@ -8,6 +8,33 @@ import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } f
 import { NativeClient } from "./workspace-ui-client.mjs";
 import { TmuxSession, tmuxAvailable, terminalFixtureShell } from "./tmux-helpers";
 
+for (const mode of ["invalid offset", "unknown record", "invalid checkpoint"]) {
+  test(`completion review recovers from ${mode} without repeating actor work`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Keep the verified preference.") : { content: "Saved the preference." }, packet => {
+      reviews++;
+      const record = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.status === "success");
+      expect(record).toBeDefined();
+      if (reviews === 1) return mode === "invalid checkpoint"
+        ? { name: "omos_review_checkpoint", args: { id: record.id, offset: 999999, bytes: 1, obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, verdict: "supports", note: "Invalid range must be rejected" })) } }
+        : { name: "omos_review_evidence", args: { action: "read", id: mode === "unknown record" ? "invented" : record.id, offset: mode === "invalid offset" ? 999999 : 0 } };
+      const correction = packet.currentInspections.find((page: any) => page.error_code);
+      expect(correction?.accepted).toBe(false);
+      expect(correction?.error_code).toBe(mode === "unknown record" ? "InvalidContractEvidence" : "InvalidEvidenceOffset");
+      if (reviews === 2) return { name: "omos_review_evidence", args: { action: "read", id: record.id, offset: 0 } };
+      expect(packet.currentInspections.some((page: any) => page.id === record.id && page.fullyInspected)).toBe(true);
+      return "met";
+    });
+    const result = await f.run(["ask", "Save my preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(2);
+    expect(reviews).toBe(3);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Keep the verified preference.");
+  }, 120000);
+}
+
 afterEach(cleanupFixtures);
 
 async function progressStream(url: string, envelope: object, controller = new AbortController()) {

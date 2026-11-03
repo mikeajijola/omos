@@ -124,6 +124,9 @@ operations whose outcome cannot be established require a concrete blocker.
 Progress assessment can cite a fully inspected failed operation when it
 establishes a diagnosis or constraint. The record retains its failure status;
 this does not satisfy completion requirements or authorize publication.
+Completion review returns invalid evidence IDs, byte ranges, and segment
+submissions to the reviewer for correction within its existing allowance.
+Rejected calls neither accept work nor require the actor to repeat it.
 
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.

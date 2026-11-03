@@ -591,16 +591,26 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
             if (remaining <= input.policy.reserved_calls) return error.ContractReviewPending;
             if (input.journal) |journal| try journal.record("review_evidence_access", call.arguments_json);
             const command = try record_json.decode(struct { action: []const u8 }, alloc, call.arguments_json, .{ .ignore_unknown_fields = true });
-            const page = if (std.mem.eql(u8, command.action, "query") or std.mem.eql(u8, command.action, "search") or std.mem.eql(u8, command.action, "related") or std.mem.eql(u8, command.action, "coverage"))
-                try view.retrieve(alloc, call.arguments_json)
+            const page = (if (std.mem.eql(u8, command.action, "query") or std.mem.eql(u8, command.action, "search") or std.mem.eql(u8, command.action, "related") or std.mem.eql(u8, command.action, "coverage"))
+                view.retrieve(alloc, call.arguments_json)
             else
-                try ledger.page(alloc, &view, call.arguments_json);
+                ledger.page(alloc, &view, call.arguments_json)) catch |err| {
+                const rejection = try reviewToolCorrection(alloc, err);
+                if (input.journal) |journal| try journal.record("review_tool_rejected", rejection);
+                try appendExchange(alloc, &messages, completion, input, request.model, rejection);
+                continue;
+            };
             if (input.journal) |journal| try journal.record("review_evidence_page", page);
             try appendExchange(alloc, &messages, completion, input, request.model, page);
             continue;
         }
         if (std.mem.eql(u8, call.name, checkpoint_schema.name)) {
-            const receipt = try ledger.submit(alloc, view, call.arguments_json);
+            const receipt = ledger.submit(alloc, view, call.arguments_json) catch |err| {
+                const rejection = try reviewToolCorrection(alloc, err);
+                if (input.journal) |journal| try journal.record("review_tool_rejected", rejection);
+                try appendExchange(alloc, &messages, completion, input, request.model, rejection);
+                continue;
+            };
             if (input.journal) |journal| try journal.record("review_segment_assessment", receipt);
             try appendExchange(alloc, &messages, completion, input, request.model, receipt);
             continue;
@@ -656,6 +666,29 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         return .{ .decision = decision, .usage = usage, .assessment = try alloc.dupe(u8, call.arguments_json) };
     }
     return error.ContractReviewPending;
+}
+
+fn reviewToolCorrection(alloc: std.mem.Allocator, err: anyerror) ![]const u8 {
+    switch (err) {
+        error.InvalidEvidenceOffset, error.InvalidContractEvidence, error.InvalidEvidenceQuery, error.UninspectedContractEvidence, error.InvalidContractAssessment => {},
+        else => return err,
+    }
+    return std.json.Stringify.valueAlloc(alloc, .{
+        .accepted = false,
+        .error_code = @errorName(err),
+        .instruction = "Correct this read-only review call within the existing review allowance. Copy exact evidence IDs; use a positive limit and the returned nextOffset or coverage gaps, never a guessed byte offset. Checkpoints require contiguous inspected bytes and every current obligation. No assessment or checkpoint was accepted. Retain pending if required evidence cannot be inspected; do not repeat actor actions.",
+    }, .{});
+}
+
+test "completion review corrects invalid evidence requests without hiding host failures" {
+    const alloc = std.testing.allocator;
+    const correction = try reviewToolCorrection(alloc, error.InvalidEvidenceOffset);
+    defer alloc.free(correction);
+    try std.testing.expect(std.mem.indexOf(u8, correction, "InvalidEvidenceOffset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, correction, "\"accepted\":false") != null);
+    try std.testing.expectError(error.OutOfMemory, reviewToolCorrection(alloc, error.OutOfMemory));
+    try std.testing.expectError(error.Cancelled, reviewToolCorrection(alloc, error.Cancelled));
+    try std.testing.expectError(error.FileNotFound, reviewToolCorrection(alloc, error.FileNotFound));
 }
 
 test "completion review rejects invented and failed evidence references" {
