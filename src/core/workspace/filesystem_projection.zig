@@ -640,7 +640,10 @@ pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: [
     if (arguments.value != .object) return;
     var manager = (try workspace.Manager.bound(alloc)) orelse return;
     var cancelled = std.atomic.Value(bool).init(false);
-    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    // Opaque commands hydrate every managed file, including cold binary objects.
+    // Keep cancellation and a finite bound without applying the single-path
+    // deadline to an entire workspace.
+    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(if (process_access) 120 else 30) }) };
     const task = (try manager.active(id)) orelse return;
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;

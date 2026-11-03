@@ -4353,6 +4353,13 @@ sys.exit(result.returncode)
   test("materialises requested paths without deleting unfetched content and hydrates opaque shell reads", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const python = Bun.which("python3");
+    const fossil = Bun.which("fossil");
+    expect(python).not.toBeNull();
+    expect(fossil).not.toBeNull();
+    const slowMarker = join(f.home, "slow-hydration");
+    const wrapper = join(f.home, "slow-fossil");
+    writeFileSync(wrapper, `#!${python}\nimport os, sys, time\nmarker = ${JSON.stringify(slowMarker)}\nif "cat" in sys.argv and "memory/shell-only.txt" in sys.argv and os.path.exists(marker):\n    os.unlink(marker)\n    time.sleep(35)\nos.execv(${JSON.stringify(fossil)}, [${JSON.stringify(fossil)}] + sys.argv[1:])\n`, { mode: 0o700 });
     let root = "";
     model(f, (body, count) => {
       const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
@@ -4376,17 +4383,20 @@ sys.exit(result.returncode)
       }
       if (count === 6) {
         expect(existsSync(join(root, "memory/shell-only.txt"))).toBe(false);
+        writeFileSync(slowMarker, "delay the cold shell input once");
         return call("shell", { request: { action: "run", command: `cat '${root}/memory/shell-only.txt'`, timeout_ms: 10000 } });
       }
+      expect(existsSync(slowMarker)).toBe(false);
+      expect(context).not.toContain("Workspace content could not be materialised: Timeout");
       expect(readFileSync(join(root, "memory/shell-only.txt"), "utf8")).toBe("Available to opaque commands");
       return { content: "Read and edited the requested records while preserving all workspace content." };
     });
-    const result = await f.run(["ask", "Read and edit workspace documents using their pinned files", "--json"], {}, 120000);
+    const result = await f.run(["ask", "Read and edit workspace documents using their pinned files", "--json"], { OMOS_FOSSIL_BIN: wrapper }, 150000);
     expect(result.code, result.stderr).toBe(0);
     expect(f.fossil("cat", "documents/one.txt", "-r", "trunk")).toBe("Pinned first document");
     expect(f.fossil("cat", "documents/unfetched.txt", "-r", "trunk")).toBe("Retain this unread file");
     expect(f.fossil("cat", "memory/shell-only.txt", "-r", "trunk")).toBe("Available to opaque commands");
-  }, 150000);
+  }, 180000);
 
   test("searches sparse managed directories using absolute globs and scoped text queries", async () => {
     const f = fixture();

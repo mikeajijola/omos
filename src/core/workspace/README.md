@@ -23,6 +23,8 @@ materialise the requested managed path before permission preflight. File searche
 materialise their selected directory. Skill discovery retrieves `SKILL.md`
 indexes; loading a skill retrieves its package. Shell commands hydrate the whole
 personal view because a process can open paths without calling the file tools.
+Whole-view preparation allows up to 120 seconds for cold content; individual
+file and skill preparation retains its 30-second bound. Both remain cancellable.
 The baseline tracks only materialised files, so unfetched content cannot become
 a deletion. Parallel hydration and checkpoints share a projection lock. This is
 a tool-driven sparse projection, rather than a transparent filesystem mount.
