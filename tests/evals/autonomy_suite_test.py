@@ -32,6 +32,16 @@ class Oracles(unittest.TestCase):
                 dump(root / "documents" / output, {})
                 self.assertTrue(grade(family, root, expected, original))
 
+    def test_reconciliation_rejects_correct_values_under_a_renamed_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); _, expected = setup("reconcile", root, 941)
+            renamed = dict(expected)
+            renamed["sorted_paid_ids"] = renamed.pop("paid_ids")
+            dump(root / "documents/reconciled.json", renamed)
+            self.assertTrue(grade("reconcile", root, expected, {}))
+            dump(root / "documents/reconciled.json", expected)
+            self.assertEqual(grade("reconcile", root, expected, {}), [])
+
     def test_repair_oracle_catches_original_nested_interval_bug(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); _, expected = setup("repair", root, 271)
