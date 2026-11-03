@@ -114,6 +114,13 @@ the background record. Verified publication is reconciled without replaying the
 actor. A stopped host still needs to be started by its owning application or
 service supervisor.
 
+The shared agent instructions require fresh outcome evidence before replaying
+an uncertain external action. This applies to foreground and background turns:
+reconnect stale handles, refresh authoritative state, then wait for and read
+the result. A tool acknowledgement or cached empty view is insufficient. This
+is reasoning guidance, not a transactional guarantee for arbitrary services;
+operations whose outcome cannot be established require a concrete blocker.
+
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.
 These records describe observable decisions. Provider replay state and private

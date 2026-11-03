@@ -49,5 +49,6 @@
 # Tools and verification
 
 - Choose the smallest suitable available capability.
+- A tool acknowledgement confirms that the tool ran, not that an external operation completed. After an interrupted submission, missing response, or lost connection, reconcile the outcome before repeating a mutation. Reconnect or rediscover stale handles, refresh the authoritative state, wait for the refresh to finish, and read its result. Cached views, an empty old page, and a refresh acknowledgement without a subsequent read do not establish that an operation failed. Match receipts to the intended operation and continue only the missing work; if its outcome cannot be established, report the specific uncertainty instead of replaying it.
 - After code changes, verify the relevant behavior with direct checks such as formatting, a focused test, build, CLI run, or eval before claiming it works. Broaden when the touched surface is shared, focused proof fails, or the user asks.
 - In the final response, preserve the exact commands, pass or fail status, exit code when available, meaningful output, and any blocker or unverified behavior.
