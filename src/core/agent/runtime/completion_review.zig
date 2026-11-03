@@ -584,9 +584,12 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         token_spent.* +|= (completion.usage.input_tokens orelse 0) +| (completion.usage.output_tokens orelse 0);
         if (input.journal) |journal| try journal.record("review_usage", try std.json.Stringify.valueAlloc(alloc, .{ .model = request.model, .call = call_index + 1, .usage = completion.usage, .reported_tokens = token_spent.* }, .{}));
         if (input.policy.max_tokens) |limit| if (completion.usage.input_tokens == null or completion.usage.output_tokens == null or token_spent.* > limit) return error.ContractReviewPending;
-        if (types.classifyProviderCompletion(completion) != .completed or completion.tool_calls.len != 1) return error.InvalidContractAssessment;
+        if (types.classifyProviderCompletion(completion) != .completed or completion.tool_calls.len != 1 or completion.tool_calls[0].argument_integrity != .valid) {
+            if (input.journal) |journal| try journal.record("review_response_rejected", try std.json.Stringify.valueAlloc(alloc, .{ .call = call_index + 1, .tool_call_count = completion.tool_calls.len, .reason = "InvalidContractAssessment", .accepted = false }, .{}));
+            try messages.append(alloc, .{ .role = .user, .content = "The host discarded the malformed or parallel review response; none of its calls was accepted or executed. Return exactly one complete evidence request, checkpoint, or contract assessment with valid arguments. Continue from previously inspected evidence within the existing allowance. Do not repeat actor actions." });
+            continue;
+        }
         const call = completion.tool_calls[0];
-        if (call.argument_integrity != .valid) return error.InvalidContractAssessment;
         if (std.mem.eql(u8, call.name, evidence_schema.name)) {
             if (remaining <= input.policy.reserved_calls) return error.ContractReviewPending;
             if (input.journal) |journal| try journal.record("review_evidence_access", call.arguments_json);
@@ -617,7 +620,12 @@ pub fn assess(alloc: std.mem.Allocator, provider: streams.Provider, input: Input
         }
         if (!std.mem.eql(u8, call.name, function_name)) return error.InvalidContractAssessment;
         if (input.journal) |journal| try journal.record("review_assessment", call.arguments_json);
-        var decision = try work_contract.assess(alloc, definition, call.arguments_json);
+        var decision = work_contract.assess(alloc, definition, call.arguments_json) catch |err| {
+            const rejection = try reviewToolCorrection(alloc, err);
+            if (input.journal) |journal| try journal.record("review_tool_rejected", rejection);
+            try appendExchange(alloc, &messages, completion, input, request.model, rejection);
+            continue;
+        };
         errdefer alloc.free(decision.feedback);
         verifyReferences(alloc, call.arguments_json, evidence) catch |err| switch (err) {
             error.InvalidContractEvidence => {
@@ -676,7 +684,7 @@ fn reviewToolCorrection(alloc: std.mem.Allocator, err: anyerror) ![]const u8 {
     return std.json.Stringify.valueAlloc(alloc, .{
         .accepted = false,
         .error_code = @errorName(err),
-        .instruction = "Correct this read-only review call within the existing review allowance. Copy exact evidence IDs; use a positive limit and the returned nextOffset or coverage gaps, never a guessed byte offset. Checkpoints require contiguous inspected bytes and every current obligation. No assessment or checkpoint was accepted. Retain pending if required evidence cannot be inspected; do not repeat actor actions.",
+        .instruction = "Correct this read-only review call within the existing review allowance. Copy exact evidence IDs; use a positive limit and the returned nextOffset or coverage gaps, never a guessed byte offset. Checkpoints require contiguous inspected bytes and every current obligation. Assessments require the exact contract identity and version and every current obligation exactly once. No assessment or checkpoint was accepted. Retain pending if required evidence cannot be inspected; do not repeat actor actions.",
     }, .{});
 }
 

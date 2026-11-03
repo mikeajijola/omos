@@ -127,6 +127,8 @@ this does not satisfy completion requirements or authorize publication.
 Completion review returns invalid evidence IDs, byte ranges, and segment
 submissions to the reviewer for correction within its existing allowance.
 Rejected calls neither accept work nor require the actor to repeat it.
+Malformed or parallel reviewer responses are discarded, and stale or incomplete
+assessments receive correction feedback without changing the fixed contract.
 
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.

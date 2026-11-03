@@ -35,6 +35,34 @@ for (const mode of ["invalid offset", "unknown record", "invalid checkpoint"]) {
   }, 120000);
 }
 
+for (const mode of ["parallel reads", "stale assessment"]) {
+  test(`completion review corrects ${mode} within the same actor turn`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Retain one successful write.") : { content: "Saved the preference." }, packet => {
+      if (++reviews === 1) {
+        if (mode === "stale assessment") return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version + 1, obligations: [] } };
+        const record = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.status === "success");
+        const tool_calls = [0, 1].map(index => ({ index, id: `parallel-${index}`, type: "function", function: { name: "omos_review_evidence", arguments: JSON.stringify({ action: "read", id: record.id }) } }));
+        return new Response([
+          `data: ${JSON.stringify({ id: "parallel-review", choices: [{ index: 0, delta: { tool_calls }, finish_reason: null }] })}`,
+          `data: ${JSON.stringify({ id: "parallel-review", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
+          "data: [DONE]", "",
+        ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
+      }
+      if (mode === "stale assessment") expect(packet.currentInspections.some((page: any) => page.error_code === "InvalidContractAssessment" && page.accepted === false)).toBe(true);
+      else expect(packet.currentInspections).toHaveLength(0);
+      return "met";
+    });
+    const result = await f.run(["ask", "Save my preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(2);
+    expect(reviews).toBe(2);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Retain one successful write.");
+  }, 120000);
+}
+
 afterEach(cleanupFixtures);
 
 async function progressStream(url: string, envelope: object, controller = new AbortController()) {
