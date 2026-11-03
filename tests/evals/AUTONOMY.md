@@ -48,6 +48,9 @@ including independent outcome checks and canonical acceptance receipts. Any
 published result that fails the external grader requires investigation before
 acceptance. Report latency, token usage when available, timeouts, infrastructure
 errors, and failed attempts separately. A retry does not replace a failure.
+CLI token totals contain reported usage and can omit nested calls; do not
+interpret them as a complete bill. If a grader is corrected, retain its original
+score and record the correction and regrading separately.
 
 ## Run
 

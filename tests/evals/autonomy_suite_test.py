@@ -38,6 +38,12 @@ class Oracles(unittest.TestCase):
             self.assertTrue(grade("repair", root, expected, {}))
             (root / "intervals.py").write_text("def merge_intervals(a):\n if any(x>y for x,y in a):raise ValueError()\n out=[]\n for x,y in sorted(a):\n  if x==y:continue\n  if out and x<=out[-1][1]:out[-1][1]=max(out[-1][1],y)\n  else:out.append([x,y])\n return out\n")
             self.assertEqual(grade("repair", root, expected, {}), [])
+            tests = root / "test_intervals.py"
+            original = {"test_intervals.py": digest(tests)}
+            tests.write_text(tests.read_text() + "\nclass MoreTests(unittest.TestCase):\n def test_touching(self): self.assertEqual(merge_intervals([[1,2],[2,3]]),[[1,3]])\n")
+            self.assertEqual(grade("repair", root, expected, original), [])
+            tests.write_text(tests.read_text().replace("self.assertEqual(merge_intervals([]),[])", "self.assertTrue(True)"))
+            self.assertTrue(grade("repair", root, expected, original))
 
     def test_web_fault_persists_exactly_one_write_before_ack_loss(self):
         with tempfile.TemporaryDirectory() as tmp:

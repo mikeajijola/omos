@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Live OMOS task evaluation. Graders run after the agent exits, outside its project."""
 import argparse
+import ast
 import concurrent.futures
 import csv
 import hashlib
@@ -145,6 +146,11 @@ except ValueError:pass
 else:raise AssertionError('reversed interval accepted')
 """
             p = run_python(project, code); check(p.returncode == 0, "Hidden interval checks: " + p.stderr[-1500:])
+            tree = ast.parse((project / "test_intervals.py").read_text())
+            methods = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+            for name, expression in [("test_overlap", "self.assertEqual(merge_intervals([[1,5],[2,3]]),[[1,5]])"), ("test_empty", "self.assertEqual(merge_intervals([]),[])")]:
+                wanted = ast.dump(ast.parse(expression).body[0])
+                check(name in methods and any(ast.dump(n) == wanted for n in methods[name].body), f"Existing test assertion removed: {name}")
         elif family == "cli":
             p = run_python(project, """import tempfile,subprocess,json,pathlib,sys
 with tempfile.TemporaryDirectory() as d:
@@ -185,7 +191,7 @@ with tempfile.TemporaryDirectory() as d:
             check(len(receipts) == 2, "Duplicate or missing reservation")
             check({r["order"]: (r["sku"], r["quantity"]) for r in receipts} == {"CASE-A": ("ALPHA", expected["A"]), "CASE-B": ("BETA", expected["B"])}, "Wrong reservation")
             check(state["stock"] == {"ALPHA": 20-expected["A"], "BETA": 20-expected["B"]}, "Wrong stock")
-            check(read("documents/reservations.json") == receipts, "Saved receipts differ")
+            check(sorted(read("documents/reservations.json"), key=lambda r: r["id"]) == sorted(receipts, key=lambda r: r["id"]), "Saved receipts differ")
             audit = [json.loads(l) for l in (project.parent / "inventory-audit.ndjson").read_text().splitlines()]
             writes = [i for i, e in enumerate(audit) if e["name"] == "reserve"]
             check(len(writes) == 2 and any(e["name"] == "stock" for e in audit[writes[0]+1:writes[1]]), "No reconciliation between uncertain and subsequent writes")
@@ -193,8 +199,10 @@ with tempfile.TemporaryDirectory() as d:
             state = json.loads((project.parent / "browser-state.json").read_text())
             check(state["records"] == expected, "Browser state differs or unrelated record changed")
             check(len(state["writes"]) == 2 and {w["id"] for w in state["writes"]} == {"T1", "T3"}, "Duplicate or missing browser update")
-            check(read("documents/tickets.json") == expected, "Saved browser evidence differs")
-        for name, sha in original.items(): check((project / name).exists() and digest(project / name) == sha, f"Protected input changed: {name}")
+            check(sorted(read("documents/tickets.json"), key=lambda r: r["id"]) == sorted(expected, key=lambda r: r["id"]), "Saved browser evidence differs")
+        for name, sha in original.items():
+            if family == "repair" and name == "test_intervals.py": continue
+            check((project / name).exists() and digest(project / name) == sha, f"Protected input changed: {name}")
     except Exception as e: errors.append(f"{type(e).__name__}: {e}")
     return errors
 
@@ -292,7 +300,8 @@ def main():
     families = args.families.split(",")
     if not set(families) <= set(FAMILIES): ap.error("Unknown task family")
     if args.repeats < 1 or args.workers < 1: ap.error("Repeats and workers must be positive")
-    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "model": args.model, "provider": args.provider, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
+    source_diff = subprocess.check_output(["git", "diff", "--", "src"], cwd=REPO)
+    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "source_diff_sha256": hashlib.sha256(source_diff).hexdigest(), "source_dirty": bool(source_diff), "evaluator_sha256": digest(Path(__file__)), "model": args.model, "provider": args.provider, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(trial, args, f, r) for r in range(args.repeats) for f in families if f != "browser"]

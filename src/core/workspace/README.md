@@ -121,6 +121,10 @@ the result. A tool acknowledgement or cached empty view is insufficient. This
 is reasoning guidance, not a transactional guarantee for arbitrary services;
 operations whose outcome cannot be established require a concrete blocker.
 
+Progress assessment can cite a fully inspected failed operation when it
+establishes a diagnosis or constraint. The record retains its failure status;
+this does not satisfy completion requirements or authorize publication.
+
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.
 These records describe observable decisions. Provider replay state and private
