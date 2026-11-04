@@ -109,10 +109,19 @@ worker must inspect retained evidence and reconcile uncertain external outcomes
 before repeating an action. Recovery is bounded by the pinned stalled-check
 allowance; cancellation, conflicts and blocked tasks are not overridden.
 Pending verification with a retained candidate can also be retried automatically,
-bounded by the pinned review attempt allowance. These recoveries are counted in
+bounded by the pinned review attempt allowance. Interrupted execution streams
+(`IncompleteStream`, `Timeout`, or `OutputTruncated`) can resume the retained
+session even before a completion candidate exists, under the same allowance.
+An explicit review token budget prevents automatic renewal. These recoveries are counted in
 the background record. Verified publication is reconciled without replaying the
 actor. A stopped host still needs to be started by its owning application or
 service supervisor.
+
+Background status includes a bounded tail of public event metadata with event
+timestamps when available. The event API's `next_offset` is a byte offset, not
+an event cursor. A running record alone does not prove current activity, and a
+quiet journal alone does not prove a stall. Null outcome counts mean unknown,
+not zero; inspect action receipts to establish completed outcomes.
 
 The shared agent instructions require fresh outcome evidence before replaying
 an uncertain external action. This applies to foreground and background turns:

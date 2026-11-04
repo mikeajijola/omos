@@ -148,7 +148,7 @@ pub fn status(manager: workspace.Manager, task: workspace.Task) !std.json.Value 
     else if (std.mem.eql(u8, reason, "workspace_governance_pending"))
         "Work is waiting because its review did not finish. This does not establish that the requested actions were completed."
     else if (std.mem.eql(u8, state, "running") or std.mem.eql(u8, state, "starting"))
-        "The worker is active. Activity alone does not confirm completed outcomes."
+        "The worker is registered as running. Inspect its recent activity; this state alone does not establish liveness or completed outcomes."
     else if (std.mem.eql(u8, state, "queued"))
         "The contract is queued for execution."
     else
@@ -159,7 +159,7 @@ pub fn status(manager: workspace.Manager, task: workspace.Task) !std.json.Value 
         break :blk prefix(model.text(review, "candidate"), 3000);
     } else "";
     const text = try a.print("{s}\nStatus: {s}. {s}{s}{s}{s}{s}", .{ task.definition.objective, state, description, if (reason.len > 0) "\nRecorded reason: " else "", reason, if (outcome.len > 0) "\nReviewed outcome: " else "", outcome });
-    return value(a, .{ .task = task.id, .contract_version = task.definition.version, .state = state, .text = text, .published = published, .publication = publication, .revision = revision, .worker = worker, .outcome_counts = @as(?usize, null), .evidence_note = "No application or other outcome count is inferred from activity. Inspect contract evidence and submission receipts.", .history_prefix = try a.print("history/{s}/", .{task.id}) });
+    return value(a, .{ .task = task.id, .contract_version = task.definition.version, .state = state, .text = text, .published = published, .publication = publication, .revision = revision, .worker = worker, .activity = if (worker) |entry| try @import("background_api.zig").activity(manager, entry) else @as(?std.json.Value, null), .outcome_counts = @as(?usize, null), .outcome_count_status = "unknown", .evidence_note = "Null outcome counts mean unknown, not zero. No outcome count is inferred from activity or publication state. Inspect contract evidence and submission receipts.", .history_prefix = try a.print("history/{s}/", .{task.id}) });
 }
 
 fn sameRequest(a: []const u8, b: []const u8) bool {

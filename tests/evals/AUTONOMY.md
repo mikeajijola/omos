@@ -81,3 +81,18 @@ system permissions. They do not establish coverage for every permission mode,
 every channel, arbitrary public websites, large repositories, or long-running
 production workflows. Inspect traces before promoting results into a broader
 readiness claim. The installed CLI and running UI are not replaced by this suite.
+
+### Background execution
+
+Add `--background` to exercise the native UI coordinator and background host.
+The evaluator waits for verified publication and records foreground events and
+background activity separately. A queued response is not a passing result.
+Run the same task families separately for each deployed model; a foreground
+pass on one model does not establish background reliability on another.
+
+Use `--background --stream-fault execution` to interrupt two background actor
+responses after tool evidence exists. Use `--stream-fault review` to interrupt
+two completion-review responses. The local proxy forwards subsequent calls to
+the configured provider and records the injected count. The grader rejects a
+trial if the requested fault was never exercised. The MCP and browser families
+separately test a persisted external change followed by a lost acknowledgement.

@@ -10,6 +10,37 @@ from autonomy_web import start
 
 
 class Oracles(unittest.TestCase):
+    def test_transport_fault_is_bounded_and_does_not_cut_foreground_requests(self):
+        from autonomy_transport import start as proxy
+        import http.server
+        import threading
+        import urllib.request
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args): pass
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200); self.end_headers()
+                self.wfile.write(b"data: [DONE]\n\n")
+        upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        try:
+            for mode in ("execution", "review"):
+                with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    server, url = proxy(f"http://127.0.0.1:{upstream.server_port}", root, mode)
+                    def send(body):
+                        with urllib.request.urlopen(urllib.request.Request(url+"/chat/completions", json.dumps(body).encode())) as response:
+                            return response.read()
+                    try:
+                        self.assertIn(b"[DONE]", send({"messages": [{"role": "user", "content": "hello"}]}))
+                        body = {"tools": [{"function": {"name": "omos_contract_assessment" if mode == "review" else "shell"}}], "messages": [{"role": "system", "content": "<omos_background_assignment>"}, {"role": "tool", "content": "receipt"}]}
+                        self.assertNotIn(b"[DONE]", send(body))
+                        self.assertNotIn(b"[DONE]", send(body))
+                        self.assertIn(b"[DONE]", send(body))
+                        self.assertEqual(json.loads((root / "transport-fault.json").read_text())["injected"], 2)
+                    finally: server.shutdown(); server.server_close()
+        finally: upstream.shutdown(); upstream.server_close()
+
     def test_structured_tasks_accept_reference_and_reject_wrong_output(self):
         for family, output in [("reconcile", "reconciled.json"), ("sql", "customer-revenue.json"), ("retrieval", "policy-answer.json"), ("schedule", "schedule.json"), ("archive", "import-manifest.json"), ("untrusted", "delivery.json")]:
             with self.subTest(family=family), tempfile.TemporaryDirectory() as tmp:

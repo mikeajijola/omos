@@ -46,7 +46,11 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         return value(manager, .{ .accepted = true, .fulfilled = false });
     }
     const entry = (try manager.backgroundRecord(request.task orelse return error.MissingTaskId)) orelse return error.BackgroundDispatchRequired;
-    if (request.action == .show) return value(manager, entry);
+    if (request.action == .show) {
+        var result = try value(manager, entry);
+        try result.object.put(manager.alloc, "activity", try activity(manager, entry));
+        return result;
+    }
     if (request.action == .events) return events(manager, entry, request.generation orelse entry.generation, request.offset);
     if (request.action == .receipt) {
         const operation = request.operation orelse return error.BackgroundOperationRequired;
@@ -138,10 +142,52 @@ fn events(manager: workspace.Manager, entry: domain.Record, generation: u64, off
         try result.append(manager.alloc, event);
         next += line.len + 1;
     }
-    return value(manager, .{ .events = result.items, .next_offset = next, .active = generation == entry.generation and entry.state == .running, .record = entry });
+    return value(manager, .{ .events = result.items, .next_offset = next, .offset_unit = "bytes", .active = generation == entry.generation and entry.state == .running, .record = entry });
 }
 
 fn saveOperation(manager: workspace.Manager, previous: domain.Record, next: domain.Record, request: Request) !void {
     const operation: domain.Operation = .{ .workspace = manager.manifest.id, .task = next.task, .operation = request.operation orelse return error.BackgroundOperationRequired, .request_sha256 = try workspace.hash(manager.alloc, try std.json.Stringify.valueAlloc(manager.alloc, request, .{})), .generation = next.generation, .state = next.state };
     try manager.saveBackgroundOperation(next, try dispatch.digest(manager, previous), operation);
+}
+
+/// Bounded journal tail; absence of recent events does not prove inactivity.
+/// Return public event metadata only, never tool payloads or inferred outcomes.
+pub fn activity(manager: workspace.Manager, entry: domain.Record) !std.json.Value {
+    const model = @import("definition.zig");
+    const name = try manager.alloc.print("background-{s}-{d}.ndjson", .{ entry.task, entry.generation });
+    const path = try control.path(manager, "events", name);
+    var file = std.Io.Dir.openFileAbsolute(io.getIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return value(manager, .{ .journal_available = false }),
+        else => return err,
+    };
+    defer file.close(io.getIo());
+    const stat = try file.stat(io.getIo());
+    const start = stat.size - @min(stat.size, 65536);
+    const buffer = try manager.alloc.alloc(u8, 65536);
+    var reader = file.reader(io.getIo(), buffer);
+    try reader.seekTo(start);
+    if (start > 0) _ = try reader.interface.takeDelimiter('\n');
+    var recent: std.ArrayList(std.json.Value) = .empty;
+    while (try reader.interface.takeDelimiter('\n')) |line| {
+        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch continue;
+        const data = model.field(event, "data") orelse continue;
+        if (recent.items.len == 16) _ = recent.orderedRemove(0);
+        try recent.append(manager.alloc, try value(manager, .{
+            .cursor = model.field(event, "cursor"),
+            .timestamp_ms = model.field(event, "timestamp_ms"),
+            .type = model.text(data, "type"),
+            .call_id = model.text(data, "call_id"),
+            .tool = model.text(data, "name"),
+        }));
+    }
+    return value(manager, .{
+        .journal_available = true,
+        .generation = entry.generation,
+        .journal_updated_ms = stat.mtime.toMilliseconds(),
+        .next_offset = stat.size,
+        .offset_unit = "bytes",
+        .tail_only = true,
+        .recent_events = recent.items,
+        .note = "A running record or a quiet journal does not prove progress. Unmatched tool events in this bounded tail do not establish a pending operation. Inspect receipts for outcomes; reconcile uncertain effects before retrying.",
+    });
 }

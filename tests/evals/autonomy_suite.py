@@ -225,6 +225,11 @@ def trial(args, family, repeat):
     home = root / "home"; (home / ".fx").mkdir(parents=True)
     settings = json.loads(args.settings.read_text())
     settings.update(permission_mode="full-access", auto_upgrade=False, session_titles=False, yolo_acknowledged=True)
+    transport = None
+    if args.stream_fault:
+        from autonomy_transport import start as start_transport
+        provider = settings["providers"][args.provider]
+        transport, provider["base_url"] = start_transport(provider["base_url"], root, args.stream_fault)
     dump(home / ".fx/settings.json", settings)
     prompt, expected = setup(family, project, args.seed)
     server = None
@@ -240,7 +245,7 @@ def trial(args, family, repeat):
     env = os.environ.copy()
     for key in list(env):
         if key.startswith("FX_E2E_") or key in ["FX_SYSTEM_PROMPT", "FX_SYSTEM_PROMPT_FILE"]: env.pop(key)
-    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home), FX_PROVIDER=args.provider, FX_REVIEW_MODEL=args.model, FX_CONTRACT_REVIEW="1", OMOS_COORDINATOR="0", FX_SOUND="0", FX_AUTO_UPGRADE="0", FX_SKIP_ONBOARDING="1", FX_DISABLE_KEYCHAIN="1", PYTHONDONTWRITEBYTECODE="1")
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home), FX_PROVIDER=args.provider, FX_REVIEW_MODEL=args.model, FX_CONTRACT_REVIEW="1", OMOS_COORDINATOR="1" if args.background else "0", FX_SOUND="0", FX_AUTO_UPGRADE="0", FX_SKIP_ONBOARDING="1", FX_DISABLE_KEYCHAIN="1", PYTHONDONTWRITEBYTECODE="1")
     # Real source files are user-visible inputs; graders and expected answers stay outside.
     subprocess.run(["git", "init", "-q", str(project)], check=True)
     start = time.monotonic()
@@ -250,7 +255,8 @@ def trial(args, family, repeat):
         (root / "init.log").write_text(init.stderr)
         if init.returncode: raise RuntimeError("Workspace initialization failed")
         with (root / "result.json").open("w") as out, (root / "stderr.log").open("w") as err:
-            p = subprocess.Popen(["omos", "ask", "--model", args.model, "--json", prompt], executable=str(args.binary), cwd=project, env=env, stdout=out, stderr=err, start_new_session=True)
+            command = [shutil.which("node"), str(Path(__file__).with_name("autonomy_background.mjs")), str(args.binary), str(project), str(root), args.model] if args.background else ["omos", "ask", "--model", args.model, "--json", prompt]
+            p = subprocess.Popen(command, executable=None if args.background else str(args.binary), cwd=project, env=env, stdout=out, stderr=err, start_new_session=True)
             dump(root / "running.json", {"pid": p.pid, "started": time.time()})
             try: code = p.wait(timeout=args.timeout)
             except subprocess.TimeoutExpired:
@@ -266,8 +272,19 @@ def trial(args, family, repeat):
         result["outcome_pass"] = not errors
         receipts = acceptance(project, args.fossil)
         dump(root / "publication.json", receipts)
+        if args.stream_fault:
+            fault_path = root / "transport-fault.json"
+            fault = json.loads(fault_path.read_text()) if fault_path.exists() else {}
+            result["transport_fault"] = fault
+            if fault.get("injected") != 2: errors.append("Requested transport fault was not exercised")
+            if args.background and args.stream_fault == "execution":
+                worker = native.get("background", {})
+                if worker.get("recoveries", 0) < 1: errors.append("Background execution did not exercise automatic recovery")
+                transitions = root / "background-transitions.ndjson"
+                sessions = {entry.get("worker_session") for entry in map(json.loads, transitions.read_text().splitlines()) if entry.get("worker_session")} if transitions.exists() else set()
+                if len(sessions) != 1: errors.append("Recovery did not preserve exactly one worker session")
         result["published"] = bool(receipts)
-        result["false_completion"] = bool(receipts) and bool(errors)
+        result["false_completion"] = bool(receipts) and not result["outcome_pass"]
         if code != 0: errors.append(f"Agent exit code {code}")
         if not receipts: errors.append("No verified canonical acceptance receipt")
         result.update(passed=not errors, failures=errors)
@@ -275,6 +292,7 @@ def trial(args, family, repeat):
         result.update(passed=False, infrastructure_error=f"{type(e).__name__}: {e}", seconds=round(time.monotonic()-start, 2))
     finally:
         if server: server.shutdown(); server.server_close()
+        if transport: transport.shutdown(); transport.server_close()
     dump(root / "score.json", result)
     print(json.dumps(result), flush=True)
     return result
@@ -285,6 +303,8 @@ def main():
     ap.add_argument("--settings", type=Path, required=True, help="Provider settings without literal credentials")
     ap.add_argument("--model", required=True)
     ap.add_argument("--provider", default="gemini")
+    ap.add_argument("--stream-fault", choices=["execution", "review"], help="Inject two incomplete model streams through a local proxy")
+    ap.add_argument("--background", action="store_true", help="Exercise the coordinator and background worker through the native UI host")
     ap.add_argument("--binary", type=Path, default=REPO / "zig-out/bin/fx")
     ap.add_argument("--fossil", default=shutil.which("fossil"))
     ap.add_argument("--output", type=Path, required=True)
@@ -301,7 +321,7 @@ def main():
     if not set(families) <= set(FAMILIES): ap.error("Unknown task family")
     if args.repeats < 1 or args.workers < 1: ap.error("Repeats and workers must be positive")
     source_diff = subprocess.check_output(["git", "diff", "--", "src"], cwd=REPO)
-    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "source_diff_sha256": hashlib.sha256(source_diff).hexdigest(), "source_dirty": bool(source_diff), "evaluator_sha256": digest(Path(__file__)), "model": args.model, "provider": args.provider, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
+    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "source_diff_sha256": hashlib.sha256(source_diff).hexdigest(), "source_dirty": bool(source_diff), "evaluator_sha256": digest(Path(__file__)), "model": args.model, "provider": args.provider, "background": args.background, "stream_fault": args.stream_fault, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(trial, args, f, r) for r in range(args.repeats) for f in families if f != "browser"]

@@ -41,6 +41,19 @@ pub fn validateOperation(operation: Operation) !void {
 
 pub const Fence = struct { owner: []const u8, generation: u64 };
 
+/// Transport interruption can occur before any completion-review candidate
+/// exists. Resume the session, never the last tool call in isolation.
+pub fn interruptedExecution(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "IncompleteStream") or std.mem.eql(u8, reason, "Timeout") or std.mem.eql(u8, reason, "OutputTruncated");
+}
+
+test "execution recovery is limited to transport failures, not task or permission failures" {
+    for ([_][]const u8{ "IncompleteStream", "Timeout", "OutputTruncated" }) |reason|
+        try std.testing.expect(interruptedExecution(reason));
+    for ([_][]const u8{ "Cancelled", "RequiredToolMissing", "PermissionDenied", "workspace_governance_pending", "verification_pending", "" }) |reason|
+        try std.testing.expect(!interruptedExecution(reason));
+}
+
 fn hex(value: []const u8, length: usize) bool {
     if (value.len != length) return false;
     for (value) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;

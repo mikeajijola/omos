@@ -5798,7 +5798,7 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     const content = "A retained policy document.\n".repeat(2000);
-    let corrupted = false, cacheRoot = "", expectedHash = "";
+    let corrupted = false, restoring = false, cacheRoot = "", expectedHash = "";
     const m = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "The policy document is saved." }, packet => {
       const record = packet.evidence.find((entry: any) => entry.kind === "tool" && !entry.complete);
       expect(record).toBeDefined();
@@ -5810,6 +5810,9 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
       cacheRoot = directory;
       expectedHash = record.sha256;
       const payload = readFileSync(join(directory, record.sha256));
+      // Bounded reviewer correction may ask again while the deliberately
+      // corrupted payload still exists. It must remain unaccepted until resume.
+      if (corrupted && !restoring) return { name: "omos_review_evidence", args: { action: "read", id: record.id } };
       expect(createHash("sha256").update(payload).digest("hex")).toBe(record.sha256);
       if (!corrupted) {
         corrupted = true;
@@ -5828,6 +5831,7 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const session = JSON.parse(first.stdout).session_id;
     expect(cacheRoot).not.toBe("");
     rmSync(cacheRoot, { recursive: true });
+    restoring = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 90000);
     expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
     expect(m.counts().actors).toBe(2);

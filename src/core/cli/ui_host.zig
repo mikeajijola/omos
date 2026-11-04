@@ -49,7 +49,7 @@ const Job = struct {
                 if (code.len > 0) self.error_code = try alloc.dupe(u8, code);
             }
         }
-        const line = try std.json.Stringify.valueAlloc(alloc, .{ .version = version, .type = "event", .turn = self.id, .cursor = self.cursor + 1, .data = parsed.value }, .{});
+        const line = try std.json.Stringify.valueAlloc(alloc, .{ .version = version, .type = "event", .turn = self.id, .cursor = self.cursor + 1, .timestamp_ms = io.milliTimestamp(), .data = parsed.value }, .{});
         defer alloc.free(line);
         var buffer: [4096]u8 = undefined;
         var writer = self.journal.writer(io.getIo(), &buffer);

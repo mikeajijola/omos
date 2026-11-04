@@ -302,6 +302,47 @@ test('restarted background host reconciles retained work and completes without r
  }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
 },180000);
 
+test('interrupted execution resumes automatically without a completion candidate or duplicate effect', async()=>{
+ const f=fixture(); const receipt=join(f.cwd,'external-receipts.txt'); let workerCalls=0; let interrupted=false;
+ const call=(id:string,command:string)=>({tool_calls:[{index:0,id,type:'function',function:{name:'shell',arguments:JSON.stringify({action:'run',profile:'clean',command})}}]});
+ model(f,async(body,_count,signal)=>{
+  const system=body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
+  if(!system.includes('<omos_background_assignment'))return {tool_calls:[{index:0,id:'dispatch-once',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  workerCalls++;
+  if(workerCalls===1)return call('perform-once',`printf 'receipt-1\\n' >> '${receipt}'`);
+  if(workerCalls===2||workerCalls===3){interrupted=true;return new Response('data: '+JSON.stringify({choices:[{index:0,delta:{content:'Checking retained work'},finish_reason:null}]})+'\n\n',{headers:{'content-type':'text/event-stream'}});}
+  expect(system).toContain('Use read-only checks to reconcile');
+  if(workerCalls===4)return call('inspect-existing-receipt',`cat '${receipt}'`);
+  return {content:'The external action completed once; receipt-1 is retained and verified.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+90000;let v:any;do{v=await read();if(predicate(v))return v;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(JSON.stringify(v)+native.stderr)};
+ const start=()=>{const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'ui-host','--background-serve'],{cwd:f.cwd,env:{...process.env,...f.env},stdout:'pipe',stderr:'pipe'});services.push(child);return child};
+ const first=start();
+ try{
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const end=terminal(native,'recover-background');
+  await native.request('coordinate',{text:'Perform the external action once and retain its receipt.'},{id:'recover-background'});
+  expect((await end).data.exit_code).toBe(0);
+  await until(async()=>interrupted,v=>v);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  const original=(await native.request('background')).workers[0].record;
+
+  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed');
+  // Each partially emitted stream ends its invocation; both faults recover.
+  expect(finished.generation).toBe(3);expect(finished.recoveries).toBe(2);
+  expect(finished.worker_session).toBe(original.worker_session);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  expect(workerCalls).toBe(5);
+  expect(finished.activity.journal_available).toBe(true);
+  expect(finished.activity.offset_unit).toBe('bytes');
+  expect(finished.activity.recent_events.some((event:any)=>event.timestamp_ms>0)).toBe(true);
+  expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  await native.request('background',{action:'stop'});await first.exited;
+ }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
+},180000);
+
 test('native owner settings persist validated defaults and expose MCP inventory', async()=>{
  const f=fixture();model(f,()=>({content:'Hello.'}));
  expect((await f.run(['fossil','init','--json'])).code).toBe(0);

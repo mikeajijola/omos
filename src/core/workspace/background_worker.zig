@@ -32,8 +32,8 @@ pub const Worker = struct {
             var manager = self.worker.manager;
             manager.alloc = self.arena.allocator();
             self.worker.executor.run(self.worker.executor.context, manager, self.entry, self.authority, owner, &self.cancelled) catch |err| {
-                // A startup failure or interruption requires explicit resumption.
-                // Never loop through a partially accepted provider operation.
+                // Record the failure before considering bounded recovery on a
+                // later tick. Recovery resumes evidence, never a raw tool call.
                 if (manager.backgroundRecord(self.entry.task) catch null) |current| {
                     const next = if (domain.owns(current, .{ .owner = owner, .generation = self.entry.generation + 1 }))
                         domain.wait(current, .{ .owner = owner, .generation = self.entry.generation + 1 }, @errorName(err), io.milliTimestamp()) catch return
@@ -106,10 +106,14 @@ pub const Worker = struct {
                 if (entry.state == .waiting and !entry.cancel_requested and io.milliTimestamp() - entry.updated_ms >= 5000 and
                     (std.mem.eql(u8, entry.reason, "verification_pending") or std.mem.eql(u8, entry.reason, "OutputTruncated") or std.mem.eql(u8, entry.reason, "ContractReviewPending") or std.mem.eql(u8, entry.reason, "Timeout") or std.mem.eql(u8, entry.reason, "IncompleteStream") or std.mem.eql(u8, entry.reason, "RequiredToolMissing")))
                 {
+                    const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse continue;
+                    defer lease.release();
                     const task = try manager.loadTask(entry.task);
                     const limit = if (task.model_basis) |basis| basis.execution.review.max_attempts else 1;
                     if (task.model_basis) |basis| if (basis.execution.review.max_tokens != null) continue;
-                    if (task.state != .blocked and task.state != .conflict and try manager.retainedReviewCandidate(task) != null) {
+                    if (task.state == .blocked or task.state == .conflict or task.state == .accepted or task.state == .publication_pending) continue;
+                    const retained_execution = domain.interruptedExecution(entry.reason) and entry.worker_session != null;
+                    if (retained_execution or try manager.retainedReviewCandidate(task) != null) {
                         const recovered = domain.recover(entry, limit, io.milliTimestamp()) catch continue;
                         try manager.saveBackgroundRecord(recovered, try dispatch.digest(manager, entry));
                     }
