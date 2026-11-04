@@ -133,16 +133,16 @@ fn events(manager: workspace.Manager, entry: domain.Record, generation: u64, off
     if (offset > (try file.stat(io.getIo())).size) return error.InvalidEventCursor;
     const buffer = try manager.alloc.alloc(u8, 2 * 1024 * 1024);
     var reader = file.reader(io.getIo(), buffer);
-    try reader.seekTo(offset);
+    const aligned = try alignEventOffset(&reader, offset);
     var result: std.ArrayList(std.json.Value) = .empty;
-    var next = offset;
+    var next = aligned;
     for (0..32) |_| {
-        const line = try reader.interface.takeDelimiter('\n') orelse break;
-        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch break;
+        const line = try completeLine(&reader.interface) orelse break;
+        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch return error.InvalidEventRecord;
         try result.append(manager.alloc, event);
         next += line.len + 1;
     }
-    return value(manager, .{ .events = result.items, .next_offset = next, .offset_unit = "bytes", .active = generation == entry.generation and entry.state == .running, .record = entry });
+    return value(manager, .{ .events = result.items, .requested_offset = offset, .aligned_offset = aligned, .next_offset = next, .offset_unit = "bytes", .active = generation == entry.generation and entry.state == .running, .record = entry });
 }
 
 fn saveOperation(manager: workspace.Manager, previous: domain.Record, next: domain.Record, request: Request) !void {
@@ -163,12 +163,14 @@ pub fn activity(manager: workspace.Manager, entry: domain.Record) !std.json.Valu
     defer file.close(io.getIo());
     const stat = try file.stat(io.getIo());
     const start = stat.size - @min(stat.size, 65536);
-    const buffer = try manager.alloc.alloc(u8, 65536);
-    var reader = file.reader(io.getIo(), buffer);
-    try reader.seekTo(start);
-    if (start > 0) _ = try reader.interface.takeDelimiter('\n');
+    const buffer = try manager.alloc.alloc(u8, @intCast(stat.size - start));
+    const bytes = buffer[0..try file.readPositionalAll(io.getIo(), buffer, start)];
+    // Inspect only this snapshot's bytes; concurrent appends cannot extend it.
+    var cursor: usize = if (start > 0) if (std.mem.indexOfScalar(u8, bytes, '\n')) |end| end + 1 else bytes.len else 0;
     var recent: std.ArrayList(std.json.Value) = .empty;
-    while (try reader.interface.takeDelimiter('\n')) |line| {
+    while (std.mem.indexOfScalarPos(u8, bytes, cursor, '\n')) |end| {
+        const line = bytes[cursor..end];
+        cursor = end + 1;
         const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch continue;
         const data = model.field(event, "data") orelse continue;
         if (recent.items.len == 16) _ = recent.orderedRemove(0);
@@ -187,7 +189,36 @@ pub fn activity(manager: workspace.Manager, entry: domain.Record) !std.json.Valu
         .next_offset = stat.size,
         .offset_unit = "bytes",
         .tail_only = true,
+        .tail_start_offset = start,
         .recent_events = recent.items,
         .note = "A running record or a quiet journal does not prove progress. Unmatched tool events in this bounded tail do not establish a pending operation. Inspect receipts for outcomes; reconcile uncertain effects before retrying.",
     });
+}
+
+// A partially written final line is not an event yet. Do not advance its cursor.
+fn completeLine(reader: *std.Io.Reader) !?[]const u8 {
+    const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => return err,
+    };
+    return line[0 .. line.len - 1];
+}
+
+// A caller may seek into a large journal without knowing every line boundary.
+// Skip only the partial prefix and report the aligned byte position explicitly.
+fn alignEventOffset(reader: *std.Io.File.Reader, offset: u64) !u64 {
+    if (offset == 0) {
+        try reader.seekTo(0);
+        return 0;
+    }
+    try reader.seekTo(offset - 1);
+    if (try reader.interface.takeByte() == '\n') return offset;
+    const fragment = try completeLine(&reader.interface) orelse return offset;
+    return offset + fragment.len + 1;
+}
+
+test "journal paging retains an incomplete final event for a later read" {
+    var reader = std.Io.Reader.fixed("{\"cursor\":1}\n{\"cursor\":2}");
+    try std.testing.expectEqualStrings("{\"cursor\":1}", (try completeLine(&reader)).?);
+    try std.testing.expect((try completeLine(&reader)) == null);
 }

@@ -119,9 +119,14 @@ service supervisor.
 
 Background status includes a bounded tail of public event metadata with event
 timestamps when available. The event API's `next_offset` is a byte offset, not
-an event cursor. A running record alone does not prove current activity, and a
+an event cursor. An offset inside a record advances to the next complete
+record and returns `aligned_offset`; an unfinished final line is left for a
+later read. A running record alone does not prove current activity, and a
 quiet journal alone does not prove a stall. Null outcome counts mean unknown,
-not zero; inspect action receipts to establish completed outcomes.
+not zero; inspect action receipts to establish completed outcomes. A supported
+status report can answer a lookup while the underlying task remains unfinished.
+The lookup must not confuse the requested progress report with commentary
+about its own investigation.
 
 The shared agent instructions require fresh outcome evidence before replaying
 an uncertain external action. This applies to foreground and background turns:

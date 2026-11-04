@@ -329,7 +329,7 @@ test('interrupted execution resumes automatically without a completion candidate
   expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
   const original=(await native.request('background')).workers[0].record;
 
-  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed');
+  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed'&&v.activity?.recent_events.some((event:any)=>event.type==='background_outcome'));
   // Each partially emitted stream ends its invocation; both faults recover.
   expect(finished.generation).toBe(3);expect(finished.recoveries).toBe(2);
   expect(finished.worker_session).toBe(original.worker_session);
@@ -338,6 +338,14 @@ test('interrupted execution resumes automatically without a completion candidate
   expect(finished.activity.journal_available).toBe(true);
   expect(finished.activity.offset_unit).toBe('bytes');
   expect(finished.activity.recent_events.some((event:any)=>event.timestamp_ms>0)).toBe(true);
+  const page=await native.request('background',{action:'events',task:original.task,offset:1});
+  expect(page.requested_offset).toBe(1);
+  expect(page.aligned_offset).toBeGreaterThan(1);
+  expect(page.events[0].cursor).toBe(2);
+  expect(page.next_offset).toBeGreaterThan(page.aligned_offset);
+  const journalEnd=await native.request('background',{action:'events',task:original.task,offset:finished.activity.next_offset});
+  expect(journalEnd.events).toEqual([]);
+  expect(journalEnd.next_offset).toBe(finished.activity.next_offset);
   expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
   await native.request('background',{action:'stop'});await first.exited;
  }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
