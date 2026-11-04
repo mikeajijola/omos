@@ -37,7 +37,11 @@ def put(root, name, text):
 
 
 def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    checksum = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            checksum.update(chunk)
+    return checksum.hexdigest()
 
 
 def setup(family, project, seed):
