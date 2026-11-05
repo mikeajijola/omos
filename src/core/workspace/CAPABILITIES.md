@@ -216,6 +216,12 @@ evidence, and existing background records retain their normal reasoning and
 reconciliation paths. Queuing does not establish completion; workers still
 satisfy the original contract through independent review.
 
+Concurrent tasks can publish identical files, including binary artifacts. If
+Fossil reports a merge conflict, the host checks the complete checkout against
+the expected three-way result, including file identities and executable flags.
+Publication proceeds only when that exact result is present; differing edits
+remain conflicts.
+
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,
 event polling, steering, and cancellation through the native conversation host.

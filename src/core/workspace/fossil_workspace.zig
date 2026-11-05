@@ -356,6 +356,11 @@ fn executableFlag(files: []const fossil_manifest.File, path: []const u8) !?bool 
     return null;
 }
 
+fn sameFile(a: ?fossil_manifest.File, b: ?fossil_manifest.File) bool {
+    if (a) |left| return if (b) |right| left.mode == right.mode and optionalEqual(left.artifact, right.artifact) else false;
+    return b == null;
+}
+
 fn contentParent(alloc: Allocator, tree: []const u8, path: []const u8) !std.Io.Dir {
     var directory = try io_mod.openDirAbsoluteNoFollow(try io_mod.realpathAlloc(alloc, tree), .{ .iterate = true });
     errdefer directory.close(io_mod.getIo());
@@ -1761,12 +1766,50 @@ pub const Manager = struct {
     fn merge(self: Manager, tree: []const u8, revision_id: []const u8, previous: Task) !void {
         self.mergeRevision(tree, revision_id) catch |err| {
             if (err == error.WorkspaceMergeConflict) {
+                // Fossil's binary merge can report a conflict for identical
+                // concurrent additions. Accept only the exact three-way result,
+                // including every file's bytes and mode, without rewriting it.
+                if (try self.exactMergeResult(tree, previous.base_revision, revision_id)) return;
                 var task = try self.loadTask(previous.id);
                 task.state = .conflict;
                 try self.saveTask(task);
             }
             return err;
         };
+    }
+
+    fn exactMergeResult(self: Manager, tree: []const u8, base: []const u8, source: []const u8) !bool {
+        const source_revision = try self.revision(source);
+        const contributors = try self.run(tree, &.{ "changes", "--merge" });
+        if (!std.mem.eql(u8, std.mem.trim(u8, contributors, " \r\n"), source_revision)) return false;
+        if (std.mem.trim(u8, try self.run(tree, &.{ "extras", "--dotfiles" }), " \r\n").len != 0) return false;
+        var expected = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer expected.deinit();
+        for (try self.fileManifest(try self.fullRevision(tree, "current"))) |file| try expected.put(file.path, file);
+        for (try self.compareFiles(base, source_revision)) |change| {
+            const target = expected.get(change.path);
+            if (!sameFile(target, change.before) and !sameFile(target, change.after)) return false;
+            if (change.after) |file| try expected.put(change.path, file) else _ = expected.remove(change.path);
+        }
+        const root = try io_mod.realpathAlloc(self.alloc, tree);
+        var files = std.mem.splitScalar(u8, try self.run(tree, &.{"ls"}), '\n');
+        while (files.next()) |path| {
+            if (path.len == 0) continue;
+            const entry = expected.fetchRemove(path) orelse return false;
+            const file = entry.value;
+            if (file.mode == .symlink or (!allowedPath(path) and !std.mem.eql(u8, path, "registry.json"))) return false;
+            const absolute = try join(self.alloc, root, path);
+            var parent = try io_mod.openDirAbsoluteNoFollow(std.Io.Dir.path.dirname(absolute).?, .{});
+            defer parent.close(io_mod.getIo());
+            var opened = try parent.openFile(io_mod.getIo(), std.Io.Dir.path.basename(path), .{ .allow_directory = false, .follow_symlinks = false });
+            defer opened.close(io_mod.getIo());
+            const stat = try opened.stat(io_mod.getIo());
+            if (stat.kind != .file or (stat.permissions.toMode() & 0o111 != 0) != (file.mode == .executable)) return false;
+            const bytes = try io_mod.readFileToEnd(self.alloc, &opened, max_bytes);
+            defer self.alloc.free(bytes);
+            fossil_manifest.verifyObject(file.artifact orelse return false, bytes) catch return false;
+        }
+        return expected.count() == 0;
     }
 
     fn mergeRevision(self: Manager, tree: []const u8, revision_id: []const u8) !void {
@@ -2990,16 +3033,10 @@ pub const Manager = struct {
         var target_files = std.StringHashMap(fossil_manifest.File).init(self.alloc);
         defer target_files.deinit();
         for (try self.fileManifest(try self.revision(target))) |file| try target_files.put(file.path, file);
-        const same = struct {
-            fn file(a: ?fossil_manifest.File, b: ?fossil_manifest.File) bool {
-                if (a) |left| return if (b) |right| left.mode == right.mode and optionalEqual(left.artifact, right.artifact) else false;
-                return b == null;
-            }
-        }.file;
         for (try self.compareFiles(task.base_revision, source)) |change| {
             if (!allowedPath(change.path) and !std.mem.eql(u8, change.path, "registry.json")) return error.WorkspacePathDenied;
             const target_file = target_files.get(change.path);
-            if (same(change.after, target_file) or same(change.before, target_file)) continue;
+            if (sameFile(change.after, target_file) or sameFile(change.before, target_file)) continue;
             var conflicted = try self.loadTask(task.id);
             conflicted.state = .conflict;
             try self.saveTask(conflicted);

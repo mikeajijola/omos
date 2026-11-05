@@ -6112,6 +6112,36 @@ sys.exit(result.returncode)
     expect(status.tasks).toHaveLength(0);
   }, 30000);
 
+  test("publishes concurrent identical text and binary files without repeating actor work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    let arrived = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const turns = { a: 0, b: 0 };
+    model(f, body => {
+      const key = JSON.stringify(body.messages).includes("task-A") ? "a" : "b";
+      if (++turns[key] > 1) return { content: `Saved the shared files and ${key}'s document.` };
+      return { tool_calls: [
+        ["documents/shared.txt", "Identical text"],
+        ["documents/shared.bin", "Identical\u0000binary"],
+        [`documents/${key}.txt`, key],
+      ].map(([path, content], index) => ({ index, id: `write-${key}-${index}`, type: "function", function: {
+        name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path, content }),
+      } })) };
+    }, async () => { if (++arrived === 2) release(); await gate; return "met"; });
+    const results = await Promise.all([
+      f.run(["ask", "task-A: save the shared files and document A", "--json"], {}, 90000),
+      f.run(["ask", "task-B: save the shared files and document B", "--json"], {}, 90000),
+    ]);
+    expect(results.map(result => result.code), JSON.stringify(results)).toEqual([0, 0]);
+    expect(turns).toEqual({ a: 2, b: 2 });
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks.map((task: any) => task.state)).toEqual(["accepted", "accepted"]);
+    expect(f.fossil("cat", "documents/shared.txt", "-r", "trunk")).toBe("Identical text");
+    expect(f.fossil("cat", "documents/shared.bin", "-r", "trunk")).toBe("Identical\u0000binary");
+    for (const key of ["a", "b"]) expect(f.fossil("cat", `documents/${key}.txt`, "-r", "trunk")).toBe(key);
+  }, 120000);
+
   test("retains a file conflict when concurrent proposals change its content and executable flag", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
