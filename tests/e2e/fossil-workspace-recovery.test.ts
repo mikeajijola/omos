@@ -6483,7 +6483,7 @@ for (const maximum of [4, 12]) {
     const policy = JSON.parse(readFileSync(policyPath, "utf8"));
     policy.defaults.progress_max_interval = maximum;
     writeFileSync(policyPath, JSON.stringify(policy));
-    fossil("commit", "--nosync", "--nosign", "--no-verify", "-m", "Set isolated cadence fixture");
+    fossil("commit", "--nosync", "--nosign", "--no-verify", "--allow-empty", "-m", "Set isolated cadence fixture");
     fossil("close");
     let reviews = 0;
     const m = model(f, (_body, count) => count <= 8 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all eight checkpoints." }, undefined, {
