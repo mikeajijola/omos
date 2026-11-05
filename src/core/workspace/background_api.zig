@@ -37,7 +37,8 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         var workers: std.ArrayList(std.json.Value) = .empty;
         for (entries) |entry| {
             const authority = try control.activation(manager, entry);
-            try workers.append(manager.alloc, try value(manager, .{ .record = entry, .session = if (authority) |local| @as(?[]const u8, local.source_session) else null, .locally_activated = authority != null }));
+            const execution = try @import("contract_execution.zig").inspect(manager, try manager.loadTask(entry.task), entry);
+            try workers.append(manager.alloc, try value(manager, .{ .record = entry, .execution = execution, .session = if (authority) |local| @as(?[]const u8, local.source_session) else null, .locally_activated = authority != null }));
         }
         return value(manager, .{ .version = "omos.background-contracts/v1", .workers = workers.items, .next_offset = if (entries.len == 32) request.offset + entries.len else @as(?usize, null) });
     }
@@ -48,6 +49,7 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
     const entry = (try manager.backgroundRecord(request.task orelse return error.MissingTaskId)) orelse return error.BackgroundDispatchRequired;
     if (request.action == .show) {
         var result = try value(manager, entry);
+        try result.object.put(manager.alloc, "execution", try value(manager, try @import("contract_execution.zig").inspect(manager, try manager.loadTask(entry.task), entry)));
         try result.object.put(manager.alloc, "activity", try activity(manager, entry));
         return result;
     }
@@ -80,7 +82,6 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
             try saveOperation(manager, entry, next, request);
             return value(manager, .{ .accepted = true, .fulfilled = true, .record = next });
         }
-        if (task.state == .accepted or task.state == .publication_pending) return error.BackgroundTaskUnavailable;
         const activation = (try control.activation(manager, entry)) orelse return error.BackgroundActivationRequired;
         try control.verifyLiveAuthority(manager, activation);
         try manager.validateTaskBasis(task);
@@ -94,6 +95,8 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         var next = entry;
         if (entry.state != .starting) next.state = .cancelled;
         next.cancel_requested = true;
+        next.retry = null;
+        next.wait_condition = null;
         next.reason = "Cancelled by the user. Work and evidence remain retained.";
         next.updated_ms = io.milliTimestamp();
         try saveOperation(manager, entry, next, request);

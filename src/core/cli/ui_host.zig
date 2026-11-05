@@ -485,13 +485,16 @@ const BackgroundRun = struct {
         ui: *interaction.Host,
         finished: std.atomic.Value(bool) = .init(false),
         checked_at: i64 = 0,
+        wait_condition: ?background.WaitCondition = null,
 
         fn loop(self: *Monitor) void {
             while (!self.finished.load(.acquire)) {
                 if (self.run_context.cancel.load(.acquire)) self.ui.stop();
                 self.poll() catch |err| {
-                    self.ui.emit(.{ .type = "notice", .text = @errorName(err) }) catch {};
-                    self.ui.stop();
+                    if (err != error.WorkspaceBusy and err != error.StaleBackgroundRecord) {
+                        self.ui.emit(.{ .type = "notice", .text = @errorName(err) }) catch {};
+                        self.ui.stop();
+                    }
                 };
                 io.sleep(100 * std.time.ns_per_ms);
             }
@@ -507,6 +510,15 @@ const BackgroundRun = struct {
             if (io.milliTimestamp() - self.checked_at >= 1000) {
                 self.checked_at = io.milliTimestamp();
                 try background_control.verifyLiveAuthority(manager, self.run_context.authority);
+            }
+            self.ui.mutex.lockUncancelable(io.getIo());
+            const condition: ?background.WaitCondition = if (self.ui.approval_id != 0 or self.ui.question_id != 0) .input else if (self.ui.validation_id != 0) .validation else null;
+            self.ui.mutex.unlock(io.getIo());
+            if (condition != self.wait_condition) {
+                const entry = (try manager.backgroundRecord(self.run_context.authority.task)) orelse return error.BackgroundDispatchRequired;
+                const next = try background.setWaitCondition(entry, .{ .owner = self.run_context.owner, .generation = self.run_context.entry.generation }, condition, io.milliTimestamp());
+                try manager.saveBackgroundRecord(next, try background_dispatch.digest(manager, entry));
+                self.wait_condition = condition;
             }
             const parent = try background_control.path(manager, "controls", "placeholder");
             var dir = try std.Io.Dir.openDirAbsolute(io.getIo(), std.Io.Dir.path.dirname(parent).?, .{ .iterate = true });

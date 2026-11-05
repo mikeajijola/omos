@@ -142,8 +142,9 @@ pub fn status(manager: workspace.Manager, task: workspace.Task) !std.json.Value 
     const published = task.state == .accepted and !try manager.publicationPending(task);
     const publication: ?std.json.Value = if (published) try manager.publicationSummary(task) else null;
     const state = if (published) "completed" else if (worker) |entry| @tagName(entry.state) else @tagName(task.state);
+    const execution = if (worker) |entry| try @import("contract_execution.zig").inspect(manager, task, entry) else null;
     const reason = if (worker) |entry| entry.reason else "";
-    const description: []const u8 = if (published)
+    const description: []const u8 = if (execution) |decision| decision.reason else if (published)
         "The contract has a verified publication."
     else if (std.mem.eql(u8, reason, "workspace_governance_pending"))
         "Work is waiting because its review did not finish. This does not establish that the requested actions were completed."
@@ -159,7 +160,7 @@ pub fn status(manager: workspace.Manager, task: workspace.Task) !std.json.Value 
         break :blk prefix(model.text(review, "candidate"), 3000);
     } else "";
     const text = try a.print("{s}\nStatus: {s}. {s}{s}{s}{s}{s}", .{ task.definition.objective, state, description, if (reason.len > 0) "\nRecorded reason: " else "", reason, if (outcome.len > 0) "\nReviewed outcome: " else "", outcome });
-    return value(a, .{ .task = task.id, .contract_version = task.definition.version, .state = state, .text = text, .published = published, .publication = publication, .revision = revision, .worker = worker, .activity = if (worker) |entry| try @import("background_api.zig").activity(manager, entry) else @as(?std.json.Value, null), .outcome_counts = @as(?usize, null), .outcome_count_status = "unknown", .evidence_note = "Null outcome counts mean unknown, not zero. No outcome count is inferred from activity or publication state. Inspect contract evidence and submission receipts.", .history_prefix = try a.print("history/{s}/", .{task.id}) });
+    return value(a, .{ .task = task.id, .contract_version = task.definition.version, .state = state, .text = text, .published = published, .publication = publication, .revision = revision, .worker = worker, .execution = execution, .activity = if (worker) |entry| try @import("background_api.zig").activity(manager, entry) else @as(?std.json.Value, null), .outcome_counts = @as(?usize, null), .outcome_count_status = "unknown", .evidence_note = "Null outcome counts mean unknown, not zero. No outcome count is inferred from activity or publication state. Inspect contract evidence and submission receipts.", .history_prefix = try a.print("history/{s}/", .{task.id}) });
 }
 
 fn sameRequest(a: []const u8, b: []const u8) bool {

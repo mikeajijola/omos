@@ -6,6 +6,7 @@ const domain = @import("background_contract.zig");
 const dispatch = @import("background_dispatch.zig");
 const control = @import("background_control.zig");
 const records = @import("../shared/record_json.zig");
+const execution = @import("contract_execution.zig");
 
 pub const Executor = struct {
     context: *anyopaque,
@@ -82,66 +83,111 @@ pub const Worker = struct {
             const page = try manager.backgroundRecords(offset);
             for (page) |entry| {
                 if (self.occupies(entry.task)) continue;
-                // Restored portable state requires explicit local activation.
-                const authority = (try control.activation(manager, entry)) orelse continue;
-                if (entry.state == .running or entry.state == .starting) {
-                    const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse continue;
-                    defer lease.release();
-                    var task = try manager.loadTask(entry.task);
-                    if (task.state == .publication_pending or task.state == .accepted) {
-                        if (try manager.publicationPending(task)) _ = try manager.retryPublication(task);
-                        task = try manager.loadTask(entry.task);
-                        if (task.state == .accepted and entry.state == .running) {
-                            _ = try dispatch.finish(manager, entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "Recovered verified publication.");
-                            continue;
-                        }
-                    }
-                    var abandoned = try domain.wait(entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "The worker host stopped. Retained work requires recovery; uncertain effects were not replayed.", io.milliTimestamp());
-                    const limit = if (task.model_basis) |basis| basis.execution.defaults.stalled_checks else 3;
-                    if (entry.worker_session != null and task.state != .blocked and task.state != .conflict and task.state != .accepted and task.state != .publication_pending)
-                        abandoned = domain.recover(abandoned, limit, io.milliTimestamp()) catch abandoned;
-                    try manager.saveBackgroundRecord(abandoned, try dispatch.digest(manager, entry));
-                    continue;
-                }
-                if (entry.state == .waiting and !entry.cancel_requested and io.milliTimestamp() - entry.updated_ms >= 5000 and
-                    (std.mem.eql(u8, entry.reason, "verification_pending") or std.mem.eql(u8, entry.reason, "OutputTruncated") or std.mem.eql(u8, entry.reason, "ContractReviewPending") or std.mem.eql(u8, entry.reason, "Timeout") or std.mem.eql(u8, entry.reason, "IncompleteStream") or std.mem.eql(u8, entry.reason, "RequiredToolMissing")))
-                {
-                    const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse continue;
-                    defer lease.release();
-                    const task = try manager.loadTask(entry.task);
-                    const limit = if (task.model_basis) |basis| basis.execution.review.max_attempts else 1;
-                    if (task.model_basis) |basis| if (basis.execution.review.max_tokens != null) continue;
-                    if (task.state == .blocked or task.state == .conflict or task.state == .accepted or task.state == .publication_pending) continue;
-                    const retained_execution = domain.interruptedExecution(entry.reason) and entry.worker_session != null;
-                    if (retained_execution or try manager.retainedReviewCandidate(task) != null) {
-                        const recovered = domain.recover(entry, limit, io.milliTimestamp()) catch continue;
-                        try manager.saveBackgroundRecord(recovered, try dispatch.digest(manager, entry));
-                    }
-                    continue;
-                }
-                if (entry.state != .queued) continue;
-                var free: ?usize = null;
-                for (self.slots, 0..) |slot, index| if (slot == null) {
-                    free = index;
-                    break;
+                self.advance(manager, entry, owner) catch |err| {
+                    // A single stale or unavailable contract must not stop the
+                    // queue or cancel other workers. CAS preserves newer state.
+                    if (err == error.WorkspaceBusy or err == error.WorkspaceExecutionBusy or err == error.StaleBackgroundRecord) continue;
+                    const current = (manager.backgroundRecord(entry.task) catch continue) orelse continue;
+                    if (current.generation != entry.generation or current.state == .completed or current.state == .cancelled or current.state == .superseded) continue;
+                    var failed = current;
+                    failed.state = .waiting;
+                    failed.reason = @errorName(err);
+                    failed.updated_ms = io.milliTimestamp();
+                    failed.retry = domain.retryFor(@errorName(err), current.recoveries, failed.updated_ms);
+                    failed.wait_condition = null;
+                    manager.saveBackgroundRecord(failed, dispatch.digest(manager, current) catch continue) catch {};
                 };
-                const index = free orelse return;
-                // A queued handoff may still be releasing its foreground lease.
-                const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse continue;
-                lease.release();
-                const slot = try std.heap.c_allocator.create(Slot);
-                errdefer std.heap.c_allocator.destroy(slot);
-                slot.* = .{ .worker = self, .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator), .entry = undefined, .authority = undefined };
-                errdefer slot.arena.deinit();
-                const alloc = slot.arena.allocator();
-                slot.entry = try records.decode(domain.Record, alloc, try std.json.Stringify.valueAlloc(alloc, entry, .{}), .{});
-                slot.authority = try records.decode(control.Authority, alloc, try std.json.Stringify.valueAlloc(alloc, authority, .{}), .{});
-                const owned_owner = try alloc.dupe(u8, owner);
-                slot.thread = try std.Thread.spawn(.{}, Slot.run, .{ slot, owned_owner });
-                self.slots[index] = slot;
             }
             if (page.len < 32) break;
         }
+    }
+
+    fn advance(self: *Worker, manager: workspace.Manager, entry: domain.Record, owner: []const u8) !void {
+        if (entry.state == .prepared or entry.state == .completed or entry.state == .superseded) return;
+        // Portable records cannot grant execution authority on another host.
+        const authority = (try control.activation(manager, entry)) orelse return;
+        const lease = (try manager.tryTaskExecutionLease(entry.task)) orelse return;
+        var leased = true;
+        defer if (leased) lease.release();
+        const task = try manager.loadTask(entry.task);
+        const decision = try execution.inspect(manager, task, entry);
+        if (decision.next == .reconcile) {
+            const next = try domain.reconcilePublished(entry, @import("definition.zig").text(try manager.publicationSummary(task), "revision"), io.milliTimestamp());
+            try manager.saveBackgroundRecord(next, try dispatch.digest(manager, entry));
+            return;
+        }
+        if ((entry.state == .running or entry.state == .starting) and (decision.phase == .cancelled or decision.phase == .attention)) {
+            const next = try domain.wait(entry, .{ .owner = entry.owner.?, .generation = entry.generation }, decision.reason, io.milliTimestamp());
+            try manager.saveBackgroundRecord(next, try dispatch.digest(manager, entry));
+            return;
+        }
+        if (decision.phase == .cancelled or decision.phase == .attention or decision.phase == .retry_wait) return;
+        var free: ?usize = null;
+        for (self.slots, 0..) |slot, index| if (slot == null) {
+            free = index;
+            break;
+        };
+        // Do not repeatedly validate queued work while every slot is occupied.
+        // Publication and recovery still advance independently of actor slots.
+        if (decision.next == .execute and free == null) return;
+        try control.verifyLiveAuthority(manager, authority);
+        try manager.validateTaskBasis(task);
+        if (decision.next == .publish) {
+            publish(manager, task, entry) catch |err| {
+                // Persist the wake-up before yielding. Restarting the host
+                // neither resets the attempt count nor loses the deadline.
+                var next = entry;
+                next.state = .waiting;
+                next.wait_condition = null;
+                next.reason = @errorName(err);
+                next.updated_ms = io.milliTimestamp();
+                next.retry = .{ .kind = .publication, .due_ms = next.updated_ms +| domain.retryDelay(entry.recoveries) };
+                next.recoveries = std.math.add(u32, entry.recoveries, 1) catch return error.BackgroundRecoveryUnavailable;
+                try manager.saveBackgroundRecord(next, try dispatch.digest(manager, entry));
+                return;
+            };
+            return;
+        }
+        if (entry.state == .running or entry.state == .starting) {
+            // No slot owns it and we acquired its task lease: the old process
+            // is gone. A quiet event stream alone never triggers this recovery.
+            var abandoned = try domain.wait(entry, .{ .owner = entry.owner.?, .generation = entry.generation }, "The previous worker stopped. Resume retained work and reconcile uncertain effects.", io.milliTimestamp());
+            if (!abandoned.cancel_requested)
+                abandoned.retry = .{ .kind = .interrupted, .due_ms = abandoned.updated_ms +| domain.retryDelay(entry.recoveries) };
+            try manager.saveBackgroundRecord(abandoned, try dispatch.digest(manager, entry));
+            return;
+        }
+        if (decision.next == .recover) {
+            const recovered = try domain.recover(entry, decision.recovery_limit, io.milliTimestamp());
+            try manager.saveBackgroundRecord(recovered, try dispatch.digest(manager, entry));
+            return;
+        }
+        if (decision.next != .execute) return;
+        const index = free orelse return;
+        // The executor claims its own task lease and generation before running.
+        lease.release();
+        leased = false;
+        const slot = try std.heap.c_allocator.create(Slot);
+        errdefer std.heap.c_allocator.destroy(slot);
+        slot.* = .{ .worker = self, .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator), .entry = undefined, .authority = undefined };
+        errdefer slot.arena.deinit();
+        const alloc = slot.arena.allocator();
+        slot.entry = try records.decode(domain.Record, alloc, try std.json.Stringify.valueAlloc(alloc, entry, .{}), .{});
+        slot.authority = try records.decode(control.Authority, alloc, try std.json.Stringify.valueAlloc(alloc, authority, .{}), .{});
+        const owned_owner = try alloc.dupe(u8, owner);
+        slot.thread = try std.Thread.spawn(.{}, Slot.run, .{ slot, owned_owner });
+        self.slots[index] = slot;
+    }
+
+    fn publish(manager: workspace.Manager, task: workspace.Task, entry: domain.Record) !void {
+        _ = (try manager.retryPublication(task)) orelse return error.WorkspaceRecoveryRequired;
+        const published = try manager.loadTask(entry.task);
+        if (published.state != .accepted) return error.WorkspacePublicationRequired;
+        const next = try domain.reconcilePublished(entry, @import("definition.zig").text(try manager.publicationSummary(published), "revision"), io.milliTimestamp());
+        // Clear pending delivery only after the retained receipt is verified.
+        // A crash after acknowledgement is reconciled on the next queue scan.
+        try manager.acknowledge(published);
+        try manager.saveBackgroundRecord(next, try dispatch.digest(manager, entry));
     }
 
     /// The caller holds the private instance host lock until all slots join.

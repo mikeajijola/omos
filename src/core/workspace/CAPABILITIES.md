@@ -225,6 +225,31 @@ the current parent and its read dependencies. Once the conflict is resolved, a
 retained final answer can return to independent review without repeating actor
 actions.
 
+Background `list` and `show`, and contract `status`, expose the same
+`omos.contract-execution/v1` decision used by the queue. It includes the current
+phase, next host action, reason, state timestamp, recovery attempts and limit,
+and any scheduled retry timestamp. Live input and interface-validation waits
+are recorded by the owning invocation, including their generation fence;
+historical input records cannot approve a new invocation. A verified contract publication takes
+precedence over a stale worker record. Pending publication retries and
+acknowledges its retained receipt without starting another actor invocation.
+
+Recoverable transport failures retain a typed continuation and an absolute
+retry deadline in `runtime/background/`. Delays increase from one second to
+64 seconds; restarting the host preserves the deadline and attempt count.
+The pinned contract policy bounds recovery: execution uses `stalled_checks`,
+and review uses `max_attempts` while respecting its token budget. A review retry
+requires a retained candidate. Cancellation, unresolved conflicts, blocked
+contracts, and exhausted recovery remain visible for attention. Explicit resume
+can retry retained publication as well as execution.
+
+The host recovers a stopped invocation only after acquiring its task lease.
+A quiet journal alone never triggers recovery. Each queue entry is handled
+independently so a stale contract or unavailable dependency does not stop other
+workers. Scheduled retry waits occupy no worker slot. Existing live requests
+for human input still retain their worker; they are not durable sleeps that
+release the entire invocation.
+
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,
 event polling, steering, and cancellation through the native conversation host.

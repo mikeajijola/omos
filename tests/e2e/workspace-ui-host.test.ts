@@ -281,6 +281,9 @@ test('background contracts release the main chat while workers await input and p
   const session = observed.find(e=>e.data.type==='session').data.session_id;
   const running = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.state==='running');
   const input = await until(()=>native.request('background',{action:'events',task:original.task,generation:running.generation}), value=>value.events.some((e:any)=>e.data.type==='input_required'));
+  const waitingInput = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.execution.phase==='awaiting_input');
+  expect(waitingInput.execution.next).toBe('none');
+  expect(waitingInput.wait_condition).toBe('input');
   expect(workerCalls).toBe(1);
   const endingSecond = terminal(native,'main-while-worker-waits');
   await native.request('coordinate',{text:'Are you still available?',session},{id:'main-while-worker-waits'});
@@ -300,6 +303,7 @@ test('background contracts release the main chat while workers await input and p
    console.error('background final',JSON.stringify(final),JSON.stringify(diagnostics.filter(e=>['result','error','notice','background_outcome'].includes(e.data.type)).slice(-12)));
   }
   expect(final.state).toBe('completed'); expect(final.task).toBe(original.task);
+  expect(final.wait_condition).toBeNull();expect(final.execution.phase).toBe('completed');
   expect(assignments).toEqual([original.task,original.task]);
   expect(final.contract_sha256).toBe(original.contract_sha256); expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
   const tasks = await native.request('snapshot',{action:'fossil.status'});
@@ -511,6 +515,48 @@ test('interrupted execution resumes automatically without a completion candidate
   await native.request('background',{action:'stop'});await first.exited;
  }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
 },180000);
+
+test('contract scheduler finishes a waiting publication after restart without replaying work', async()=>{
+ const f=fixture();let actorCalls=0;
+ model(f,(body)=>{
+  const worker=body.messages.some((m:any)=>m.role==='system'&&String(m.content).includes('<omos_background_assignment'));
+  if(!worker)return {tool_calls:[{index:0,id:'dispatch',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  actorCalls++;
+  if(actorCalls===1)return {tool_calls:[{index:0,id:'write-once',type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'documents/durable-result.txt',content:'One reviewed result.'})}}]};
+  return {content:'The durable result was written and verified.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(v:any)=>boolean)=>{const deadline=Date.now()+120000;let v:any;do{v=await read();if(predicate(v))return v;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(JSON.stringify(v)+native.stderr)};
+ const start=(fault?:string)=>{const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'ui-host','--background-serve'],{cwd:f.cwd,env:{...process.env,...f.env,FX_E2E_FOSSIL_FAULT:fault},stdout:'pipe',stderr:'pipe'});services.push(child);return child};
+ const first=start('publication-committed');
+ try{
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const end=terminal(native,'durable-publication');
+  await native.request('coordinate',{text:'Write and publish documents/durable-result.txt containing One reviewed result.'},{id:'durable-publication'});
+  expect((await end).data.exit_code).toBe(0);
+  const original=(await native.request('background')).workers[0].record;
+  const waiting=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='waiting');
+  expect(['publishing','retry_wait','attention']).toContain(waiting.execution.phase);
+  expect(actorCalls).toBe(2);
+  await native.request('background',{action:'stop'});await first.exited;
+  // An explicit resume also permits retrying publication after its bounded
+  // automatic budget, without handing the completed action back to an actor.
+  const second=start();
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const retained=await native.request('background',{action:'show',task:original.task});
+  if(retained.execution.phase==='attention')await native.request('background',{action:'resume',task:original.task,generation:retained.generation,operation:'b'.repeat(64)});
+  const done=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed');
+  expect(done.execution.phase).toBe('completed');expect(done.execution.next).toBe('none');
+  expect(done.generation).toBe(1);expect(actorCalls).toBe(2);
+  expect(f.fossil('cat','documents/durable-result.txt','-r','trunk')).toBe('One reviewed result.');
+  const request=join(f.home,'contract-status.json');writeFileSync(request,JSON.stringify({action:'contracts',contracts:{action:'status',task:original.task}}));
+  const cli=await f.run(['fossil','capabilities',request,'--json']);expect(cli.code,cli.stderr).toBe(0);
+  expect(JSON.parse(cli.stdout).execution).toEqual(done.execution);
+  await native.request('background',{action:'stop'});await second.exited;
+  expect(await new Response(second.stderr).text()).toBe('');
+ }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
+},240000);
 
 test('native owner settings persist validated defaults and expose MCP inventory', async()=>{
  const f=fixture();model(f,()=>({content:'Hello.'}));

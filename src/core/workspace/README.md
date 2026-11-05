@@ -579,6 +579,15 @@ publication receipt. Permission questions and UI compilation requests stay
 pending until the trusted CLI or browser host responds. The existing synchronous
 subagent tool remains available to workers and direct execution clients.
 
+The queue derives its next action from the retained contract and publication
+state. `background show` and contract `status` expose that same decision, with a
+reason, recovery count, and scheduled retry time. Transport and review retries
+retain their deadlines across host restarts and use the pinned execution policy
+for their limits. Publication recovery verifies and acknowledges the existing
+receipt without replaying actor work. A contract that needs attention does not
+stop unrelated queue entries. See [capability behavior](CAPABILITIES.md) for the
+status fields and recovery limits.
+
 Image inputs retain their original identities and verified bytes. The handoff
 copies immutable snapshots into private host storage and records references in
 local activation, rather than embedding image payloads in a dispatch record.
