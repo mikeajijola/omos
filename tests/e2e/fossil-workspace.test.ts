@@ -80,12 +80,15 @@ describe("portable Fossil agent workspace", () => {
     });
     const result = await f.run(["ask", "Save sixteen sequential preference checkpoints", "--json"], {}, 240000);
     expect(result.code, result.stderr + result.stdout).toBe(0);
-    expect(steps.size).toBe(4);
-    expect(corrections).toBe(3);
+    // A ready assessment permits the seeded policy's longer interval; reused
+    // evidence still requires reconciliation at the next review.
+    expect([...steps]).toEqual([4, 16]);
+    expect(corrections).toBe(1);
     expect(provider.counts().actors).toBe(17);
     expect(provider.counts().assessments).toBeGreaterThan(0);
     expect(JSON.parse(result.stdout).final_output).toBe("Saved all sixteen checkpoints.");
     expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Checkpoint 16");
   }, 270000);
 
   test("an unavailable planner cannot start actor work without a validated contract", async () => {
