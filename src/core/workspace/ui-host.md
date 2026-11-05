@@ -26,6 +26,8 @@ Supported operations:
 | `ui.import_legacy` | Retain local appearance history as an unpublished migration artifact on a paused task branch. |
 | `task.resume` | Select retained work with a current task revision fence. Explicit `rebind_project: true` relocates eligible personal work to the host's project and requires fresh source validation. |
 
+A temporary repository-lock timeout during a host inspection fails that request without cancelling an active conversation. A confirmed workspace binding change still stops the invocation and prevents the host from silently retargeting it.
+
 A repeated prompt ID must identify the same request. Reconnection reads events; it never starts another invocation. If the native process stops, the external host reports retained partial work and requires explicit continuation.
 
 A coordinated handoff releases the main session's task selection after its checkpoint is durable. It reports delegated work rather than completed obligations. Background workers own independent saved sessions and task leases; only independently verified Fossil publication establishes completion. Worker input and validation decisions belong to the trusted external host. Its main conversation can continue while a worker waits. See [background contract workers](README.md#background-contract-workers) for lifecycle, local activation and recovery semantics.

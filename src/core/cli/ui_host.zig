@@ -181,7 +181,12 @@ const Server = struct {
         // Cancellation and public replay remain available for retained work.
         if (!std.mem.eql(u8, method, "cancel") and !std.mem.eql(u8, method, "events") and !std.mem.eql(u8, method, "session.events")) {
             const bound = (workspace.Manager.bound(arena) catch |err| {
-                if (self.job) |active| active.ui.stop();
+                // A busy refresh has not established a binding change. Keep
+                // the existing invocation; fail only this inspection request.
+                switch (err) {
+                    error.WorkspaceBusy, error.Timeout, error.Cancelled => {},
+                    else => if (self.job) |active| active.ui.stop(),
+                }
                 return err;
             }) orelse {
                 if (self.job) |active| active.ui.stop();

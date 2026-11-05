@@ -69,6 +69,27 @@ test('a live UI host cannot silently retarget a changed workspace binding',async
  await expect(native.request('prompt',{text:'This request must not run in another repository.'},{id:'changed-binding-request'})).rejects.toThrow('WorkspaceBindingChanged');
 },90000);
 
+test('temporary workspace contention does not cancel an active UI conversation',async()=>{
+ const f=fixture();let entered=false;let release!:()=>void;const gate=new Promise<void>(r=>release=r);
+ model(f,async()=>{entered=true;await gate;return {content:'The foreground answer survived temporary workspace contention.'};});
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);const observed:any[]=[];native.on('event',(e:any)=>observed.push(e));
+ const ending=terminal(native,'contention-survival');
+ await native.request('prompt',{text:'Provide a short informational answer.'},{id:'contention-survival'});
+ const deadline=Date.now()+30000;while(!entered&&Date.now()<deadline)await Bun.sleep(20);expect(entered).toBe(true);
+ const binding=JSON.parse(readFileSync(join(f.home,'.fx/omos-workspace.json'),'utf8'));
+ const commandLock=join(f.home,'.fx/fossil',createHash('sha256').update(binding.repository).digest('hex'),'command.lock');
+ const blocker=Bun.spawn(['python3','-u','-c',"import fcntl,sys\nwith open(sys.argv[1],'r+') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n print('locked',flush=True)\n sys.stdin.read()\n",commandLock],{stdin:'pipe',stdout:'pipe',stderr:'pipe'});
+ try{
+  const reader=blocker.stdout.getReader();let signal='';while(!signal.includes('\n')){const chunk=await reader.read();if(chunk.done)break;signal+=new TextDecoder().decode(chunk.value);}reader.releaseLock();expect(signal).toBe('locked\n');
+  await expect(native.request('initialize',{}, {timeout:60000})).rejects.toThrow('WorkspaceBusy');
+ }finally{blocker.stdin.end();await blocker.exited;release();}
+ expect((await ending).data.exit_code).toBe(0);
+ const result=observed.find(e=>e.data.type==='result');
+ expect(result.data.data.final_output).toContain('survived temporary workspace contention');
+ expect(native.stderr).toBe('');
+},90000);
+
 test('workspace content is natively authorized in auto mode without an auxiliary safety reviewer', async()=>{
  const f=fixture();let stage=0;const calls:any[]=[];
  model(f,(body)=>{calls.push(body);stage++;
