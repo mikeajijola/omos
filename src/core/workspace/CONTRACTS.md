@@ -236,6 +236,21 @@ adds actor signatures and delegated path grants. Distributed storage, remote
 filesystem mounting, and hosted company actor sessions require additional
 implementations.
 
+## Retained execution context
+
+On invocation startup, the host projects action intents and tool results from
+retained task history into a compact recovery summary. It joins records by
+execution identity, counts successful and failed tool results, and includes up
+to 16 unresolved intent references with an omitted count. A missing result is
+unresolved. Failed external calls can have effects and require reconciliation
+before retrying. These counts do not establish completed user outcomes, grant
+permission to replay tools, or replace independent completion review.
+
+Progress assessment reuses the evidence snapshot supplied to its reviewer when
+updating continuation state. Completion review still collects its own current
+snapshot. Governance response records include model-call elapsed milliseconds
+and request-message counts for latency investigation.
+
 ## Audit and migration
 
 `omos fossil audit --json` validates canonical action, evidence and plan records

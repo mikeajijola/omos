@@ -41,8 +41,24 @@ fn compactJson(comptime source: []const u8) []const u8 {
 
 pub const Policy = struct {
     progress_interval: usize = 4,
+    progress_max_interval: ?usize = null,
     stalled_checks: usize = 3,
     max_actor_steps: usize = 100,
+
+    pub fn jsonStringify(self: Policy, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("progress_interval");
+        try writer.write(self.progress_interval);
+        if (self.progress_max_interval) |maximum| {
+            try writer.objectField("progress_max_interval");
+            try writer.write(maximum);
+        }
+        try writer.objectField("stalled_checks");
+        try writer.write(self.stalled_checks);
+        try writer.objectField("max_actor_steps");
+        try writer.write(self.max_actor_steps);
+        try writer.endObject();
+    }
 };
 pub const ReviewPolicy = struct {
     pub const legacy: ReviewPolicy = .{ .reserved_calls = 1, .response_timeout_ms = 60_000, .attempt_timeout_ms = 60_000, .max_attempts = 1, .total_timeout_ms = 60_000 };
@@ -239,6 +255,7 @@ pub fn parse(alloc: Allocator, bytes: []const u8) !Declaration {
 pub fn parseExecution(alloc: Allocator, bytes: []const u8) !Execution {
     const execution = try record_json.decode(Execution, alloc, bytes, .{});
     const p = execution.defaults;
+    if (p.progress_max_interval) |maximum| if (maximum < p.progress_interval or maximum > 100) return error.InvalidExecutionPolicy;
     if (!std.mem.eql(u8, execution.version, "omos.execution/v1") or p.progress_interval == 0 or p.progress_interval > 100 or p.stalled_checks == 0 or p.stalled_checks > 20 or p.max_actor_steps < 2 or p.max_actor_steps > 10000) return error.InvalidExecutionPolicy;
     if (execution.reviewWorkers() < 1 or execution.reviewWorkers() > 4) return error.InvalidExecutionPolicy;
     if (execution.server) |server| if (server.validation_handle) |handle| {
@@ -257,7 +274,7 @@ pub fn compatibleExecution(old: Execution, next: Execution) bool {
     const x = old.review;
     const y = next.review;
     if (!std.mem.eql(u8, old.validationHandle(), next.validationHandle())) return false;
-    return next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and b.stalled_checks <= a.stalled_checks and
+    return next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and (b.progress_max_interval orelse b.progress_interval) <= (a.progress_max_interval orelse a.progress_interval) and b.stalled_checks <= a.stalled_checks and
         y.max_calls <= x.max_calls and y.reserved_calls >= x.reserved_calls and y.response_timeout_ms <= x.response_timeout_ms and
         y.attempt_timeout_ms <= x.attempt_timeout_ms and y.max_attempts <= x.max_attempts and y.total_timeout_ms <= x.total_timeout_ms and
         y.max_context_bytes <= x.max_context_bytes and y.max_read_bytes <= x.max_read_bytes and
@@ -901,4 +918,17 @@ test "workspace projection policy preserves legacy hashes and bounds disposable 
     try std.testing.expectEqual(@as(usize, 0), bounded.projections.?.max_clean_views);
     try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(a, "{\"projections\":{\"max_clean_views\":1025}}"));
     try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(a, "{\"projections\":{\"max_clean_bytes\":4294967297}}"));
+}
+
+test "workspace declaration adaptive review bounds require explicit allowance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expectEqualStrings("{\"progress_interval\":4,\"stalled_checks\":3,\"max_actor_steps\":100}", try std.json.Stringify.valueAlloc(alloc, Policy{}, .{}));
+    const legacy = try parseExecution(alloc, "{}");
+    const adaptive = try parseExecution(alloc, "{\"defaults\":{\"progress_max_interval\":12}}");
+    try std.testing.expect(!compatibleExecution(legacy, adaptive));
+    try std.testing.expect(compatibleExecution(adaptive, legacy));
+    try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(alloc, "{\"defaults\":{\"progress_max_interval\":3}}"));
+    try std.testing.expectError(error.InvalidExecutionPolicy, parseExecution(alloc, "{\"defaults\":{\"progress_max_interval\":101}}"));
 }

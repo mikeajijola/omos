@@ -5395,6 +5395,7 @@ sys.exit(result.returncode)
     expect(result.code).toBe(1);
     expect(checks).toBe(8);
     expect(result.stderr + result.stdout).toContain("actor-step budget");
+    expect(recoveryDelivered).toBe(true);
     expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
@@ -5431,8 +5432,12 @@ sys.exit(result.returncode)
     writeFileSync(declaration, JSON.stringify(seed));
     writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 3 } }));
     expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
-    const m = model(f, (body, count) => !body.tools?.length ? { content: "Two workspace inspections completed; further work remains." } : {
-      tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    let recoveryDelivered = false;
+    const m = model(f, (body, count) => {
+      if (count === 4) recoveryDelivered = body.messages.some((message: any) => typeof message.content === "string" && message.content.includes("Retained execution summary") && message.content.includes('"successful_tool_results":2'));
+      return !body.tools?.length ? { content: "Two workspace inspections completed; further work remains." } : {
+        tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+      };
     });
     const first = await f.run(["ask", "Inspect this workspace until a useful result is found", "--json"], {}, 120000);
     expect(first.code, first.stderr).toBe(1);
@@ -6296,6 +6301,11 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
     expect(task.state).toBe("accepted");
     const journal = governanceJournal(f, task);
     expect(journal.some((entry: any) => entry.kind === "governance_response")).toBe(true);
+    for (const entry of journal.filter((entry: any) => entry.kind === "governance_response")) {
+      const response = JSON.parse(entry.value.data);
+      expect(response.model_elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(response.request_messages).toBeGreaterThan(0);
+    }
     expect(journal.some((entry: any) => entry.kind === "governance_failure")).toBe(false);
   }, 120000);
 }
@@ -6457,3 +6467,38 @@ test("progress readiness requires a specific result and verification and forward
   expect(m.counts().actors).toBe(6);
   expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Verified increment.");
 }, 120000);
+
+for (const maximum of [4, 12]) {
+  test(`contract review cadence ${maximum} preserves all writes and independent acceptance`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    const tree = join(f.home, "policy-fixture");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { ...f.env, PATH: process.env.PATH, USER: "omos", FOSSIL_HOME: f.home }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+    const policyPath = join(tree, "execution/omos.json");
+    const policy = JSON.parse(readFileSync(policyPath, "utf8"));
+    policy.defaults.progress_max_interval = maximum;
+    writeFileSync(policyPath, JSON.stringify(policy));
+    fossil("commit", "--nosync", "--nosign", "--no-verify", "-m", "Set isolated cadence fixture");
+    fossil("close");
+    let reviews = 0;
+    const m = model(f, (_body, count) => count <= 8 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all eight checkpoints." }, undefined, {
+      progress(packet) {
+        reviews++;
+        const evidence = packet.evidence.find((item: any) => item.complete && item.status === "success");
+        expect(evidence).toBeDefined();
+        return { outcome: "continue_work", meaningful: true, evidence: [evidence.id], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "The latest requested checkpoint is retained.", reassessment: "The newest checkpoint records the next requested increment." };
+      },
+    });
+    const result = await f.run(["ask", "Save eight successive numbered preference checkpoints", "--json"], {}, 240000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(9);
+    expect(m.counts().assessments).toBeGreaterThan(0);
+    expect(reviews).toBe(maximum === 4 ? 2 : 1);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Checkpoint 8");
+  }, 240000);
+}

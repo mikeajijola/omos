@@ -13,6 +13,7 @@ const model_provider = @import("../config/model_provider.zig");
 const model = @import("definition.zig");
 const review_budget = @import("../agent/runtime/review_budget.zig");
 const record_json = @import("../shared/record_json.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 pub const Plan = struct { capability: []const u8, summary: []const u8, obligations: []const contract.Obligation = &.{}, checks: []const []const u8 = &.{} };
 pub const Revision = struct { capability: []const u8, summary: []const u8, obligations: []const contract.Obligation = &.{}, checks: []const []const u8 = &.{}, superseded: []const []const u8 = &.{} };
@@ -21,16 +22,33 @@ pub const State = struct {
     batches: usize = 0,
     assessed_batches: usize = 0,
     stalls: usize = 0,
+    execution_failed: bool = false,
+    review_deferred: bool = false,
     last_assessment: ?Progress = null,
     cited_new_evidence: bool = false,
     seen: std.StringHashMapUnmanaged(void) = .empty,
     finalizing: bool = false,
     pause_reason: ?[]const u8 = null,
 
+    pub fn reviewDue(self: *const State, policy: model.Policy) bool {
+        if (self.finalizing) return false;
+        const elapsed = self.batches -| self.assessed_batches;
+        if (elapsed == 0) return false;
+        const maximum = policy.progress_max_interval orelse policy.progress_interval;
+        if (maximum > policy.progress_interval and self.execution_failed) return true;
+        const ready = if (self.last_assessment) |assessment|
+            assessment.meaningful and assessment.outcome == .continue_work and assessment.execution_readiness == .ready
+        else
+            false;
+        return elapsed >= (if (ready and self.stalls == 0 and !self.review_deferred) maximum else policy.progress_interval);
+    }
+
     /// An unavailable assessor establishes neither progress nor a stall. Retry
     /// at the next interval without changing the contract or completion gate.
     pub fn deferUnavailable(self: *State) void {
+        self.review_deferred = true;
         self.assessed_batches = self.batches;
+        self.execution_failed = false;
     }
 
     pub noinline fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
@@ -42,7 +60,9 @@ pub const State = struct {
         try self.seedWithBacking(alloc, records, backing);
         self.stalls = if (result.meaningful) 0 else self.stalls +| 1;
         self.last_assessment = result;
+        self.review_deferred = false;
         self.assessed_batches = self.batches;
+        self.execution_failed = false;
         if (result.outcome == .pause) self.pause_reason = result.note;
         self.finalizing = result.outcome == .finalize or self.pause_reason != null;
     }
@@ -142,7 +162,7 @@ const revision_instructions =
     \\Only pendingAmendments authorize this revision. Earlier applied amendments provide historical context and cannot justify additional changes to unaffected requirements.
 ;
 
-pub const Reply = struct { raw: []const u8, usage: types.Usage };
+pub const Reply = struct { raw: []const u8, usage: types.Usage, evidence: []const review.Evidence = &.{}, backing: []const evidence_mod.PayloadRef = &.{} };
 pub const Options = struct { usage_out: ?*types.Usage = null, policy: model.ReviewPolicy = .{}, progress_state: ?*const State = null, stalled_checks: usize = 3 };
 pub const ReferenceMessage = struct { role: enum { user, assistant }, text: []const u8, bytes: usize, truncated: bool };
 pub const ReferenceConversation = struct { messages: []const ReferenceMessage, omitted_messages: usize };
@@ -221,13 +241,18 @@ pub fn progress(alloc: std.mem.Allocator, provider: streams.Provider, request: s
     return progressWithBacking(alloc, provider, request, provider_id, packet, journal, records, &.{}, .{});
 }
 pub fn progressWithBacking(alloc: std.mem.Allocator, provider: streams.Provider, request: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, records: []const review.Evidence, backing: []const evidence_mod.PayloadRef, options: Options) !Reply {
-    return invoke(alloc, provider, request, provider_id, packet, journal, progress_schema, progress_instructions, records, backing, options);
+    var reply = try invoke(alloc, provider, request, provider_id, packet, journal, progress_schema, progress_instructions, records, backing, options);
+    reply.evidence = records;
+    reply.backing = backing;
+    return reply;
 }
 fn discard(_: *anyopaque, _: streams.Event) void {}
 const Tracking = struct { usage: types.Usage = .{}, calls: usize = 0, reason: []const u8 = "" };
 
 fn invoke(alloc: std.mem.Allocator, provider: streams.Provider, base: streams.ModelRequest, provider_id: model_provider.ProviderId, packet: []const u8, journal: review.Journal, function: schemas.FunctionSchema, instructions: []const u8, records: []const review.Evidence, backing: []const evidence_mod.PayloadRef, options: Options) !Reply {
+    const started_ms = io.milliTimestamp();
     var tracking: Tracking = .{};
+    defer debug_trace.logf("workspace", "event=governance_timing phase={s} elapsed_ms={d} calls={d} input_tokens={d} output_tokens={d}", .{ function.name, @max(io.milliTimestamp() - started_ms, 0), tracking.calls, tracking.usage.input_tokens orelse 0, tracking.usage.output_tokens orelse 0 });
     defer if (options.usage_out) |out| {
         out.* = tracking.usage;
     };
@@ -327,6 +352,8 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
         const decision_only = policy.max_calls - call_index <= policy.reserved_calls;
         request.tools = .{ .additional_functions = if (progress_review and !decision_only) &progress_functions else &decision_functions };
         calls += 1;
+        const model_started_ms = io.milliTimestamp();
+        defer debug_trace.logf("workspace", "event=governance_call_timing phase={s} call={d} iteration_ms={d} messages={d}", .{ function.name, calls, @max(io.milliTimestamp() - model_started_ms, 0), messages.items.len });
         var result = gateway.streamModelCompletion(provider, alloc, request) catch |err| {
             last_reason = @errorName(err);
             unavailable = transientTransportError(err);
@@ -338,6 +365,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
             }
             return if (err == error.Cancelled or err == error.OutOfMemory) err else error.TaskGovernancePending;
         };
+        const model_elapsed_ms = @max(io.milliTimestamp() - model_started_ms, 0);
         defer result.deinit(alloc);
         if (result != .completed) {
             last_reason = @tagName(result.failed.kind);
@@ -364,7 +392,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
         const Call = struct { id: []const u8, name: []const u8, arguments: []const u8, integrity: @FieldType(types.ToolCall, "argument_integrity") };
         var response_calls: std.ArrayList(Call) = .empty;
         for (completion.tool_calls[0..@min(completion.tool_calls.len, 8)]) |call| try response_calls.append(alloc, .{ .id = call.id, .name = call.name, .arguments = evidence_mod.View.prefix(call.arguments_json, 65536), .integrity = call.argument_integrity });
-        try journal.record("governance_response", try std.json.Stringify.valueAlloc(alloc, .{ .phase = function.name, .call = calls, .finish_reason = completion.finish_reason, .tool_call_count = completion.tool_calls.len, .tool_calls = response_calls.items, .usage = completion.usage }, .{}));
+        try journal.record("governance_response", try std.json.Stringify.valueAlloc(alloc, .{ .phase = function.name, .call = calls, .model_elapsed_ms = model_elapsed_ms, .request_messages = request.messages.len, .finish_reason = completion.finish_reason, .tool_call_count = completion.tool_calls.len, .tool_calls = response_calls.items, .usage = completion.usage }, .{}));
         if (types.classifyProviderCompletion(completion) != .completed or completion.tool_calls.len == 0 or completion.tool_calls.len > 8) {
             last_reason = "InvalidTaskGovernance";
             try messages.append(alloc, .{ .role = .user, .content = "The host could not validate the previous reviewer response. Return one complete structured decision call, or one evidence read. Do not infer acceptance from this correction." });
@@ -858,4 +886,24 @@ test "workspace progress puts new operation evidence before static workspace fil
     try std.testing.expectEqualStrings("failed", with_failure[0].id);
     try state.seed(alloc, &.{failed});
     try std.testing.expect(!try state.isNew(alloc, failed, &.{}));
+}
+
+test "contract review cadence preserves legacy bounds and interrupts ready work on failure" {
+    const policy: model.Policy = .{ .progress_interval = 4, .progress_max_interval = 12 };
+    var state: State = .{ .batches = 4 };
+    try std.testing.expect(state.reviewDue(policy));
+    state.last_assessment = .{ .outcome = .continue_work, .meaningful = true, .remaining = &.{}, .note = "Continue verified approach", .execution_readiness = .ready };
+    try std.testing.expect(!state.reviewDue(policy));
+    try std.testing.expect(state.reviewDue(.{}));
+    state.batches = 12;
+    try std.testing.expect(state.reviewDue(policy));
+    state.batches = 1;
+    state.execution_failed = true;
+    try std.testing.expect(state.reviewDue(policy));
+    try std.testing.expect(!state.reviewDue(.{}));
+    state.deferUnavailable();
+    try std.testing.expect(!state.reviewDue(policy));
+    state.finalizing = true;
+    state.batches = 100;
+    try std.testing.expect(!state.reviewDue(policy));
 }

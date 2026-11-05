@@ -1857,7 +1857,7 @@ pub const Manager = struct {
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
         try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .review = .{}, .server = .{}, .projections = .{} }));
+        try atomicWrite(alloc, try join(alloc, tree, model.execution_path), try json(alloc, model.Execution{ .defaults = .{ .progress_max_interval = 12 }, .review = .{}, .server = .{}, .projections = .{} }));
         _ = try self.commit(tree, "Initialize omos agent workspace");
         return self;
     }
@@ -4560,7 +4560,7 @@ pub const Manager = struct {
         var manifest = self.manifest;
         manifest.format = 2;
         try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), model.initial_declaration);
-        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .review = .{}, .server = .{}, .projections = .{} }));
+        try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, model.Execution{ .defaults = .{ .progress_max_interval = 12 }, .review = .{}, .server = .{}, .projections = .{} }));
         try atomicWrite(self.alloc, try join(self.alloc, tree, manifest_path), try json(self.alloc, manifest));
         _ = try self.commit(tree, "Add governed workspace model; retain legacy task contracts");
         return self.alloc.print("Activated omos.workspace/v1 for future tasks. Verified backup: {s}. Existing tasks retain their original contract and legacy adapter.", .{backup});
@@ -4577,6 +4577,7 @@ pub const Manager = struct {
         if (model.field(execution_document, "review") == null) execution.review = .{};
         if (model.field(execution_document, "server") == null) execution.server = .{};
         if (model.field(execution_document, "projections") == null) execution.projections = .{};
+        if (execution.defaults.progress_max_interval == null) execution.defaults.progress_max_interval = @min(100, execution.defaults.progress_interval * 3);
         if (std.mem.eql(u8, previous.hash, next.hash) and std.mem.eql(u8, try json(self.alloc, old_execution), try json(self.alloc, execution))) return "Workspace contracts are current; active task bases remain pinned.";
         const backup = try self.alloc.print("{s}.pre-contracts-{d}.fossil", .{ self.repository, io_mod.milliTimestamp() });
         try self.exportRepository(backup);

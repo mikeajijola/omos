@@ -11,6 +11,7 @@ pub const Turn = struct {
     reviewed_revision: ?[]const u8 = null,
     assessment: []const u8 = "",
     review_snapshot: []const u8 = "",
+    recovery_context: []const u8 = "",
     recovered_candidate: ?[]const u8 = null,
     review_only_candidate: ?[]const u8 = null,
     source_basis: ?[]const u8 = null,
@@ -19,7 +20,7 @@ pub const Turn = struct {
     prior_review_checkpoints: []const []const u8 = &.{},
     review_seen: std.StringHashMapUnmanaged(void) = .empty,
     review_progress_count: usize = 0,
-    recorded_evidence: std.ArrayList([]const u8) = .empty,
+    recorded_evidence: std.StringHashMapUnmanaged(void) = .empty,
     invocation_id: ?[]const u8 = null,
     assessment_record: ?[]const u8 = null,
     filesystem_view: bool = false,
@@ -71,6 +72,7 @@ pub const Turn = struct {
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
         _ = try manager.checkpoint(turn.task);
+        turn.recovery_context = try @import("execution_recovery.zig").context(manager, turn.task);
         turn.projection_pin = try @import("../shared/resource_pin.zig").acquire(try @import("filesystem_projection.zig").retentionPath(manager, turn.task), manager.operation_control);
         try @import("filesystem_projection.zig").prepare(manager, turn.task);
         turn.filesystem_view = true;
@@ -121,10 +123,7 @@ pub const Turn = struct {
                 record.id = try alloc.print("execution:{s}:{s}", .{ record.action_id.?, record.id });
             };
             record.source = source;
-            const observed = for (self.recorded_evidence.items) |id| {
-                if (std.mem.eql(u8, id, record.id)) break true;
-            } else false;
-            if (observed) continue;
+            if (self.recorded_evidence.contains(record.id)) continue;
             try self.manager.record(self.task, "tool_evidence", &[_]review.Evidence{record});
             if (try @import("evidence_receipt.zig").derive(alloc, record)) |receipt| try self.manager.record(self.task, "command_receipt", receipt);
             if (source) |current| if (self.source_basis) |previous| {
@@ -132,7 +131,7 @@ pub const Turn = struct {
                     try self.manager.record(self.task, "source_validation", .{ .evidence = record.id, .source = current });
                 }
             };
-            try self.recorded_evidence.append(alloc, record.id);
+            try self.recorded_evidence.put(alloc, record.id, {});
         }
         self.source_basis = source;
         // User corrections are authenticated by the runtime's message origin.
@@ -195,6 +194,7 @@ pub const Turn = struct {
         if (self.task.revision_pending) return error.TaskContractRevisionPending;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
+        var tool_evidence_ids: std.StringHashMapUnmanaged(void) = .empty;
         var payloads: std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
         var page_bytes: usize = 0;
@@ -269,10 +269,9 @@ pub const Turn = struct {
                 if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
                 const records = (try std.json.parseFromValue([]review.Evidence, a, entry.value, .{})).value;
                 for (records) |record| {
-                    const present = for (evidence.items) |existing| {
-                        if (std.mem.eql(u8, record.id, existing.id)) break true;
-                    } else false;
-                    if (!present) try self.appendReviewEvidence(alloc, &evidence, &payloads, record);
+                    if (tool_evidence_ids.contains(record.id)) continue;
+                    try self.appendReviewEvidence(alloc, &evidence, &payloads, record);
+                    try tool_evidence_ids.put(alloc, try alloc.dupe(u8, record.id), {});
                 }
             }
         }

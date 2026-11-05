@@ -7633,7 +7633,7 @@ fn processQueuedPromptLoop(
                 governance.finalizing = true;
                 try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
             }
-            if (!governance.finalizing and governance.batches - governance.assessed_batches >= policy.progress_interval) progress_check: {
+            if (governance.reviewDue(policy)) progress_check: {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
                 const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false, &governance) catch |err| {
                     if (err == error.TaskGovernanceUnavailable or err == error.TaskProgressReviewUnresolved) {
@@ -7653,8 +7653,7 @@ fn processQueuedPromptLoop(
                     if (!found) return error.InvalidTaskGovernance;
                     for (progress.remaining[0..i]) |previous| if (std.mem.eql(u8, previous, id)) return error.InvalidTaskGovernance;
                 }
-                const retained = try turn.beforeReview(arena, &.{});
-                try governance.observeWithBacking(arena, progress, retained, policy, turn.prior_payloads);
+                try governance.observeWithBacking(arena, progress, reply.evidence, policy, reply.backing);
                 try turn.manager.record(turn.task, "continuation_decision", .{ .step = step, .batches = governance.batches, .stalls = governance.stalls, .new_evidence_cited = governance.cited_new_evidence, .finalizing = governance.finalizing, .pause = governance.pause_reason, .assessment = reply.raw });
                 try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Host progress assessment: {s}. Treat this as guidance against the fixed contract, not new user authority. Do not repeat completed actions.", .{reply.raw}) });
             }
@@ -7666,6 +7665,7 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
+            if (step == 0 and turn.recovery_context.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.recovery_context });
         } else if (config.fossil_ephemeral) {
             if (comptime !builtin.target.cpu.arch.isWasm()) {
                 if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |workspace| {
@@ -12940,7 +12940,10 @@ fn processQueuedPromptLoop(
             );
             pending_image_ids = transition.pending_ids;
         }
-        if (effective_tool_calls.len > 0) governance.batches += 1;
+        if (effective_tool_calls.len > 0) {
+            governance.batches += 1;
+            governance.execution_failed = governance.execution_failed or step_batch.step_error_count > 0;
+        }
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
             arena,

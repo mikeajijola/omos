@@ -21,6 +21,15 @@ pinned in the E2E development dependencies.
 The execution policy is a separate `omos.execution/v1` document. Its bounded
 fields are `progress_interval` (1–100), `stalled_checks` (1–20) and
 `max_actor_steps` (2–10000). Defaults are 4, 3 and 100 respectively.
+The optional `progress_max_interval` field allows up to 100 tool batches between
+progress reviews after an assessor reports meaningful progress and a ready next
+action. It must be at least `progress_interval`. A failed tool batch triggers
+an earlier review. Missing values preserve the fixed interval. Increasing this
+allowance requires explicit activation; existing task policies remain pinned.
+New workspaces use 12. The operator command `omos fossil migrate --contracts`
+adds a missing allowance of three times the base interval, capped at 100,
+with a verified backup. It preserves any explicitly configured allowance.
+Completion still requires independent review and publication.
 The optional `review` section bounds model calls, reserved decision calls,
 response and attempt deadlines, automatic attempts, total time, serialized
 context, individual reads and reported token usage. New workspaces save these
