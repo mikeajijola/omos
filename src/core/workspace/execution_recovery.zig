@@ -4,7 +4,7 @@ const model = @import("definition.zig");
 const workspace = @import("fossil_workspace.zig");
 
 const Outcome = enum { unresolved, succeeded, failed };
-const Action = struct { id: []const u8, tool: []const u8 = "", outcome: Outcome = .unresolved };
+const Action = struct { id: []const u8, tool: []const u8 = "", outcome: Outcome = .unresolved, conflicting: bool = false };
 const Ledger = struct {
     actions: std.StringHashMapUnmanaged(Action) = .empty,
 
@@ -25,8 +25,8 @@ const Ledger = struct {
                 const slot = try self.actions.getOrPut(alloc, try alloc.dupe(u8, id));
                 if (!slot.found_existing) slot.value_ptr.* = .{ .id = slot.key_ptr.*, .tool = try alloc.dupe(u8, model.text(record, "tool")), .outcome = outcome } else {
                     // Conflicting observations require inspection, not guessing.
-                    if (slot.value_ptr.outcome != .unresolved and slot.value_ptr.outcome != outcome) return error.ConflictingExecutionEvidence;
-                    slot.value_ptr.outcome = outcome;
+                    if (slot.value_ptr.outcome != .unresolved and slot.value_ptr.outcome != outcome) slot.value_ptr.conflicting = true;
+                    slot.value_ptr.outcome = if (slot.value_ptr.conflicting) .unresolved else outcome;
                 }
             }
         }
@@ -86,4 +86,7 @@ test "execution recovery joins results before intents and never infers missing s
     try std.testing.expectEqual(Outcome.succeeded, ledger.actions.get("one").?.outcome);
     try std.testing.expectEqual(Outcome.unresolved, ledger.actions.get("two").?.outcome);
     try std.testing.expectEqual(@as(usize, 2), ledger.actions.count());
+    try ledger.observe(a, "tool_evidence", try std.json.parseFromSliceLeaky(std.json.Value, a, "[{\"action_id\":\"one\",\"status\":\"failure\"}]", .{}));
+    try std.testing.expect(ledger.actions.get("one").?.conflicting);
+    try std.testing.expectEqual(Outcome.unresolved, ledger.actions.get("one").?.outcome);
 }
