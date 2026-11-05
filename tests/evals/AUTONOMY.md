@@ -80,7 +80,9 @@ into each private test profile; it does not modify your normal profile.
 It records the selected reviewer and whether classification was configured.
 
 The runner records the binary hash, source commit, model, task requests, raw
-results, stderr, independent scores, and publication receipts. It uses
+results, stderr, independent scores, publication receipts, and the contract
+capabilities selected in published task records. This makes unnecessary coding
+requirements on operational tasks visible. The isolated profile uses
 full-access permission mode within the isolated trial profile, matching the
 initial deployment evaluation. These workspaces isolate state, not operating
 system permissions. They do not establish coverage for every permission mode,

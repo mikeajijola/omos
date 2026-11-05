@@ -282,6 +282,12 @@ def trial(args, family, repeat):
         result["outcome_pass"] = not errors
         receipts = acceptance(project, args.fossil)
         dump(root / "publication.json", receipts)
+        capabilities = set()
+        for receipt in receipts:
+            task_id = receipt["receipt"]["review"]["task_id"]
+            retained = json.loads(subprocess.check_output([args.fossil, "cat", f"tasks/{task_id}.json", "-r", "trunk", "-R", str(project / "omos.fossil")], text=True, timeout=30))
+            capabilities.add(retained.get("model_basis", {}).get("capability"))
+        result["capabilities"] = sorted(capabilities, key=str)
         if args.stream_fault:
             fault_path = root / "transport-fault.json"
             fault = json.loads(fault_path.read_text()) if fault_path.exists() else {}
