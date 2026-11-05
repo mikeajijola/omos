@@ -179,6 +179,7 @@ const Server = struct {
     fn execute(self: *Server, arena: std.mem.Allocator, id: []const u8, method: []const u8, params: std.json.Value) !std.json.Value {
         // A profile binding change never retargets a running UI host.
         // Cancellation and public replay remain available for retained work.
+        var bound_manager: ?workspace.Manager = null;
         if (!std.mem.eql(u8, method, "cancel") and !std.mem.eql(u8, method, "events") and !std.mem.eql(u8, method, "session.events")) {
             const bound = (workspace.Manager.bound(arena) catch |err| {
                 // A busy refresh has not established a binding change. Keep
@@ -196,6 +197,7 @@ const Server = struct {
                 if (self.job) |active| active.ui.stop();
                 return error.WorkspaceBindingChanged;
             }
+            bound_manager = bound;
         }
         if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1" } });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
@@ -238,7 +240,9 @@ const Server = struct {
             };
             return parse(arena, try owner_settings.execute(arena, request));
         }
-        const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        // Reuse this request's verified binding instead of reopening Fossil
+        // under the same dispatch lock for every workspace RPC.
+        const manager = bound_manager orelse (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
         if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
         if (std.mem.eql(u8, method, "channel.dispatch")) {
