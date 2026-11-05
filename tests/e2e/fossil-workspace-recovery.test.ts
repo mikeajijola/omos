@@ -6418,16 +6418,18 @@ for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", 
   }, 120000);
 }
 
-test("progress readiness requires a concrete next step and forwards it without replaying work", async () => {
+test("progress readiness requires a specific result and verification and forwards them without replaying work", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   let reviews = 0;
   let delivered = false;
   const nextStep = "Write the requested preference checkpoint, then verify its retained result.";
+  const readyTarget = "memory/preference.md containing the requested preference";
+  const verification = "Read the retained preference checkpoint and compare its content.";
   const m = model(f, (body, count) => {
     if (count <= 4) return { tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] };
     if (count === 5) {
-      delivered = body.messages.some((message: any) => message.role === "user" && message.content.includes("Host progress assessment:") && message.content.includes(nextStep));
+      delivered = body.messages.some((message: any) => message.role === "user" && message.content.includes("Host progress assessment:") && message.content.includes(nextStep) && message.content.includes(readyTarget) && message.content.includes(verification));
       return writeMemory("Verified increment.");
     }
     return { content: "Saved the requested preference checkpoint." };
@@ -6438,11 +6440,13 @@ test("progress readiness requires a concrete next step and forwards it without r
       const schema = body.tools.find((tool: any) => tool.function?.name === "omos_progress_assessment").function.parameters;
       expect(schema.required).toContain("execution_readiness");
       expect(schema.required).toContain("next_step");
+      expect(schema.required).toContain("ready_target");
+      expect(schema.required).toContain("verification");
       if (reviews === 2) expect(body.messages.some((message: any) => message.role === "tool" && message.content.includes("InvalidProgressReadiness"))).toBe(true);
       return { tool_calls: [governanceCall("omos_progress_assessment", {
         outcome: "continue_work", meaningful: false, evidence: [], remaining: ["request_complete"],
         note: "Preparation is sufficient for the requested checkpoint.", execution_readiness: "ready",
-        next_step: reviews === 1 ? "" : nextStep, prerequisite: "",
+        next_step: nextStep, ready_target: reviews === 1 ? "" : readyTarget, verification: reviews === 1 ? "" : verification, prerequisite: "",
       })] };
     },
   });

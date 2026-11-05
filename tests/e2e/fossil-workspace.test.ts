@@ -70,7 +70,7 @@ describe("portable Fossil agent workspace", () => {
         const name = results.length === 0 ? "omos_review_evidence" : "omos_progress_assessment";
         const args = results.length === 0 ? { action: "read", id: retainedId } : {
           outcome: "continue_work", meaningful: true, evidence: [retainedId],
-          execution_readiness: "ready", next_step: "Write the next preference checkpoint and verify it.", prerequisite: "",
+          execution_readiness: "ready", ready_target: "The next preference checkpoint", verification: "Read the retained preference content", next_step: "Write the next preference checkpoint and verify it.", prerequisite: "",
           remaining: packet.context.contract.obligations.map((obligation: any) => obligation.id),
           note: `Continue the remaining checkpoints after step ${packet.context.step}.`,
           ...(corrected ? { reassessment: "The retained write result establishes the supported operation; apply it to the next checkpoint rather than repeating the previous checkpoint." } : {}),

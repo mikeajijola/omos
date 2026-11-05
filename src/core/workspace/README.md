@@ -490,8 +490,11 @@ within the existing actor-step budget; it cannot establish a task stall or
 permit publication.
 
 Progress assessments explicitly record whether an authorized outcome increment is ready
-to execute, the next concrete action, or the prerequisite preventing it. The actor
-receives this guidance with the assessment. This does not change permissions,
+to execute, the next concrete action, or the prerequisite preventing it. A ready
+assessment must name one specific result and the observable evidence that will
+verify it. The next action advances that result without requiring a complete
+inventory of independent items first. The actor receives this guidance with the
+assessment. This does not change permissions,
 requested quantities, or the independent completion check. Older retained
 assessments without these fields remain readable.
 

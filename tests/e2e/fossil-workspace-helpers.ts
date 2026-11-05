@@ -59,6 +59,8 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         if (!planning && !revising) {
           decision.execution_readiness ??= decision.outcome === "continue_work" ? "ready" : "not_applicable";
           decision.next_step ??= decision.outcome === "continue_work" ? "Perform the next requested fixture operation and verify its result." : "";
+          decision.ready_target ??= decision.execution_readiness === "ready" ? "The requested fixture result" : "";
+          decision.verification ??= decision.execution_readiness === "ready" ? "Inspect the retained fixture result" : "";
           decision.prerequisite ??= "";
         }
         delta = governance.reply?.(body, packet, planning ? "plan" : revising ? "revise" : "progress") ?? { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
