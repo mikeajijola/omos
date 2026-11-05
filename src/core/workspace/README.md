@@ -108,6 +108,9 @@ It retains the task and session and acquires a new execution generation. The
 worker must inspect retained evidence and reconcile uncertain external outcomes
 before repeating an action. Recovery is bounded by the pinned stalled-check
 allowance; cancellation, conflicts and blocked tasks are not overridden.
+The retained source revision must remain an ancestor of the task head, including
+through merge parents. This check covers the full history regardless of the
+number of checkpoints; an unrelated replacement branch remains stale.
 Pending verification with a retained candidate can also be retried automatically,
 bounded by the pinned review attempt allowance. Interrupted execution streams
 (`IncompleteStream`, `Timeout`, or `OutputTruncated`) can resume the retained

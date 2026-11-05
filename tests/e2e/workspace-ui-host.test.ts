@@ -264,7 +264,7 @@ test('background contracts release the main chat while workers await input and p
 },180000);
 
 
-test('restarted background host reconciles retained work and completes without repeating its external effect', async()=>{
+for(const history of ['long ancestry','unrelated fork'])test(`restarted background host checks ${history} without repeating its external effect`, async()=>{
  const f=fixture(); const receipt=join(f.cwd,'external-receipts.txt'); let workerCalls=0; let interrupted=false;
  const call=(id:string,command:string)=>({tool_calls:[{index:0,id,type:'function',function:{name:'shell',arguments:JSON.stringify({action:'run',profile:'clean',command})}}]});
  model(f,async(body,_count,signal)=>{
@@ -291,13 +291,33 @@ test('restarted background host reconciles retained work and completes without r
   expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
   const original=(await native.request('background')).workers[0].record;
   first.kill('SIGKILL');await first.exited;
+  // More than one timeline page separates the retained contract from its head.
+  // Exercise real check-ins rather than fabricating ancestry in the database.
+  const checkout=join(f.home,'long-history');mkdirSync(checkout);
+  const fossil=(args:string[])=>execFileSync('fossil',['--user','omos',...args],{cwd:checkout,env:{PATH:process.env.PATH,HOME:f.home,FOSSIL_HOME:f.home,XDG_CONFIG_HOME:f.home,USER:'fixture',LC_ALL:'C'},encoding:'utf8'});
+  const taskPath=`tasks/${original.task}.json`;
+  const retained=f.fossil('cat',taskPath,'-r',`task/${original.task}`);
+  fossil(['open',join(f.cwd,'omos.fossil'),history==='long ancestry'?`task/${original.task}`:'trunk']);
+  if(history==='long ancestry'){
+   for(let i=0;i<130;i++)fossil(['commit','--allow-empty','--nosign','-m',`Retained checkpoint ${i}`]);
+  }else{
+   mkdirSync(join(checkout,'tasks'),{recursive:true});writeFileSync(join(checkout,taskPath),retained);
+   fossil(['add',taskPath]);
+   fossil(['commit','--allow-fork','--force','--branch',`task/${original.task}`,'--nosign','-m','Unrelated replacement branch']);
+  }
+  fossil(['close']);
   const second=start();
-  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed');
-  expect(finished.generation).toBe(2);expect(finished.recoveries).toBe(1);
+  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>history==='long ancestry'?v.state==='completed':v.state==='waiting'&&v.reason==='StaleWorkContract');
   expect(finished.worker_session).toBe(original.worker_session);
   expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
-  expect(workerCalls).toBe(4);
-  expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  if(history==='long ancestry'){
+   expect(finished.generation).toBe(2);expect(finished.recoveries).toBe(1);
+   expect(workerCalls).toBe(4);
+   expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  }else{
+   expect(workerCalls).toBe(2);
+   expect(finished.publication_revision).toBeNull();
+  }
   await native.request('background',{action:'stop'});await second.exited;
  }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
 },180000);

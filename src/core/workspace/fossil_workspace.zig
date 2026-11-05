@@ -569,21 +569,19 @@ pub const Manager = struct {
     }
 
     fn ancestorRevision(self: Manager, head: []const u8, candidate: []const u8) !?[]const u8 {
-        if (revisionMatches(candidate, head)) return head;
-        var offset: usize = 0;
-        while (true) {
-            const ancestors = try self.run(null, &.{ "timeline", "ancestors", head, "--type", "ci", "--limit", "128", "--offset", try self.alloc.print("{d}", .{offset}), "--format", "%H", "-R", self.repository });
-            var lines = std.mem.splitScalar(u8, ancestors, '\n');
-            var count: usize = 0;
-            while (lines.next()) |raw| {
-                const line = std.mem.trim(u8, raw, " \r\t");
-                if (!immutableRevision(line)) continue;
-                count += 1;
-                if (revisionMatches(candidate, line)) return line;
-            }
-            if (count < 128) return null;
-            offset += count;
-        }
+        if (!immutableRevision(head) or !immutableRevision(candidate)) return error.InvalidFossilRevision;
+        // Fossil timeline limits the ancestor set before applying its offset, so
+        // pagination cannot establish ancestry beyond the first page. Traverse
+        // every parent (including merges), returning only the matching identity.
+        const query = try self.alloc.print(
+            "WITH RECURSIVE heads(rid) AS (SELECT rid FROM blob WHERE uuid='{s}' OR (length('{s}')=40 AND length(uuid)=64 AND substr(uuid,1,40)='{s}')), " ++
+                "ancestors(rid) AS (SELECT rid FROM heads WHERE (SELECT count(*) FROM heads)=1 UNION SELECT plink.pid FROM plink JOIN ancestors ON plink.cid=ancestors.rid) " ++
+                "SELECT uuid FROM blob JOIN ancestors USING(rid) WHERE uuid='{s}' OR (length('{s}')=40 AND length(uuid)=64 AND substr(uuid,1,40)='{s}') LIMIT 2;",
+            .{ head, head, head, candidate, candidate, candidate },
+        );
+        const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query });
+        const rows = try parse(self.alloc, []const struct { uuid: []const u8 }, if (std.mem.trim(u8, raw, " \t\r\n").len == 0) "[]" else raw);
+        return if (rows.len == 1) rows[0].uuid else null;
     }
 
     pub fn companyContent(self: Manager, path: []const u8) ![]const u8 {
