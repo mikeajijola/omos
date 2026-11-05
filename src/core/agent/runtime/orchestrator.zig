@@ -7253,6 +7253,7 @@ fn processQueuedPromptLoop(
         };
     };
     var retrieval_turn = false;
+    var classified_work = false;
     var lookup_state: lookup_checkpoint.State = .{};
     const lookup_checkpoints_enabled = if (comptime builtin.target.cpu.arch.isWasm()) false else @import("../../workspace/classification.zig").lookupConfigured();
     defer if (comptime !builtin.target.cpu.arch.isWasm()) {
@@ -7333,6 +7334,7 @@ fn processQueuedPromptLoop(
                 }
             }
             retrieval_turn = decision.route != .work;
+            classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null);
             if (retrieval_turn) {
                 config.contract_review_enabled = false;
                 config.coordinator_mode = true;
@@ -7760,6 +7762,32 @@ fn processQueuedPromptLoop(
         }
 
         while (true) {
+            // Routing identified work and the host validated its fresh contract.
+            // Submit its handoff through the ordinary tool batch
+            // below, including permission admission, intents, and activation.
+            // Recovery and steering keep their existing reasoning path.
+            if (step == 0 and classified_work and config.coordinator_mode and !config.background_worker and
+                config.origin == .root and !retrieval_turn and !governance.finalizing and
+                job.recovery_checkpoint == null and steering_action != .continued)
+            {
+                if (managed) |*turn| if (turn.task.model_basis != null and
+                    turn.task.model_basis.?.capability != null and
+                    turn.recovery_context.len == 0 and
+                    turn.review_only_candidate == null and
+                    containsToolName(config.advertised_tool_names, "fossil_workspace"))
+                {
+                    if (try turn.manager.backgroundRecord(turn.task.id) == null) {
+                        const calls = try arena.alloc(types.ToolCall, 1);
+                        calls[0] = .{ .id = try arena.print("host-dispatch-{s}", .{turn.task.id}), .name = "fossil_workspace", .arguments_json = "{\"action\":\"dispatch\"}" };
+                        try turn.manager.record(turn.task, "coordinator_handoff_proposed", .{ .origin = "host", .contract_version = turn.task.definition.version, .call_id = calls[0].id });
+                        try deps.push_system_notice(deps.ctx, "Queuing the validated work contract...");
+                        stream_result = .{ .completed = .{ .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls }, .ownership = .borrowed } };
+                        stream_result_set = true;
+                        successful_gateway_model = job.model;
+                        break;
+                    }
+                };
+            }
             if (reset_stream_for_next_attempt) {
                 try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;

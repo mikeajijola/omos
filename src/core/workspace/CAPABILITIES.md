@@ -207,6 +207,15 @@ lease timeout, the host retains its worker slots and retries on its normal polli
 cadence. Existing workers keep their execution identities while foreground
 commits finish.
 
+For a fresh coordinator request explicitly classified or resolved as work, the
+host proposes dispatch as soon as the task plan is validated. It uses the normal
+tool admission, permission, action intent, and activation path without an
+additional actor model call. The retained `coordinator_handoff_proposed` record
+identifies the host decision. Steering, unclassified requests, resumed execution
+evidence, and existing background records retain their normal reasoning and
+reconciliation paths. Queuing does not establish completion; workers still
+satisfy the original contract through independent review.
+
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,
 event polling, steering, and cancellation through the native conversation host.

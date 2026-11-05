@@ -7,8 +7,16 @@ import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
 const clients:NativeClient[]=[];
 const services:ReturnType<typeof Bun.spawn>[]=[];
-afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}cleanupFixtures()});
-function host(f:ReturnType<typeof fixture>){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env}});clients.push(native);return native}
+const classifiers:ReturnType<typeof Bun.serve>[]=[];
+afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}for(const server of classifiers.splice(0))server.stop(true);cleanupFixtures()});
+function host(f:ReturnType<typeof fixture>,extra:Record<string,string>={}){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env,...extra}});clients.push(native);return native}
+function routingClassifier(route:(message:string)=>string){
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+  const body=await request.json() as any;const choice=route(body.state.latest_message);
+  return Response.json({model:'fixture-classifier',answers:{route:{type:'choice',choice,confidence:0.99,probabilities:Object.fromEntries(['conversation','retrieval','work','unresolved'].map(label=>[label,label===choice?0.99:0.01/3]))}}});
+ }});classifiers.push(server);
+ return {OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'};
+}
 async function terminal(native:NativeClient,turn:string){return await new Promise<any>((resolve,reject)=>{const timer=setTimeout(()=>{native.off('event',listener);reject(Error('UI invocation did not stop'))},90000);const listener=(event:any)=>{if(event.turn===turn&&event.data.type==='turn_end'){clearTimeout(timer);native.off('event',listener);resolve(event)}};native.on('event',listener)})}
 test('native UI host saves governed turns and replays public events without repeating actions',async()=>{
  const f=fixture();const fixtureModel=model(f,()=>({content:'Hello from the governed native agent.'}));expect((await f.run(['fossil','init','--json'])).code).toBe(0);
@@ -203,13 +211,14 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
 },120000);
 
 test('background contracts release the main chat while workers await input and publish independently', async () => {
- const f = fixture(); let answered = false; let workerCalls = 0; const assignments:string[]=[];
+ const f = fixture(); let answered = false; let workerCalls = 0; let coordinatorCalls = 0; const assignments:string[]=[];
  const pngBase64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
  const imagePath=join(f.cwd,'reference.png');writeFileSync(imagePath,Buffer.from(pngBase64,'base64'));
  model(f, (body) => {
   const names = body.tools?.map((tool:any) => tool.function?.name) || [];
   const system = body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
   if (!names.includes('write_file')) {
+   coordinatorCalls++;
    expect(system).not.toContain('<omos_background_assignment');
    const user = body.messages.filter((m:any) => m.role === 'user').at(-1)?.content || '';
    if (String(user).includes('still available')) return {content:'The main chat is still available.'};
@@ -227,7 +236,7 @@ test('background contracts release the main chat while workers await input and p
  });
  const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));settings.providers.local.model_metadata['fixture-model'].supports_vision=true;writeFileSync(settingsPath,JSON.stringify(settings));
  expect((await f.run(['fossil','init','--json'])).code).toBe(0);
- const native = host(f); const observed:any[] = [];
+ const native = host(f,routingClassifier(message=>message==='Are you still available?'?'conversation':'work')); const observed:any[] = [];
  native.on('event', (event:any) => observed.push(event));
  const until = async (read:()=>Promise<any>, predicate:(value:any)=>boolean) => {
   const deadline = Date.now()+60000; let value:any;
@@ -260,6 +269,7 @@ test('background contracts release the main chat while workers await input and p
   expect(handoffEnd.data.exit_code).toBe(0);
   const dispatched = observed.find(e=>e.data.type==='background_dispatch');
   expect(dispatched).toBeDefined();
+  expect(coordinatorCalls).toBe(0);
   const original = (await native.request('background')).workers[0].record;
   expect(original.state).not.toBe('completed'); expect(original.publication_revision).toBeNull();
   const repositoryHash=createHash('sha256').update(join(f.cwd,'omos.fossil')).digest('hex');
@@ -276,6 +286,7 @@ test('background contracts release the main chat while workers await input and p
   await native.request('coordinate',{text:'Are you still available?',session},{id:'main-while-worker-waits'});
   expect((await endingSecond).data.exit_code).toBe(0);
   expect(observed.some(e=>e.turn==='main-while-worker-waits' && e.data.type==='text_delta' && e.data.text.includes('still available'))).toBe(true);
+  expect(coordinatorCalls).toBe(1);
   expect((await native.request('background',{action:'show',task:original.task})).state).toBe('running');
   const required = input.events.find((e:any)=>e.data.type==='input_required').data;
   await expect(native.request('background',{action:'input',task:original.task,generation:running.generation+1,operation:'b'.repeat(64),request_id:required.request_id,answers:['Brief']})).rejects.toThrow('StaleBackgroundOwner');
@@ -306,6 +317,44 @@ test('background contracts release the main chat while workers await input and p
  }
 },180000);
 
+
+test('host-proposed coordinator handoff respects configured tool denial', async()=>{
+ const f=fixture();let calls=0;
+ model(f,(body)=>{calls++;expect(body.tools?.some((tool:any)=>tool.function?.name==='fossil_workspace')).toBe(false);return {content:'The configured policy denied the background handoff.'}});
+ const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));
+ settings.permission={fossil_workspace:'deny'};writeFileSync(settingsPath,JSON.stringify(settings));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f,{...routingClassifier(()=>'work'),FX_PERMISSION_MODE:'auto'});const seen:any[]=[];
+ native.on('event',(event:any)=>seen.push(event));
+ const end=terminal(native,'denied-handoff');
+ await native.request('coordinate',{text:'Prepare a report in this workspace.'},{id:'denied-handoff'});
+ await end;
+ expect(calls).toBeGreaterThan(0);
+ expect(seen.some(e=>e.data.type==='background_dispatch')).toBe(false);
+ expect((await native.request('background')).workers).toHaveLength(0);
+ expect(seen.some(e=>e.data.type==='notice'&&e.data.text.includes('Queuing the validated work contract'))).toBe(false);
+ expect(native.stderr).toBe('');
+},90000);
+
+for(const classified of [false,true])test(`coordinator chat does not auto-dispatch with classification ${classified?'configured':'absent'}`,async()=>{
+ const f=fixture();let calls=0;
+ model(f,()=>{calls++;return {content:'I am available to help.'}});
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f,classified?routingClassifier(()=>'conversation'):{});const seen:any[]=[];
+ native.on('event',(event:any)=>seen.push(event));
+ let session:string|undefined;
+ for(const [index,text] of ['Hello','Are you still available?'].entries()){
+  const id=`chat-${index}`;const end=terminal(native,id);
+  await native.request('coordinate',{text,...(session?{session}:{})},{id});
+  expect((await end).data.exit_code).toBe(0);
+  session=seen.find(e=>e.data.type==='session').data.session_id;
+  expect(seen.some(e=>e.turn===id&&e.data.type==='text_delta'&&e.data.text.includes('available'))).toBe(true);
+ }
+ expect(calls).toBe(2);
+ expect(seen.some(e=>e.data.type==='background_dispatch')).toBe(false);
+ expect((await native.request('background')).workers).toHaveLength(0);
+ expect(native.stderr).toBe('');
+},90000);
 
 for(const history of ['long ancestry','unrelated fork'])test(`restarted background host checks ${history} without repeating its external effect`, async()=>{
  const f=fixture(); const receipt=join(f.cwd,'external-receipts.txt'); let workerCalls=0; let interrupted=false;
