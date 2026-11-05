@@ -220,7 +220,10 @@ Concurrent tasks can publish identical files, including binary artifacts. If
 Fossil reports a merge conflict, the host checks the complete checkout against
 the expected three-way result, including file identities and executable flags.
 Publication proceeds only when that exact result is present; differing edits
-remain conflicts.
+remain conflicts. An explicit background resume rechecks conflicted work against
+the current parent and its read dependencies. Once the conflict is resolved, a
+retained final answer can return to independent review without repeating actor
+actions.
 
 The local MCP adapter is `omos-ui/bin/mcp.mjs`; set `OMOS_BINARY` to the absolute
 native binary and `OMOS_PROJECT` to the project directory. It also exposes chat,

@@ -3061,6 +3061,19 @@ pub const Manager = struct {
         }
     }
 
+    /// An explicit host resume may retry retained work once its conflicting
+    /// files and read dependencies agree with the current parent again.
+    pub fn reconcileConflict(self: Manager, previous: Task) !void {
+        const lease = try self.writerLease();
+        defer lease.release();
+        var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
+        if (task.state != .conflict) return;
+        try self.ensureMergeable(task, try self.currentRevision(task), try self.revision(task.parent));
+        try self.validateDependencies(task);
+        task.state = .active;
+        try self.saveTask(task);
+    }
+
     pub fn trunkContent(self: Manager, path: []const u8) ![]const u8 {
         if (!allowedPath(path)) return error.WorkspacePathDenied;
         return self.run(null, &.{ "cat", path, "-r", "trunk", "-R", self.repository });

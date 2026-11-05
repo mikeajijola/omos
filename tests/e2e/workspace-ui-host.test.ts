@@ -318,6 +318,55 @@ test('background contracts release the main chat while workers await input and p
 },180000);
 
 
+test('explicit background resume rechecks resolved conflicts without repeating actor work',async()=>{
+ const f=fixture();let workerCalls=0;let reviewing=false;let reviewReleased=false;let release!:()=>void;
+ const reviewGate=new Promise<void>(resolve=>{release=resolve});const foreground={conflict:0,restore:0};
+ model(f,body=>{
+  const names=body.tools?.map((tool:any)=>tool.function?.name)||[];
+  if(!names.includes('write_file'))return {tool_calls:[{index:0,id:'dispatch-conflict-test',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  const worker=body.messages.some((m:any)=>m.role==='system'&&String(m.content).includes('<omos_background_assignment'));
+  const key=JSON.stringify(body.messages).includes('RESTORE-RESULT')?'restore':'conflict';
+  const count=worker?++workerCalls:++foreground[key];
+  if(count>1)return {content:'The requested shared document is saved.'};
+  return {tool_calls:[{index:0,id:`save-${worker?'worker':key}`,type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'documents/shared.txt',content:worker||key==='restore'?'original result':'different result'})}}]};
+ },async packet=>{
+  if(packet.originalRequest.includes('BACKGROUND-RESULT')&&!reviewReleased){reviewing=true;await reviewGate;}
+  return 'met';
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+60000;let value:any;do{value=await read();if(predicate(value))return value;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(`State did not converge: ${JSON.stringify(value)}; ${native.stderr}`)};
+ try{
+  expect((await f.run(['ui-host','--background-start'])).code).toBe(0);
+  const dispatchEnd=terminal(native,'dispatch-conflict');
+  await native.request('coordinate',{text:'BACKGROUND-RESULT: save the original result in documents/shared.txt.'},{id:'dispatch-conflict'});
+  expect((await dispatchEnd).data.exit_code).toBe(0);
+  await until(async()=>reviewing,value=>value);
+  const original=(await native.request('background')).workers[0].record;
+  const conflictEnd=terminal(native,'create-conflict');
+  await native.request('prompt',{text:'CONFLICT-RESULT: save a different result in documents/shared.txt.'},{id:'create-conflict'});
+  expect((await conflictEnd).data.exit_code).toBe(0);
+  reviewReleased=true;release();
+  const waiting=await until(()=>native.request('background',{action:'show',task:original.task}),value=>value.state==='waiting');
+  expect((await native.request('snapshot',{action:'fossil.status'})).tasks.find((task:any)=>task.id===original.task).state).toBe('conflict');
+  await expect(native.request('background',{action:'resume',task:original.task,generation:waiting.generation,operation:'9'.repeat(64)})).rejects.toThrow('WorkspaceMergeConflict');
+  expect(workerCalls).toBe(2);
+  const restoreEnd=terminal(native,'resolve-conflict');
+  await native.request('prompt',{text:'RESTORE-RESULT: save the original result in documents/shared.txt.'},{id:'resolve-conflict'});
+  expect((await restoreEnd).data.exit_code).toBe(0);
+  await native.request('background',{action:'resume',task:original.task,generation:waiting.generation,operation:'a'.repeat(64)});
+  const final=await until(()=>native.request('background',{action:'show',task:original.task}),value=>value.state==='completed');
+  expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  expect(workerCalls).toBe(2);
+  expect(f.fossil('cat','documents/shared.txt','-r','trunk')).toBe('original result');
+  expect(native.stderr).toBe('');
+ }finally{
+  reviewReleased=true;release();
+  await native.request('background',{action:'stop'});
+  await until(()=>native.request('background',{action:'host'}),value=>!value.running);
+ }
+},240000);
+
 test('host-proposed coordinator handoff respects configured tool denial', async()=>{
  const f=fixture();let calls=0;
  model(f,(body)=>{calls++;expect(body.tools?.some((tool:any)=>tool.function?.name==='fossil_workspace')).toBe(false);return {content:'The configured policy denied the background handoff.'}});

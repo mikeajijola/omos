@@ -80,11 +80,12 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
             try saveOperation(manager, entry, next, request);
             return value(manager, .{ .accepted = true, .fulfilled = true, .record = next });
         }
-        if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.BackgroundTaskUnavailable;
+        if (task.state == .accepted or task.state == .publication_pending) return error.BackgroundTaskUnavailable;
         const activation = (try control.activation(manager, entry)) orelse return error.BackgroundActivationRequired;
         try control.verifyLiveAuthority(manager, activation);
         try manager.validateTaskBasis(task);
         const next = try domain.resumeRecord(entry, io.milliTimestamp());
+        if (task.state == .conflict) try manager.reconcileConflict(task);
         try control.ensureHost(manager);
         try saveOperation(manager, entry, next, request);
         return value(manager, .{ .accepted = true, .fulfilled = false, .record = next });
