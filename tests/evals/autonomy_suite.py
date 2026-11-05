@@ -229,12 +229,18 @@ def trial(args, family, repeat):
     home = root / "home"; (home / ".fx").mkdir(parents=True)
     settings = json.loads(args.settings.read_text())
     settings.update(permission_mode="full-access", auto_upgrade=False, session_titles=False, yolo_acknowledged=True)
+    if args.review_model:
+        settings["review_model"] = args.review_model
     transport = None
     if args.stream_fault:
         from autonomy_transport import start as start_transport
         provider = settings["providers"][args.provider]
         transport, provider["base_url"] = start_transport(provider["base_url"], root, args.stream_fault)
     dump(home / ".fx/settings.json", settings)
+    (home / ".fx/settings.json").chmod(0o600)
+    if args.classifier:
+        shutil.copyfile(args.classifier, home / ".fx/classifier.json")
+        (home / ".fx/classifier.json").chmod(0o600)
     prompt, expected = setup(family, project, args.seed)
     server = None
     if family == "mcp":
@@ -248,8 +254,8 @@ def trial(args, family, repeat):
     dump(root / "task.json", {"family": family, "repeat": repeat, "seed": args.seed, "prompt": prompt, "protected_inputs": original})
     env = os.environ.copy()
     for key in list(env):
-        if key.startswith("FX_E2E_") or key in ["FX_SYSTEM_PROMPT", "FX_SYSTEM_PROMPT_FILE"]: env.pop(key)
-    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home), FX_PROVIDER=args.provider, FX_REVIEW_MODEL=args.model, FX_CONTRACT_REVIEW="1", OMOS_COORDINATOR="1" if args.background else "0", FX_SOUND="0", FX_AUTO_UPGRADE="0", FX_SKIP_ONBOARDING="1", FX_DISABLE_KEYCHAIN="1", PYTHONDONTWRITEBYTECODE="1")
+        if key.startswith(("FX_", "OMOS_")): env.pop(key)
+    env.update(HOME=str(home), XDG_CONFIG_HOME=str(home), FOSSIL_HOME=str(home), FX_PROVIDER=args.provider, FX_CONTRACT_REVIEW="1", OMOS_COORDINATOR="1" if args.background else "0", FX_SOUND="0", FX_AUTO_UPGRADE="0", FX_SKIP_ONBOARDING="1", FX_DISABLE_KEYCHAIN="1", PYTHONDONTWRITEBYTECODE="1", FX_TRACE_LOG=str(root / "trace.log"), FX_TRACE_SCOPES="workspace")
     # Real source files are user-visible inputs; graders and expected answers stay outside.
     subprocess.run(["git", "init", "-q", str(project)], check=True)
     start = time.monotonic()
@@ -306,6 +312,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--settings", type=Path, required=True, help="Provider settings without literal credentials")
     ap.add_argument("--model", required=True)
+    ap.add_argument("--review-model", help="Override the reviewer; otherwise retain the supplied provider settings")
+    ap.add_argument("--classifier", type=Path, help="Use this classifier configuration in each isolated profile")
     ap.add_argument("--provider", default="gemini")
     ap.add_argument("--stream-fault", choices=["execution", "review"], help="Inject two incomplete model streams through a local proxy")
     ap.add_argument("--background", action="store_true", help="Exercise the coordinator and background worker through the native UI host")
@@ -322,10 +330,12 @@ def main():
     args.output = args.output.resolve(); args.output.mkdir(exist_ok=True)
     args.binary = args.binary.resolve()
     families = args.families.split(",")
+    settings = json.loads(args.settings.read_text())
+    reviewer = args.review_model or settings.get("review_model") or settings.get("providers", {}).get(args.provider, {}).get("reviewer_model")
     if not set(families) <= set(FAMILIES): ap.error("Unknown task family")
     if args.repeats < 1 or args.workers < 1: ap.error("Repeats and workers must be positive")
     source_diff = subprocess.check_output(["git", "diff", "--", "src"], cwd=REPO)
-    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "source_diff_sha256": hashlib.sha256(source_diff).hexdigest(), "source_dirty": bool(source_diff), "evaluator_sha256": digest(Path(__file__)), "model": args.model, "provider": args.provider, "background": args.background, "stream_fault": args.stream_fault, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
+    dump(args.output / "protocol.json", {"schema": 1, "binary_sha256": digest(args.binary), "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "source_diff_sha256": hashlib.sha256(source_diff).hexdigest(), "source_dirty": bool(source_diff), "evaluator_sha256": digest(Path(__file__)), "model": args.model, "review_model": reviewer, "classifier_configured": bool(args.classifier), "provider": args.provider, "background": args.background, "stream_fault": args.stream_fault, "families": families, "repeats": args.repeats, "seed": args.seed, "timeout_seconds": args.timeout, "workers": args.workers, "acceptance": "Each family must pass both runs; no false completion or duplicate external mutation. Report latency separately. Not an official public-benchmark score."})
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(trial, args, f, r) for r in range(args.repeats) for f in families if f != "browser"]

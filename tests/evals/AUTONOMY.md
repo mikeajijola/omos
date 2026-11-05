@@ -73,6 +73,12 @@ trials use up to `--workers` concurrent processes in separate workspaces.
 retain a separate output directory when evaluating another seed or revision.
 Each trial has a 1,200-second external timeout by default.
 
+The reviewer follows the supplied settings. Use `--review-model` to pin a
+different reviewer and `--classifier /path/to/classifier.json` to exercise
+classification with the deployed configuration. The runner copies that file
+into each private test profile; it does not modify your normal profile.
+It records the selected reviewer and whether classification was configured.
+
 The runner records the binary hash, source commit, model, task requests, raw
 results, stderr, independent scores, and publication receipts. It uses
 full-access permission mode within the isolated trial profile, matching the
@@ -86,7 +92,8 @@ readiness claim. The installed CLI and running UI are not replaced by this suite
 
 Add `--background` to exercise the native UI coordinator and background host.
 The evaluator waits for verified publication and records foreground events and
-background activity separately. A queued response is not a passing result.
+background activity separately, with timestamps for latency analysis. A queued
+response is not a passing result.
 Run the same task families separately for each deployed model; a foreground
 pass on one model does not establish background reliability on another.
 

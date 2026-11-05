@@ -136,7 +136,7 @@ const progress_schema: schemas.FunctionSchema = .{
         .{ .name = "meaningful", .json_type = .boolean },
         .{ .name = "reassessment", .json_type = .string, .description = "Explain the change since the previous assessment, including a new inference or approach from existing evidence. For pause, explain why recent evidence and alternative approaches do not permit useful continuation. Required when the host requests reconciliation." },
         .{ .name = "evidence", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
-        .{ .name = "remaining", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "remaining", .json_type = .array, .description = "Exact IDs of unresolved obligations from the pinned contract. Never use descriptions or invent IDs.", .shape = &.{ .array_values = .{ .json_type = .string } } },
         .{ .name = "note", .json_type = .string },
         .{ .name = "execution_readiness", .json_type = .string, .description = "Choose ready when at least one authorized outcome increment can be executed and verified now, even if other items remain undiscovered. Choose prerequisite only when a specific unresolved dependency prevents that increment. Use not_applicable for finalize or pause.", .shape = &.{ .enum_values = &.{ "ready", "prerequisite", "not_applicable" } } },
         .{ .name = "ready_target", .json_type = .string, .description = "When ready, identify one specific evidence-grounded unit of the requested result that can be produced now. Name the actual item, artifact or change, not a batch, full inventory or overall goal. Otherwise leave empty." },
@@ -318,8 +318,9 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
     const instruction_messages = [_]types.ChatMessage{ .{ .role = .system, .content = instructions }, .{ .role = .system, .content = context_instructions } };
     request.instructions = &instruction_messages;
     const progress_review = std.mem.eql(u8, function.name, progress_schema.name);
-    const decision_functions = [_]schemas.FunctionSchema{function};
-    const progress_functions = [_]schemas.FunctionSchema{ function, page_schema };
+    const bound_function = if (progress_review) try progressSchema(alloc, definition) else function;
+    const decision_functions = [_]schemas.FunctionSchema{bound_function};
+    const progress_functions = [_]schemas.FunctionSchema{ bound_function, page_schema };
     request.tools = .{ .additional_functions = if (progress_review) &progress_functions else &decision_functions };
     request.tool_choice = .required;
     request.provider_options.parallel_tool_calls = false;
@@ -443,7 +444,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
             } else failure = error.InvalidTaskGovernance;
             if (failure) |err| {
                 last_reason = @errorName(err);
-                content = try std.json.Stringify.valueAlloc(alloc, .{ .error_code = @errorName(err), .instruction = if (decision and std.mem.eql(u8, function.name, revision_schema.name)) try revisionCorrection(alloc, definition, call.arguments_json) else if (err == error.InvalidProgressReadiness) "Supply execution_readiness, next_step, ready_target, verification and prerequisite. When ready, name the specific evidence-grounded result in ready_target and its observable success evidence in verification; otherwise leave both empty. For continue_work, choose ready and name one executable outcome increment with its verification, or choose prerequisite and explain the specific dependency preventing that increment and the action to resolve it. For finalize or pause use not_applicable. Leave prerequisite empty unless readiness is prerequisite. Correct these fields using the inspected evidence; do not read unrelated records merely to repair the response format." else if (err == error.ProgressReassessmentRequired) "Reassess against progressContext.previousAssessment and the newly presented evidence. Reusing citations does not disprove progress: explain the new inference or changed approach in reassessment, or revise meaningful. Before pausing, explain why recent evidence and viable alternatives cannot support continuation. At the no-progress threshold, justify the next approach or a concrete pause. Do not repeat completed external actions. Return one corrected decision; no task has been paused." else "Correct the reviewer call. Copy an exact evidence ID from the manifest; use list to retrieve available IDs. Inspect all relevant bytes before citing evidence. Return exactly one decision, with only current obligation IDs. No work has been accepted." }, .{});
+                content = try std.json.Stringify.valueAlloc(alloc, .{ .error_code = @errorName(err), .instruction = if (decision and std.mem.eql(u8, function.name, revision_schema.name)) try revisionCorrection(alloc, definition, call.arguments_json) else if (err == error.InvalidProgressObligations) try progressObligationCorrection(alloc, definition) else if (err == error.InvalidProgressReadiness) "Supply execution_readiness, next_step, ready_target, verification and prerequisite. When ready, name the specific evidence-grounded result in ready_target and its observable success evidence in verification; otherwise leave both empty. For continue_work, choose ready and name one executable outcome increment with its verification, or choose prerequisite and explain the specific dependency preventing that increment and the action to resolve it. For finalize or pause use not_applicable. Leave prerequisite empty unless readiness is prerequisite. Correct these fields using the inspected evidence; do not read unrelated records merely to repair the response format." else if (err == error.ProgressReassessmentRequired) "Reassess against progressContext.previousAssessment and the newly presented evidence. Reusing citations does not disprove progress: explain the new inference or changed approach in reassessment, or revise meaningful. Before pausing, explain why recent evidence and viable alternatives cannot support continuation. At the no-progress threshold, justify the next approach or a concrete pause. Do not repeat completed external actions. Return one corrected decision; no task has been paused." else "Correct the reviewer call. Copy an exact evidence ID from the manifest; use list to retrieve available IDs. Inspect all relevant bytes before citing evidence. Return exactly one decision, with only current obligation IDs. No work has been accepted." }, .{});
                 try journal.record("governance_correction", try std.json.Stringify.valueAlloc(alloc, .{ .phase = function.name, .call = calls, .tool = call.name, .reason = @errorName(err) }, .{}));
             }
             try messages.append(alloc, .{ .role = .tool, .tool_call_id = try alloc.dupe(u8, call.id), .tool_name = try alloc.dupe(u8, call.name), .tool_result_status = if (failure != null) .failure else .success, .content = content });
@@ -576,6 +577,29 @@ fn revisionCorrection(alloc: std.mem.Allocator, definition: contract.Definition,
     return "Correct the revision fields: use general_task or coding_task and a nonempty summary; obligations contains only new or changed user requirements with unique IDs, and superseded contains only existing user requirement IDs being replaced or removed. To change an existing requirement, include its ID in superseded. Preserve capability and use empty obligations and superseded for an unchanged request. Do not read evidence to repair revision fields.";
 }
 
+fn progressObligationIds(alloc: std.mem.Allocator, definition: contract.Definition) ![]const []const u8 {
+    const ids = try alloc.alloc([]const u8, definition.obligations.len);
+    for (definition.obligations, ids) |obligation, *id| id.* = obligation.id;
+    return ids;
+}
+
+fn progressSchema(alloc: std.mem.Allocator, definition: contract.Definition) !schemas.FunctionSchema {
+    var schema = progress_schema;
+    const properties = try alloc.dupe(schemas.Property, schema.input_schema.properties);
+    const shape = try alloc.create(schemas.PropertyShape);
+    shape.* = .{ .array_values = .{ .json_type = .string, .enum_values = try progressObligationIds(alloc, definition) } };
+    for (properties) |*property| if (std.mem.eql(u8, property.name, "remaining")) {
+        property.shape = shape;
+    };
+    schema.input_schema.properties = properties;
+    return schema;
+}
+
+fn progressObligationCorrection(alloc: std.mem.Allocator, definition: contract.Definition) ![]const u8 {
+    const ids = try std.json.Stringify.valueAlloc(alloc, try progressObligationIds(alloc, definition), .{});
+    return alloc.print("Repair only remaining: use exact unresolved obligation IDs from {s}, without duplicates or descriptions. This error does not request more evidence reads. Preserve already inspected evidence; other fields will still be validated. Return one corrected decision.", .{ids});
+}
+
 fn validateDecision(alloc: std.mem.Allocator, name: []const u8, definition: contract.Definition, view: *evidence_mod.View, records: []const review.Evidence, raw: []const u8) !void {
     if (std.mem.eql(u8, name, progress_schema.name)) {
         const decision = try record_json.decode(Progress, alloc, raw, .{});
@@ -596,8 +620,8 @@ fn validateDecision(alloc: std.mem.Allocator, name: []const u8, definition: cont
             const found = for (definition.obligations) |obligation| {
                 if (std.mem.eql(u8, id, obligation.id)) break true;
             } else false;
-            if (!found) return error.InvalidTaskGovernance;
-            for (decision.remaining[0..i]) |previous| if (std.mem.eql(u8, previous, id)) return error.InvalidTaskGovernance;
+            if (!found) return error.InvalidProgressObligations;
+            for (decision.remaining[0..i]) |previous| if (std.mem.eql(u8, previous, id)) return error.InvalidProgressObligations;
         }
         for (decision.evidence) |id| {
             try view.requireInspected(id);
@@ -833,6 +857,60 @@ test "workspace progress prioritizes recent evidence and reserves a decision cal
         .cancel_flag = &cancel,
     }, .gateway, try std.json.Stringify.valueAlloc(alloc, .{ .contract = definition }, .{}), .{ .context = &context, .record_fn = Fake.record }, &records, &.{}, .{ .policy = .{ .max_calls = 3, .reserved_calls = 1 } });
     try std.testing.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "workspace progress repairs obligation IDs without unrelated evidence reads" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn record(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+        fn stream(raw: ?*anyopaque, alloc: std.mem.Allocator, request: streams.ModelRequest) !streams.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try request.admission.admit();
+            self.calls += 1;
+            const schema = request.tools.additional_functions[0];
+            for (schema.input_schema.properties) |property| {
+                if (std.mem.eql(u8, property.name, "remaining")) {
+                    try std.testing.expectEqualStrings("request_complete", property.shape.?.array_values.enum_values[0]);
+                }
+            }
+            const deciding = self.calls == 2;
+            if (deciding) {
+                const correction = request.messages[request.messages.len - 1].content.?;
+                try std.testing.expect(std.mem.indexOf(u8, correction, "InvalidProgressObligations") != null);
+                try std.testing.expect(std.mem.indexOf(u8, correction, "request_complete") != null);
+                try std.testing.expect(std.mem.indexOf(u8, correction, "does not request more evidence reads") != null);
+            }
+            const calls = try alloc.alloc(types.ToolCall, 1);
+            calls[0] = .{ .id = try alloc.dupe(u8, "review"), .name = try alloc.dupe(u8, "omos_progress_assessment"), .arguments_json = try alloc.dupe(u8, if (deciding) "{\"execution_readiness\":\"ready\",\"ready_target\":\"Requested fixture result\",\"verification\":\"Inspect the retained result\",\"next_step\":\"Perform the diagnosed next action and verify its result.\",\"prerequisite\":\"\",\"outcome\":\"continue_work\",\"meaningful\":false,\"evidence\":[],\"remaining\":[\"request_complete\"],\"note\":\"Use the requested external capability next.\"}" else "{\"execution_readiness\":\"ready\",\"ready_target\":\"Requested fixture result\",\"verification\":\"Inspect the retained result\",\"next_step\":\"Perform the diagnosed next action and verify its result.\",\"prerequisite\":\"\",\"outcome\":\"continue_work\",\"meaningful\":false,\"evidence\":[],\"remaining\":[\"Use the browser\"],\"note\":\"Use the requested external capability next.\"}") };
+            return .{ .completed = .{ .ownership = .owned, .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls } } };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var fake: Fake = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var delivery: streams.DeliveryCertainty = .init();
+    var attempt: streams.AttemptEvidence = .{};
+    var context: u8 = 0;
+    const definition: contract.Definition = .{ .id = "task", .version = 1, .objective = "Use the browser", .obligations = &.{.{ .id = "request_complete", .description = "Use the browser" }} };
+    var records: [20]review.Evidence = undefined;
+    for (&records, 0..) |*record, i| record.* = .{ .id = try alloc.print("record-{d}", .{i}), .kind = .verification, .content = "Workspace inspection" };
+    _ = try progressWithBacking(alloc, .{ .context = &fake, .stream_fn = Fake.stream }, .{
+        .credential = .{ .direct = .{ .secret_bytes = "fixture" } },
+        .model = "fixture",
+        .retry_count = 0,
+        .messages = &.{},
+        .tool_choice = .required,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = null,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt,
+        .events = .{ .context = &context, .emit_fn = discard },
+        .cancel_flag = &cancel,
+    }, .gateway, try std.json.Stringify.valueAlloc(alloc, .{ .contract = definition }, .{}), .{ .context = &context, .record_fn = Fake.record }, &records, &.{}, .{ .policy = .{ .max_calls = 3, .reserved_calls = 1 } });
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "workspace progress reconciles reused evidence and pauses without converting signals into outcomes" {

@@ -5395,7 +5395,6 @@ sys.exit(result.returncode)
     expect(result.code).toBe(1);
     expect(checks).toBe(8);
     expect(result.stderr + result.stdout).toContain("actor-step budget");
-    expect(recoveryDelivered).toBe(true);
     expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
@@ -5446,6 +5445,7 @@ sys.exit(result.returncode)
     const session = JSON.parse(first.stdout).session_id;
     const second = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
     expect(second.code, second.stderr).toBe(1);
+    expect(recoveryDelivered).toBe(true);
     expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
   }, 180000);
@@ -5496,6 +5496,16 @@ sys.exit(result.returncode)
     const result = await f.run(["ask", "Implement answer.txt and test that it exists", "--json"], {}, 150000);
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(m.counts()).toEqual({ actors: 5, assessments: 2 });
+    const snapshots = m.packets.map((packet: any) => {
+      const source = packet.evidence.find((record: any) => record.id.startsWith("source-state:"));
+      return { state: JSON.parse(source.content), evidence: packet.evidence };
+    });
+    expect(snapshots).toHaveLength(2);
+    for (const [index, snapshot] of snapshots.entries()) {
+      const current = snapshot.evidence.find((record: any) => record.raw_call_id === `code-${index === 0 ? 2 : 4}`);
+      expect(snapshot.state.current_validation_evidence).toContain(current.id);
+    }
+    expect(snapshots[1].state.current_validation_evidence).not.toContain(snapshots[0].state.current_validation_evidence[0]);
   }, 150000);
 
   test("does not execute a repeated invalid tool proposal", async () => {

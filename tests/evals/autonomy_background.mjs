@@ -7,7 +7,7 @@ const task=JSON.parse(readFileSync(`${root}/task.json`));
 const client=new NativeClient({binary,project});
 const worker=spawn(binary,['ui-host','--background-serve'],{cwd:project,env:process.env,stdio:['ignore','ignore','pipe']});
 worker.stderr.on('data',data=>appendFileSync(`${root}/background-stderr.log`,data));
-client.on('event',event=>appendFileSync(`${root}/foreground-events.ndjson`,JSON.stringify(event)+'\n'));
+client.on('event',event=>appendFileSync(`${root}/foreground-events.ndjson`,JSON.stringify({at:Date.now(),...event})+'\n'));
 const pause=()=>new Promise(resolve=>setTimeout(resolve,1000));
 let code=1;
 try {
@@ -19,7 +19,7 @@ try {
   record=listing.workers?.[0]?.record;
   if(record){
    const transition=JSON.stringify({state:record.state,generation:record.generation,recoveries:record.recoveries,worker_session:record.worker_session,reason:record.reason});
-   if(transition!==previous){appendFileSync(`${root}/background-transitions.ndjson`,transition+'\n');previous=transition;}
+   if(transition!==previous){appendFileSync(`${root}/background-transitions.ndjson`,JSON.stringify({at:Date.now(),...JSON.parse(transition)})+'\n');previous=transition;}
    const status=await client.request('background',{action:'show',task:record.task});
    writeFileSync(`${root}/background-status.json`,JSON.stringify(status,null,2));
    if(record.state==='completed'){code=0;break;}

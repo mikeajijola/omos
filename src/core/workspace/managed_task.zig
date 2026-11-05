@@ -199,6 +199,7 @@ pub const Turn = struct {
         var pages: std.ArrayList([]const u8) = .empty;
         var page_bytes: usize = 0;
         var checkpoints: std.ArrayList([]const u8) = .empty;
+        var current_validations: std.ArrayList([]const u8) = .empty;
         for (self.task.company_reads) |reference| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
@@ -241,6 +242,15 @@ pub const Turn = struct {
                 const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
                 const entry = (try std.json.parseFromSlice(Entry, a, bytes, .{ .ignore_unknown_fields = true })).value;
                 if (!std.mem.eql(u8, entry.task, self.task.id)) return error.InvalidWorkspaceJournal;
+                if (self.source_basis) |source| {
+                    const model = @import("definition.zig");
+                    if (std.mem.eql(u8, entry.kind, "source_validation") and
+                        entry.contract_version >= (self.task.source_validation_version orelse 1) and
+                        std.mem.eql(u8, model.text(entry.value, "source"), source))
+                    {
+                        try current_validations.append(alloc, try alloc.dupe(u8, model.text(entry.value, "evidence")));
+                    }
+                }
                 if (entry.contract_version == self.task.definition.version and (std.mem.eql(u8, entry.kind, "review_request") or std.mem.eql(u8, entry.kind, "review_evidence_page") or std.mem.eql(u8, entry.kind, "review_segment_assessment"))) {
                     if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try self.trackReview(entry.kind, data.string, false);
                 }
@@ -279,7 +289,10 @@ pub const Turn = struct {
         self.prior_review_checkpoints = checkpoints.items;
         const inputs = try self.manager.reviewInputs(self.task, self.reviewed_revision.?);
         self.review_snapshot = inputs.snapshot;
-        if (self.source_basis) |source| try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try alloc.print("source-state:{s}", .{source}), .kind = .verification, .content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .note = "Current source bytes observed by the host; validation requires a matching successful command receipt." }, .{}) });
+        if (self.source_basis) |source| {
+            const content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .current_validation_evidence = current_validations.items, .note = "For coding_validation, inspect and cite a listed current_validation_evidence ID (or its matching command receipt). These commands succeeded against unchanged current source bytes; independently assess whether their checks cover the request. An empty list means a check must run against the final source before completion. A successful command that changed source is not a current validation. This source-state record alone proves neither coverage nor completion." }, .{});
+            try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try alloc.print("source-state:{s}", .{try workspace.hash(alloc, content)}), .kind = .verification, .content = content });
+        }
         try self.appendReviewEvidence(alloc, &evidence, &payloads, try review.workspaceEvidence(alloc, self.review_snapshot));
         for (inputs.files) |file| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
