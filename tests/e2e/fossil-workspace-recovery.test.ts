@@ -6282,7 +6282,7 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
           return { tool_calls: mode === "shortened evidence ID" ? [first] : [first, governanceCall("omos_review_evidence", { action: "read", id }, 1)] };
         }
         if (mode === "shortened evidence ID" && progressCalls === 2) return { tool_calls: [governanceCall("omos_review_evidence", { action: "read", id: evidence.id })] };
-        return { tool_calls: [governanceCall("omos_progress_assessment", { outcome: "finalize", meaningful: true, evidence: [evidence.id], remaining: ["request_complete"], note: "Inspected the workspace evidence." })] };
+        return { tool_calls: [governanceCall("omos_progress_assessment", { execution_readiness: "not_applicable", next_step: "", prerequisite: "", outcome: "finalize", meaningful: true, evidence: [evidence.id], remaining: ["request_complete"], note: "Inspected the workspace evidence." })] };
       },
     });
     const result = await f.run(["ask", "Identify the workspace kind after inspecting it", "--json"], {}, 120000);
@@ -6314,7 +6314,7 @@ test("workspace governance defers rejected assessments with diagnostics until th
     reply(_body, _packet, phase) {
       if (phase !== "progress") return;
       progressCalls++;
-      return { tool_calls: [governanceCall("omos_progress_assessment", { outcome: "finalize", meaningful: false, evidence: [], remaining: ["invented_obligation"], note: "This ID is not in the contract." })] };
+      return { tool_calls: [governanceCall("omos_progress_assessment", { execution_readiness: "not_applicable", next_step: "", prerequisite: "", outcome: "finalize", meaningful: false, evidence: [], remaining: ["invented_obligation"], note: "This ID is not in the contract." })] };
     },
   });
   const result = await f.run(["ask", "Inspect the workspace before answering", "--json"], {}, 120000);
@@ -6417,3 +6417,39 @@ for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", 
     expect(m.counts().actors).toBe(2);
   }, 120000);
 }
+
+test("progress readiness requires a concrete next step and forwards it without replaying work", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  let reviews = 0;
+  let delivered = false;
+  const nextStep = "Write the requested preference checkpoint, then verify its retained result.";
+  const m = model(f, (body, count) => {
+    if (count <= 4) return { tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] };
+    if (count === 5) {
+      delivered = body.messages.some((message: any) => message.role === "user" && message.content.includes("Host progress assessment:") && message.content.includes(nextStep));
+      return writeMemory("Verified increment.");
+    }
+    return { content: "Saved the requested preference checkpoint." };
+  }, undefined, {
+    reply(body, _packet, phase) {
+      if (phase !== "progress") return;
+      reviews++;
+      const schema = body.tools.find((tool: any) => tool.function?.name === "omos_progress_assessment").function.parameters;
+      expect(schema.required).toContain("execution_readiness");
+      expect(schema.required).toContain("next_step");
+      if (reviews === 2) expect(body.messages.some((message: any) => message.role === "tool" && message.content.includes("InvalidProgressReadiness"))).toBe(true);
+      return { tool_calls: [governanceCall("omos_progress_assessment", {
+        outcome: "continue_work", meaningful: false, evidence: [], remaining: ["request_complete"],
+        note: "Preparation is sufficient for the requested checkpoint.", execution_readiness: "ready",
+        next_step: reviews === 1 ? "" : nextStep, prerequisite: "",
+      })] };
+    },
+  });
+  const result = await f.run(["ask", "Inspect the workspace and save one preference checkpoint", "--json"], {}, 120000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(reviews).toBe(2);
+  expect(delivered).toBe(true);
+  expect(m.counts().actors).toBe(6);
+  expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Verified increment.");
+}, 120000);

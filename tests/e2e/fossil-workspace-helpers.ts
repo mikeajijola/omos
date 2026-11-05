@@ -56,6 +56,11 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         const decision = planning ? (typeof governance.plan === "function" ? await governance.plan(packet) : governance.plan) ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
           : revising ? governance.revise?.(packet) ?? { capability: packet.context.model.basis?.capability ?? "general_task", summary: "Retain requirements with the supplied clarification", obligations: [], checks: [], superseded: [] }
           : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
+        if (!planning && !revising) {
+          decision.execution_readiness ??= decision.outcome === "continue_work" ? "ready" : "not_applicable";
+          decision.next_step ??= decision.outcome === "continue_work" ? "Perform the next requested fixture operation and verify its result." : "";
+          decision.prerequisite ??= "";
+        }
         delta = governance.reply?.(body, packet, planning ? "plan" : revising ? "revise" : "progress") ?? { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
         reason = "tool_calls";
       } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {

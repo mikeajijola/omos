@@ -486,6 +486,12 @@ change. An unresolved periodic progress assessment is journaled and deferred
 within the existing actor-step budget; it cannot establish a task stall or
 permit publication.
 
+Progress assessments explicitly record whether an authorized outcome increment is ready
+to execute, the next concrete action, or the prerequisite preventing it. The actor
+receives this guidance with the assessment. This does not change permissions,
+requested quantities, or the independent completion check. Older retained
+assessments without these fields remain readable.
+
 The execution policy defaults to a progress check after every four completed
 tool batches, a required reassessment after three consecutive no-progress
 judgments, and at most 100
