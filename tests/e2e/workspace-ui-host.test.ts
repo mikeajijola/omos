@@ -33,6 +33,28 @@ test('native UI writes require a task fence and compilation evidence before publ
  await expect(native.request('validation',{turn:'invalid-ui-source',request_id:validation.data.request_id,receipt:{status:'passed'}})).rejects.toThrow();
 },90000);
 
+test('UI inspection preserves revision-bound binary and duplicate contents across batches',async()=>{
+ const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);const before=await native.request('snapshot',{action:'fossil.status'});
+ await expect(native.request('ui.inspect',{revision:before.trunk_revision})).rejects.toThrow('UiNotInstalled');
+ const source=new Map<string,Buffer>();
+ source.set('ui/manifest.json',Buffer.from(JSON.stringify({version:'omos.ui-source/v1',bridge:'omos.ui-bridge/v1',renderer:'omos.react/v1',toolchain:'a'.repeat(64)})));
+ for(let i=0;i<35;i++)source.set(`ui/src/file-${i}.txt`,Buffer.from(i%2?'shared source':`source ${i}`));
+ source.set('ui/src/large.bin',Buffer.from(Array.from({length:65537},(_,i)=>i%256)));
+ const files=[...source].map(([path,bytes])=>({path,content:bytes.toString('base64'),encoding:'base64',sha256:createHash('sha256').update(bytes).digest('hex')}));
+ const installed=await native.request('ui.install',{revision:before.trunk_revision,files});
+ for(const revision of [installed.revision,installed.revision.slice(0,40)]){
+  const inspected=await native.request('ui.inspect',{revision});
+  expect(inspected.files.length).toBe(source.size);
+  for(const file of inspected.files){const bytes=source.get(file.path)!;expect(file.bytes).toBe(bytes.length);expect(file.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));}
+ }
+ const page=await native.request('ui.read',{revision:installed.revision,path:'ui/src/large.bin',offset:65536});
+ expect(Buffer.from(page.content,'base64')).toEqual(source.get('ui/src/large.bin')!.subarray(65536));
+ expect(page.next_offset).toBeNull();
+ await expect(native.request('ui.inspect',{revision:'trunk'})).rejects.toThrow('ImmutableRevisionRequired');
+ expect(native.stderr).toBe('');
+},90000);
+
 test('legacy interface history is retained once on an unpublished branch',async()=>{
  const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);const native=host(f);const before=await native.request('snapshot',{action:'fossil.status'});
  const content=JSON.stringify({version:'omos.ui-legacy-input/v1',status:'unpublished_input',files:[{path:'.revisions/old.json',content:'Retained local appearance input'}]});const retained=await native.request('ui.import_legacy',{content});expect(retained.retained).toBe(true);expect(retained.publication).toBe('unpublished');expect(retained.artifact).toStartWith('artifacts/');

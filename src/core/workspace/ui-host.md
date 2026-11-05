@@ -34,6 +34,8 @@ Complete frontend source belongs under `ui/`. Its manifest pins `omos.ui-source/
 
 The native completion path retains the candidate before requesting validation. A source change invalidates earlier validation. Compilation failure requires further work; unavailable validation retains a review failure for later verification. Validation uses the pinned review policy's first attempt deadline, clipped to the total review allowance. Waiting for the host consumes that same allowance rather than starting a separate 60-second timer or renewing the model budget. Cancellation stops the wait; late responses cannot satisfy a retired request. Independent contract review still decides whether obligations are met. Publication checks the source receipt again before writing its durable publication operation.
 
+UI inspection resolves immutable file identities once, verifies small source files in bounded batches, and reads larger assets individually. It returns the same SHA-256 digests and byte counts for text and binary files, including historical source revisions.
+
 Compilation receipts establish compilation, not visual correctness or external-action success. The compatible external renderer must provide isolation, preview recovery, browser verification and a way to rebuild its disposable cache from saved Fossil source.
 
 Native UI turns identify the Fossil `ui/` tree as the running interface source. Tool-start events expose only bounded `path` and workspace `action` presentation fields, not file content or arbitrary arguments. Tool outcomes preserve their native kind and summary so the interface can show a held or denied action.

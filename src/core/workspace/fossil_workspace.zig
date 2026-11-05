@@ -3194,6 +3194,34 @@ pub const Manager = struct {
         return json(self.alloc, .{ .versions = rows.items, .next_offset = if (rows.items.len == 32) @as(?usize, offset + 32) else null });
     }
 
+    pub const UiSourceFile = struct { path: []const u8, content: []const u8 };
+
+    /// Resolve immutable file identities once and verify bounded content batches.
+    /// Large binary assets use the individual artifact reader's existing limit.
+    pub fn uiSourceFiles(self: Manager, revision_id: []const u8) ![]const UiSourceFile {
+        var source_entries: std.ArrayList(fossil_manifest.File) = .empty;
+        for (try self.fileEntries(revision_id, true)) |entry| {
+            if (@import("ui_artifact.zig").safePath(entry.path)) try source_entries.append(self.alloc, entry);
+        }
+        var files: std.ArrayList(UiSourceFile) = .empty;
+        var offset: usize = 0;
+        while (offset < source_entries.items.len) {
+            const batch = source_entries.items[offset..@min(offset + 32, source_entries.items.len)];
+            var identities: [32][]const u8 = undefined;
+            for (batch, 0..) |entry, i| identities[i] = entry.artifact orelse return error.InvalidFossilManifest;
+            const objects = try self.retrievalObjects(identities[0..batch.len]);
+            for (batch) |entry| {
+                const identity = entry.artifact.?;
+                const source_bytes = for (objects) |object| {
+                    if (std.mem.eql(u8, identity, object.artifact)) break object.bytes;
+                } else try self.retrievalArtifact(identity);
+                try files.append(self.alloc, .{ .path = entry.path, .content = source_bytes });
+            }
+            offset += batch.len;
+        }
+        return files.items;
+    }
+
     /// Installation is a host bootstrap operation, never an agent completion.
     /// It only creates the first UI tree and verifies every committed byte.
     pub fn installUi(self: Manager, expected: []const u8, files: []const @import("ui_artifact.zig").File) ![]const u8 {
