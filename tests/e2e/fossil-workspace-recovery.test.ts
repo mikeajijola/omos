@@ -6379,7 +6379,7 @@ test("workspace governance defers rejected assessments with diagnostics until th
   expect(journal.some((entry: any) => entry.kind === "progress_assessment")).toBe(false);
   const failure = JSON.parse(journal.find((entry: any) => entry.kind === "governance_failure").value.data);
   expect(failure.reason).toBe("TaskGovernancePending");
-  expect(failure.last_reason).toBe("InvalidTaskGovernance");
+  expect(failure.last_reason).toBe("InvalidProgressObligations");
   expect(failure.calls).toBe(8);
   expect(failure.usage.input_tokens).toBe(184);
   expect(failure.usage.output_tokens).toBe(56);
