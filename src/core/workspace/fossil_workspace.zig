@@ -3863,6 +3863,17 @@ pub const Manager = struct {
 
     pub fn retrievalObjects(self: Manager, identities: []const []const u8) ![]const RetrievalObject {
         if (identities.len == 0 or identities.len > 32) return error.InvalidRetrievalBatch;
+        return self.verifiedObjects(identities, 65536);
+    }
+
+    /// Bound projection verification to eight one-megabyte objects per query.
+    /// Missing or larger objects must still pass the individual artifact reader.
+    pub fn projectionObjects(self: Manager, identities: []const []const u8) ![]const RetrievalObject {
+        if (identities.len == 0 or identities.len > 8) return error.InvalidRetrievalBatch;
+        return self.verifiedObjects(identities, 1024 * 1024);
+    }
+
+    fn verifiedObjects(self: Manager, identities: []const []const u8, max_object_bytes: usize) ![]const RetrievalObject {
         var query: std.Io.Writer.Allocating = .init(self.alloc);
         try query.writer.writeAll("SELECT uuid AS artifact, hex(content(uuid)) AS encoded FROM blob WHERE uuid IN (");
         for (identities, 0..) |identity, i| {
@@ -3870,7 +3881,7 @@ pub const Manager = struct {
             if (i > 0) try query.writer.writeByte(',');
             try query.writer.print("'{s}'", .{identity});
         }
-        try query.writer.writeAll(") AND size <= 65536;");
+        try query.writer.print(") AND size <= {d};", .{max_object_bytes});
         const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query.written() });
         const rows = try parse(self.alloc, []const struct { artifact: []const u8, encoded: []const u8 }, if (std.mem.trim(u8, raw, " \r\n\t").len == 0) "[]" else raw);
         var result: std.ArrayList(RetrievalObject) = .empty;

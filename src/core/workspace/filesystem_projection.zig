@@ -483,20 +483,32 @@ fn cleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8)
     if (files.items.len != saved.entries.len) return error.WorkspaceProjectionConflict;
     const revision = try manager.currentRevision(task);
     const manifest = try manager.fileManifest(revision);
-    for (files.items) |file| {
-        if (manager.operation_control) |control| try control.check();
-        if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
-        const canonical = for (manifest) |entry| {
-            if (std.mem.eql(u8, entry.path, file.path)) break entry;
-        } else return error.WorkspaceProjectionConflict;
-        if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+    var offset: usize = 0;
+    while (offset < files.items.len) {
         var page = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer page.deinit();
         var reader = manager;
         reader.alloc = page.allocator();
-        const body = try reader.contentAt(file.path, revision);
-        try @import("fossil_manifest.zig").verifyObject(canonical.artifact orelse return error.WorkspaceProjectionConflict, body);
-        if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        const batch = files.items[offset..@min(offset + 8, files.items.len)];
+        var identities: [8][]const u8 = undefined;
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
+            const canonical = for (manifest) |entry| {
+                if (std.mem.eql(u8, entry.path, file.path)) break entry;
+            } else return error.WorkspaceProjectionConflict;
+            if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+            identities[i] = canonical.artifact orelse return error.WorkspaceProjectionConflict;
+        }
+        const objects = try reader.projectionObjects(identities[0..batch.len]);
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            const body = for (objects) |object| {
+                if (std.mem.eql(u8, identities[i], object.artifact)) break object.bytes;
+            } else try reader.retrievalArtifact(identities[i]);
+            if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        }
+        offset += batch.len;
     }
     return total;
 }

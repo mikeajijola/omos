@@ -264,6 +264,49 @@ describe("portable Fossil workspace recovery", () => {
     expect(f.fossil("cat", "documents/draft.txt", "-r", "trunk")).toBe("Uncommitted legacy draft");
   }, 120000);
 
+  test("batches canonical cache verification and retains views when repository bytes fail verification", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let root = "";
+    model(f, (body, count) => {
+      if (count > 1) return { content: "Saved the requested documents." };
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      return { tool_calls: Array.from({ length: 12 }, (_, index) => ({ index, id: `batch-${index}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: join(root, `documents/batch-${index}.txt`), content: `Canonical ${index}\n`.repeat(index === 11 ? 90000 : 6000) }) } })) };
+    });
+    const saved = await f.run(["ask", "Save twelve documents for cache verification", "--json"], {}, 90000);
+    expect(saved.code, saved.stderr).toBe(0);
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    const helper = join(f.home, "count-cache-reads.py"), log = join(f.home, "cache-reads.jsonl"), fault = join(f.home, "corrupt-cache-batch");
+    writeFileSync(fault, "1");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(${JSON.stringify(log)}, 'a') as output: output.write(json.dumps(args)+'\\n')
+result = subprocess.run([${JSON.stringify(realFossil)}, *args], capture_output=True)
+if os.path.exists(${JSON.stringify(fault)}) and 'size <= 1048576' in args[-1] and result.returncode == 0:
+    rows = json.loads(result.stdout)
+    if rows: rows[0]['encoded'] = '626164'
+    print(json.dumps(rows))
+else: sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const refused = await f.run(["fossil", "cache", "prune", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(refused.code, refused.stderr).toBe(0);
+    expect(JSON.parse(refused.stdout).model_data.removed).toBe(0);
+    expect(existsSync(root)).toBe(true);
+    rmSync(fault);
+    writeFileSync(log, "");
+    const pruned = await f.run(["fossil", "cache", "prune", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(pruned.code, pruned.stderr).toBe(0);
+    expect(JSON.parse(pruned.stdout).model_data.removed).toBe(1);
+    expect(existsSync(root)).toBe(false);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.filter(args => args.some((arg: string) => arg.includes("size <= 1048576")))).toHaveLength(4);
+    expect(calls.filter(args => args.includes("cat") && args.some((arg: string) => arg.startsWith("documents/batch-")))).toHaveLength(0);
+  }, 180000);
+
   test("prunes only clean accepted views and preserves drafts, execution caches, and live resources", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
