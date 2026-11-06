@@ -294,6 +294,11 @@ else: sys.stdout.buffer.write(result.stdout)
 sys.stderr.buffer.write(result.stderr)
 sys.exit(result.returncode)
 `, { mode: 0o700 });
+    const retained = await f.run(["fossil", "cache", "trim", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(retained.code, retained.stderr).toBe(0);
+    expect(JSON.parse(retained.stdout).model_data.entries.find((entry: any) => entry.path === root).state).toBe("unverified_within_budget");
+    expect(readFileSync(log, "utf8")).not.toContain("size <= 1048576");
+    expect(existsSync(root)).toBe(true);
     const refused = await f.run(["fossil", "cache", "prune", "--json"], { OMOS_FOSSIL_BIN: helper });
     expect(refused.code, refused.stderr).toBe(0);
     expect(JSON.parse(refused.stdout).model_data.removed).toBe(0);

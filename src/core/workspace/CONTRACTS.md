@@ -501,6 +501,12 @@ removed, including verification after quarantine. Batching reduces
 Fossil process launches while preserving the same deletion checks.
 
 Fresh execution policies bound clean cached views to 256 MiB and 32 views.
+Before automatic trimming, a metadata-only scan counts eligible views and their
+file sizes as a conservative upper bound. When both totals fit the policy, the
+collector retains the views as `unverified_within_budget` without hashing file
+contents or taking writer locks. Exceeding either bound uses the full canonical
+verification and deletion checks. Explicit `status` and `prune` retain those
+checks regardless of the budget.
 The `projections` field is omitted when absent in legacy policies, preserving
 pinned policy hashes. Saved managed turns, the writable service, and the persistent
 UI host share one kernel-owned background maintenance lease per repository binding.
