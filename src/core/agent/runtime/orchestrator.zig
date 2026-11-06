@@ -7293,15 +7293,15 @@ fn processQueuedPromptLoop(
             } else |_| {}
         };
     };
-    var contract_selection: @import("../../workspace/contract_contract_selection.zig").Admission = .{};
+    var contract_selection: @import("../../workspace/contract_admission.zig").Admission = .{};
     if (comptime !builtin.target.cpu.arch.isWasm()) {
         if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and (config.ui_host == null or config.ui_host.?.channel_context == null)) {
             if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
-                contract_selection = try @import("../../workspace/contract_contract_selection.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
+                contract_selection = try @import("../../workspace/contract_admission.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
                 if (contract_selection.unresolved_task) |id| {
                     try deps.push_system_notice(deps.ctx, "Resolving the requested contract operation...");
                     const choice = try resolveContractIntent(deps, arena, &config, job, summary_accumulator_ptr, manager, id, history_messages.items, turn_id);
-                    contract_selection = try @import("../../workspace/contract_contract_selection.zig").apply(manager, config.fossil_session_id.?, job.prompt, id, choice);
+                    contract_selection = try @import("../../workspace/contract_admission.zig").apply(manager, config.fossil_session_id.?, job.prompt, id, choice);
                 }
                 if (contract_selection.response) |response| {
                     try deps.push_text(deps.ctx, .assistant_started);
@@ -7345,7 +7345,9 @@ fn processQueuedPromptLoop(
             // advisory classifier must not turn it into a read-only chat and
             // strand the pending review or publication behind another model call.
             const selected_task = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, job.prompt, " \t\r\n"), "continue")) try manager.active(config.fossil_session_id.?) else null;
-            var decision: routing.Decision = if (contract_selection.task != null or contract_selection.new_goal != null)
+            var decision: routing.Decision = if (contract_selection.lookup_task != null)
+                .{ .route = .retrieval, .reason = "selected_contract_status" }
+            else if (contract_selection.task != null or contract_selection.new_goal != null)
                 .{ .route = .work, .reason = "resolved_contract_operation" }
             else if (selected_task != null and selected_task.?.state != .accepted)
                 .{ .route = .work, .reason = "explicit_contract_continuation" }
@@ -7399,6 +7401,9 @@ fn processQueuedPromptLoop(
             retrieval_turn = decision.route != .work;
             classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null);
             if (retrieval_turn) {
+                if (contract_selection.lookup_task) |id| {
+                    try stable_prefix.append(arena, .{ .role = .system, .content = try arena.print("This read-only request concerns retained contract {s}. Use this exact task ID for workspace_content contracts/background reads; do not inspect unrelated contracts. Start with its current status and inspect receipts or ledgers if the question asks for completed outcomes. A missing publication or null count means unknown, not zero.", .{id}) });
+                }
                 config.contract_review_enabled = false;
                 config.coordinator_mode = true;
                 config.initial_dynamic_tools = &.{};

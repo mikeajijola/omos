@@ -846,3 +846,20 @@ for (const fallback of [false, true]) for (const intent of ["resume", "amend", "
     if (intent === "clarify") expect(m.counts().actors).toBe(1);
   } finally { classifier.stop(true); }
 }, 180000);
+
+test("agent contract status defaults to its bound task without inspecting the whole queue", async () => {
+  const f = fixture();
+  let observed: any;
+  model(f, (body, count) => {
+    if (count === 1) return { tool_calls: [{ index: 0, id: "own-contract", type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "contracts", contracts: { action: "status" } }) } }] };
+    const tool = body.messages.find((item: any) => item.role === "tool" && item.tool_call_id === "own-contract");
+    observed = JSON.parse(tool.content);
+    return { content: "The selected contract is active and has no verified publication yet." };
+  });
+  const result = await f.run(["ask", "Inspect the current contract without an explicit task ID", "--json"]);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+  expect(observed.task).toBe(tasks[0].id);
+  expect(observed.published).toBe(false);
+  expect(observed.outcome_counts).toBe(null);
+}, 120000);

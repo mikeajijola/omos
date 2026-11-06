@@ -14,6 +14,7 @@ pub const Admission = struct {
     new_goal: ?[]const u8 = null,
     independent: bool = false,
     unresolved_task: ?[]const u8 = null,
+    lookup_task: ?[]const u8 = null,
 };
 const Focus = struct { kind: []const u8 = "contract_selection", task: ?[]const u8, pending: bool = false };
 const Intent = channels.Intent;
@@ -105,7 +106,7 @@ pub fn apply(manager: workspace.Manager, session: []const u8, message: []const u
         },
         .status => {
             try saveFocus(manager, session, task.id, false);
-            return .{ .response = model.text(try channels.status(manager, task), "text") };
+            return .{ .lookup_task = task.id };
         },
         .new => {
             try saveFocus(manager, session, null, false);
