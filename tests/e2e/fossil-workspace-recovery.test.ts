@@ -5379,7 +5379,7 @@ sys.exit(result.returncode)
     const declaration = join(f.home, "definition.json");
     const execution = join(f.home, "execution.json");
     writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
-    writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 6 } }));
+    writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic", max_actor_steps: 6 } }));
     expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
     let checks = 0;
     const m = model(f, (body, count) => !body.tools?.length ? { content: "The policy is retained but verification is unfinished." } : count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
@@ -6360,7 +6360,7 @@ test("workspace governance defers rejected assessments with diagnostics until th
   const declaration = join(f.home, "definition.json");
   const execution = join(f.home, "execution.json");
   writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
-  writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 6 } }));
+  writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic", max_actor_steps: 6 } }));
   expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
   let progressCalls = 0;
   const m = model(f, (body) => !body.tools?.length ? { content: "Inspection remains unfinished." } : ({ tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] }), undefined, {

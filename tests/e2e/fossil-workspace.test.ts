@@ -793,6 +793,7 @@ test("read routing keeps its ordinary loop when no stopping model is selected", 
 
 test("successful execution uses checkpoints and completion review without periodic model reviews", async () => {
   const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   let progress = 0;
   const m = model(f, (_body, count) => count <= 12 ? writeMemory(`Requested increment ${count}`) : { content: "Saved twelve requested increments." }, undefined, {
     reply(_body, _packet, phase) { if (phase === "progress") { progress++; throw Error("Healthy work must not require a periodic review"); } },
@@ -807,6 +808,7 @@ test("successful execution uses checkpoints and completion review without period
 
 for (const fallback of [false, true]) for (const intent of ["resume", "amend", "new", "clarify"] as const) test(`retained contract selection handles ${intent} with ${fallback ? "bounded fallback" : "classification"} without accidental replacement`, async () => {
   const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   let blocked = true;
   let plans = 0;
   const m = model(f, () => ({ content: "The requested result is retained." }), () => blocked ? "blocked" : "met", {
@@ -849,6 +851,7 @@ for (const fallback of [false, true]) for (const intent of ["resume", "amend", "
 
 test("agent contract status defaults to its bound task without inspecting the whole queue", async () => {
   const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
   let observed: any;
   model(f, (body, count) => {
     if (count === 1) return { tool_calls: [{ index: 0, id: "own-contract", type: "function", function: { name: "workspace_content", arguments: JSON.stringify({ action: "contracts", contracts: { action: "status" } }) } }] };
