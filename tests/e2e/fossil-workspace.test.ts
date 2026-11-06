@@ -805,11 +805,12 @@ test("successful execution uses checkpoints and completion review without period
   expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Requested increment 12");
 }, 180000);
 
-for (const intent of ["resume", "amend", "new", "clarify"] as const) test(`retained contract selection handles ${intent} without accidental replacement`, async () => {
+for (const fallback of [false, true]) for (const intent of ["resume", "amend", "new", "clarify"] as const) test(`retained contract selection handles ${intent} with ${fallback ? "bounded fallback" : "classification"} without accidental replacement`, async () => {
   const f = fixture();
   let blocked = true;
   let plans = 0;
   const m = model(f, () => ({ content: "The requested result is retained." }), () => blocked ? "blocked" : "met", {
+    intent,
     plan: () => { plans++; return { capability: "general_task", summary: "Produce the requested result", obligations: [], checks: [] }; },
   });
   const goal = "Produce the retained result for this contract";
@@ -829,7 +830,7 @@ for (const intent of ["resume", "amend", "new", "clarify"] as const) test(`retai
     expect(body.questions.intent).toBeDefined();
     expect(body.state.selected_contract.objective).toBe(goal);
     const labels = Object.keys(body.questions.intent.criteria);
-    return Response.json({ model: "fixture-classifier", answers: { intent: { type: "choice", choice: intent, confidence: 0.99, probabilities: Object.fromEntries(labels.map(label => [label, label === intent ? 0.99 : 0.01 / (labels.length - 1)])) } } });
+    return Response.json({ model: "fixture-classifier", answers: { intent: { type: "choice", choice: intent, confidence: fallback ? 0.5 : 0.99, probabilities: Object.fromEntries(labels.map(label => [label, label === intent ? 0.99 : 0.01 / (labels.length - 1)])) } } });
   } });
   try {
     blocked = false;

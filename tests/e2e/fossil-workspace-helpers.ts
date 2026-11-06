@@ -38,7 +38,7 @@ export function fixture() {
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | Response | { name: string; args: object } | Promise<string | Response | { name: string; args: object }>, governance: { reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | Response | { name: string; args: object } | Promise<string | Response | { name: string; args: object }>, governance: { intent?: string; reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -48,7 +48,10 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
       if (request.method !== "POST") return Response.json({ data: [] });
       const body = await request.json() as any;
       let delta: any, reason = "stop";
-      if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment" || tool.function?.name === "omos_contract_revision")) {
+      if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_intent")) {
+        delta = { tool_calls: [{ index: 0, id: "contract-intent", type: "function", function: { name: "omos_contract_intent", arguments: JSON.stringify({ choice: governance.intent ?? "clarify" }) } }] };
+        reason = "tool_calls";
+      } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment" || tool.function?.name === "omos_contract_revision")) {
         const planning = body.tools.some((tool: any) => tool.function?.name === "omos_task_plan");
         const revising = body.tools.some((tool: any) => tool.function?.name === "omos_contract_revision");
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);

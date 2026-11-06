@@ -13,6 +13,7 @@ pub const Admission = struct {
     continuing: bool = false,
     new_goal: ?[]const u8 = null,
     independent: bool = false,
+    unresolved_task: ?[]const u8 = null,
 };
 const Focus = struct { kind: []const u8 = "contract_selection", task: ?[]const u8, pending: bool = false };
 const Intent = channels.Intent;
@@ -85,6 +86,13 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
     }
     const continuing = std.ascii.eqlIgnoreCase(std.mem.trim(u8, message, " \t\r\n"), "continue");
     const choice: Intent = if (continuing) .@"resume" else if (classification.configured()) try channels.interpretIntent(manager, task, message, focus.pending, cancel) else return .{};
+    if (choice == .clarify) return .{ .unresolved_task = task.id };
+    return apply(manager, session, message, task.id, choice);
+}
+
+pub fn apply(manager: workspace.Manager, session: []const u8, message: []const u8, id: []const u8, choice: Intent) !Admission {
+    const task = try manager.loadTask(id);
+    if (task.authority != null or task.parent_task_id != null) return error.CompanyExecutionIsolationRequired;
     switch (choice) {
         .unrelated => {
             try saveFocus(manager, session, null, false);

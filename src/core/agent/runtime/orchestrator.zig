@@ -7068,6 +7068,47 @@ noinline fn assessCompletionAttempt(
     return result.decision;
 }
 
+noinline fn resolveContractIntent(deps: *const AgentRuntimeDeps, alloc: Allocator, config: *const Config, job: QueuedPrompt, summary: *runtime_telemetry.TurnSummaryAccumulator, manager: @import("../../workspace/fossil_workspace.zig").Manager, task_id: []const u8, history: []const ChatMessage, turn_id: u64) !@import("../../workspace/contract_channels.zig").Intent {
+    const provider = config.contract_review_provider orelse job.provider;
+    const credential = try completion_review.reviewerCredential(job.provider, provider, activeCredentialLease(job.api_key, job), config.contract_review_credential);
+    var delivery: agent_stream_provider.DeliveryCertainty = .init();
+    var attempt: agent_stream_provider.AttemptEvidence = .{};
+    var event_context: u8 = 0;
+    const task = try manager.loadTask(task_id);
+    const context = try std.json.Stringify.valueAlloc(alloc, .{
+        .latest_message = @import("review_evidence.zig").View.prefix(job.prompt, 8192),
+        .selected_task = task.id,
+        .objective = @import("review_evidence.zig").View.prefix(task.definition.objective, 8192),
+        .state = task.state,
+        .conversation = try task_governance.referenceConversation(alloc, history),
+    }, .{});
+    const result = @import("../../workspace/request_routing.zig").resolveContract(alloc, config.contract_review_stream_provider orelse deps.agent_stream_provider, .{
+        .observer = deps.observer,
+        .credential = credential,
+        .model = if (config.contract_review_model.len > 0) config.contract_review_model else job.model,
+        .retry_count = 0,
+        .messages = &.{},
+        .tool_choice = .required,
+        .provider_options = .{},
+        .trace_ctx = .{ .turn_id = turn_id },
+        .content_capture_limit = 1024,
+        .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(20000) }),
+        .delivery = &delivery,
+        .attempt_evidence = &attempt,
+        .events = .{ .context = &event_context, .emit_fn = discardContractEvent },
+        .cooperative_pulse = deps.cooperative_transport_pulse,
+        .cancel_flag = config.cancel_flag,
+    }, context) catch |err| {
+        if (err == error.Cancelled or err == error.OutOfMemory) return err;
+        return .clarify;
+    };
+    if (deps.report_usage) |report| report(deps.ctx, result.usage);
+    summary.prepareTokenRequest();
+    _ = summary.reconcileTokenRequest(result.usage, false);
+    try manager.retainRoutingDecision(config.fossil_session_id.?, job.prompt, .{ .task = task_id, .choice = result.choice, .reason = "bounded_contract_resolution" });
+    return result.choice;
+}
+
 noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate, planning: bool, progress_state: ?*const task_governance.State) !task_governance.Reply {
     const turn = input.managed orelse return error.UnmanagedHost;
     var delivery: agent_stream_provider.DeliveryCertainty = .init();
@@ -7252,12 +7293,17 @@ fn processQueuedPromptLoop(
             } else |_| {}
         };
     };
-    var admission: @import("../../workspace/contract_admission.zig").Admission = .{};
+    var contract_selection: @import("../../workspace/contract_contract_selection.zig").Admission = .{};
     if (comptime !builtin.target.cpu.arch.isWasm()) {
         if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and (config.ui_host == null or config.ui_host.?.channel_context == null)) {
             if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
-                admission = try @import("../../workspace/contract_admission.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
-                if (admission.response) |response| {
+                contract_selection = try @import("../../workspace/contract_contract_selection.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
+                if (contract_selection.unresolved_task) |id| {
+                    try deps.push_system_notice(deps.ctx, "Resolving the requested contract operation...");
+                    const choice = try resolveContractIntent(deps, arena, &config, job, summary_accumulator_ptr, manager, id, history_messages.items, turn_id);
+                    contract_selection = try @import("../../workspace/contract_contract_selection.zig").apply(manager, config.fossil_session_id.?, job.prompt, id, choice);
+                }
+                if (contract_selection.response) |response| {
                     try deps.push_text(deps.ctx, .assistant_started);
                     try deps.push_text(deps.ctx, .{ .assistant_source = response });
                     try deps.push_text(deps.ctx, .{ .assistant_rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, response) });
@@ -7299,7 +7345,7 @@ fn processQueuedPromptLoop(
             // advisory classifier must not turn it into a read-only chat and
             // strand the pending review or publication behind another model call.
             const selected_task = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, job.prompt, " \t\r\n"), "continue")) try manager.active(config.fossil_session_id.?) else null;
-            var decision: routing.Decision = if (admission.task != null or admission.new_goal != null)
+            var decision: routing.Decision = if (contract_selection.task != null or contract_selection.new_goal != null)
                 .{ .route = .work, .reason = "resolved_contract_operation" }
             else if (selected_task != null and selected_task.?.state != .accepted)
                 .{ .route = .work, .reason = "explicit_contract_continuation" }
@@ -7376,16 +7422,16 @@ fn processQueuedPromptLoop(
         if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
             const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
             execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
-            if (admission.task) |id| _ = try manager.resumeTask(config.fossil_session_id.?, id, config.workspace_root);
-            if (admission.new_goal) |goal| {
+            if (contract_selection.task) |id| _ = try manager.resumeTask(config.fossil_session_id.?, id, config.workspace_root);
+            if (contract_selection.new_goal) |goal| {
                 _ = try manager.start(config.fossil_session_id.?, config.workspace_root, goal, null);
-            } else if (admission.independent) {
+            } else if (contract_selection.independent) {
                 _ = try manager.start(config.fossil_session_id.?, config.workspace_root, job.prompt, null);
             }
         }
     }
     var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (!retrieval_turn and config.fossil_session_id != null and !config.fossil_ephemeral)
-        try managed_task.Turn.beginResolved(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt, admission.continuing or admission.new_goal != null)
+        try managed_task.Turn.beginResolved(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt, contract_selection.continuing or contract_selection.new_goal != null)
     else
         null;
     defer if (managed) |*turn| {
