@@ -384,6 +384,7 @@ const Server = struct {
         if (scheduled) |invocation| {
             job.ui.project_root = invocation.task.project_root;
             job.ui.execution_lease_held = true;
+            job.ui.contract_selected = true;
         }
         if (background_run) |run_context| {
             const task = try run_context.manager.loadTask(run_context.entry.task);

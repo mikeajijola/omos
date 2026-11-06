@@ -611,3 +611,34 @@ test('channel commands survive a host restart and dispatch once through governed
  expect(followup.resolution.status.published).toBe(true);
  expect(second.stderr).toBe('');
 },180000);
+
+test('UI continuation selects the retained contract while its session lease is held', async () => {
+ const f=fixture(); let blocked=true; let plans=0;
+ const provider=model(f,()=>({content:'The requested result is retained.'}),()=>blocked?'blocked':'met',{
+  plan:()=>{plans++;return {capability:'general_task',summary:'Produce the result',obligations:[],checks:[]}}
+ });
+ const goal='Produce the saved result for the UI continuation';
+ expect((await f.run(['ask',goal,'--json'])).code).toBe(1);
+ const original=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+  const body=await request.json() as any; expect(body.questions.intent).toBeDefined();
+  const labels=Object.keys(body.questions.intent.criteria);
+  return Response.json({model:'fixture-classifier',answers:{intent:{type:'choice',choice:'resume',confidence:0.99,probabilities:Object.fromEntries(labels.map(label=>[label,label==='resume'?0.99:0.01/(labels.length-1)]))}}});
+ }});classifiers.push(server);
+ const native=host(f,{OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'});
+ const events:any[]=[];native.on('event',(event:any)=>events.push(event));
+ const firstEnd=terminal(native,'select-retained');
+ await native.request('prompt',{text:goal,coordinator:false},{id:'select-retained'});
+ expect((await firstEnd).data.exit_code).toBe(0);
+ const session=events.find(event=>event.turn==='select-retained'&&event.data.type==='session')?.data.session_id;
+ expect(session).toBeString(); expect(provider.counts().actors).toBe(1);
+ blocked=false;
+ const secondEnd=terminal(native,'resume-retained');
+ await native.request('prompt',{text:'finish the one already set-up',session,coordinator:false},{id:'resume-retained'});
+ expect((await secondEnd).data.exit_code,JSON.stringify(events)).toBe(0);
+ const tasks=(await native.request('snapshot',{action:'fossil.status'})).tasks;
+ expect(tasks).toHaveLength(1);expect(tasks[0].id).toBe(original.id);
+ expect(tasks[0].definition.version).toBe(original.definition.version);
+ expect(tasks[0].state).toBe('accepted');expect(plans).toBe(1);
+ expect(native.stderr).toBe('');
+},180000);

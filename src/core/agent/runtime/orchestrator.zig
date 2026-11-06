@@ -7295,7 +7295,7 @@ fn processQueuedPromptLoop(
     };
     var contract_selection: @import("../../workspace/contract_admission.zig").Admission = .{};
     if (comptime !builtin.target.cpu.arch.isWasm()) {
-        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and (config.ui_host == null or config.ui_host.?.channel_context == null)) {
+        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and (config.ui_host == null or (config.ui_host.?.channel_context == null and !config.ui_host.?.contract_selected))) {
             if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
                 contract_selection = try @import("../../workspace/contract_admission.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
                 if (contract_selection.unresolved_task) |id| {
@@ -7424,9 +7424,9 @@ fn processQueuedPromptLoop(
     var execution_lease: ?@import("../../workspace/fossil_workspace.zig").ExecutionLease = null;
     defer if (execution_lease) |lease| lease.release();
     if (comptime !builtin.target.cpu.arch.isWasm()) {
-        if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
+        if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral) {
             const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
-            execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
+            if (!config.fossil_execution_lease_held) execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
             if (contract_selection.task) |id| _ = try manager.resumeTask(config.fossil_session_id.?, id, config.workspace_root);
             if (contract_selection.new_goal) |goal| {
                 _ = try manager.start(config.fossil_session_id.?, config.workspace_root, goal, null);

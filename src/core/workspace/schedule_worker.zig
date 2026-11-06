@@ -204,7 +204,7 @@ pub const Headless = struct {
     error_code: ?[]const u8 = null,
 
     pub fn init(self: *Headless, project: []const u8) void {
-        self.ui = .{ .context = self, .emit_fn = emit, .project_root = project, .execution_lease_held = true };
+        self.ui = .{ .context = self, .emit_fn = emit, .project_root = project, .execution_lease_held = true, .contract_selected = true };
     }
 
     fn emit(raw: *anyopaque, bytes: []const u8) !void {

@@ -840,7 +840,7 @@ for (const fallback of [false, true]) for (const intent of ["resume", "amend", "
     const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
     expect(tasks).toHaveLength(intent === "new" ? 2 : 1);
     const original = tasks.find((task: any) => task.id === before.id);
-    expect(original.definition.version).toBe(intent === "amend" ? before.definition.version + 2 : before.definition.version);
+    expect(original.definition.version).toBe(intent === "amend" ? before.definition.version + 1 : before.definition.version);
     expect(plans).toBe(intent === "new" ? 2 : 1);
     if (intent === "resume") expect(original.state).toBe("accepted");
     if (intent === "clarify") expect(m.counts().actors).toBe(1);
