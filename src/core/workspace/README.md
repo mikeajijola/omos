@@ -7,6 +7,10 @@ an empty personal instance automatically when no repository is bound.
 `omos fossil ensure --json` performs the same bootstrap without importing
 existing sessions.
 
+See [conversation and content capabilities](CAPABILITIES.md) for retrieval,
+request classification, public chat history, and the attention feed shared by
+the CLI, workspace UI, local MCP adapter, and agent tools.
+
 Managed turns checkpoint changes in the task's projected `memory/`, `skills/`,
 `documents/`, `artifacts/`, and `ui/` directories. The host hashes local files
 through fixed-size buffers and retains their metadata while identifying
@@ -19,6 +23,11 @@ materialise the requested managed path before permission preflight. File searche
 materialise their selected directory. Skill discovery retrieves `SKILL.md`
 indexes; loading a skill retrieves its package. Shell commands hydrate the whole
 personal view because a process can open paths without calling the file tools.
+Whole-view preparation allows up to 120 seconds for cold content; individual
+file and skill preparation retains its 30-second bound. Both remain cancellable.
+Save named deliverables, including PDFs and receipts, under `documents/`.
+`artifacts/` stores immutable objects named by their exact SHA-256 content hash;
+it does not accept ordinary filenames or nested directories.
 The baseline tracks only materialised files, so unfetched content cannot become
 a deletion. Parallel hydration and checkpoints share a projection lock. This is
 a tool-driven sparse projection, rather than a transparent filesystem mount.
@@ -88,6 +97,55 @@ A review attempt permits at most eight auxiliary model calls under one deadline.
 Exhausting the review budget retains the answer, evidence, and review records.
 Continuing a task with a retained failed-review candidate starts with verification.
 The actor resumes only when assessment identifies useful remaining work.
+Incomplete reviewer responses are discarded and retried within the same call
+and time allowance. Truncated responses receive a larger output allowance, up
+to 32,768 tokens, while validated evidence inspections remain available. When
+an explicit token budget is configured and a failed stream provides no usage,
+verification remains pending rather than silently renewing that budget.
+
+An active background host can recover abandoned workers after a host restart.
+It retains the task and session and acquires a new execution generation. The
+worker must inspect retained evidence and reconcile uncertain external outcomes
+before repeating an action. Recovery is bounded by the pinned stalled-check
+allowance; cancellation, conflicts and blocked tasks are not overridden.
+The retained source revision must remain an ancestor of the task head, including
+through merge parents. This check covers the full history regardless of the
+number of checkpoints; an unrelated replacement branch remains stale.
+Pending verification with a retained candidate can also be retried automatically,
+bounded by the pinned review attempt allowance. Interrupted execution streams
+(`IncompleteStream`, `Timeout`, or `OutputTruncated`) can resume the retained
+session even before a completion candidate exists, under the same allowance.
+An explicit review token budget prevents automatic renewal. These recoveries are counted in
+the background record. Verified publication is reconciled without replaying the
+actor. A stopped host still needs to be started by its owning application or
+service supervisor.
+
+Background status includes a bounded tail of public event metadata with event
+timestamps when available. The event API's `next_offset` is a byte offset, not
+an event cursor. An offset inside a record advances to the next complete
+record and returns `aligned_offset`; an unfinished final line is left for a
+later read. A running record alone does not prove current activity, and a
+quiet journal alone does not prove a stall. Null outcome counts mean unknown,
+not zero; inspect action receipts to establish completed outcomes. A supported
+status report can answer a lookup while the underlying task remains unfinished.
+The lookup must not confuse the requested progress report with commentary
+about its own investigation.
+
+The shared agent instructions require fresh outcome evidence before replaying
+an uncertain external action. This applies to foreground and background turns:
+reconnect stale handles, refresh authoritative state, then wait for and read
+the result. A tool acknowledgement or cached empty view is insufficient. This
+is reasoning guidance, not a transactional guarantee for arbitrary services;
+operations whose outcome cannot be established require a concrete blocker.
+
+Progress assessment can cite a fully inspected failed operation when it
+establishes a diagnosis or constraint. The record retains its failure status;
+this does not satisfy completion requirements or authorize publication.
+Completion review returns invalid evidence IDs, byte ranges, and segment
+submissions to the reviewer for correction within its existing allowance.
+Rejected calls neither accept work nor require the actor to repeat it.
+Malformed or parallel reviewer responses are discarded, and stale or incomplete
+assessments receive correction feedback without changing the fixed contract.
 
 The host commits each actor tool-batch intent before any tool effect starts.
 The host records review requests, evidence accesses, assessments, and failures.
@@ -170,6 +228,16 @@ worker lease retains an interrupted schedule for inspection and continuation;
 it does not automatically replay potentially completed external effects.
 Reschedule retained waiting work explicitly after resolving its blocker.
 
+Planning and progress reviews use the task's pinned response and attempt timeouts.
+The inference allowance begins after evidence collection and the initial journal
+write. Planning and contract revision expose only their decision tool; progress
+review can page through evidence, starting with up to 16 records prioritized by
+new tool and verification evidence, then workspace changes and older evidence. The final
+reserved calls expose only the decision tool. A review can report no demonstrated
+progress without paging through unrelated history. Work prompts include the pinned
+execution policy and a reference to the full model declaration instead of copying
+the full declaration into every actor step.
+
 Authenticated user updates mark a contract revision pending. The independent
 planner can replace affected obligations while preserving unrelated obligations
 and host requirements. The host records old and new contract versions and the
@@ -179,8 +247,61 @@ requirements, with existing evidence available for independent reassessment.
 The workspace UI Calendar displays planned starts, current requirements,
 schedule history, and execution state. Its editor creates, moves, or cancels
 starts with a revision fence. Calendar timestamps display in the browser's
-local timezone; stored execution instants use UTC. Schedules are one-time starts,
-not deadlines or recurring templates.
+local timezone; stored execution instants use UTC.
+
+### Repeat work
+
+A recurring series pins a planned root contract as its template. The source
+may already be accepted. Each occurrence creates a fresh contract and native
+session, preserving the source's published results. Permissions, conversation
+history, replay state and credentials are not copied into new sessions.
+
+```sh
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00+01:00' --every daily --count 30
+omos schedule series add TASK_ID --at '2026-11-02T09:00:00Z' --every weekly --weekdays mon,wed,fri
+omos schedule series list --json
+omos schedule series show SERIES_ID --json
+omos schedule series update SERIES_ID --at '2026-11-02T10:00:00Z' --every daily --revision HASH
+omos schedule series pause SERIES_ID
+omos schedule series resume SERIES_ID
+omos schedule series skip SERIES_ID
+omos schedule series move SERIES_ID --occurrence OCCURRENCE_ID --at '2026-11-03T10:00:00Z'
+omos schedule series cancel SERIES_ID
+```
+
+The same commands work through `/schedule`. `--every 30m`, `6h`, `1d` and `2w`
+are fixed UTC durations. Calendar `daily`, `weekly` and `monthly` rules retain
+the explicit offset in `--at`; they do not follow daylight saving changes.
+Use `--frequency N` for calendar multiples and `--month-day 31` to clamp shorter
+months without shifting the following month's day. IANA timezones and cron
+expressions are not supported.
+
+`--count` limits created occurrences from 1 to 10,000; it does not count only
+successful runs. Omit it for an unlimited series. `--until TIMESTAMP` includes
+that nominal start instant. When both are set, the first limit reached ends
+generation. `update` accepts `--clear-count` and `--clear-until`.
+
+Only one occurrence per series can be unresolved. The default `--overlap block`
+waits for running, waiting or failed work. `--overlap skip` records later slots
+as skipped while that occurrence remains unresolved. Neither policy retries
+waiting or failed work: continue its retained conversation or explicitly skip
+it. Missed slots during downtime coalesce into the latest due start. Pausing
+cancels dispatch of unclaimed starts and allows running work to finish.
+
+The host must remain running. Series templates and history are portable, but
+an imported repository cannot grant local execution authority. Preparation
+pauses with a reason until the owner explicitly resumes the series on that
+host. Missing projects or model bindings also pause preparation.
+Prepared starts receive the same local authority check before dispatch.
+Resuming a portable series also verifies its template against the pinned source
+contract; replacing the template payload and its hash cannot authorize different
+work.
+
+Calendar's **Repeat work** editor offers these rules and controls. Derived
+future slots are labelled projected; they become executable only after the
+host reserves their task and session. See the
+[recurring scheduling specification](recurring-scheduling-spec.md) for storage,
+recovery, paging and execution limits.
 
 ### Calendar service
 
@@ -191,6 +312,17 @@ and an `action` of `list`, `show`, `add`, `move`, or `cancel`. `show`, `move`, a
 `from` and `to`. Mutations require writable service mode and the calendar
 `revision` returned by the previous read. The native UI bridge exposes the same
 operations through its typed `schedule` method.
+
+`POST /v1/schedule-series` uses the same bearer authentication and accepts
+`{ "version": "omos.schedule-series/v1", "workspace": "WORKSPACE_ID", "request": REQUEST }`.
+The native method is `schedule.series`; initialization advertises
+`schedule_series_v1`. Requests use `list`, `show`, `add`, `update`, `pause`,
+`resume`, `skip`, `move` or `cancel`. Every mutation requires a calendar revision
+and writable service mode. A rule contains `cadence`, `every`, `interval_ms`,
+`weekdays_mask` (Monday is bit 0), `month_day` and `offset_minutes`, with only the
+fields appropriate to its cadence populated. `show` and `list` accept bounded
+`from`/`to` projection ranges. Use `cursor` for run history, `events_cursor` for
+series events, and `limit` with the returned revision for subsequent pages.
 
 ## Declare the workspace model
 
@@ -323,16 +455,67 @@ of copying transport and record schemas into each planning request. The host
 continues to validate every operation against those schemas. Original requests
 and pending user amendments remain intact within the planning budget.
 
+Planning also receives the workspace root, gathered repository instructions,
+authenticated root-user context, and bounded earlier conversation text. Earlier
+assistant answers are reference material for follow-ups such as "implement the
+feature"; they cannot authorize actions or establish successful work. Truncated
+references and omitted messages are identified explicitly. The planner leaves
+anticipated checks empty when the applicable validation commands are unknown.
+
+Governance requests sequential reviewer calls. If a provider returns multiple
+read-only evidence lookups, the host services them in order; a decision must
+stand alone. Invalid lookups and malformed decisions receive correction feedback
+within the same eight-call and context budgets. Contract revisions preserve the
+existing requirements when a follow-up does not change the requested outcome.
+An exact copy of a retained requirement is ignored and does not count toward the
+32 new or changed requirements allowed per revision. Revision requests contain
+at most 100 requirement entries. Changing or superseding a
+host requirement remains invalid. Revision correction feedback identifies protected
+fields instead of requesting unrelated evidence reads. Exact evidence identities
+and full inspection remain required. Repeated invalid responses pause the task with
+`workspace_governance_pending`, preserving actor work and evidence. Response
+metadata, correction reasons, failure diagnostics, and reported usage survive a
+failed review. Credentials and opaque provider replay state are not journaled.
+
+Transient reviewer timeouts and service failures retry within the pinned call,
+attempt, and deadline limits. Provider throttling defers the check without an
+immediate retry. If a periodic progress assessor remains unavailable, the host
+records `progress_review_deferred` and continues the existing contract until
+the next progress interval. This records neither meaningful progress nor a
+stall and does not reset previous stall counts. Actor-step limits, permissions,
+and independent completion verification still apply. Planning and contract
+revision require a valid assessment before execution starts or requirements
+change. An unresolved periodic progress assessment is journaled and deferred
+within the existing actor-step budget; it cannot establish a task stall or
+permit publication.
+
+Progress assessments explicitly record whether an authorized outcome increment is ready
+to execute, the next concrete action, or the prerequisite preventing it. A ready
+assessment must name one specific result and the observable evidence that will
+verify it. The next action advances that result without requiring a complete
+inventory of independent items first. The actor receives this guidance with the
+assessment. This does not change permissions,
+requested quantities, or the independent completion check. Older retained
+assessments without these fields remain readable.
+
 The execution policy defaults to a progress check after every four completed
-tool batches, a pause after three consecutive stalled checks, and at most 100
+tool batches, a required reassessment after three consecutive no-progress
+judgments, and at most 100
 actor steps per invocation. The last actor slot is reserved for a summary with
 tools disabled. The existing global agent-step limit still applies. Continuing
 a paused task starts another bounded invocation with the same contract and
 retained evidence.
 
 Progress assessment records successful evidence, remaining obligation IDs and
-a reason to continue, finalize or pause. New call IDs and repeated identical
-results cannot establish fresh progress. Finalize requests a candidate answer;
+a reason to continue, finalize or pause. The reviewer receives the previous
+assessment and consecutive no-progress count. New call IDs and repeated
+identical results do not count as new evidence. Novelty is a host signal, not
+a progress verdict: the reviewer can explain a useful new inference or changed
+approach using existing evidence. Reused citations, the no-progress threshold,
+and every pause require an explicit reassessment. Missing explanations are
+returned for correction within the same bounded review. The host follows the
+validated reviewer decision instead of converting repeated citations into a
+pause. Finalize requests a candidate answer;
 the normal completion assessment and verified publication remain required.
 Pause retains a partial result and leaves the task unaccepted.
 
@@ -345,6 +528,12 @@ provide current validation evidence. A later source edit invalidates that basis.
 Incomplete scans, unreadable or oversized files cannot establish validation.
 Generated files should follow the repository's ignore rules; changes to visible
 generated files also change the source basis.
+The bound Fossil database, its SQLite sidecars, and its timestamped native
+migration backups are excluded as generated host state. Large source files are
+hashed incrementally within the aggregate scan budget. Preparation failures
+retain their reason and pause before actor execution with
+`workspace_preparation_pending`. After installing a newer CLI, restart any
+already-running terminal process to load the new executable before resuming.
 
 ## Migrate an existing workspace
 
@@ -389,6 +578,15 @@ review. A worker is marked completed only after the host verifies its Fossil
 publication receipt. Permission questions and UI compilation requests stay
 pending until the trusted CLI or browser host responds. The existing synchronous
 subagent tool remains available to workers and direct execution clients.
+
+The queue derives its next action from the retained contract and publication
+state. `background show` and contract `status` expose that same decision, with a
+reason, recovery count, and scheduled retry time. Transport and review retries
+retain their deadlines across host restarts and use the pinned execution policy
+for their limits. Publication recovery verifies and acknowledges the existing
+receipt without replaying actor work. A contract that needs attention does not
+stop unrelated queue entries. See [capability behavior](CAPABILITIES.md) for the
+status fields and recovery limits.
 
 Image inputs retain their original identities and verified bytes. The handoff
 copies immutable snapshots into private host storage and records references in

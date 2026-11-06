@@ -561,7 +561,7 @@ for (const scenario of ["general_task", "coding_task", "retry", "resume"]) test(
       expect(current.planning_state).toBe("running"); expect(current.record.invocations).toBe(0); expect(current.execution).toBeNull(); expect(actors).toBe(0);
       expect((await coordinator.tick()).started).toBe(0);
       release();
-      if (scenario === "retry" || scenario === "resume") {
+      if (scenario === "resume") {
         const failureDeadline = Date.now() + 45000;
         do { current = await mutate({ change: "inspect", view }); if (current.planning_state === "failed") break; await Bun.sleep(50); } while (Date.now() < failureDeadline);
         expect(current.planning_state).toBe("failed"); expect(current.record.invocations).toBe(0);

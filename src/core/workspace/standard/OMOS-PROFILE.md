@@ -21,6 +21,22 @@ pinned in the E2E development dependencies.
 The execution policy is a separate `omos.execution/v1` document. Its bounded
 fields are `progress_interval` (1–100), `stalled_checks` (1–20) and
 `max_actor_steps` (2–10000). Defaults are 4, 3 and 100 respectively.
+Progress review defaults to `progress_review: "events"`. Successful tool batches
+retain checkpoints without periodic model assessment. Consecutive failed batches
+(`stalled_checks`) or unchanged tool requests and observations (`progress_interval`)
+request a semantic progress assessment. These signals do not establish failure or
+stop work themselves. An unavailable progress assessor defers the check and lets
+the actor continue within its execution budget. Initial planning, changed
+requirements, and completion still require their respective validation.
+
+Operators can explicitly select `progress_review: "periodic"` for fixed-cadence
+assessment. In that mode, `progress_max_interval` allows up to 100 tool batches
+between reviews after an assessor reports meaningful progress and a ready next
+action. It must be at least `progress_interval`. New workspaces retain 12 as this
+optional cadence's maximum. Missing `progress_review` selects event review without
+changing the serialized contract or its hash. Switching an explicit periodic
+policy to event review requires operator activation.
+
 The optional `review` section bounds model calls, reserved decision calls,
 response and attempt deadlines, automatic attempts, total time, serialized
 context, individual reads and reported token usage. New workspaces save these

@@ -84,6 +84,13 @@ The CLI also picks up these extensions:
 - **MCP servers**: `/mcp add slack` sets up Slack, and `fx mcp` manages servers from your terminal. A server's tool schemas load when the model looks for them ([MCP](https://fx.sh/docs/capabilities/mcp)).
 - **Project instructions**: fx follows the `AGENTS.md` in your project, nested `AGENTS.md` files for the directories they cover, and `~/.fx/AGENTS.md` for your own instructions across projects ([project instructions](https://fx.sh/docs/configure-fx/project-instructions)).
 
+MCP discovery uses compact descriptions. Selecting a tool loads its complete
+description, input schema, and server instructions, and provider adapters preserve
+that content when sending the model request. The default server-instruction and
+selected-schema limits are each 64 KiB. If complete instructions exceed a configured
+limit, selection reports the limiting setting instead of loading a partial tool.
+Large tool results remain available through the existing paged result reader.
+
 ## Examples
 
 [`examples/`](examples) has small libfx apps you can run with an AI Gateway API key:

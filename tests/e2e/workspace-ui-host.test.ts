@@ -1,14 +1,24 @@
 import {afterEach,expect,test} from 'bun:test';
 import {resolve,join} from 'node:path';
-import {existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {existsSync,mkdirSync,readFileSync,writeFileSync,readdirSync,unlinkSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {NativeClient} from './workspace-ui-client.mjs';
 import {cleanupFixtures,fixture,model} from './fossil-workspace-helpers';
 const clients:NativeClient[]=[];
 const services:ReturnType<typeof Bun.spawn>[]=[];
-afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}cleanupFixtures()});
-function host(f:ReturnType<typeof fixture>){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env}});clients.push(native);return native}
+const classifiers:ReturnType<typeof Bun.serve>[]=[];
+afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}for(const server of classifiers.splice(0))server.stop(true);cleanupFixtures()});
+function host(f:ReturnType<typeof fixture>,extra:Record<string,string>={}){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env,...extra}});clients.push(native);return native}
+function routingClassifier(route:(message:string)=>string,intent?:(message:string)=>string){
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+  const body=await request.json() as any;const question=body.questions.intent?'intent':'route';
+  if(question==='intent')expect(intent).toBeDefined();
+  const choice=(question==='intent'?intent!:route)(body.state.latest_message);const labels=Object.keys(body.questions[question].criteria);expect(labels).toContain(choice);
+  return Response.json({model:'fixture-classifier',answers:{[question]:{type:'choice',choice,confidence:0.99,probabilities:Object.fromEntries(labels.map(label=>[label,label===choice?0.99:0.01/(labels.length-1)]))}}});
+ }});classifiers.push(server);
+ return {OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'};
+}
 async function terminal(native:NativeClient,turn:string){return await new Promise<any>((resolve,reject)=>{const timer=setTimeout(()=>{native.off('event',listener);reject(Error('UI invocation did not stop'))},90000);const listener=(event:any)=>{if(event.turn===turn&&event.data.type==='turn_end'){clearTimeout(timer);native.off('event',listener);resolve(event)}};native.on('event',listener)})}
 test('native UI host saves governed turns and replays public events without repeating actions',async()=>{
  const f=fixture();const fixtureModel=model(f,()=>({content:'Hello from the governed native agent.'}));expect((await f.run(['fossil','init','--json'])).code).toBe(0);
@@ -33,6 +43,28 @@ test('native UI writes require a task fence and compilation evidence before publ
  await expect(native.request('validation',{turn:'invalid-ui-source',request_id:validation.data.request_id,receipt:{status:'passed'}})).rejects.toThrow();
 },90000);
 
+test('UI inspection preserves revision-bound binary and duplicate contents across batches',async()=>{
+ const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);const before=await native.request('snapshot',{action:'fossil.status'});
+ await expect(native.request('ui.inspect',{revision:before.trunk_revision})).rejects.toThrow('UiNotInstalled');
+ const source=new Map<string,Buffer>();
+ source.set('ui/manifest.json',Buffer.from(JSON.stringify({version:'omos.ui-source/v1',bridge:'omos.ui-bridge/v1',renderer:'omos.react/v1',toolchain:'a'.repeat(64)})));
+ for(let i=0;i<35;i++)source.set(`ui/src/file-${i}.txt`,Buffer.from(i%2?'shared source':`source ${i}`));
+ source.set('ui/src/large.bin',Buffer.from(Array.from({length:65537},(_,i)=>i%256)));
+ const files=[...source].map(([path,bytes])=>({path,content:bytes.toString('base64'),encoding:'base64',sha256:createHash('sha256').update(bytes).digest('hex')}));
+ const installed=await native.request('ui.install',{revision:before.trunk_revision,files});
+ for(const revision of [installed.revision,installed.revision.slice(0,40)]){
+  const inspected=await native.request('ui.inspect',{revision});
+  expect(inspected.files.length).toBe(source.size);
+  for(const file of inspected.files){const bytes=source.get(file.path)!;expect(file.bytes).toBe(bytes.length);expect(file.sha256).toBe(createHash('sha256').update(bytes).digest('hex'));}
+ }
+ const page=await native.request('ui.read',{revision:installed.revision,path:'ui/src/large.bin',offset:65536});
+ expect(Buffer.from(page.content,'base64')).toEqual(source.get('ui/src/large.bin')!.subarray(65536));
+ expect(page.next_offset).toBeNull();
+ await expect(native.request('ui.inspect',{revision:'trunk'})).rejects.toThrow('ImmutableRevisionRequired');
+ expect(native.stderr).toBe('');
+},90000);
+
 test('legacy interface history is retained once on an unpublished branch',async()=>{
  const f=fixture();expect((await f.run(['fossil','init','--json'])).code).toBe(0);const native=host(f);const before=await native.request('snapshot',{action:'fossil.status'});
  const content=JSON.stringify({version:'omos.ui-legacy-input/v1',status:'unpublished_input',files:[{path:'.revisions/old.json',content:'Retained local appearance input'}]});const retained=await native.request('ui.import_legacy',{content});expect(retained.retained).toBe(true);expect(retained.publication).toBe('unpublished');expect(retained.artifact).toStartWith('artifacts/');
@@ -45,6 +77,27 @@ test('a live UI host cannot silently retarget a changed workspace binding',async
  const other=join(f.home,'other-project');mkdirSync(other);execFileSync(resolve(import.meta.dir,'../../zig-out/bin/fx'),['fossil','init','--json'],{cwd:other,env:{...process.env,...f.env},encoding:'utf8'});
  await expect(native.request('snapshot',{action:'fossil.status'})).rejects.toThrow('WorkspaceBindingChanged');
  await expect(native.request('prompt',{text:'This request must not run in another repository.'},{id:'changed-binding-request'})).rejects.toThrow('WorkspaceBindingChanged');
+},90000);
+
+test('temporary workspace contention does not cancel an active UI conversation',async()=>{
+ const f=fixture();let entered=false;let release!:()=>void;const gate=new Promise<void>(r=>release=r);
+ model(f,async()=>{entered=true;await gate;return {content:'The foreground answer survived temporary workspace contention.'};});
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);const observed:any[]=[];native.on('event',(e:any)=>observed.push(e));
+ const ending=terminal(native,'contention-survival');
+ await native.request('prompt',{text:'Provide a short informational answer.'},{id:'contention-survival'});
+ const deadline=Date.now()+30000;while(!entered&&Date.now()<deadline)await Bun.sleep(20);expect(entered).toBe(true);
+ const binding=JSON.parse(readFileSync(join(f.home,'.fx/omos-workspace.json'),'utf8'));
+ const commandLock=join(f.home,'.fx/fossil',createHash('sha256').update(binding.repository).digest('hex'),'command.lock');
+ const blocker=Bun.spawn(['python3','-u','-c',"import fcntl,sys\nwith open(sys.argv[1],'r+') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n print('locked',flush=True)\n sys.stdin.read()\n",commandLock],{stdin:'pipe',stdout:'pipe',stderr:'pipe'});
+ try{
+  const reader=blocker.stdout.getReader();let signal='';while(!signal.includes('\n')){const chunk=await reader.read();if(chunk.done)break;signal+=new TextDecoder().decode(chunk.value);}reader.releaseLock();expect(signal).toBe('locked\n');
+  await expect(native.request('initialize',{}, {timeout:60000})).rejects.toThrow('WorkspaceBusy');
+ }finally{blocker.stdin.end();await blocker.exited;release();}
+ expect((await ending).data.exit_code).toBe(0);
+ const result=observed.find(e=>e.data.type==='result');
+ expect(result.data.data.final_output).toContain('survived temporary workspace contention');
+ expect(native.stderr).toBe('');
 },90000);
 
 test('workspace content is natively authorized in auto mode without an auxiliary safety reviewer', async()=>{
@@ -160,13 +213,14 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
 },120000);
 
 test('background contracts release the main chat while workers await input and publish independently', async () => {
- const f = fixture(); let answered = false; let workerCalls = 0; const assignments:string[]=[];
+ const f = fixture(); let answered = false; let workerCalls = 0; let coordinatorCalls = 0; const assignments:string[]=[];
  const pngBase64='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
  const imagePath=join(f.cwd,'reference.png');writeFileSync(imagePath,Buffer.from(pngBase64,'base64'));
  model(f, (body) => {
   const names = body.tools?.map((tool:any) => tool.function?.name) || [];
   const system = body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
   if (!names.includes('write_file')) {
+   coordinatorCalls++;
    expect(system).not.toContain('<omos_background_assignment');
    const user = body.messages.filter((m:any) => m.role === 'user').at(-1)?.content || '';
    if (String(user).includes('still available')) return {content:'The main chat is still available.'};
@@ -184,7 +238,7 @@ test('background contracts release the main chat while workers await input and p
  });
  const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));settings.providers.local.model_metadata['fixture-model'].supports_vision=true;writeFileSync(settingsPath,JSON.stringify(settings));
  expect((await f.run(['fossil','init','--json'])).code).toBe(0);
- const native = host(f); const observed:any[] = [];
+ const native = host(f,routingClassifier(message=>message==='Are you still available?'?'conversation':'work',message=>{expect(message).toBe('Are you still available?');return 'unrelated';})); const observed:any[] = [];
  native.on('event', (event:any) => observed.push(event));
  const until = async (read:()=>Promise<any>, predicate:(value:any)=>boolean) => {
   const deadline = Date.now()+60000; let value:any;
@@ -192,6 +246,24 @@ test('background contracts release the main chat while workers await input and p
   throw Error(`Background state did not converge: ${JSON.stringify(value)}; ${native.stderr}`);
  };
  try {
+  // A foreground Fossil operation may hold the command lease longer than the
+  // worker's 30-second bounded wait. The same host must survive and dispatch
+  // the following contract once the lease becomes available.
+  const slowStart=join(f.home,'slow-host-start');writeFileSync(slowStart,'delay');
+  const fossilWrapper=join(f.home,'slow-fossil');
+  const realFossil=Bun.which('fossil');expect(realFossil).not.toBeNull();
+  writeFileSync(fossilWrapper,`#!/usr/bin/env python3\nimport os,sys,time\nif os.path.exists(${JSON.stringify(slowStart)}) and 'cat' in sys.argv:\n time.sleep(6)\nos.execv(${JSON.stringify(realFossil)},[${JSON.stringify(realFossil)}]+sys.argv[1:])\n`,{mode:0o755});
+  try {
+   expect((await f.run(['ui-host','--background-start'],{OMOS_FOSSIL_BIN:fossilWrapper})).code).toBe(0);
+  } finally { unlinkSync(slowStart); }
+  const rootHash=createHash('sha256').update(join(f.cwd,'omos.fossil')).digest('hex');
+  const commandLock=join(f.home,'.fx','fossil',rootHash,'command.lock');
+  const blocker=Bun.spawn(['python3','-u','-c',"import fcntl,sys,time\nwith open(sys.argv[1],'r+') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n print('locked',flush=True)\n time.sleep(36)\n",commandLock],{stdout:'pipe',stderr:'pipe'});
+  try {
+   expect(await new Response(blocker.stdout).text()).toBe('locked\n');
+   expect(await blocker.exited).toBe(0);
+   expect((await native.request('background',{action:'host'})).running).toBe(true);
+  } finally { blocker.kill(); await blocker.exited; }
   const ending = terminal(native,'dispatch-report');
   await native.request('coordinate',{text:'Prepare the report using the attached reference after I choose its presentation.',images:[imagePath]},{id:'dispatch-report'});
   const handoffEnd = await ending;
@@ -199,6 +271,7 @@ test('background contracts release the main chat while workers await input and p
   expect(handoffEnd.data.exit_code).toBe(0);
   const dispatched = observed.find(e=>e.data.type==='background_dispatch');
   expect(dispatched).toBeDefined();
+  expect(coordinatorCalls).toBe(0);
   const original = (await native.request('background')).workers[0].record;
   expect(original.state).not.toBe('completed'); expect(original.publication_revision).toBeNull();
   const repositoryHash=createHash('sha256').update(join(f.cwd,'omos.fossil')).digest('hex');
@@ -210,11 +283,15 @@ test('background contracts release the main chat while workers await input and p
   const session = observed.find(e=>e.data.type==='session').data.session_id;
   const running = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.state==='running');
   const input = await until(()=>native.request('background',{action:'events',task:original.task,generation:running.generation}), value=>value.events.some((e:any)=>e.data.type==='input_required'));
+  const waitingInput = await until(()=>native.request('background',{action:'show',task:original.task}), value=>value.execution.phase==='awaiting_input');
+  expect(waitingInput.execution.next).toBe('none');
+  expect(waitingInput.wait_condition).toBe('input');
   expect(workerCalls).toBe(1);
   const endingSecond = terminal(native,'main-while-worker-waits');
   await native.request('coordinate',{text:'Are you still available?',session},{id:'main-while-worker-waits'});
   expect((await endingSecond).data.exit_code).toBe(0);
   expect(observed.some(e=>e.turn==='main-while-worker-waits' && e.data.type==='text_delta' && e.data.text.includes('still available'))).toBe(true);
+  expect(coordinatorCalls).toBe(1);
   expect((await native.request('background',{action:'show',task:original.task})).state).toBe('running');
   const required = input.events.find((e:any)=>e.data.type==='input_required').data;
   await expect(native.request('background',{action:'input',task:original.task,generation:running.generation+1,operation:'b'.repeat(64),request_id:required.request_id,answers:['Brief']})).rejects.toThrow('StaleBackgroundOwner');
@@ -228,6 +305,7 @@ test('background contracts release the main chat while workers await input and p
    console.error('background final',JSON.stringify(final),JSON.stringify(diagnostics.filter(e=>['result','error','notice','background_outcome'].includes(e.data.type)).slice(-12)));
   }
   expect(final.state).toBe('completed'); expect(final.task).toBe(original.task);
+  expect(final.wait_condition).toBeNull();expect(final.execution.phase).toBe('completed');
   expect(assignments).toEqual([original.task,original.task]);
   expect(final.contract_sha256).toBe(original.contract_sha256); expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
   const tasks = await native.request('snapshot',{action:'fossil.status'});
@@ -243,4 +321,326 @@ test('background contracts release the main chat while workers await input and p
   await native.request('background',{action:'stop'});
   await until(()=>native.request('background',{action:'host'}), value=>!value.running);
  }
-},120000);
+},300000);
+
+
+test('explicit background resume rechecks resolved conflicts without repeating actor work',async()=>{
+ const f=fixture();let workerCalls=0;let reviewing=false;let reviewReleased=false;let release!:()=>void;
+ const reviewGate=new Promise<void>(resolve=>{release=resolve});const foreground={conflict:0,restore:0};
+ model(f,body=>{
+  const names=body.tools?.map((tool:any)=>tool.function?.name)||[];
+  if(!names.includes('write_file'))return {tool_calls:[{index:0,id:'dispatch-conflict-test',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  const worker=body.messages.some((m:any)=>m.role==='system'&&String(m.content).includes('<omos_background_assignment'));
+  const key=JSON.stringify(body.messages).includes('RESTORE-RESULT')?'restore':'conflict';
+  const count=worker?++workerCalls:++foreground[key];
+  if(count>1)return {content:'The requested shared document is saved.'};
+  return {tool_calls:[{index:0,id:`save-${worker?'worker':key}`,type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'documents/shared.txt',content:worker||key==='restore'?'original result':'different result'})}}]};
+ },async packet=>{
+  if(packet.originalRequest.includes('BACKGROUND-RESULT')&&!reviewReleased){reviewing=true;await reviewGate;}
+  return 'met';
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+60000;let value:any;do{value=await read();if(predicate(value))return value;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(`State did not converge: ${JSON.stringify(value)}; ${native.stderr}`)};
+ try{
+  expect((await f.run(['ui-host','--background-start'])).code).toBe(0);
+  const dispatchEnd=terminal(native,'dispatch-conflict');
+  await native.request('coordinate',{text:'BACKGROUND-RESULT: save the original result in documents/shared.txt.'},{id:'dispatch-conflict'});
+  expect((await dispatchEnd).data.exit_code).toBe(0);
+  await until(async()=>reviewing,value=>value);
+  const original=(await native.request('background')).workers[0].record;
+  const conflictEnd=terminal(native,'create-conflict');
+  await native.request('prompt',{text:'CONFLICT-RESULT: save a different result in documents/shared.txt.'},{id:'create-conflict'});
+  expect((await conflictEnd).data.exit_code).toBe(0);
+  reviewReleased=true;release();
+  const waiting=await until(()=>native.request('background',{action:'show',task:original.task}),value=>value.state==='waiting');
+  expect((await native.request('snapshot',{action:'fossil.status'})).tasks.find((task:any)=>task.id===original.task).state).toBe('conflict');
+  await expect(native.request('background',{action:'resume',task:original.task,generation:waiting.generation,operation:'9'.repeat(64)})).rejects.toThrow('WorkspaceMergeConflict');
+  expect(workerCalls).toBe(2);
+  const restoreEnd=terminal(native,'resolve-conflict');
+  await native.request('prompt',{text:'RESTORE-RESULT: save the original result in documents/shared.txt.'},{id:'resolve-conflict'});
+  expect((await restoreEnd).data.exit_code).toBe(0);
+  await native.request('background',{action:'resume',task:original.task,generation:waiting.generation,operation:'a'.repeat(64)});
+  const final=await until(()=>native.request('background',{action:'show',task:original.task}),value=>value.state==='completed');
+  expect(final.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  expect(workerCalls).toBe(2);
+  expect(f.fossil('cat','documents/shared.txt','-r','trunk')).toBe('original result');
+  expect(native.stderr).toBe('');
+ }finally{
+  reviewReleased=true;release();
+  await native.request('background',{action:'stop'});
+  await until(()=>native.request('background',{action:'host'}),value=>!value.running);
+ }
+},240000);
+
+test('host-proposed coordinator handoff respects configured tool denial', async()=>{
+ const f=fixture();let calls=0;
+ model(f,(body)=>{calls++;expect(body.tools?.some((tool:any)=>tool.function?.name==='fossil_workspace')).toBe(false);return {content:'The configured policy denied the background handoff.'}});
+ const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));
+ settings.permission={fossil_workspace:'deny'};writeFileSync(settingsPath,JSON.stringify(settings));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f,{...routingClassifier(()=>'work'),FX_PERMISSION_MODE:'auto'});const seen:any[]=[];
+ native.on('event',(event:any)=>seen.push(event));
+ const end=terminal(native,'denied-handoff');
+ await native.request('coordinate',{text:'Prepare a report in this workspace.'},{id:'denied-handoff'});
+ await end;
+ expect(calls).toBeGreaterThan(0);
+ expect(seen.some(e=>e.data.type==='background_dispatch')).toBe(false);
+ expect((await native.request('background')).workers).toHaveLength(0);
+ expect(seen.some(e=>e.data.type==='notice'&&e.data.text.includes('Queuing the validated work contract'))).toBe(false);
+ expect(native.stderr).toBe('');
+},90000);
+
+for(const classified of [false,true])test(`coordinator chat does not auto-dispatch with classification ${classified?'configured':'absent'}`,async()=>{
+ const f=fixture();let calls=0;
+ model(f,()=>{calls++;return {content:'I am available to help.'}});
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f,classified?routingClassifier(()=>'conversation'):{});const seen:any[]=[];
+ native.on('event',(event:any)=>seen.push(event));
+ let session:string|undefined;
+ for(const [index,text] of ['Hello','Are you still available?'].entries()){
+  const id=`chat-${index}`;const end=terminal(native,id);
+  await native.request('coordinate',{text,...(session?{session}:{})},{id});
+  expect((await end).data.exit_code).toBe(0);
+  session=seen.find(e=>e.data.type==='session').data.session_id;
+  expect(seen.some(e=>e.turn===id&&e.data.type==='text_delta'&&e.data.text.includes('available'))).toBe(true);
+ }
+ expect(calls).toBe(2);
+ expect(seen.some(e=>e.data.type==='background_dispatch')).toBe(false);
+ expect((await native.request('background')).workers).toHaveLength(0);
+ expect(native.stderr).toBe('');
+},90000);
+
+for(const history of ['long ancestry','unrelated fork'])test(`restarted background host checks ${history} without repeating its external effect`, async()=>{
+ const f=fixture(); const receipt=join(f.cwd,'external-receipts.txt'); let workerCalls=0; let interrupted=false;
+ const call=(id:string,command:string)=>({tool_calls:[{index:0,id,type:'function',function:{name:'shell',arguments:JSON.stringify({action:'run',profile:'clean',command})}}]});
+ model(f,async(body,_count,signal)=>{
+  const system=body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
+  if(!system.includes('<omos_background_assignment'))return {tool_calls:[{index:0,id:'dispatch-once',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  workerCalls++;
+  if(workerCalls===1)return call('perform-once',`printf 'receipt-1\\n' >> '${receipt}'`);
+  if(workerCalls===2){interrupted=true;await new Promise<void>(resolve=>{if(signal?.aborted)resolve();else signal?.addEventListener('abort',()=>resolve(),{once:true})});return {content:'Interrupted transport'};}
+  expect(system).toContain('Use read-only checks to reconcile');
+  if(workerCalls===3)return call('inspect-existing-receipt',`cat '${receipt}'`);
+  return {content:'The external action completed once; receipt-1 is retained and verified.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+90000;let v:any;do{v=await read();if(predicate(v))return v;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(JSON.stringify(v)+native.stderr)};
+ const start=()=>{const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'ui-host','--background-serve'],{cwd:f.cwd,env:{...process.env,...f.env},stdout:'pipe',stderr:'pipe'});services.push(child);return child};
+ const first=start();
+ try{
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const end=terminal(native,'recover-background');
+  await native.request('coordinate',{text:'Perform the external action once and retain its receipt.'},{id:'recover-background'});
+  expect((await end).data.exit_code).toBe(0);
+  await until(async()=>interrupted,v=>v);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  const original=(await native.request('background')).workers[0].record;
+  first.kill('SIGKILL');await first.exited;
+  // More than one timeline page separates the retained contract from its head.
+  // Exercise real check-ins rather than fabricating ancestry in the database.
+  const checkout=join(f.home,'long-history');mkdirSync(checkout);
+  const fossil=(args:string[])=>execFileSync('fossil',['--user','omos',...args],{cwd:checkout,env:{PATH:process.env.PATH,HOME:f.home,FOSSIL_HOME:f.home,XDG_CONFIG_HOME:f.home,USER:'fixture',LC_ALL:'C'},encoding:'utf8'});
+  const taskPath=`tasks/${original.task}.json`;
+  const retained=f.fossil('cat',taskPath,'-r',`task/${original.task}`);
+  fossil(['open',join(f.cwd,'omos.fossil'),history==='long ancestry'?`task/${original.task}`:'trunk']);
+  if(history==='long ancestry'){
+   for(let i=0;i<130;i++)fossil(['commit','--allow-empty','--nosign','-m',`Retained checkpoint ${i}`]);
+  }else{
+   mkdirSync(join(checkout,'tasks'),{recursive:true});writeFileSync(join(checkout,taskPath),retained);
+   fossil(['add',taskPath]);
+   fossil(['commit','--allow-fork','--force','--branch',`task/${original.task}`,'--nosign','-m','Unrelated replacement branch']);
+  }
+  fossil(['close']);
+  const second=start();
+  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>history==='long ancestry'?v.state==='completed':v.state==='waiting'&&v.reason==='StaleWorkContract');
+  expect(finished.worker_session).toBe(original.worker_session);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  if(history==='long ancestry'){
+   expect(finished.generation).toBe(2);expect(finished.recoveries).toBe(1);
+   expect(workerCalls).toBe(4);
+   expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  }else{
+   expect(workerCalls).toBe(2);
+   expect(finished.publication_revision).toBeNull();
+  }
+  await native.request('background',{action:'stop'});await second.exited;
+ }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
+},180000);
+
+test('interrupted execution resumes automatically without a completion candidate or duplicate effect', async()=>{
+ const f=fixture(); const receipt=join(f.cwd,'external-receipts.txt'); let workerCalls=0; let interrupted=false;
+ const call=(id:string,command:string)=>({tool_calls:[{index:0,id,type:'function',function:{name:'shell',arguments:JSON.stringify({action:'run',profile:'clean',command})}}]});
+ model(f,async(body,_count,signal)=>{
+  const system=body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
+  if(!system.includes('<omos_background_assignment'))return {tool_calls:[{index:0,id:'dispatch-once',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  workerCalls++;
+  if(workerCalls===1)return call('perform-once',`printf 'receipt-1\\n' >> '${receipt}'`);
+  if(workerCalls===2||workerCalls===3){interrupted=true;return new Response('data: '+JSON.stringify({choices:[{index:0,delta:{content:'Checking retained work'},finish_reason:null}]})+'\n\n',{headers:{'content-type':'text/event-stream'}});}
+  expect(system).toContain('Use read-only checks to reconcile');
+  if(workerCalls===4)return call('inspect-existing-receipt',`cat '${receipt}'`);
+  return {content:'The external action completed once; receipt-1 is retained and verified.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+90000;let v:any;do{v=await read();if(predicate(v))return v;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(JSON.stringify(v)+native.stderr)};
+ const start=()=>{const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'ui-host','--background-serve'],{cwd:f.cwd,env:{...process.env,...f.env},stdout:'pipe',stderr:'pipe'});services.push(child);return child};
+ const first=start();
+ try{
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const end=terminal(native,'recover-background');
+  await native.request('coordinate',{text:'Perform the external action once and retain its receipt.'},{id:'recover-background'});
+  expect((await end).data.exit_code).toBe(0);
+  await until(async()=>interrupted,v=>v);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  const original=(await native.request('background')).workers[0].record;
+
+  const finished=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed'&&v.activity?.recent_events.some((event:any)=>event.type==='background_outcome'));
+  // Each partially emitted stream ends its invocation; both faults recover.
+  expect(finished.generation).toBe(3);expect(finished.recoveries).toBe(2);
+  expect(finished.worker_session).toBe(original.worker_session);
+  expect(readFileSync(receipt,'utf8')).toBe('receipt-1\n');
+  expect(workerCalls).toBe(5);
+  expect(finished.activity.journal_available).toBe(true);
+  expect(finished.activity.offset_unit).toBe('bytes');
+  expect(finished.activity.recent_events.some((event:any)=>event.timestamp_ms>0)).toBe(true);
+  const page=await native.request('background',{action:'events',task:original.task,offset:1});
+  expect(page.requested_offset).toBe(1);
+  expect(page.aligned_offset).toBeGreaterThan(1);
+  expect(page.events[0].cursor).toBe(2);
+  expect(page.next_offset).toBeGreaterThan(page.aligned_offset);
+  const journalEnd=await native.request('background',{action:'events',task:original.task,offset:finished.activity.next_offset});
+  expect(journalEnd.events).toEqual([]);
+  expect(journalEnd.next_offset).toBe(finished.activity.next_offset);
+  expect(finished.publication_revision).toMatch(/^[a-f0-9]{40,64}$/);
+  await native.request('background',{action:'stop'});await first.exited;
+ }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
+},180000);
+
+test('contract scheduler finishes a waiting publication after restart without replaying work', async()=>{
+ const f=fixture();let actorCalls=0;
+ model(f,(body)=>{
+  const worker=body.messages.some((m:any)=>m.role==='system'&&String(m.content).includes('<omos_background_assignment'));
+  if(!worker)return {tool_calls:[{index:0,id:'dispatch',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  actorCalls++;
+  if(actorCalls===1)return {tool_calls:[{index:0,id:'write-once',type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'documents/durable-result.txt',content:'One reviewed result.'})}}]};
+  return {content:'The durable result was written and verified.'};
+ });
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const until=async(read:()=>Promise<any>,predicate:(v:any)=>boolean)=>{const deadline=Date.now()+120000;let v:any;do{v=await read();if(predicate(v))return v;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(JSON.stringify(v)+native.stderr)};
+ const start=(fault?:string)=>{const child=Bun.spawn([resolve(import.meta.dir,'../../zig-out/bin/fx'),'ui-host','--background-serve'],{cwd:f.cwd,env:{...process.env,...f.env,FX_E2E_FOSSIL_FAULT:fault},stdout:'pipe',stderr:'pipe'});services.push(child);return child};
+ const first=start('publication-committed');
+ try{
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const end=terminal(native,'durable-publication');
+  await native.request('coordinate',{text:'Write and publish documents/durable-result.txt containing One reviewed result.'},{id:'durable-publication'});
+  expect((await end).data.exit_code).toBe(0);
+  const original=(await native.request('background')).workers[0].record;
+  const waiting=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='waiting');
+  expect(['publishing','retry_wait','attention']).toContain(waiting.execution.phase);
+  expect(actorCalls).toBe(2);
+  await native.request('background',{action:'stop'});await first.exited;
+  // An explicit resume also permits retrying publication after its bounded
+  // automatic budget, without handing the completed action back to an actor.
+  const second=start();
+  await until(()=>native.request('background',{action:'host'}),v=>v.running);
+  const retained=await native.request('background',{action:'show',task:original.task});
+  if(retained.execution.phase==='attention')await native.request('background',{action:'resume',task:original.task,generation:retained.generation,operation:'b'.repeat(64)});
+  const done=await until(()=>native.request('background',{action:'show',task:original.task}),v=>v.state==='completed');
+  expect(done.execution.phase).toBe('completed');expect(done.execution.next).toBe('none');
+  expect(done.generation).toBe(1);expect(actorCalls).toBe(2);
+  expect(f.fossil('cat','documents/durable-result.txt','-r','trunk')).toBe('One reviewed result.');
+  const request=join(f.home,'contract-status.json');writeFileSync(request,JSON.stringify({action:'contracts',contracts:{action:'status',task:original.task}}));
+  const cli=await f.run(['fossil','capabilities',request,'--json']);expect(cli.code,cli.stderr).toBe(0);
+  expect(JSON.parse(cli.stdout).execution).toEqual(done.execution);
+  await native.request('background',{action:'stop'});await second.exited;
+  expect(await new Response(second.stderr).text()).toBe('');
+ }finally{await native.request('background',{action:'stop'}).catch(()=>{});}
+},240000);
+
+test('native owner settings persist validated defaults and expose MCP inventory', async()=>{
+ const f=fixture();model(f,()=>({content:'Hello.'}));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);
+ const before=await native.request('settings');
+ expect(before.settings.length).toBe(14);
+ await expect(native.request('settings',{action:'set',key:'credentials',value:'forbidden'})).rejects.toThrow('UnknownSetting');
+ await expect(native.request('settings',{action:'set',key:'fast_mode',value:'invalid'})).rejects.toThrow('InvalidSettingValue');
+ await native.request('settings',{action:'set',key:'session_titles',value:'off'});
+ await native.request('settings',{action:'set',key:'review_model',value:'fixture-reviewer'});
+ const after=await native.request('settings');
+ expect(after.settings.find((row:any)=>row.key==='session_titles').value).toBe('off');
+ expect(after.review_model).toBe('fixture-reviewer');
+ expect(JSON.parse(readFileSync(join(f.home,'.fx','settings.json'),'utf8')).review_model).toBe('fixture-reviewer');
+ const inventory=await native.request('snapshot',{action:'mcp'});
+ expect(inventory.servers).toBeArray();
+ expect(native.stderr).toBe('');
+},90000);
+
+
+test('channel commands survive a host restart and dispatch once through governed execution',async()=>{
+ const f=fixture();const provider=model(f,(body)=>{expect(body.messages.some((message:any)=>typeof message.content==='string'&&message.content.includes('Retained channel context data follows'))).toBe(true);return {content:'Hello from the retained contract queue.'}});
+ expect((await f.run(['fossil','init'])).code).toBe(0);
+ const first=host(f);
+ const received=await first.request('contracts',{action:'receive',destination:{channel:'cli',address:'owner'},message_id:'one',text:'Say hello from the shared workspace'});
+ const command=await first.request('contracts',{action:'command',key:received.key,choice:'new'});
+ expect(command.command.state).toBe('queued');
+ await first.close();clients.splice(clients.indexOf(first),1);
+ const second=host(f);
+ const retained=await second.request('contracts',{action:'commands'});
+ expect(retained.items[0].key).toBe(command.key);
+ const observed:any[]=[];second.on('event',(event:any)=>observed.push(event));
+ const roots=readdirSync(join(f.home,'.fx','fossil'));
+ const activation=roots.map(root=>join(f.home,'.fx','fossil',root,'channel-activations',command.key)).find(existsSync)!;
+ expect(activation).toBeString();unlinkSync(activation);
+ const inactive=await second.request('channel.dispatch',{key:command.key});
+ expect(inactive.state).toBe('blocked');expect(inactive.reason).toBe('ChannelActivationRequired');expect(provider.counts().actors).toBe(0);
+ const activated=await second.request('contracts',{action:'command',key:received.key,choice:'new'});
+ expect(activated.command.state).toBe('queued');
+ const ending=terminal(second,command.key);
+ const dispatched=await second.request('channel.dispatch',{key:command.key});
+ expect(dispatched.state).toBe('accepted');
+ const ended=await ending;if(ended.data.exit_code)console.error(JSON.stringify(observed),second.stderr);expect(ended.data.exit_code).toBe(0);
+ const calls=provider.counts().actors;
+ const replay=await second.request('channel.dispatch',{key:command.key});
+ expect(replay.state).toBe('accepted');expect(provider.counts().actors).toBe(calls);
+ const commands=await second.request('contracts',{action:'commands'});
+ const task=commands.items[0].record.task;expect(task).toBeString();
+ const followup=await second.request('contracts',{action:'receive',destination:{channel:'telegram',address:'owner'},message_id:'two',text:'How did it go?',reply_to:received.key});
+ expect(followup.resolution.task).toBe(task);
+ expect(followup.resolution.status.published).toBe(true);
+ expect(second.stderr).toBe('');
+},180000);
+
+test('UI continuation selects the retained contract while its session lease is held', async () => {
+ const f=fixture(); let blocked=true; let plans=0;
+ const provider=model(f,()=>({content:'The requested result is retained.'}),()=>blocked?'blocked':'met',{
+  plan:()=>{plans++;return {capability:'general_task',summary:'Produce the result',obligations:[],checks:[]}}
+ });
+ const goal='Produce the saved result for the UI continuation';
+ expect((await f.run(['ask',goal,'--json'])).code).toBe(1);
+ const original=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
+  const body=await request.json() as any; expect(body.questions.intent).toBeDefined();
+  const labels=Object.keys(body.questions.intent.criteria);
+  return Response.json({model:'fixture-classifier',answers:{intent:{type:'choice',choice:'resume',confidence:0.99,probabilities:Object.fromEntries(labels.map(label=>[label,label==='resume'?0.99:0.01/(labels.length-1)]))}}});
+ }});classifiers.push(server);
+ const native=host(f,{OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'});
+ const events:any[]=[];native.on('event',(event:any)=>events.push(event));
+ const firstEnd=terminal(native,'select-retained');
+ await native.request('prompt',{text:goal,coordinator:false},{id:'select-retained'});
+ expect((await firstEnd).data.exit_code).toBe(0);
+ const session=events.find(event=>event.turn==='select-retained'&&event.data.type==='session')?.data.session_id;
+ expect(session).toBeString(); expect(provider.counts().actors).toBe(1);
+ blocked=false;
+ const secondEnd=terminal(native,'resume-retained');
+ await native.request('prompt',{text:'finish the one already set-up',session,coordinator:false},{id:'resume-retained'});
+ expect((await secondEnd).data.exit_code,JSON.stringify(events)).toBe(0);
+ const tasks=(await native.request('snapshot',{action:'fossil.status'})).tasks;
+ expect(tasks).toHaveLength(1);expect(tasks[0].id).toBe(original.id);
+ expect(tasks[0].definition.version).toBe(original.definition.version);
+ expect(tasks[0].state).toBe('accepted');expect(plans).toBe(1);
+ expect(native.stderr).toBe('');
+},180000);

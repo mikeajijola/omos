@@ -16,6 +16,7 @@ Supported operations:
 | `cancel`, `steer` | Stop or steer the exact active invocation. |
 | `input` | Resolve an exact pending native question or permission request. |
 | `validation` | Return a host compilation receipt for an exact pending source revision request. |
+| `settings` | Read the native preference catalog or apply a typed owner-only preference, directory or permission-rule update. Mutations require an idle foreground turn and apply to future turns. The trusted host must keep this method outside the editable workspace bridge. |
 | `snapshot` | Read an allowlisted native JSON snapshot; arbitrary CLI arguments are unavailable. |
 | `workspace` | Use the revision-pinned read-only workspace service. |
 | `profile.read`, `profile.update` | Read or explicitly replace the local owner's portable profile photo through the host-owned record and image store. |
@@ -25,6 +26,8 @@ Supported operations:
 | `ui.import_legacy` | Retain local appearance history as an unpublished migration artifact on a paused task branch. |
 | `task.resume` | Select retained work with a current task revision fence. Explicit `rebind_project: true` relocates eligible personal work to the host's project and requires fresh source validation. |
 
+A temporary repository-lock timeout during a host inspection fails that request without cancelling an active conversation. A confirmed workspace binding change still stops the invocation and prevents the host from silently retargeting it.
+
 A repeated prompt ID must identify the same request. Reconnection reads events; it never starts another invocation. If the native process stops, the external host reports retained partial work and requires explicit continuation.
 
 A coordinated handoff releases the main session's task selection after its checkpoint is durable. It reports delegated work rather than completed obligations. Background workers own independent saved sessions and task leases; only independently verified Fossil publication establishes completion. Worker input and validation decisions belong to the trusted external host. Its main conversation can continue while a worker waits. See [background contract workers](README.md#background-contract-workers) for lifecycle, local activation and recovery semantics.
@@ -33,6 +36,8 @@ Complete frontend source belongs under `ui/`. Its manifest pins `omos.ui-source/
 
 The native completion path retains the candidate before requesting validation. A source change invalidates earlier validation. Compilation failure requires further work; unavailable validation retains a review failure for later verification. Validation uses the pinned review policy's first attempt deadline, clipped to the total review allowance. Waiting for the host consumes that same allowance rather than starting a separate 60-second timer or renewing the model budget. Cancellation stops the wait; late responses cannot satisfy a retired request. Independent contract review still decides whether obligations are met. Publication checks the source receipt again before writing its durable publication operation.
 
+UI inspection resolves immutable file identities once, verifies small source files in bounded batches, and reads larger assets individually. It returns the same SHA-256 digests and byte counts for text and binary files, including historical source revisions.
+
 Compilation receipts establish compilation, not visual correctness or external-action success. The compatible external renderer must provide isolation, preview recovery, browser verification and a way to rebuild its disposable cache from saved Fossil source.
 
 Native UI turns identify the Fossil `ui/` tree as the running interface source. Tool-start events expose only bounded `path` and workspace `action` presentation fields, not file content or arbitrary arguments. Tool outcomes preserve their native kind and summary so the interface can show a held or denied action.
@@ -40,3 +45,9 @@ Native UI turns identify the Fossil `ui/` tree as the running interface source. 
 The `fossil_workspace` tool uses native workspace ownership and protected-path checks without a second model safety review. Configured permission rules still apply. A saved task is required for mutations; ephemeral sessions remain read-only. The tool cannot overwrite host-owned evidence, assessments or publication receipts. Completion still requires independent verification and native publication.
 
 The UI host initializes an empty personal Fossil instance when no workspace is bound. Profile updates accept a validated base64 PNG, JPEG or WebP up to 512 KiB, or null for removal. They return the content and saved revision. The profile entity must exist in the current declaration. The external UI host owns migration of an old operational photo and retains its original source.
+
+The trusted local browser shell may expose native settings through a separate
+owner panel. Read responses contain preference values and provider names, never
+provider definitions or credentials. Mutations use the native settings store,
+including its validation and atomic persistence. Workspace-authored JavaScript
+can request that the panel open but cannot choose or submit its changes.

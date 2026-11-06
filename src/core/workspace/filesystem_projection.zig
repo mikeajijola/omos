@@ -483,20 +483,32 @@ fn cleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8)
     if (files.items.len != saved.entries.len) return error.WorkspaceProjectionConflict;
     const revision = try manager.currentRevision(task);
     const manifest = try manager.fileManifest(revision);
-    for (files.items) |file| {
-        if (manager.operation_control) |control| try control.check();
-        if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
-        const canonical = for (manifest) |entry| {
-            if (std.mem.eql(u8, entry.path, file.path)) break entry;
-        } else return error.WorkspaceProjectionConflict;
-        if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+    var offset: usize = 0;
+    while (offset < files.items.len) {
         var page = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer page.deinit();
         var reader = manager;
         reader.alloc = page.allocator();
-        const body = try reader.contentAt(file.path, revision);
-        try @import("fossil_manifest.zig").verifyObject(canonical.artifact orelse return error.WorkspaceProjectionConflict, body);
-        if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        const batch = files.items[offset..@min(offset + 8, files.items.len)];
+        var identities: [8][]const u8 = undefined;
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
+            const canonical = for (manifest) |entry| {
+                if (std.mem.eql(u8, entry.path, file.path)) break entry;
+            } else return error.WorkspaceProjectionConflict;
+            if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+            identities[i] = canonical.artifact orelse return error.WorkspaceProjectionConflict;
+        }
+        const objects = try reader.projectionObjects(identities[0..batch.len]);
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            const body = for (objects) |object| {
+                if (std.mem.eql(u8, identities[i], object.artifact)) break object.bytes;
+            } else try reader.retrievalArtifact(identities[i]);
+            if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        }
+        offset += batch.len;
     }
     return total;
 }
@@ -528,6 +540,68 @@ pub fn collect(source: workspace.Manager, mode: CacheMode) anyerror!CacheReport 
     return collectControlled(manager, mode);
 }
 
+// A conservative upper bound is enough to decide that eviction is unnecessary.
+// This pass never labels content clean, takes writer locks, or deletes anything.
+// Concurrent growth can defer collection until the next pass, not authorize it.
+fn footprintFits(manager: workspace.Manager, dir: std.Io.Dir, remaining: *u64, visited: *usize) anyerror!bool {
+    var iterator = dir.iterate();
+    while (try iterator.next(io_mod.getIo())) |entry| {
+        if (manager.operation_control) |control| try control.check();
+        visited.* += 1;
+        if (visited.* > max_files) return false;
+        switch (entry.kind) {
+            .file => {
+                var file = try dir.openFile(io_mod.getIo(), entry.name, .{ .allow_directory = false, .follow_symlinks = false });
+                defer file.close(io_mod.getIo());
+                const stat = try file.stat(io_mod.getIo());
+                if (stat.kind != .file or stat.size > remaining.*) return false;
+                remaining.* -= stat.size;
+            },
+            .directory => {
+                var child = try dir.openDir(io_mod.getIo(), entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer child.close(io_mod.getIo());
+                if (!try footprintFits(manager, child, remaining, visited)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn retainedWithinBudget(manager: workspace.Manager, tasks: []const workspace.Task, policy: @import("definition.zig").ProjectionPolicy) !?CacheReport {
+    var report: CacheReport = .{};
+    var entries: std.ArrayList(CacheEntry) = .empty;
+    var remaining = policy.max_clean_bytes;
+    var candidates: usize = 0;
+    for (tasks) |task| {
+        if (manager.operation_control) |control| try control.check();
+        if (task.authority != null) continue;
+        const root = try directory(manager, task);
+        var dir = io_mod.openDirAbsoluteNoFollow(root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close(io_mod.getIo());
+        var state_name: []const u8 = @tagName(task.state);
+        if (task.state == .accepted) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(root), task.id)) {
+                state_name = "legacy_resources";
+            } else {
+                candidates += 1;
+                if (candidates > policy.max_clean_views) return null;
+                var visited: usize = 0;
+                if (!try footprintFits(manager, dir, &remaining, &visited)) return null;
+                state_name = "unverified_within_budget";
+            }
+        }
+        report.views += 1;
+        report.retained += 1;
+        try entries.append(manager.alloc, .{ .task = task.id, .path = root, .state = state_name });
+    }
+    report.entries = entries.items;
+    return report;
+}
+
 fn collectControlled(manager: workspace.Manager, mode: CacheMode) anyerror!CacheReport {
     const basis = try manager.modelBasis(try manager.revision("trunk"));
     const policy = if (basis) |value| value.execution.projections else null;
@@ -538,6 +612,13 @@ fn collectControlled(manager: workspace.Manager, mode: CacheMode) anyerror!Cache
             return a.created_at_ms > b.created_at_ms;
         }
     }.less);
+    if (mode == .trim) {
+        const retained = retainedWithinBudget(manager, tasks, policy.?) catch |err| switch (err) {
+            error.Timeout, error.Cancelled, error.OutOfMemory => return err,
+            else => null,
+        };
+        if (retained) |report| return report;
+    }
     var report: CacheReport = .{};
     var entries: std.ArrayList(CacheEntry) = .empty;
     for (tasks) |task| {
@@ -640,7 +721,10 @@ pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: [
     if (arguments.value != .object) return;
     var manager = (try workspace.Manager.bound(alloc)) orelse return;
     var cancelled = std.atomic.Value(bool).init(false);
-    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    // Opaque commands hydrate every managed file, including cold binary objects.
+    // Keep cancellation and a finite bound without applying the single-path
+    // deadline to an entire workspace.
+    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(if (process_access) 120 else 30) }) };
     const task = (try manager.active(id)) orelse return;
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;

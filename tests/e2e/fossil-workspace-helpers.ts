@@ -22,6 +22,7 @@ export function fixture() {
     HOME: home, FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1",
     FX_SKIP_ONBOARDING: "1", FX_CONTRACT_REVIEW: "1", FX_E2E_FOSSIL_FAULT: undefined,
     AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, GEMINI_API_KEY: undefined,
+    OMOS_LOOKUP_CLASSIFIER_MODEL: undefined, OMOS_CLASSIFIER_URL: undefined, OMOS_CLASSIFIER_TOKEN: undefined, OMOS_CLASSIFIER_MODEL: undefined,
     FX_PROVIDER: undefined, FX_MODEL: undefined, FX_REVIEW_MODEL: undefined, OMOS_FOSSIL_BIN: undefined,
   };
   const run = async (args: string[], extra: Record<string, string | undefined> = {}, timeoutMs = 60000) => {
@@ -31,13 +32,13 @@ export function fixture() {
   };
   const fossil = (...args: string[]) => {
     const result = spawnSync("fossil", [...args, "-R", join(cwd, "omos.fossil")], { env: { PATH: process.env.PATH, HOME: home, FOSSIL_HOME: home, XDG_CONFIG_HOME: home, USER: "fixture", LC_ALL: "C" }, encoding: "utf8" });
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr + result.stdout).toBe(0);
     return result.stdout;
   };
   return { home, cwd, env, run, fossil };
 }
 
-export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | { name: string; args: object } | Promise<string | { name: string; args: object }>, governance: { plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
+export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: number, signal?: AbortSignal) => object | Promise<object>, assess?: (packet: any) => string | Response | { name: string; args: object } | Promise<string | Response | { name: string; args: object }>, governance: { intent?: string; reply?: (body: any, packet: any, phase: "plan" | "revise" | "progress") => object | undefined; plan?: object | ((packet: any) => object | Promise<object>); revise?: (packet: any) => object; progress?: (packet: any) => object; usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } } = {}) {
   let actors = 0, assessments = 0;
   const packets: any[] = [];
   const revisionPackets: any[] = [];
@@ -47,7 +48,10 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
       if (request.method !== "POST") return Response.json({ data: [] });
       const body = await request.json() as any;
       let delta: any, reason = "stop";
-      if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment" || tool.function?.name === "omos_contract_revision")) {
+      if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_intent")) {
+        delta = { tool_calls: [{ index: 0, id: "contract-intent", type: "function", function: { name: "omos_contract_intent", arguments: JSON.stringify({ choice: governance.intent ?? "clarify" }) } }] };
+        reason = "tool_calls";
+      } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_task_plan" || tool.function?.name === "omos_progress_assessment" || tool.function?.name === "omos_contract_revision")) {
         const planning = body.tools.some((tool: any) => tool.function?.name === "omos_task_plan");
         const revising = body.tools.some((tool: any) => tool.function?.name === "omos_contract_revision");
         const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
@@ -55,7 +59,14 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         const decision = planning ? (typeof governance.plan === "function" ? await governance.plan(packet) : governance.plan) ?? { capability: "general_task", summary: "Answer the original request", obligations: [], checks: [] }
           : revising ? governance.revise?.(packet) ?? { capability: packet.context.model.basis?.capability ?? "general_task", summary: "Retain requirements with the supplied clarification", obligations: [], checks: [], superseded: [] }
           : governance.progress?.(packet) ?? { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "No further useful progress observed" };
-        delta = { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
+        if (!planning && !revising) {
+          decision.execution_readiness ??= decision.outcome === "continue_work" ? "ready" : "not_applicable";
+          decision.next_step ??= decision.outcome === "continue_work" ? "Perform the next requested fixture operation and verify its result." : "";
+          decision.ready_target ??= decision.execution_readiness === "ready" ? "The requested fixture result" : "";
+          decision.verification ??= decision.execution_readiness === "ready" ? "Inspect the retained fixture result" : "";
+          decision.prerequisite ??= "";
+        }
+        delta = governance.reply?.(body, packet, planning ? "plan" : revising ? "revise" : "progress") ?? { tool_calls: [{ index: 0, id: `governance-${actors}`, type: "function", function: { name: planning ? "omos_task_plan" : revising ? "omos_contract_revision" : "omos_progress_assessment", arguments: JSON.stringify(decision) } }] };
         reason = "tool_calls";
       } else if (body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment")) {
         assessments++;
@@ -64,6 +75,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         packet.inspections = [...(packet.previousInspections ?? []), ...packet.currentInspections];
         packets.push(packet);
         const status = await assess?.(packet) ?? "met";
+        if (status instanceof Response) return status;
         const evidence = packet.evidence.filter((item: any) => item.complete && (item.kind === "candidate" || item.status === "success")).map((item: any) => item.id);
         delta = { tool_calls: [{ index: 0, id: `assessment-${assessments}`, type: "function", function: {
           name: typeof status === "string" ? "omos_contract_assessment" : status.name, arguments: JSON.stringify(typeof status === "string" ? { contractId: packet.contract.id, version: packet.contract.version, obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status, evidence: status === "met" ? evidence : [], note: status === "blocked" ? "Waiting for requested input" : "Checked host evidence" })) } : status.args),
@@ -73,6 +85,7 @@ export function model(f: ReturnType<typeof fixture>, actor: (body: any, count: n
         delta = await actor(body, ++actors, request.signal);
         if ((delta as any).tool_calls) reason = "tool_calls";
       }
+      if (delta instanceof Response) return delta;
       const chunks: object[] = [
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta, finish_reason: null }] },
         { id: "fossil-fixture", model: body.model, choices: [{ index: 0, delta: {}, finish_reason: reason }] },
@@ -127,4 +140,16 @@ export async function startWorkspaceService(f: ReturnType<typeof fixture>, writa
   } finally {
     reader.releaseLock();
   }
+}
+
+// Legacy cadence remains an explicit policy for assessor-protocol tests. Normal
+// fixtures exercise event-triggered reviews and the independent completion gate.
+export async function periodicReviews(f: ReturnType<typeof fixture>) {
+  const declaration = join(f.home, "periodic-definition.json");
+  const execution = join(f.home, "periodic-execution.json");
+  writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+  writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic", progress_max_interval: 12 } }));
+  const result = await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"]);
+  expect(result.code, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout).model_data.state).toBe("activated");
 }

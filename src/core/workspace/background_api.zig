@@ -37,7 +37,8 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         var workers: std.ArrayList(std.json.Value) = .empty;
         for (entries) |entry| {
             const authority = try control.activation(manager, entry);
-            try workers.append(manager.alloc, try value(manager, .{ .record = entry, .session = if (authority) |local| @as(?[]const u8, local.source_session) else null, .locally_activated = authority != null }));
+            const execution = try @import("contract_execution.zig").inspect(manager, try manager.loadTask(entry.task), entry);
+            try workers.append(manager.alloc, try value(manager, .{ .record = entry, .execution = execution, .session = if (authority) |local| @as(?[]const u8, local.source_session) else null, .locally_activated = authority != null }));
         }
         return value(manager, .{ .version = "omos.background-contracts/v1", .workers = workers.items, .next_offset = if (entries.len == 32) request.offset + entries.len else @as(?usize, null) });
     }
@@ -46,7 +47,12 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         return value(manager, .{ .accepted = true, .fulfilled = false });
     }
     const entry = (try manager.backgroundRecord(request.task orelse return error.MissingTaskId)) orelse return error.BackgroundDispatchRequired;
-    if (request.action == .show) return value(manager, entry);
+    if (request.action == .show) {
+        var result = try value(manager, entry);
+        try result.object.put(manager.alloc, "execution", try value(manager, try @import("contract_execution.zig").inspect(manager, try manager.loadTask(entry.task), entry)));
+        try result.object.put(manager.alloc, "activity", try activity(manager, entry));
+        return result;
+    }
     if (request.action == .events) return events(manager, entry, request.generation orelse entry.generation, request.offset);
     if (request.action == .receipt) {
         const operation = request.operation orelse return error.BackgroundOperationRequired;
@@ -76,11 +82,11 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
             try saveOperation(manager, entry, next, request);
             return value(manager, .{ .accepted = true, .fulfilled = true, .record = next });
         }
-        if (task.state == .accepted or task.state == .publication_pending or task.state == .conflict) return error.BackgroundTaskUnavailable;
         const activation = (try control.activation(manager, entry)) orelse return error.BackgroundActivationRequired;
         try control.verifyLiveAuthority(manager, activation);
         try manager.validateTaskBasis(task);
         const next = try domain.resumeRecord(entry, io.milliTimestamp());
+        if (task.state == .conflict) try manager.reconcileConflict(task);
         try control.ensureHost(manager);
         try saveOperation(manager, entry, next, request);
         return value(manager, .{ .accepted = true, .fulfilled = false, .record = next });
@@ -89,6 +95,8 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
         var next = entry;
         if (entry.state != .starting) next.state = .cancelled;
         next.cancel_requested = true;
+        next.retry = null;
+        next.wait_condition = null;
         next.reason = "Cancelled by the user. Work and evidence remain retained.";
         next.updated_ms = io.milliTimestamp();
         try saveOperation(manager, entry, next, request);
@@ -129,19 +137,92 @@ fn events(manager: workspace.Manager, entry: domain.Record, generation: u64, off
     if (offset > (try file.stat(io.getIo())).size) return error.InvalidEventCursor;
     const buffer = try manager.alloc.alloc(u8, 2 * 1024 * 1024);
     var reader = file.reader(io.getIo(), buffer);
-    try reader.seekTo(offset);
+    const aligned = try alignEventOffset(&reader, offset);
     var result: std.ArrayList(std.json.Value) = .empty;
-    var next = offset;
+    var next = aligned;
     for (0..32) |_| {
-        const line = try reader.interface.takeDelimiter('\n') orelse break;
-        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch break;
+        const line = try completeLine(&reader.interface) orelse break;
+        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch return error.InvalidEventRecord;
         try result.append(manager.alloc, event);
         next += line.len + 1;
     }
-    return value(manager, .{ .events = result.items, .next_offset = next, .active = generation == entry.generation and entry.state == .running, .record = entry });
+    return value(manager, .{ .events = result.items, .requested_offset = offset, .aligned_offset = aligned, .next_offset = next, .offset_unit = "bytes", .active = generation == entry.generation and entry.state == .running, .record = entry });
 }
 
 fn saveOperation(manager: workspace.Manager, previous: domain.Record, next: domain.Record, request: Request) !void {
     const operation: domain.Operation = .{ .workspace = manager.manifest.id, .task = next.task, .operation = request.operation orelse return error.BackgroundOperationRequired, .request_sha256 = try workspace.hash(manager.alloc, try std.json.Stringify.valueAlloc(manager.alloc, request, .{})), .generation = next.generation, .state = next.state };
     try manager.saveBackgroundOperation(next, try dispatch.digest(manager, previous), operation);
+}
+
+/// Bounded journal tail; absence of recent events does not prove inactivity.
+/// Return public event metadata only, never tool payloads or inferred outcomes.
+pub fn activity(manager: workspace.Manager, entry: domain.Record) !std.json.Value {
+    const model = @import("definition.zig");
+    const name = try manager.alloc.print("background-{s}-{d}.ndjson", .{ entry.task, entry.generation });
+    const path = try control.path(manager, "events", name);
+    var file = std.Io.Dir.openFileAbsolute(io.getIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return value(manager, .{ .journal_available = false }),
+        else => return err,
+    };
+    defer file.close(io.getIo());
+    const stat = try file.stat(io.getIo());
+    const start = stat.size - @min(stat.size, 65536);
+    const buffer = try manager.alloc.alloc(u8, @intCast(stat.size - start));
+    const bytes = buffer[0..try file.readPositionalAll(io.getIo(), buffer, start)];
+    // Inspect only this snapshot's bytes; concurrent appends cannot extend it.
+    var cursor: usize = if (start > 0) if (std.mem.indexOfScalar(u8, bytes, '\n')) |end| end + 1 else bytes.len else 0;
+    var recent: std.ArrayList(std.json.Value) = .empty;
+    while (std.mem.indexOfScalarPos(u8, bytes, cursor, '\n')) |end| {
+        const line = bytes[cursor..end];
+        cursor = end + 1;
+        const event = std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, line, .{}) catch continue;
+        const data = model.field(event, "data") orelse continue;
+        if (recent.items.len == 16) _ = recent.orderedRemove(0);
+        try recent.append(manager.alloc, try value(manager, .{
+            .cursor = model.field(event, "cursor"),
+            .timestamp_ms = model.field(event, "timestamp_ms"),
+            .type = model.text(data, "type"),
+            .call_id = model.text(data, "call_id"),
+            .tool = model.text(data, "name"),
+        }));
+    }
+    return value(manager, .{
+        .journal_available = true,
+        .generation = entry.generation,
+        .journal_updated_ms = stat.mtime.toMilliseconds(),
+        .next_offset = stat.size,
+        .offset_unit = "bytes",
+        .tail_only = true,
+        .tail_start_offset = start,
+        .recent_events = recent.items,
+        .note = "A running record or a quiet journal does not prove progress. Unmatched tool events in this bounded tail do not establish a pending operation. Inspect receipts for outcomes; reconcile uncertain effects before retrying.",
+    });
+}
+
+// A partially written final line is not an event yet. Do not advance its cursor.
+fn completeLine(reader: *std.Io.Reader) !?[]const u8 {
+    const line = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.EndOfStream => return null,
+        else => return err,
+    };
+    return line[0 .. line.len - 1];
+}
+
+// A caller may seek into a large journal without knowing every line boundary.
+// Skip only the partial prefix and report the aligned byte position explicitly.
+fn alignEventOffset(reader: *std.Io.File.Reader, offset: u64) !u64 {
+    if (offset == 0) {
+        try reader.seekTo(0);
+        return 0;
+    }
+    try reader.seekTo(offset - 1);
+    if (try reader.interface.takeByte() == '\n') return offset;
+    const fragment = try completeLine(&reader.interface) orelse return offset;
+    return offset + fragment.len + 1;
+}
+
+test "journal paging retains an incomplete final event for a later read" {
+    var reader = std.Io.Reader.fixed("{\"cursor\":1}\n{\"cursor\":2}");
+    try std.testing.expectEqualStrings("{\"cursor\":1}", (try completeLine(&reader)).?);
+    try std.testing.expect((try completeLine(&reader)) == null);
 }

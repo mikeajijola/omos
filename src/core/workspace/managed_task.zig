@@ -11,6 +11,7 @@ pub const Turn = struct {
     reviewed_revision: ?[]const u8 = null,
     assessment: []const u8 = "",
     review_snapshot: []const u8 = "",
+    recovery_context: []const u8 = "",
     recovered_candidate: ?[]const u8 = null,
     review_only_candidate: ?[]const u8 = null,
     source_basis: ?[]const u8 = null,
@@ -19,7 +20,7 @@ pub const Turn = struct {
     prior_review_checkpoints: []const []const u8 = &.{},
     review_seen: std.StringHashMapUnmanaged(void) = .empty,
     review_progress_count: usize = 0,
-    recorded_evidence: std.ArrayList([]const u8) = .empty,
+    recorded_evidence: std.StringHashMapUnmanaged(void) = .empty,
     invocation_id: ?[]const u8 = null,
     assessment_record: ?[]const u8 = null,
     filesystem_view: bool = false,
@@ -28,6 +29,10 @@ pub const Turn = struct {
     projection_pin: ?@import("../shared/resource_pin.zig").Pin = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
+        return beginResolved(alloc, session, parent_session, project, prompt, false);
+    }
+
+    pub fn beginResolved(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8, continuing: bool) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
         var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
@@ -42,7 +47,7 @@ pub const Turn = struct {
         @import("../shared/io.zig").getIo().random(&invocation);
         turn.invocation_id = try workspace.hash(alloc, &invocation);
         if (task.state == .publication_pending or (task.state == .accepted and try manager.publicationPending(task))) {
-            const steering = parent_session == null and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue") and !std.mem.eql(u8, prompt, task.definition.objective);
+            const steering = !continuing and parent_session == null and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue") and !std.mem.eql(u8, prompt, task.definition.objective);
             if (steering) {
                 if (try manager.publicationCommitted(task)) {
                     _ = try manager.retryPublication(task);
@@ -65,12 +70,13 @@ pub const Turn = struct {
             try turn.selectTask(task);
         }
         turn.task = try manager.setState(task.id, .active);
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
-        if (parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
+        if (continuing or std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
+        if (!continuing and parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
             turn.task = try manager.amend(task, prompt);
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
         _ = try manager.checkpoint(turn.task);
+        turn.recovery_context = try @import("execution_recovery.zig").context(manager, turn.task);
         turn.projection_pin = try @import("../shared/resource_pin.zig").acquire(try @import("filesystem_projection.zig").retentionPath(manager, turn.task), manager.operation_control);
         try @import("filesystem_projection.zig").prepare(manager, turn.task);
         turn.filesystem_view = true;
@@ -98,6 +104,15 @@ pub const Turn = struct {
         self.execution_lease = null;
     }
 
+    /// Check execution prerequisites without assembling historical review pages.
+    pub fn prepareExecution(self: *Turn, alloc: std.mem.Allocator) !void {
+        const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
+        if (coding) self.source_basis = if (self.task.authority != null)
+            try @import("company_validation.zig").fingerprint(self.manager, self.task)
+        else
+            try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
+    }
+
     // Checkpoints and reviews share these retained-evidence traversal paths.
     pub noinline fn progress(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) !void {
         const latest = try self.manager.loadTask(self.task.id);
@@ -121,10 +136,7 @@ pub const Turn = struct {
                 record.id = try alloc.print("execution:{s}:{s}", .{ record.action_id.?, record.id });
             };
             record.source = source;
-            const observed = for (self.recorded_evidence.items) |id| {
-                if (std.mem.eql(u8, id, record.id)) break true;
-            } else false;
-            if (observed) continue;
+            if (self.recorded_evidence.contains(record.id)) continue;
             try self.manager.record(self.task, "tool_evidence", &[_]review.Evidence{record});
             if (try @import("evidence_receipt.zig").derive(alloc, record)) |receipt| try self.manager.record(self.task, "command_receipt", receipt);
             if (source) |current| if (self.source_basis) |previous| {
@@ -132,7 +144,7 @@ pub const Turn = struct {
                     try self.manager.record(self.task, "source_validation", .{ .evidence = record.id, .source = current });
                 }
             };
-            try self.recorded_evidence.append(alloc, record.id);
+            try self.recorded_evidence.put(alloc, record.id, {});
         }
         self.source_basis = source;
         // User corrections are authenticated by the runtime's message origin.
@@ -195,10 +207,12 @@ pub const Turn = struct {
         if (self.task.revision_pending) return error.TaskContractRevisionPending;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
+        var tool_evidence_ids: std.StringHashMapUnmanaged(void) = .empty;
         var payloads: std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef) = .empty;
         var pages: std.ArrayList([]const u8) = .empty;
         var page_bytes: usize = 0;
         var checkpoints: std.ArrayList([]const u8) = .empty;
+        var current_validations: std.ArrayList([]const u8) = .empty;
         for (self.task.company_reads) |reference| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
@@ -241,6 +255,15 @@ pub const Turn = struct {
                 const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
                 const entry = (try std.json.parseFromSlice(Entry, a, bytes, .{ .ignore_unknown_fields = true })).value;
                 if (!std.mem.eql(u8, entry.task, self.task.id)) return error.InvalidWorkspaceJournal;
+                if (self.source_basis) |source| {
+                    const model = @import("definition.zig");
+                    if (std.mem.eql(u8, entry.kind, "source_validation") and
+                        entry.contract_version >= (self.task.source_validation_version orelse 1) and
+                        std.mem.eql(u8, model.text(entry.value, "source"), source))
+                    {
+                        try current_validations.append(alloc, try alloc.dupe(u8, model.text(entry.value, "evidence")));
+                    }
+                }
                 if (entry.contract_version == self.task.definition.version and (std.mem.eql(u8, entry.kind, "review_request") or std.mem.eql(u8, entry.kind, "review_evidence_page") or std.mem.eql(u8, entry.kind, "review_segment_assessment"))) {
                     if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try self.trackReview(entry.kind, data.string, false);
                 }
@@ -269,10 +292,9 @@ pub const Turn = struct {
                 if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
                 const records = (try std.json.parseFromValue([]review.Evidence, a, entry.value, .{})).value;
                 for (records) |record| {
-                    const present = for (evidence.items) |existing| {
-                        if (std.mem.eql(u8, record.id, existing.id)) break true;
-                    } else false;
-                    if (!present) try self.appendReviewEvidence(alloc, &evidence, &payloads, record);
+                    if (tool_evidence_ids.contains(record.id)) continue;
+                    try self.appendReviewEvidence(alloc, &evidence, &payloads, record);
+                    try tool_evidence_ids.put(alloc, try alloc.dupe(u8, record.id), {});
                 }
             }
         }
@@ -280,7 +302,10 @@ pub const Turn = struct {
         self.prior_review_checkpoints = checkpoints.items;
         const inputs = try self.manager.reviewInputs(self.task, self.reviewed_revision.?);
         self.review_snapshot = inputs.snapshot;
-        if (self.source_basis) |source| try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try alloc.print("source-state:{s}", .{source}), .kind = .verification, .content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .note = "Current source bytes observed by the host; validation requires a matching successful command receipt." }, .{}) });
+        if (self.source_basis) |source| {
+            const content = try std.json.Stringify.valueAlloc(alloc, .{ .source_hash = source, .current_validation_evidence = current_validations.items, .note = "For coding_validation, inspect and cite a listed current_validation_evidence ID (or its matching command receipt). These commands succeeded against unchanged current source bytes; independently assess whether their checks cover the request. An empty list means a check must run against the final source before completion. A successful command that changed source is not a current validation. This source-state record alone proves neither coverage nor completion." }, .{});
+            try self.appendReviewEvidence(alloc, &evidence, &payloads, .{ .id = try alloc.print("source-state:{s}", .{try workspace.hash(alloc, content)}), .kind = .verification, .content = content });
+        }
         try self.appendReviewEvidence(alloc, &evidence, &payloads, try review.workspaceEvidence(alloc, self.review_snapshot));
         for (inputs.files) |file| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);

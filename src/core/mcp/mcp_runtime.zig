@@ -8316,7 +8316,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
 
     try runtime.addServer(.{ .name = try alloc.dupe(u8, "fs"), .command = try alloc.dupe(u8, "cmd") });
     runtime.servers.items[0].state.store(.ready, .release);
-    runtime.servers.items[0].instructions = try alloc.dupe(u8, text_utils.repeat("i", 1500) ++ "instruction tail");
+    runtime.servers.items[0].instructions = try alloc.dupe(u8, text_utils.repeat("i", 8000) ++ "instruction tail");
 
     var used = tool_names.Registry.init(alloc);
     defer used.deinit();
@@ -8339,7 +8339,7 @@ test "MCP exact selection returns one executable schema by prefixed name" {
     try std.testing.expect((try runtime.toolSchemaJsonByName(alloc, "mcp_missing", .{}, .{})) == null);
 }
 
-test "MCP selection truncates instructions and rejects an oversized schema atomically" {
+test "MCP selection preserves full instructions or rejects the schema atomically" {
     const alloc = std.testing.allocator;
     var runtime = McpRuntime.init(alloc);
     defer runtime.deinit();
@@ -8355,7 +8355,6 @@ test "MCP selection truncates instructions and rejects an oversized schema atomi
     try parseAndStoreTools(alloc, runtime.servers.items[0], .{}, response, &used);
 
     var limits = context_limits.Values{};
-    limits.mcp_server_instructions_bytes = .{ .value = .{ .bytes = 11 }, .source = .user_workspace };
     var schema_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;
     defer schema_result.deinit(alloc);
     const schema = switch (schema_result) {
@@ -8363,9 +8362,16 @@ test "MCP selection truncates instructions and rejects an oversized schema atomi
         .rejected => return error.TestExpectedEqual,
     };
     try std.testing.expect(std.mem.find(u8, schema, "first line&#x0a;") != null);
-    try std.testing.expect(std.mem.find(u8, schema, "second line") == null);
-    try std.testing.expect(std.mem.find(u8, schema, "mcp_server_instructions_bytes") != null);
+    try std.testing.expect(std.mem.find(u8, schema, "third line") != null);
     try std.testing.expect(std.mem.find(u8, schema, "An exact query that must stay intact") != null);
+
+    limits.mcp_server_instructions_bytes = .{ .value = .{ .bytes = 11 }, .source = .user_workspace };
+    var instruction_rejection = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)).?;
+    defer instruction_rejection.deinit(alloc);
+    try std.testing.expect(instruction_rejection == .rejected);
+    try std.testing.expect(std.mem.find(u8, instruction_rejection.rejected.model_output, "mcp_server_instructions_bytes") != null);
+    try std.testing.expect(std.mem.find(u8, instruction_rejection.rejected.model_output, "inputSchema") == null);
+    limits.mcp_server_instructions_bytes = (context_limits.Values{}).mcp_server_instructions_bytes;
 
     limits.mcp_selected_schema_bytes = .{ .value = .{ .bytes = schema.len - 1 }, .source = .command_line };
     var rejected_result = (try runtime.toolSchemaJsonByName(alloc, "mcp_docs_lookup", .{}, limits)) orelse return error.TestExpectedEqual;

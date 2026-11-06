@@ -604,7 +604,7 @@ describe("web_search Gateway fixture", () => {
         for (const request of [initial, continuing]) {
           expect(findUnavailableCapabilityReferences(request)).toEqual([]);
           expect(customProviderGuidanceState(request)).toEqual({
-            providerToolIndices: [13],
+            providerToolIndices: [AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.indexOf("exa_search")],
             guidanceMessageIndices: [1],
           });
           expect(
@@ -846,7 +846,7 @@ describe("web_search Gateway fixture", () => {
         );
         expect(findUnavailableCapabilityReferences(request)).toEqual([]);
         expect(customProviderGuidanceState(request)).toEqual({
-          providerToolIndices: [13],
+          providerToolIndices: [AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.indexOf("exa_search")],
           guidanceMessageIndices: [1],
         });
       } finally {

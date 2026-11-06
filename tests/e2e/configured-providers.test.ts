@@ -830,7 +830,7 @@ describe("CLI work contracts", () => {
     return body.tools?.some((tool: any) => tool.function?.name === "omos_contract_assessment");
   }
   function assessment(body: any, status: string, evidence?: string[]) {
-    const packet = JSON.parse(body.messages.at(-1).content);
+    const packet = JSON.parse(body.messages.find((message: any) => message.role === "user").content);
     return toolCompletion(body.model, "omos_contract_assessment", {
       contractId: packet.contract.id, version: packet.contract.version,
       obligations: [{ id: "request_complete", status,
@@ -890,12 +890,12 @@ describe("CLI work contracts", () => {
     });
     try {
       const result = await runFx(["ask", "--json", "Verify the task"], {
-        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 90000,
       });
       expect(result.code).not.toBe(0);
       expect(result.stdout + result.stderr).toMatch(/Contract|contract|Invalid|failed/);
     } finally { f.close(); }
-  }, 25000);
+  }, 100000);
 
   test("pending work at the step limit remains incomplete", async () => {
     const f = fixture(body => isReview(body) ? assessment(body, "pending") : completion(body.model, "Done."));

@@ -18,7 +18,7 @@ pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []con
         if (entry.kind != .file) continue;
         const path = try std.Io.Dir.path.join(alloc, &.{ root, entry.path });
         defer alloc.free(path);
-        if (std.mem.eql(u8, path, repository)) continue;
+        if (workspaceState(path, repository)) continue;
         const stat = try std.Io.Dir.cwd().statFile(io.getIo(), path, .{ .follow_symlinks = false });
         if (stat.kind == .sym_link) {
             var link: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -52,6 +52,43 @@ pub fn fingerprint(alloc: std.mem.Allocator, root: []const u8, repository: []con
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
     return alloc.dupe(u8, &std.fmt.bytesToHex(&digest, .lower));
+}
+
+// The native store, SQLite sidecars and migration backups are generated host
+// state. A parent workspace scan may see them despite a nested Git exclude.
+fn workspaceState(path: []const u8, repository: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, repository)) return false;
+    const suffix = path[repository.len..];
+    if (suffix.len == 0) return true;
+    for ([_][]const u8{ "-wal", "-shm", "-journal" }) |sidecar| if (std.mem.eql(u8, suffix, sidecar)) return true;
+    for ([_][]const u8{ ".pre-omniform-", ".pre-contracts-" }) |prefix| {
+        if (!std.mem.startsWith(u8, suffix, prefix) or !std.mem.endsWith(u8, suffix, ".fossil")) continue;
+        const timestamp = suffix[prefix.len .. suffix.len - ".fossil".len];
+        if (timestamp.len == 0) return false;
+        for (timestamp) |byte| if (!std.ascii.isDigit(byte)) return false;
+        return true;
+    }
+    return false;
+}
+
+test "source fingerprint excludes only native database state and migration backups" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "answer.txt", .data = "source" });
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repository = try std.Io.Dir.path.join(alloc, &.{ root, "personal.fossil" });
+    const before = try fingerprint(alloc, root, repository);
+    for ([_][]const u8{ "personal.fossil", "personal.fossil-wal", "personal.fossil-shm", "personal.fossil-journal", "personal.fossil.pre-omniform-123.fossil", "personal.fossil.pre-contracts-456.fossil" }) |name| {
+        const file = try tmp.dir.createFile(std.testing.io, name, .{});
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, 512 * 1024 * 1024);
+    }
+    try std.testing.expectEqualStrings(before, try fingerprint(alloc, root, repository));
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "personal.fossil.pre-contracts-source.fossil", .data = "user source" });
+    try std.testing.expect(!std.mem.eql(u8, before, try fingerprint(alloc, root, repository)));
 }
 
 const Kind = enum(u8) { file, link };

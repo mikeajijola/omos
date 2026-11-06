@@ -2,7 +2,7 @@ const std = @import("std");
 const workspace = @import("fossil_workspace.zig");
 
 pub const Options = struct {
-    action: enum { workers, init, ensure, request, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
+    action: enum { capabilities, classify, workers, init, ensure, request, company, @"company-key", use, status, tasks, diff, history, verify, recover, migrate, definition, query, audit, cache, package, serve, remote, @"export-scope", @"verify-scope", @"export" } = .status,
     path: ?[]const u8 = null,
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
@@ -90,7 +90,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             if (options.package_action == .import and options.request_path == null) return error.MissingPath;
         },
         .cache => if (options.path != null) return error.UnexpectedArgument,
-        .request, .company, .@"company-key" => if (options.path == null) return error.MissingPath,
+        .capabilities, .classify, .request, .company, .@"company-key" => if (options.path == null) return error.MissingPath,
         .workers, .init, .diff, .query, .serve => {},
         else => if (options.path != null) return error.UnexpectedArgument,
     }
@@ -109,6 +109,16 @@ pub fn parse(args: []const [:0]const u8) !Options {
 pub const Reply = union(enum) { api: std.json.Value, workspace: workspace.Snapshot, identity: @import("company_identity.zig").Snapshot, scope: @import("scope_export.zig").Snapshot };
 
 pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
+    if (options.action == .capabilities) {
+        const capabilities = @import("capabilities.zig");
+        const request = try @import("../shared/record_json.zig").decode(capabilities.Request, alloc, try readDefinition(alloc, options.path.?), .{});
+        return .{ .api = try capabilities.execute(alloc, request, true, null) };
+    }
+    if (options.action == .classify) {
+        const classification = @import("classification.zig");
+        const request = try @import("../shared/record_json.zig").decode(classification.Request, alloc, try readDefinition(alloc, options.path.?), .{});
+        return .{ .api = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, try classification.execute(alloc, request, null), .{}), .{}) };
+    }
     if (options.action == .@"company-key") {
         const model = @import("definition.zig");
         const declaration = try model.parse(alloc, model.seed);
@@ -159,7 +169,7 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
     var detail: []const u8 = "";
     var model_data: ?std.json.Value = null;
     switch (options.action) {
-        .request, .workers => unreachable,
+        .classify, .capabilities, .request, .workers => unreachable,
         .company => model_data = (try std.json.parseFromSlice(std.json.Value, alloc, try @import("company_service.zig").administer(manager, try readDefinition(alloc, options.path.?)), .{})).value,
         .ensure => detail = "Personal instance initialized or existing workspace retained.",
         .init => {

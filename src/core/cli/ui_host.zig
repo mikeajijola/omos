@@ -9,6 +9,7 @@ const schedule_worker = @import("../workspace/schedule_worker.zig");
 const scheduling = @import("../workspace/scheduling.zig");
 const background = @import("../workspace/background_contract.zig");
 const background_dispatch = @import("../workspace/background_dispatch.zig");
+const channels = @import("../workspace/contract_channels.zig");
 const background_control = @import("../workspace/background_control.zig");
 const version = "omos.ui-host/v1";
 const alloc = std.heap.c_allocator;
@@ -32,6 +33,8 @@ const Job = struct {
     journal: std.Io.File,
     position: u64 = 0,
     cursor: usize = 0,
+    attention_seen: bool = false,
+    channel_session: ?[]const u8 = null,
 
     fn emit(raw: *anyopaque, data: []const u8) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
@@ -46,7 +49,7 @@ const Job = struct {
                 if (code.len > 0) self.error_code = try alloc.dupe(u8, code);
             }
         }
-        const line = try std.json.Stringify.valueAlloc(alloc, .{ .version = version, .type = "event", .turn = self.id, .cursor = self.cursor + 1, .data = parsed.value }, .{});
+        const line = try std.json.Stringify.valueAlloc(alloc, .{ .version = version, .type = "event", .turn = self.id, .cursor = self.cursor + 1, .timestamp_ms = io.milliTimestamp(), .data = parsed.value }, .{});
         defer alloc.free(line);
         var buffer: [4096]u8 = undefined;
         var writer = self.journal.writer(io.getIo(), &buffer);
@@ -60,6 +63,7 @@ const Job = struct {
         if (std.mem.eql(u8, @import("../workspace/definition.zig").text(parsed.value, "type"), "session")) {
             const session = @import("../workspace/definition.zig").text(parsed.value, "session_id");
             if (!safeSessionId(session)) return error.InvalidSessionId;
+            if (std.mem.startsWith(u8, self.id, "command-") and self.channel_session == null) self.channel_session = try alloc.dupe(u8, session);
             const digest = try workspace.hash(alloc, session);
             defer alloc.free(digest);
             const index_path = try alloc.print("{s}/session-{s}.json", .{ self.server.journal_dir, digest });
@@ -69,6 +73,22 @@ const Job = struct {
             try io.writeFileAtomic(alloc, index_path, index_bytes);
         }
         try output(line);
+        const kind = model.text(parsed.value, "type");
+        const attention = std.mem.eql(u8, kind, "input_required") or std.mem.eql(u8, kind, "input_resolved");
+        if (attention or (self.attention_seen and std.mem.eql(u8, kind, "turn_end"))) {
+            self.attention_seen = true;
+            var saved = true;
+            for (self.args) |arg| if (std.mem.eql(u8, arg, "--no-save")) {
+                saved = false;
+            };
+            if (saved) {
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                if (workspace.Manager.bound(arena.allocator())) |bound| {
+                    if (bound) |manager| manager.retainAttentionEvent(self.id, self.cursor, parsed.value) catch {};
+                } else |_| {}
+            }
+        }
     }
 
     fn run(self: *Job) void {
@@ -77,6 +97,7 @@ const Job = struct {
     }
 
     fn perform(self: *Job) void {
+        defer self.journal.unlock(io.getIo());
         defer if (self.execution_lease) |lease| {
             lease.release();
             self.execution_lease = null;
@@ -86,6 +107,15 @@ const Job = struct {
             self.ui.emit(.{ .type = "error", .code = @errorName(err) }) catch {};
             break :blk @as(u8, 1);
         };
+        if (self.channel_session) |session| {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            if (workspace.Manager.bound(arena.allocator())) |bound| {
+                if (bound) |manager| channels.bindCommand(manager, self.id, session) catch |err| {
+                    self.ui.emit(.{ .type = "channel_binding_pending", .code = @errorName(err), .command = self.id }) catch {};
+                };
+            } else |_| {}
+        }
         self.exit_code = exit;
         self.ui.emit(.{ .type = "turn_end", .exit_code = exit }) catch {};
     }
@@ -98,6 +128,8 @@ const Job = struct {
         alloc.free(self.id);
         alloc.free(self.request_hash);
         if (self.error_code) |code| alloc.free(code);
+        if (self.channel_session) |session| alloc.free(session);
+        if (self.ui.channel_context) |context| alloc.free(context);
         if (self.execution_lease) |lease| lease.release();
         alloc.destroy(self);
     }
@@ -147,9 +179,15 @@ const Server = struct {
     fn execute(self: *Server, arena: std.mem.Allocator, id: []const u8, method: []const u8, params: std.json.Value) !std.json.Value {
         // A profile binding change never retargets a running UI host.
         // Cancellation and public replay remain available for retained work.
+        var bound_manager: ?workspace.Manager = null;
         if (!std.mem.eql(u8, method, "cancel") and !std.mem.eql(u8, method, "events") and !std.mem.eql(u8, method, "session.events")) {
             const bound = (workspace.Manager.bound(arena) catch |err| {
-                if (self.job) |active| active.ui.stop();
+                // A busy refresh has not established a binding change. Keep
+                // the existing invocation; fail only this inspection request.
+                switch (err) {
+                    error.WorkspaceBusy, error.Timeout, error.Cancelled => {},
+                    else => if (self.job) |active| active.ui.stop(),
+                }
                 return err;
             }) orelse {
                 if (self.job) |active| active.ui.stop();
@@ -159,8 +197,9 @@ const Server = struct {
                 if (self.job) |active| active.ui.stop();
                 return error.WorkspaceBindingChanged;
             }
+            bound_manager = bound;
         }
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null });
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1" } });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
             var coordinated = params;
             if (coordinated != .object) return error.InvalidPrompt;
@@ -184,6 +223,7 @@ const Server = struct {
             const job = self.job orelse return error.NoActiveTurn;
             if (!std.mem.eql(u8, control.turn, job.id)) return error.StaleTurn;
             if (std.mem.eql(u8, method, "cancel")) job.ui.stop() else if (std.mem.eql(u8, method, "steer")) try job.ui.steer(control.text) else if (std.mem.eql(u8, method, "validation")) try job.ui.validated(control.request_id, try std.json.Stringify.valueAlloc(arena, control.receipt orelse return error.MissingReceipt, .{})) else try job.ui.answer(control.request_id, control.approved, control.answers);
+            if (std.mem.eql(u8, method, "input")) try job.ui.emit(.{ .type = "input_resolved", .request_id = control.request_id });
             return value(arena, .{ .accepted = true });
         }
         if (std.mem.eql(u8, method, "snapshot")) {
@@ -192,8 +232,32 @@ const Server = struct {
             const args = try snapshotArgs(arena, query.action, query.id, query.entity, query.offset);
             return parse(arena, try self.runner.snapshot(self.runner.context, arena, args));
         }
-        const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "settings")) {
+            const owner_settings = @import("../config/host_settings.zig");
+            const request = try std.json.parseFromValueLeaky(owner_settings.Request, arena, params, .{});
+            if (request.action != .read) if (self.job) |job| {
+                if (!job.finished.load(.acquire)) return error.SettingsBusy;
+            };
+            return parse(arena, try owner_settings.execute(arena, request));
+        }
+        // Reuse this request's verified binding instead of reopening Fossil
+        // under the same dispatch lock for every workspace RPC.
+        const manager = bound_manager orelse (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
+        if (std.mem.eql(u8, method, "channel.dispatch")) {
+            const query = try std.json.parseFromValueLeaky(struct { key: []const u8 }, arena, params, .{});
+            const command = try channels.loadCommand(manager, query.key);
+            if (command.state != .queued) return value(arena, command);
+            const result = self.dispatchChannel(arena, manager, query.key, command) catch |err| {
+                if (err == error.TurnInProgress or err == error.WorkspaceExecutionBusy or err == error.WorkspaceBusy) return value(arena, .{ .state = "queued", .message = "Your request is retained and waiting for the current planning turn to finish." });
+                try channels.finishCommand(manager, query.key, null, @errorName(err));
+                return value(arena, .{ .state = "blocked", .reason = @errorName(err), .message = "This request needs attention. Its work and evidence are retained." });
+            };
+            try channels.finishCommand(manager, query.key, result, null);
+            return value(arena, .{ .state = "accepted", .result = result });
+        }
+        if (std.mem.eql(u8, method, "contracts")) return @import("../workspace/contract_channels.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/contract_channels.zig").Request, arena, params, .{}), true);
         if (std.mem.eql(u8, method, "schedule")) {
             const request = try std.json.parseFromValueLeaky(scheduling.Request, arena, params, .{});
             if (request.action == .add or request.action == .move or request.action == .cancel) {
@@ -213,6 +277,25 @@ const Server = struct {
 
     fn start(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation) !std.json.Value {
         return self.startWithBackground(arena, id, params, scheduled, null);
+    }
+
+    fn dispatchChannel(self: *Server, arena: std.mem.Allocator, manager: workspace.Manager, key: []const u8, command: channels.Command) !std.json.Value {
+        try channels.authorizeCommand(manager, key, command);
+        if (command.background_request) |request| return @import("../workspace/background_api.zig").execute(manager, request);
+        if (self.job) |active| if (!std.mem.eql(u8, active.id, key)) return error.TurnInProgress;
+        // An existing journal is reconciled by start's request hash before any
+        // session selection can mutate retained work after a restart.
+        const journal_path = try arena.print("{s}/{s}.ndjson", .{ self.journal_dir, key });
+        const previous = std.Io.Dir.openFileAbsolute(io.getIo(), journal_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        defer if (previous) |file| file.close(io.getIo());
+        if (previous == null) if (command.session) |session| {
+            const task = try manager.loadTask(command.task orelse return error.MissingTaskId);
+            _ = try manager.resumeTask(session, task.id, task.project_root);
+        };
+        return self.start(arena, key, try value(arena, .{ .coordinator = true, .text = command.text, .session = command.session }), null);
     }
 
     fn startWithBackground(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation, background_run: ?*BackgroundRun) !std.json.Value {
@@ -274,6 +357,7 @@ const Server = struct {
             journal.close(io.getIo());
             std.Io.Dir.deleteFileAbsolute(io.getIo(), path) catch {};
         }
+        try journal.lock(io.getIo(), .exclusive);
         const owned_id = try alloc.dupe(u8, id);
         errdefer alloc.free(owned_id);
         const owned_hash = try alloc.dupe(u8, request_hash);
@@ -292,9 +376,15 @@ const Server = struct {
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
         job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .coordinator_mode = request.coordinator and background_run == null and scheduled == null and !std.mem.eql(u8, io.getenv("OMOS_COORDINATOR") orelse "", "0"), .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
+        if (std.mem.startsWith(u8, id, "command-")) {
+            const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            const command = try channels.loadCommand(manager, id);
+            job.ui.channel_context = try std.json.Stringify.valueAlloc(alloc, command.recent_context, .{});
+        }
         if (scheduled) |invocation| {
             job.ui.project_root = invocation.task.project_root;
             job.ui.execution_lease_held = true;
+            job.ui.contract_selected = true;
         }
         if (background_run) |run_context| {
             const task = try run_context.manager.loadTask(run_context.entry.task);
@@ -330,7 +420,7 @@ const Server = struct {
             const invocation = try schedule_worker.prepare(manager, schedule);
             const id = try manager.alloc.print("schedule-{s}-{d}", .{ schedule.id, schedule.generation });
             if (!safeId(id)) return error.InvalidTurnId;
-            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = invocation.session }), invocation);
+            const accepted = try self.start(manager.alloc, id, try value(manager.alloc, .{ .text = invocation.prompt, .session = invocation.session }), invocation);
             if (@import("../workspace/definition.zig").field(accepted, "already_accepted")) |retained| {
                 if (retained == .bool and retained.bool) return error.ScheduledTurnAcceptanceUncertain;
             }
@@ -396,13 +486,16 @@ const BackgroundRun = struct {
         ui: *interaction.Host,
         finished: std.atomic.Value(bool) = .init(false),
         checked_at: i64 = 0,
+        wait_condition: ?background.WaitCondition = null,
 
         fn loop(self: *Monitor) void {
             while (!self.finished.load(.acquire)) {
                 if (self.run_context.cancel.load(.acquire)) self.ui.stop();
                 self.poll() catch |err| {
-                    self.ui.emit(.{ .type = "notice", .text = @errorName(err) }) catch {};
-                    self.ui.stop();
+                    if (err != error.WorkspaceBusy and err != error.StaleBackgroundRecord) {
+                        self.ui.emit(.{ .type = "notice", .text = @errorName(err) }) catch {};
+                        self.ui.stop();
+                    }
                 };
                 io.sleep(100 * std.time.ns_per_ms);
             }
@@ -418,6 +511,15 @@ const BackgroundRun = struct {
             if (io.milliTimestamp() - self.checked_at >= 1000) {
                 self.checked_at = io.milliTimestamp();
                 try background_control.verifyLiveAuthority(manager, self.run_context.authority);
+            }
+            self.ui.mutex.lockUncancelable(io.getIo());
+            const condition: ?background.WaitCondition = if (self.ui.approval_id != 0 or self.ui.question_id != 0) .input else if (self.ui.validation_id != 0) .validation else null;
+            self.ui.mutex.unlock(io.getIo());
+            if (condition != self.wait_condition) {
+                const entry = (try manager.backgroundRecord(self.run_context.authority.task)) orelse return error.BackgroundDispatchRequired;
+                const next = try background.setWaitCondition(entry, .{ .owner = self.run_context.owner, .generation = self.run_context.entry.generation }, condition, io.milliTimestamp());
+                try manager.saveBackgroundRecord(next, try background_dispatch.digest(manager, entry));
+                self.wait_condition = condition;
             }
             const parent = try background_control.path(manager, "controls", "placeholder");
             var dir = try std.Io.Dir.openDirAbsolute(io.getIo(), std.Io.Dir.path.dirname(parent).?, .{ .iterate = true });

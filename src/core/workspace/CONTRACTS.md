@@ -236,6 +236,21 @@ adds actor signatures and delegated path grants. Distributed storage, remote
 filesystem mounting, and hosted company actor sessions require additional
 implementations.
 
+## Retained execution context
+
+On invocation startup, the host projects action intents and tool results from
+retained task history into a compact recovery summary. It joins records by
+execution identity, counts successful and failed tool results, and includes up
+to 16 unresolved intent references with an omitted count. A missing result is
+unresolved. Failed external calls can have effects and require reconciliation
+before retrying. These counts do not establish completed user outcomes, grant
+permission to replay tools, or replace independent completion review.
+
+Progress assessment reuses the evidence snapshot supplied to its reviewer when
+updating continuation state. Completion review still collects its own current
+snapshot. Governance response records include model-call elapsed milliseconds
+and request-message counts for latency investigation.
+
 ## Audit and migration
 
 `omos fossil audit --json` validates canonical action, evidence and plan records
@@ -479,7 +494,19 @@ collector renames a clean view into quarantine and verifies it again before
 removal. Interrupted quarantines remain available for inspection. Baselines and
 Fossil history are retained.
 
+Canonical content verification reads up to eight objects of at most 1 MiB per
+query. Larger objects use the individual verified artifact reader. Each object
+must match its manifest identity and the local file hash before a view can be
+removed, including verification after quarantine. Batching reduces
+Fossil process launches while preserving the same deletion checks.
+
 Fresh execution policies bound clean cached views to 256 MiB and 32 views.
+Before automatic trimming, a metadata-only scan counts eligible views and their
+file sizes as a conservative upper bound. When both totals fit the policy, the
+collector retains the views as `unverified_within_budget` without hashing file
+contents or taking writer locks. Exceeding either bound uses the full canonical
+verification and deletion checks. Explicit `status` and `prune` retain those
+checks regardless of the budget.
 The `projections` field is omitted when absent in legacy policies, preserving
 pinned policy hashes. Saved managed turns, the writable service, and the persistent
 UI host share one kernel-owned background maintenance lease per repository binding.
@@ -1316,3 +1343,23 @@ This transition dispatches no actor and does not reset a worker invocation
 budget. It requires current scoped submission and compute authority. Only its
 admitted immutable intent permits internal reconciliation without an execution
 fence; publication retains independent verification and current-base checks.
+
+## Conversation continuity and review triggers
+
+Native CLI and UI turns resolve references before creating execution state.
+Exact repeated objectives report the retained contract and its state. The selected
+contract is stored in `runtime/communications/selection-*.json`, so a later
+instruction to finish it survives a process restart. The shared intent classifier
+chooses among status, resume, amendment, separate work, unrelated conversation,
+and clarification. The host validates the selected task and applies its existing
+queue controls; classification never proves completion or answers a permission
+prompt. A resume preserves the contract ID, requirements, and valid plan. Changed
+requirements use contract revision. Explicit separate work creates a new contract.
+Running and queued workers are reported without dispatching a duplicate.
+
+Execution checkpoints remain durable. Full historical evidence is assembled when
+review needs it, rather than before every invocation. Source prerequisites for
+coding tasks are still checked before execution. Event-triggered progress review
+provides guidance after repeated failures or unchanged observations; it does not
+replace independent completion review or the exact-revision publication fence.
+The explicit periodic policy remains available for operators who require it.

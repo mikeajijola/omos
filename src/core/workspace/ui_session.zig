@@ -67,8 +67,10 @@ pub const Host = struct {
     session_id: []const u8 = "",
     project_root: ?[]const u8 = null,
     execution_lease_held: bool = false,
+    contract_selected: bool = false,
     background_authority: ?*const @import("background_control.zig").Authority = null,
     coordinator_mode: bool = false,
+    channel_context: ?[]const u8 = null,
     session_binding_ctx: ?*anyopaque = null,
     session_binding_fn: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
 

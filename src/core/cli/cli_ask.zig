@@ -1422,7 +1422,7 @@ pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_
     }
     var ui_cfg = cfg;
     const assignment = if (ui.background_authority) |authority|
-        try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.\n</omos_background_assignment>", .{authority.task})
+        try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. When resuming after interruption, first inspect the retained task history and external receipts. A missing tool response means the outcome is uncertain, not that the action failed. Use read-only checks to reconcile it before any repeat submission or other external mutation; if no check can establish a safe next action, report that specific blocker. Reconnect tools and rediscover browser tabs when handles are stale. Preserve confirmed outcomes and continue only the remaining obligations. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.\n</omos_background_assignment>", .{authority.task})
     else
         null;
     defer if (assignment) |text| alloc.free(text);
@@ -2536,6 +2536,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .record_tool_call_rejected = recordToolCallRejected,
         .record_tool_call_failed = recordToolCallFailed,
         .report_usage = reportUsage,
+        .report_failure = reportFailure,
     };
 }
 
@@ -2638,6 +2639,11 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
     const writable = if (ctx.writable) |*value| value else return;
     if (usage.input_tokens) |input| writable.state.total_input_tokens = input;
     if (usage.output_tokens) |output| writable.state.total_output_tokens = output;
+}
+
+fn reportFailure(raw_ctx: *anyopaque, code: []const u8) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.typed_error_code = code;
 }
 
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {

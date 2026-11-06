@@ -1,12 +1,67 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, realpathSync, rmSync, copyFileSync, chmodSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync, appendFileSync, statSync, realpathSync, rmSync, copyFileSync, chmodSync, renameSync, truncateSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
+import { cleanupFixtures, fixture, periodicReviews, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { NativeClient } from "./workspace-ui-client.mjs";
 import { TmuxSession, tmuxAvailable, terminalFixtureShell } from "./tmux-helpers";
+
+for (const mode of ["invalid offset", "unknown record", "invalid checkpoint"]) {
+  test(`completion review recovers from ${mode} without repeating actor work`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Keep the verified preference.") : { content: "Saved the preference." }, packet => {
+      reviews++;
+      const record = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.status === "success");
+      expect(record).toBeDefined();
+      if (reviews === 1) return mode === "invalid checkpoint"
+        ? { name: "omos_review_checkpoint", args: { id: record.id, offset: 999999, bytes: 1, obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, verdict: "supports", note: "Invalid range must be rejected" })) } }
+        : { name: "omos_review_evidence", args: { action: "read", id: mode === "unknown record" ? "invented" : record.id, offset: mode === "invalid offset" ? 999999 : 0 } };
+      const correction = packet.currentInspections.find((page: any) => page.error_code);
+      expect(correction?.accepted).toBe(false);
+      expect(correction?.error_code).toBe(mode === "unknown record" ? "InvalidContractEvidence" : "InvalidEvidenceOffset");
+      if (reviews === 2) return { name: "omos_review_evidence", args: { action: "read", id: record.id, offset: 0 } };
+      expect(packet.currentInspections.some((page: any) => page.id === record.id && page.fullyInspected)).toBe(true);
+      return "met";
+    });
+    const result = await f.run(["ask", "Save my preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(2);
+    expect(reviews).toBe(3);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Keep the verified preference.");
+  }, 120000);
+}
+
+for (const mode of ["parallel reads", "stale assessment"]) {
+  test(`completion review corrects ${mode} within the same actor turn`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Retain one successful write.") : { content: "Saved the preference." }, packet => {
+      if (++reviews === 1) {
+        if (mode === "stale assessment") return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version + 1, obligations: [] } };
+        const record = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.status === "success");
+        const tool_calls = [0, 1].map(index => ({ index, id: `parallel-${index}`, type: "function", function: { name: "omos_review_evidence", arguments: JSON.stringify({ action: "read", id: record.id }) } }));
+        return new Response([
+          `data: ${JSON.stringify({ id: "parallel-review", choices: [{ index: 0, delta: { tool_calls }, finish_reason: null }] })}`,
+          `data: ${JSON.stringify({ id: "parallel-review", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}`,
+          "data: [DONE]", "",
+        ].join("\n\n"), { headers: { "content-type": "text/event-stream" } });
+      }
+      if (mode === "stale assessment") expect(packet.currentInspections.some((page: any) => page.error_code === "InvalidContractAssessment" && page.accepted === false)).toBe(true);
+      else expect(packet.currentInspections).toHaveLength(0);
+      return "met";
+    });
+    const result = await f.run(["ask", "Save my preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(2);
+    expect(reviews).toBe(2);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Retain one successful write.");
+  }, 120000);
+}
 
 afterEach(cleanupFixtures);
 
@@ -209,6 +264,56 @@ describe("portable Fossil workspace recovery", () => {
     expect(f.fossil("cat", "documents/draft.txt", "-r", "trunk")).toBe("Uncommitted legacy draft");
   }, 120000);
 
+  test("batches canonical cache verification and retains views when repository bytes fail verification", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let root = "";
+    model(f, (body, count) => {
+      if (count > 1) return { content: "Saved the requested documents." };
+      const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
+      root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      const program = "import pathlib,sys\nroot=pathlib.Path(sys.argv[1])/'documents'\nroot.mkdir(exist_ok=True)\nfor i in range(12): (root/f'batch-{i}.txt').write_text((f'Canonical {i}\\n')*(90000 if i==11 else 6000))";
+      return { tool_calls: [{ index: 0, id: "cache-fixture-files", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", profile: "clean", command: `python3 -c ${quote(program)} ${quote(root)}`, timeout_ms: 10000 } }) } }] };
+    });
+    const saved = await f.run(["ask", "Save twelve documents for cache verification", "--json"], {}, 90000);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
+    const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
+    const helper = join(f.home, "count-cache-reads.py"), log = join(f.home, "cache-reads.jsonl"), fault = join(f.home, "corrupt-cache-batch");
+    writeFileSync(fault, "1");
+    writeFileSync(helper, `#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(${JSON.stringify(log)}, 'a') as output: output.write(json.dumps(args)+'\\n')
+result = subprocess.run([${JSON.stringify(realFossil)}, *args], capture_output=True)
+if os.path.exists(${JSON.stringify(fault)}) and 'size <= 1048576' in args[-1] and result.returncode == 0:
+    rows = json.loads(result.stdout)
+    if rows: rows[0]['encoded'] = '626164'
+    print(json.dumps(rows))
+else: sys.stdout.buffer.write(result.stdout)
+sys.stderr.buffer.write(result.stderr)
+sys.exit(result.returncode)
+`, { mode: 0o700 });
+    const retained = await f.run(["fossil", "cache", "trim", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(retained.code, retained.stderr).toBe(0);
+    expect(JSON.parse(retained.stdout).model_data.entries.find((entry: any) => entry.path === root).state).toBe("unverified_within_budget");
+    expect(readFileSync(log, "utf8")).not.toContain("size <= 1048576");
+    expect(existsSync(root)).toBe(true);
+    const refused = await f.run(["fossil", "cache", "prune", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(refused.code, refused.stderr).toBe(0);
+    expect(JSON.parse(refused.stdout).model_data.removed).toBe(0);
+    expect(existsSync(root)).toBe(true);
+    rmSync(fault);
+    writeFileSync(log, "");
+    const pruned = await f.run(["fossil", "cache", "prune", "--json"], { OMOS_FOSSIL_BIN: helper });
+    expect(pruned.code, pruned.stderr).toBe(0);
+    expect(JSON.parse(pruned.stdout).model_data.removed).toBe(1);
+    expect(existsSync(root)).toBe(false);
+    const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(calls.filter(args => args.some((arg: string) => arg.includes("size <= 1048576")))).toHaveLength(6);
+    expect(calls.filter(args => args.includes("cat") && args.some((arg: string) => arg.startsWith("documents/batch-")))).toHaveLength(0);
+  }, 180000);
+
   test("prunes only clean accepted views and preserves drafts, execution caches, and live resources", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -294,8 +399,10 @@ describe("portable Fossil workspace recovery", () => {
       expect(readFileSync(join(root, "documents/shared.txt"), "utf8")).toBe(content);
       return { content: "Read verified portable content." };
     });
+    // Exercise separate views explicitly; an identical request selects its retained contract.
+    let readNumber = 0;
     const read = async () => {
-      const result = await f.run(["ask", "Read the shared portable document", "--json"]);
+      const result = await f.run(["ask", `Start independent cache-read task ${++readNumber}: read the shared portable document`, "--json"]);
       expect(result.code, result.stderr).toBe(0);
     };
     await read();
@@ -345,7 +452,7 @@ describe("portable Fossil workspace recovery", () => {
       return { content: "Retained the complete declared fixture package." };
     });
     const saved = await f.run(["ask", "Save the portable skill fixture", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const result = await f.run(["fossil", "package", "plan", "cv_builder", "--realisation", "cv_builder_skill", "--json"]);
     expect(result.code, result.stderr).toBe(0);
     const snapshot = JSON.parse(result.stdout).model_data;
@@ -385,7 +492,7 @@ describe("portable Fossil workspace recovery", () => {
       { path: "documents/unrelated.txt", content: "Outside the selected capability" },
     ].map((args, index) => ({ index, id: `closure-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...args }) } })) } : { content: "Saved the portable fixture and unrelated document." });
     const saved = await f.run(["ask", "Save the declared package inputs", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const admin = async (body: object) => {
       const file = join(f.home, "operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
       const result = await f.run(["fossil", "company", file, "--json"]);
@@ -4218,7 +4325,7 @@ sys.exit(result.returncode)
       return { content: "The script text and executable flag are verified in the portable workspace." };
     });
     const saved = await f.run(["ask", "Save and update a portable executable script", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const firstRevision = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision;
     expect(f.fossil("artifact", firstRevision)).toMatch(/^F skills\/portable\/run.sh [a-f0-9]+ x$/m);
     const exported = join(f.home, "executable-package.fossil");
@@ -4353,6 +4460,13 @@ sys.exit(result.returncode)
   test("materialises requested paths without deleting unfetched content and hydrates opaque shell reads", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const python = Bun.which("python3");
+    const fossil = Bun.which("fossil");
+    expect(python).not.toBeNull();
+    expect(fossil).not.toBeNull();
+    const slowMarker = join(f.home, "slow-hydration");
+    const wrapper = join(f.home, "slow-fossil");
+    writeFileSync(wrapper, `#!${python}\nimport os, sys, time\nmarker = ${JSON.stringify(slowMarker)}\nif "cat" in sys.argv and "memory/shell-only.txt" in sys.argv and os.path.exists(marker):\n    os.unlink(marker)\n    time.sleep(35)\nos.execv(${JSON.stringify(fossil)}, [${JSON.stringify(fossil)}] + sys.argv[1:])\n`, { mode: 0o700 });
     let root = "";
     model(f, (body, count) => {
       const context = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
@@ -4376,17 +4490,20 @@ sys.exit(result.returncode)
       }
       if (count === 6) {
         expect(existsSync(join(root, "memory/shell-only.txt"))).toBe(false);
+        writeFileSync(slowMarker, "delay the cold shell input once");
         return call("shell", { request: { action: "run", command: `cat '${root}/memory/shell-only.txt'`, timeout_ms: 10000 } });
       }
+      expect(existsSync(slowMarker)).toBe(false);
+      expect(context).not.toContain("Workspace content could not be materialised: Timeout");
       expect(readFileSync(join(root, "memory/shell-only.txt"), "utf8")).toBe("Available to opaque commands");
       return { content: "Read and edited the requested records while preserving all workspace content." };
     });
-    const result = await f.run(["ask", "Read and edit workspace documents using their pinned files", "--json"], {}, 120000);
+    const result = await f.run(["ask", "Read and edit workspace documents using their pinned files", "--json"], { OMOS_FOSSIL_BIN: wrapper }, 150000);
     expect(result.code, result.stderr).toBe(0);
     expect(f.fossil("cat", "documents/one.txt", "-r", "trunk")).toBe("Pinned first document");
     expect(f.fossil("cat", "documents/unfetched.txt", "-r", "trunk")).toBe("Retain this unread file");
     expect(f.fossil("cat", "memory/shell-only.txt", "-r", "trunk")).toBe("Available to opaque commands");
-  }, 150000);
+  }, 180000);
 
   test("searches sparse managed directories using absolute globs and scoped text queries", async () => {
     const f = fixture();
@@ -5050,9 +5167,15 @@ sys.exit(result.returncode)
   test("verifies a retained answer on the server without replaying actor work", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
-    let permit = false;
-    const m = model(f, () => ({ content: "The retained answer can be reviewed independently." }), packet => permit ? "met" : {
+    let permit = false, truncated = false;
+    const m = model(f, () => ({ content: "The retained answer can be reviewed independently." }), packet => {
+      if (permit && !truncated) {
+        truncated = true;
+        return new Response('data: {"id":"server-review","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } });
+      }
+      return permit ? "met" : {
       name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["invented"], note: "Fixture forces retained review failure" }] },
+      };
     });
     const first = await f.run(["ask", "Give a short informational answer", "--json"]);
     expect(first.code).toBe(1);
@@ -5090,6 +5213,7 @@ sys.exit(result.returncode)
       }
       expect(completed, existsSync(f.env.FX_TRACE_LOG) ? readFileSync(f.env.FX_TRACE_LOG, "utf8").slice(-4000) : "").toMatchObject({ state: "published", generation: 1 });
       expect(m.counts().actors).toBe(actorCount);
+      expect(truncated).toBe(true);
       expect(m.packets.at(-1).contract.objective).toBe(task.definition.objective);
       const repaired = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
       expect(repaired.state).toBe("accepted");
@@ -5303,8 +5427,14 @@ sys.exit(result.returncode)
   test("does not let a progress checkpoint cite a cached large preview as fully inspected evidence", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
+    const declaration = join(f.home, "definition.json");
+    const execution = join(f.home, "execution.json");
+    writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+    writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic", max_actor_steps: 6 } }));
+    expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
     let checks = 0;
-    const m = model(f, (_body, count) => count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
+    const m = model(f, (body, count) => !body.tools?.length ? { content: "The policy is retained but verification is unfinished." } : count === 1 ? writeMemory("A long policy statement.\n".repeat(2000)) : {
       tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     }, undefined, { progress: packet => {
       checks++;
@@ -5316,18 +5446,26 @@ sys.exit(result.returncode)
     } });
     const result = await f.run(["ask", "Save the policy and inspect the workspace for useful follow-up information", "--json"], {}, 90000);
     expect(result.code).toBe(1);
-    expect(checks).toBe(1);
-    expect(m.counts().actors).toBe(4);
+    expect(checks).toBe(8);
+    expect(result.stderr + result.stdout).toContain("actor-step budget");
+    expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("memory/preference.md");
   }, 120000);
 
-  test("stops a repeated successful search after three stalled progress checks", async () => {
+  test("reviewer pauses a repeated successful search after reassessing three stalled checks", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     const m = model(f, (body, count) => !body.tools?.length ? { content: "The search is unfinished. The repeated results are retained." } : {
       tool_calls: [{ index: 0, id: `search-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
-    });
+    }, undefined, { progress: (packet) => ({
+      outcome: packet.progressContext.consecutiveNoProgress >= 2 ? "pause" : "continue_work",
+      meaningful: false, evidence: [], remaining: ["request_complete"],
+      note: "Repeated workspace reads have not resolved the request.",
+      reassessment: "Three checks found the same workspace data; repeating this search cannot resolve the missing information.",
+    }) });
+
     const result = await f.run(["ask", "Inspect the workspace repeatedly until useful information is found", "--json"], {}, 180000);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain("Task paused");
@@ -5347,8 +5485,12 @@ sys.exit(result.returncode)
     writeFileSync(declaration, JSON.stringify(seed));
     writeFileSync(execution, JSON.stringify({ defaults: { max_actor_steps: 3 } }));
     expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
-    const m = model(f, (body, count) => !body.tools?.length ? { content: "Two workspace inspections completed; further work remains." } : {
-      tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+    let recoveryDelivered = false;
+    const m = model(f, (body, count) => {
+      if (count === 4) recoveryDelivered = body.messages.some((message: any) => typeof message.content === "string" && message.content.includes("Retained execution summary") && message.content.includes('"successful_tool_results":2'));
+      return !body.tools?.length ? { content: "Two workspace inspections completed; further work remains." } : {
+        tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
+      };
     });
     const first = await f.run(["ask", "Inspect this workspace until a useful result is found", "--json"], {}, 120000);
     expect(first.code, first.stderr).toBe(1);
@@ -5357,6 +5499,7 @@ sys.exit(result.returncode)
     const session = JSON.parse(first.stdout).session_id;
     const second = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 120000);
     expect(second.code, second.stderr).toBe(1);
+    expect(recoveryDelivered).toBe(true);
     expect(m.counts().actors).toBe(6);
     expect(m.counts().assessments).toBe(0);
   }, 180000);
@@ -5407,6 +5550,16 @@ sys.exit(result.returncode)
     const result = await f.run(["ask", "Implement answer.txt and test that it exists", "--json"], {}, 150000);
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(m.counts()).toEqual({ actors: 5, assessments: 2 });
+    const snapshots = m.packets.map((packet: any) => {
+      const source = packet.evidence.find((record: any) => record.id.startsWith("source-state:"));
+      return { state: JSON.parse(source.content), evidence: packet.evidence };
+    });
+    expect(snapshots).toHaveLength(2);
+    for (const [index, snapshot] of snapshots.entries()) {
+      const current = snapshot.evidence.find((record: any) => record.raw_call_id === `code-${index === 0 ? 2 : 4}`);
+      expect(snapshot.state.current_validation_evidence).toContain(current.id);
+    }
+    expect(snapshots[1].state.current_validation_evidence).not.toContain(snapshots[0].state.current_validation_evidence[0]);
   }, 150000);
 
   test("does not execute a repeated invalid tool proposal", async () => {
@@ -5714,7 +5867,7 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     const content = "A retained policy document.\n".repeat(2000);
-    let corrupted = false, cacheRoot = "", expectedHash = "";
+    let corrupted = false, restoring = false, cacheRoot = "", expectedHash = "";
     const m = model(f, (_body, count) => count === 1 ? writeMemory(content) : { content: "The policy document is saved." }, packet => {
       const record = packet.evidence.find((entry: any) => entry.kind === "tool" && !entry.complete);
       expect(record).toBeDefined();
@@ -5726,6 +5879,9 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
       cacheRoot = directory;
       expectedHash = record.sha256;
       const payload = readFileSync(join(directory, record.sha256));
+      // Bounded reviewer correction may ask again while the deliberately
+      // corrupted payload still exists. It must remain unaccepted until resume.
+      if (corrupted && !restoring) return { name: "omos_review_evidence", args: { action: "read", id: record.id } };
       expect(createHash("sha256").update(payload).digest("hex")).toBe(record.sha256);
       if (!corrupted) {
         corrupted = true;
@@ -5744,6 +5900,7 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const session = JSON.parse(first.stdout).session_id;
     expect(cacheRoot).not.toBe("");
     rmSync(cacheRoot, { recursive: true });
+    restoring = true;
     const resumed = await f.run(["ask", "--resume-id", session, "continue", "--json"], {}, 90000);
     expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
     expect(m.counts().actors).toBe(2);
@@ -5751,6 +5908,40 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe(content);
     expect(f.fossil("ls", "-r", "trunk")).not.toContain("review-payloads");
   }, 180000);
+
+  test.each(["length", "incomplete", "missing-tool"])("recovers a %s reviewer response and publishes without replaying completed actions", async failure => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let reviews = 0;
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Saved once before review recovery.") : { content: "The preference is saved." }, () => {
+      if (++reviews !== 1) return "met";
+      // Even a plausible assessment must not be accepted from a length-ended
+      // stream. The next review must run without repeating the actor's write.
+      const prefix = 'data: {"id":"interrupted-review","choices":[{"index":0,"delta":{"content":"incomplete assessment"},"finish_reason":null}]}\n\n';
+      const end = failure === "incomplete" ? "" : `data: ${JSON.stringify({id:"interrupted-review",choices:[{index:0,delta:{},finish_reason:failure === "length" ? "length" : "stop"}]})}\n\ndata: [DONE]\n\n`;
+      return new Response(prefix + end, { headers: { "content-type": "text/event-stream" } });
+    });
+    const result = await f.run(["ask", "Save the preference", "--json"], {}, 90000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(reviews).toBeGreaterThan(1);
+    expect(m.counts().actors).toBe(2);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Saved once before review recovery.");
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks[0].state).toBe("accepted");
+  }, 120000);
+
+  test("exhausts incomplete reviewer retries without accepting a partial answer or repeating actor work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    const m = model(f, () => ({ content: "Retain this answer for later verification." }), () => new Response('data: {"id":"always-truncated","choices":[{"index":0,"delta":{"content":"unfinished"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n', { headers: { "content-type": "text/event-stream" } }));
+    const result = await f.run(["ask", "Give a short informational answer", "--json"], {}, 90000);
+    expect(result.code).toBe(1);
+    expect(result.stderr + result.stdout).toContain("Verification is pending");
+    expect(m.counts().actors).toBe(1);
+    expect(m.counts().assessments).toBeLessThanOrEqual(24);
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks[0].state).toBe("paused");
+  }, 120000);
 
   test("continues a failed review from its retained candidate without repeating actor work", async () => {
     const f = fixture();
@@ -5767,8 +5958,14 @@ os.execv(${JSON.stringify(executable)}, [${JSON.stringify(executable)}, *args])
     const actual = JSON.parse(first.stdout).session_id;
     expect(session).toBe(createHash("sha256").update(actual).digest("hex"));
     permit = true;
-    const resumed = await f.run(["ask", "--resume-id", actual, "continue", "--json"]);
+    let classifierCalls = 0;
+    const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch() { classifierCalls++; return new Response("unavailable", { status: 503 }); } });
+    let resumed: Awaited<ReturnType<typeof f.run>>;
+    try {
+      resumed = await f.run(["ask", "--resume-id", actual, "continue", "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${classifier.port}`, OMOS_CLASSIFIER_MODEL: "fixture-classifier" });
+    } finally { classifier.stop(true); }
     expect(resumed.code, resumed.stderr).toBe(0);
+    expect(classifierCalls).toBe(0);
     expect(resumed.stdout).toContain("A retained answer.");
     expect(m.counts().actors).toBe(1);
   }, 60000);
@@ -5979,6 +6176,36 @@ sys.exit(result.returncode)
     expect(status.tasks).toHaveLength(0);
   }, 30000);
 
+  test("publishes concurrent identical text and binary files without repeating actor work", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    let arrived = 0, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const turns = { a: 0, b: 0 };
+    model(f, body => {
+      const key = JSON.stringify(body.messages).includes("task-A") ? "a" : "b";
+      if (++turns[key] > 1) return { content: `Saved the shared files and ${key}'s document.` };
+      return { tool_calls: [
+        ["documents/shared.txt", "Identical text"],
+        ["documents/shared.bin", "Identical\u0000binary"],
+        [`documents/${key}.txt`, key],
+      ].map(([path, content], index) => ({ index, id: `write-${key}-${index}`, type: "function", function: {
+        name: "fossil_workspace", arguments: JSON.stringify({ action: "write", path, content }),
+      } })) };
+    }, async () => { if (++arrived === 2) release(); await gate; return "met"; });
+    const results = await Promise.all([
+      f.run(["ask", "task-A: save the shared files and document A", "--json"], {}, 90000),
+      f.run(["ask", "task-B: save the shared files and document B", "--json"], {}, 90000),
+    ]);
+    expect(results.map(result => result.code), JSON.stringify(results)).toEqual([0, 0]);
+    expect(turns).toEqual({ a: 2, b: 2 });
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks.map((task: any) => task.state)).toEqual(["accepted", "accepted"]);
+    expect(f.fossil("cat", "documents/shared.txt", "-r", "trunk")).toBe("Identical text");
+    expect(f.fossil("cat", "documents/shared.bin", "-r", "trunk")).toBe("Identical\u0000binary");
+    for (const key of ["a", "b"]) expect(f.fossil("cat", `documents/${key}.txt`, "-r", "trunk")).toBe(key);
+  }, 120000);
+
   test("retains a file conflict when concurrent proposals change its content and executable flag", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -6121,3 +6348,255 @@ sys.exit(result.returncode)
     expect(readFileSync(join(session, "session.json"), "utf8")).toContain("must-not-export");
   }, 30000);
 });
+
+
+function governanceCall(name: string, args: object, index = 0) {
+  return { index, id: `review-${index}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
+}
+
+function governanceJournal(f: ReturnType<typeof fixture>, task: any) {
+  const query = `SELECT content(uuid) AS raw FROM files_of_checkin('task/${task.id}') WHERE filename GLOB 'history/${task.id}/*'`;
+  return JSON.parse(f.fossil("sql", "--readonly", "-init", "/dev/null", "-batch", "-json", query)).map((row: any) => JSON.parse(row.raw));
+}
+
+for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
+  test(`workspace governance recovers from ${mode} without replaying actor work`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
+    let progressCalls = 0;
+    const parallel: unknown[] = [];
+    const feedback: any[] = [];
+    const m = model(f, (_body, count) => count <= 4 ? {
+      tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })],
+    } : { content: "The workspace kind is omos." }, undefined, {
+      reply(body, packet, phase) {
+        if (phase !== "progress") return;
+        progressCalls++;
+        parallel.push(body.parallel_tool_calls);
+        feedback.push(...body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content)));
+        const evidence = packet.evidence.find((entry: any) => entry.id.startsWith("execution:"));
+        if (progressCalls === 1) {
+          const id = mode === "shortened evidence ID" ? evidence.id.slice(0, evidence.id.lastIndexOf(":tool:")) : evidence.id;
+          const first = governanceCall("omos_review_evidence", { action: "read", id });
+          return { tool_calls: mode === "shortened evidence ID" ? [first] : [first, governanceCall("omos_review_evidence", { action: "read", id }, 1)] };
+        }
+        if (mode === "shortened evidence ID" && progressCalls === 2) return { tool_calls: [governanceCall("omos_review_evidence", { action: "read", id: evidence.id })] };
+        return { tool_calls: [governanceCall("omos_progress_assessment", { execution_readiness: "not_applicable", next_step: "", prerequisite: "", outcome: "finalize", meaningful: true, evidence: [evidence.id], remaining: ["request_complete"], note: "Inspected the workspace evidence." })] };
+      },
+    });
+    const result = await f.run(["ask", "Identify the workspace kind after inspecting it", "--json"], {}, 120000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 5, assessments: 1 });
+    expect(progressCalls).toBe(mode === "shortened evidence ID" ? 3 : 2);
+    expect(parallel.every(value => value === false)).toBe(true);
+    if (mode === "shortened evidence ID") expect(feedback.some(value => value.error_code === "InvalidContractEvidence")).toBe(true);
+    else expect(feedback.filter(value => value.fullyInspected === true)).toHaveLength(2);
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).toBe("accepted");
+    const journal = governanceJournal(f, task);
+    expect(journal.some((entry: any) => entry.kind === "governance_response")).toBe(true);
+    for (const entry of journal.filter((entry: any) => entry.kind === "governance_response")) {
+      const response = JSON.parse(entry.value.data);
+      expect(response.model_elapsed_ms).toBeGreaterThanOrEqual(0);
+      expect(response.request_messages).toBeGreaterThan(0);
+    }
+    expect(journal.some((entry: any) => entry.kind === "governance_failure")).toBe(false);
+  }, 120000);
+}
+
+test("workspace governance defers rejected assessments with diagnostics until the actor budget", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
+  const declaration = join(f.home, "definition.json");
+  const execution = join(f.home, "execution.json");
+  writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+  writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic", max_actor_steps: 6 } }));
+  expect((await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"])).code).toBe(0);
+  let progressCalls = 0;
+  const m = model(f, (body) => !body.tools?.length ? { content: "Inspection remains unfinished." } : ({ tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] }), undefined, {
+    usage: { prompt_tokens: 23, completion_tokens: 7, total_tokens: 30 },
+    reply(_body, _packet, phase) {
+      if (phase !== "progress") return;
+      progressCalls++;
+      return { tool_calls: [governanceCall("omos_progress_assessment", { execution_readiness: "not_applicable", next_step: "", prerequisite: "", outcome: "finalize", meaningful: false, evidence: [], remaining: ["invented_obligation"], note: "This ID is not in the contract." })] };
+    },
+  });
+  const result = await f.run(["ask", "Inspect the workspace before answering", "--json"], {}, 120000);
+  expect(result.code).toBe(1);
+  expect(result.stderr + result.stdout).toContain("actor-step budget");
+  expect(progressCalls).toBe(8);
+  expect(m.counts()).toEqual({ actors: 6, assessments: 0 });
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("paused");
+  const journal = governanceJournal(f, task);
+  expect(journal.some((entry: any) => entry.kind === "progress_review_deferred")).toBe(true);
+  expect(journal.some((entry: any) => entry.kind === "progress_assessment")).toBe(false);
+  const failure = JSON.parse(journal.find((entry: any) => entry.kind === "governance_failure").value.data);
+  expect(failure.reason).toBe("TaskGovernancePending");
+  expect(failure.last_reason).toBe("InvalidProgressObligations");
+  expect(failure.calls).toBe(8);
+  expect(failure.usage.input_tokens).toBe(184);
+  expect(failure.usage.output_tokens).toBe(56);
+  expect(JSON.parse(result.stdout).usage.input_tokens).toBeGreaterThanOrEqual(184);
+  expect(JSON.parse(result.stdout).usage.output_tokens).toBeGreaterThanOrEqual(56);
+  expect(journal.filter((entry: any) => entry.kind === "governance_response" && JSON.parse(entry.value.data).phase === "omos_progress_assessment")).toHaveLength(8);
+}, 120000);
+
+test("workspace governance corrects malformed plans before actor execution", async () => {
+  const f = fixture();
+  let plans = 0;
+  const m = model(f, () => ({ content: "Answered the question." }), undefined, {
+    reply(body, _packet, phase) {
+      if (phase !== "plan") return;
+      expect(body.parallel_tool_calls).toBe(false);
+      plans++;
+      if (plans === 1) return { tool_calls: [governanceCall("omos_task_plan", { capability: "invented", summary: "Invalid capability", obligations: [], checks: [] })] };
+    },
+  });
+  const result = await f.run(["ask", "Answer the question", "--json"], {}, 120000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(plans).toBe(2);
+  expect(m.counts().actors).toBe(1);
+}, 120000);
+
+test("workspace governance retains oversized source preparation failures before actor execution", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  writeFileSync(join(f.cwd, "large.bin"), "");
+  truncateSync(join(f.cwd, "large.bin"), 256 * 1024 * 1024 + 1);
+  const m = model(f, () => ({ content: "Must not execute" }), undefined, { plan: { capability: "coding_task", summary: "Implement the request", obligations: [], checks: [] } });
+  const result = await f.run(["ask", "Implement the requested source change", "--json"], {}, 120000);
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("Workspace evidence could not be prepared");
+  expect(result.stdout + result.stderr).toContain("SourceStateTooLarge");
+  expect(m.counts().actors).toBe(0);
+  expect(JSON.parse(result.stdout).error).toBe("workspace_preparation_pending");
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("paused");
+  const failure = governanceJournal(f, task).find((entry: any) => entry.kind === "invocation_failure");
+  expect(failure.value.reason).toBe("SourceStateTooLarge");
+}, 120000);
+
+for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", "changed outcome"]) {
+  test(`contract revision recovery handles ${mode} and resumes the saved task`, async () => {
+    const f = fixture();
+    let blocked = true;
+    let revisions = 0;
+    const goal = "Could the agent control its own harness using its CLI";
+    const m = model(f, () => ({ content: "The CLI exposes controls subject to host checks." }), () => blocked ? "blocked" : "met", {
+      plan: { capability: "general_task", summary: "Explain CLI control", obligations: mode === "large unchanged echo"
+        ? Array.from({ length: 32 }, (_, i) => ({ id: `explain_cli_${i}`, description: `Explain CLI control ${i}` }))
+        : [{ id: "explain_cli", description: "Explain CLI control" }], checks: [] },
+      reply(body, packet, phase) {
+        if (phase !== "revise") return;
+        revisions++;
+        const obligations = structuredClone(packet.context.contract.obligations);
+        if (mode === "protected edit" && revisions === 1) obligations[0].description = "Accept unfinished work";
+        if (mode === "protected edit" && revisions === 2) {
+          const feedback = body.messages.filter((message: any) => message.role === "tool").map((message: any) => JSON.parse(message.content));
+          expect(feedback.at(-1).instruction).toContain("Remove protected requirement 'request_complete' from obligations");
+        }
+        if (mode === "changed outcome") obligations.find((o: any) => o.id === "explain_cli").description = "Explain scheduling only";
+        return { tool_calls: [governanceCall("omos_contract_revision", {
+          capability: "general_task", summary: "Apply the user follow-up", obligations, checks: [],
+          superseded: mode === "changed outcome" ? ["explain_cli"] : [],
+        })] };
+      },
+    });
+    const first = await f.run(["ask", goal, "--json"]);
+    expect(first.code, first.stderr).toBe(1);
+    const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    blocked = false;
+    const followup = mode === "changed outcome" ? "Explain scheduling only instead" : goal + "?";
+    const second = await f.run(["ask", "--resume-id", JSON.parse(first.stdout).session_id, followup, "--json"]);
+    expect(second.code, second.stderr + second.stdout).toBe(0);
+    expect(revisions).toBe(mode === "protected edit" ? 2 : 1);
+    const after = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(after.id).toBe(before.id);
+    expect(after.state).toBe("accepted");
+    expect(after.revision_pending).toBe(false);
+    expect(after.definition.obligations[0]).toEqual(before.definition.obligations[0]);
+    if (mode === "changed outcome") expect(after.definition.obligations.find((o: any) => o.id === "explain_cli").description).toBe("Explain scheduling only");
+    else expect(after.definition.obligations).toEqual(before.definition.obligations);
+    expect(m.counts().actors).toBe(2);
+  }, 120000);
+}
+
+test("progress readiness requires a specific result and verification and forwards them without replaying work", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
+  let reviews = 0;
+  let delivered = false;
+  const nextStep = "Write the requested preference checkpoint, then verify its retained result.";
+  const readyTarget = "memory/preference.md containing the requested preference";
+  const verification = "Read the retained preference checkpoint and compare its content.";
+  const m = model(f, (body, count) => {
+    if (count <= 4) return { tool_calls: [governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] };
+    if (count === 5) {
+      delivered = body.messages.some((message: any) => message.role === "user" && message.content.includes("Host progress assessment:") && message.content.includes(nextStep) && message.content.includes(readyTarget) && message.content.includes(verification));
+      return writeMemory("Verified increment.");
+    }
+    return { content: "Saved the requested preference checkpoint." };
+  }, undefined, {
+    reply(body, _packet, phase) {
+      if (phase !== "progress") return;
+      reviews++;
+      const schema = body.tools.find((tool: any) => tool.function?.name === "omos_progress_assessment").function.parameters;
+      expect(schema.required).toContain("execution_readiness");
+      expect(schema.required).toContain("next_step");
+      expect(schema.required).toContain("ready_target");
+      expect(schema.required).toContain("verification");
+      if (reviews === 2) expect(body.messages.some((message: any) => message.role === "tool" && message.content.includes("InvalidProgressReadiness"))).toBe(true);
+      return { tool_calls: [governanceCall("omos_progress_assessment", {
+        outcome: "continue_work", meaningful: false, evidence: [], remaining: ["request_complete"],
+        note: "Preparation is sufficient for the requested checkpoint.", execution_readiness: "ready",
+        next_step: nextStep, ready_target: reviews === 1 ? "" : readyTarget, verification: reviews === 1 ? "" : verification, prerequisite: "",
+      })] };
+    },
+  });
+  const result = await f.run(["ask", "Inspect the workspace and save one preference checkpoint", "--json"], {}, 120000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(reviews).toBe(2);
+  expect(delivered).toBe(true);
+  expect(m.counts().actors).toBe(6);
+  expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Verified increment.");
+}, 120000);
+
+for (const maximum of [4, 12]) {
+  test(`contract review cadence ${maximum} preserves all writes and independent acceptance`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    const tree = join(f.home, "policy-fixture");
+    mkdirSync(tree);
+    const fossil = (...args: string[]) => {
+      const result = spawnSync("fossil", args, { cwd: tree, env: { ...f.env, PATH: process.env.PATH, USER: "omos", FOSSIL_HOME: f.home }, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
+    const policyPath = join(tree, "execution/omos.json");
+    const policy = JSON.parse(readFileSync(policyPath, "utf8"));
+    policy.defaults.progress_review = "periodic";
+    policy.defaults.progress_max_interval = maximum;
+    writeFileSync(policyPath, JSON.stringify(policy));
+    fossil("commit", "--nosync", "--nosign", "--no-verify", "--allow-empty", "-m", "Set isolated cadence fixture");
+    fossil("close");
+    let reviews = 0;
+    const m = model(f, (_body, count) => count <= 8 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all eight checkpoints." }, undefined, {
+      progress(packet) {
+        reviews++;
+        const evidence = packet.evidence.find((item: any) => item.complete && item.status === "success");
+        expect(evidence).toBeDefined();
+        return { outcome: "continue_work", meaningful: true, evidence: [evidence.id], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "The latest requested checkpoint is retained.", reassessment: "The newest checkpoint records the next requested increment." };
+      },
+    });
+    const result = await f.run(["ask", "Save eight successive numbered preference checkpoints", "--json"], {}, 240000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts().actors).toBe(9);
+    expect(m.counts().assessments).toBeGreaterThan(0);
+    expect(reviews).toBe(maximum === 4 ? 2 : 1);
+    expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Checkpoint 8");
+  }, 240000);
+}
