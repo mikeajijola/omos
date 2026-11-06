@@ -162,7 +162,8 @@ pub fn resolveContract(alloc: std.mem.Allocator, provider: streams.Provider, bas
     request.tools = .{ .additional_functions = &.{intent_schema} };
     request.tool_choice = .required;
     request.provider_options.parallel_tool_calls = false;
-    request.max_output_tokens = 128;
+    // Reasoning providers count internal reasoning against this budget too.
+    request.max_output_tokens = 1024;
     var result = try gateway.streamModelCompletion(provider, alloc, request);
     defer result.deinit(alloc);
     if (result != .completed) return error.RoutingResolutionUnavailable;

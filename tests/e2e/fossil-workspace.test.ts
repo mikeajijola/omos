@@ -830,7 +830,8 @@ for (const fallback of [false, true]) for (const intent of ["resume", "amend", "
   const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.json() as any;
     expect(body.questions.intent).toBeDefined();
-    expect(body.state.selected_contract.objective).toBe(goal);
+    expect(body.state.selected_contract).toEqual({ objective: goal });
+    expect(Object.keys(body.state).sort()).toEqual(["latest_message", "selected_contract"]);
     const labels = Object.keys(body.questions.intent.criteria);
     return Response.json({ model: "fixture-classifier", answers: { intent: { type: "choice", choice: intent, confidence: fallback ? 0.5 : 0.99, probabilities: Object.fromEntries(labels.map(label => [label, label === intent ? 0.99 : 0.01 / (labels.length - 1)])) } } });
   } });

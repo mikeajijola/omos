@@ -86,7 +86,7 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
         return .{ .response = try manager.alloc.print("This request already has contract {s}.\n{s}\nYou can continue this contract, ask for its status, change its requirements, or explicitly start separate work.", .{ task.id, model.text(state, "text") }) };
     }
     const continuing = std.ascii.eqlIgnoreCase(std.mem.trim(u8, message, " \t\r\n"), "continue");
-    const choice: Intent = if (continuing) .@"resume" else if (classification.configured()) try channels.interpretIntent(manager, task, message, focus.pending, cancel) else return .{};
+    const choice: Intent = if (continuing) .@"resume" else if (classification.configured()) try channels.interpretIntent(manager, task, message, cancel) else return .{};
     if (choice == .clarify) return .{ .unresolved_task = task.id };
     return apply(manager, session, message, task.id, choice);
 }
