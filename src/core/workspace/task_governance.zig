@@ -23,6 +23,9 @@ pub const State = struct {
     assessed_batches: usize = 0,
     stalls: usize = 0,
     execution_failed: bool = false,
+    consecutive_failures: usize = 0,
+    unchanged_batches: usize = 0,
+    last_batch: ?[32]u8 = null,
     review_deferred: bool = false,
     last_assessment: ?Progress = null,
     cited_new_evidence: bool = false,
@@ -34,6 +37,11 @@ pub const State = struct {
         if (self.finalizing) return false;
         const elapsed = self.batches -| self.assessed_batches;
         if (elapsed == 0) return false;
+        if (policy.progress_review == .events) {
+            // A batch count is a resource limit, not evidence of a problem.
+            // Give the actor a chance to recover before asking for judgment.
+            return self.consecutive_failures >= policy.stalled_checks or self.unchanged_batches >= policy.progress_interval;
+        }
         const maximum = policy.progress_max_interval orelse policy.progress_interval;
         if (maximum > policy.progress_interval and self.execution_failed) return true;
         const ready = if (self.last_assessment) |assessment|
@@ -43,12 +51,44 @@ pub const State = struct {
         return elapsed >= (if (ready and self.stalls == 0 and !self.review_deferred) maximum else policy.progress_interval);
     }
 
+    pub fn completedBatch(self: *State, messages: []const types.ChatMessage, failed: bool) void {
+        self.batches += 1;
+        self.execution_failed = self.execution_failed or failed;
+        self.consecutive_failures = if (failed) self.consecutive_failures +| 1 else 0;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var count: usize = 0;
+        // Only the latest batch, with call IDs excluded. Unchanged observations
+        // prompt a review; they never prove a stall or authorize stopping work.
+        var start = messages.len;
+        while (start > 0) {
+            start -= 1;
+            if (messages[start].role == .assistant and messages[start].tool_calls.len > 0) break;
+        }
+        for (messages[start..]) |message| {
+            if (message.role == .assistant) for (message.tool_calls) |call| {
+                hash.update(call.name);
+                hash.update(&.{0});
+                hash.update(call.arguments_json);
+                hash.update(&.{0});
+            };
+            if (message.role != .tool) continue;
+            hash.update(message.content orelse "");
+            hash.update(&.{0});
+            count += 1;
+        }
+        const digest = hash.finalResult();
+        self.unchanged_batches = if (count > 0 and self.last_batch != null and std.mem.eql(u8, &digest, &self.last_batch.?)) self.unchanged_batches +| 1 else 0;
+        self.last_batch = if (count > 0) digest else null;
+    }
+
     /// An unavailable assessor establishes neither progress nor a stall. Retry
     /// at the next interval without changing the contract or completion gate.
     pub fn deferUnavailable(self: *State) void {
         self.review_deferred = true;
         self.assessed_batches = self.batches;
         self.execution_failed = false;
+        self.consecutive_failures = 0;
+        self.unchanged_batches = 0;
     }
 
     pub noinline fn observe(self: *State, alloc: std.mem.Allocator, result: Progress, records: []const review.Evidence, policy: model.Policy) !void {
@@ -63,6 +103,8 @@ pub const State = struct {
         self.review_deferred = false;
         self.assessed_batches = self.batches;
         self.execution_failed = false;
+        self.consecutive_failures = 0;
+        self.unchanged_batches = 0;
         if (result.outcome == .pause) self.pause_reason = result.note;
         self.finalizing = result.outcome == .finalize or self.pause_reason != null;
     }
@@ -967,21 +1009,47 @@ test "workspace progress puts new operation evidence before static workspace fil
 }
 
 test "contract review cadence preserves legacy bounds and interrupts ready work on failure" {
-    const policy: model.Policy = .{ .progress_interval = 4, .progress_max_interval = 12 };
+    const policy: model.Policy = .{ .progress_review = .periodic, .progress_interval = 4, .progress_max_interval = 12 };
     var state: State = .{ .batches = 4 };
     try std.testing.expect(state.reviewDue(policy));
     state.last_assessment = .{ .outcome = .continue_work, .meaningful = true, .remaining = &.{}, .note = "Continue verified approach", .execution_readiness = .ready };
     try std.testing.expect(!state.reviewDue(policy));
-    try std.testing.expect(state.reviewDue(.{}));
+    try std.testing.expect(state.reviewDue(.{ .progress_review = .periodic }));
     state.batches = 12;
     try std.testing.expect(state.reviewDue(policy));
     state.batches = 1;
     state.execution_failed = true;
     try std.testing.expect(state.reviewDue(policy));
-    try std.testing.expect(!state.reviewDue(.{}));
+    try std.testing.expect(!state.reviewDue(.{ .progress_review = .periodic }));
     state.deferUnavailable();
     try std.testing.expect(!state.reviewDue(policy));
     state.finalizing = true;
     state.batches = 100;
     try std.testing.expect(!state.reviewDue(policy));
+}
+
+test "event review does not interrupt successful work and failed review backs off" {
+    var state: State = .{};
+    for (0..50) |_| state.completedBatch(&.{}, false);
+    try std.testing.expect(!state.reviewDue(.{}));
+    state.completedBatch(&.{}, true);
+    try std.testing.expect(!state.reviewDue(.{}));
+    state.completedBatch(&.{}, false);
+    try std.testing.expectEqual(@as(usize, 0), state.consecutive_failures);
+    for (0..3) |_| state.completedBatch(&.{}, true);
+    try std.testing.expect(state.reviewDue(.{}));
+    state.deferUnavailable();
+    state.completedBatch(&.{}, false);
+    try std.testing.expect(!state.reviewDue(.{}));
+}
+
+test "identical observations request judgment without asserting failure" {
+    var state: State = .{};
+    const messages = [_]types.ChatMessage{.{ .role = .tool, .tool_name = "read_file", .content = "unchanged" }};
+    for (0..5) |_| state.completedBatch(&messages, false);
+    try std.testing.expect(state.reviewDue(.{}));
+    try std.testing.expect(!state.finalizing);
+    try std.testing.expect(state.pause_reason == null);
+    state.completedBatch(&.{.{ .role = .tool, .content = "changed" }}, false);
+    try std.testing.expect(!state.reviewDue(.{}));
 }

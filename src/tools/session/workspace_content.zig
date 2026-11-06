@@ -31,8 +31,25 @@ pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.D
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return .{ .failure = try ctx.allocator.dupe(u8, "Workspace capabilities require a native host.") };
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
-    const result = capabilities.execute(arena.allocator(), input.as(Parsed).value, false, ctx.cancel_flag) catch |err| {
+    const request = scopedRequest(ctx, arena.allocator(), input.as(Parsed).value) catch |err| {
+        return .{ .failure = try ctx.allocator.print("Workspace contract context unavailable: {s}.", .{@errorName(err)}) };
+    };
+    const result = capabilities.execute(arena.allocator(), request, false, ctx.cancel_flag) catch |err| {
         return .{ .failure = try ctx.allocator.print("Workspace capability unavailable: {s}. No decision or permission was granted.", .{@errorName(err)}) };
     };
     return .{ .success = try std.json.Stringify.valueAlloc(ctx.allocator, result, .{}) };
+}
+
+fn scopedRequest(ctx: dispatch.DispatchContext, alloc: std.mem.Allocator, input: capabilities.Request) !capabilities.Request {
+    var request = input;
+    if (request.contracts) |*contract| {
+        if (contract.task == null and (contract.action == .status or contract.action == .context)) {
+            if (ctx.fossil_session_id) |session| {
+                if (try @import("../../core/workspace/fossil_workspace.zig").Manager.bound(alloc)) |manager| {
+                    if (try manager.active(session)) |task| contract.task = task.id;
+                }
+            }
+        }
+    }
+    return request;
 }

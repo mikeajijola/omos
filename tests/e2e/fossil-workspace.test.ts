@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { cleanupFixtures, fixture, model, writeMemory } from "./fossil-workspace-helpers";
+import { cleanupFixtures, fixture, periodicReviews, model, writeMemory } from "./fossil-workspace-helpers";
 
 afterEach(cleanupFixtures);
 
@@ -29,6 +29,7 @@ describe("portable Fossil agent workspace", () => {
   test("an unavailable progress reviewer defers the check without replaying work or bypassing completion", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     let progressCalls = 0;
     const provider = model(f, (_body, count) => count <= 4 ? writeMemory(`Checkpoint ${count}`) : { content: "Saved all four checkpoints." }, undefined, {
       reply: (_body, _packet, phase) => {
@@ -50,6 +51,7 @@ describe("portable Fossil agent workspace", () => {
   test("reused evidence is reconciled without overriding useful continuation", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     let retainedId = "";
     let corrections = 0;
     const steps = new Set<number>();
@@ -237,6 +239,7 @@ describe("portable Fossil agent workspace", () => {
   test("a progress finalize decision still passes the independent completion gate", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     const m = model(f, (body, count) => !body.tools?.length ? { content: "This is an omos agent workspace." } : {
       tool_calls: [{ index: 0, id: `inspect-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     }, undefined, { progress: () => ({ outcome: "finalize", meaningful: false, evidence: [], remaining: ["request_complete"], note: "The actor has enough information to answer" }) });
@@ -787,3 +790,58 @@ test("read routing keeps its ordinary loop when no stopping model is selected", 
     expect(m.counts()).toEqual({ actors: 2, assessments: 0 });
   } finally { server.stop(true); }
 }, 120000);
+
+test("successful execution uses checkpoints and completion review without periodic model reviews", async () => {
+  const f = fixture();
+  let progress = 0;
+  const m = model(f, (_body, count) => count <= 12 ? writeMemory(`Requested increment ${count}`) : { content: "Saved twelve requested increments." }, undefined, {
+    reply(_body, _packet, phase) { if (phase === "progress") { progress++; throw Error("Healthy work must not require a periodic review"); } },
+  });
+  const result = await f.run(["ask", "Save twelve successive numbered preference increments", "--json"], {}, 180000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(progress).toBe(0);
+  expect(m.counts().actors).toBe(13);
+  expect(m.counts().assessments).toBeGreaterThan(0);
+  expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Requested increment 12");
+}, 180000);
+
+for (const intent of ["resume", "amend", "new", "clarify"] as const) test(`retained contract selection handles ${intent} without accidental replacement`, async () => {
+  const f = fixture();
+  let blocked = true;
+  let plans = 0;
+  const m = model(f, () => ({ content: "The requested result is retained." }), () => blocked ? "blocked" : "met", {
+    plan: () => { plans++; return { capability: "general_task", summary: "Produce the requested result", obligations: [], checks: [] }; },
+  });
+  const goal = "Produce the retained result for this contract";
+  const first = await f.run(["ask", goal, "--json"]);
+  expect(first.code, first.stderr).toBe(1);
+  const before = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  const selected = await f.run(["ask", goal, "--json"]);
+  expect(selected.code, selected.stderr).toBe(0);
+  const response = JSON.parse(selected.stdout);
+  expect(response.final_output).toContain(before.id);
+  const session = response.session_id;
+  expect(session).toBeTruthy();
+  expect(plans).toBe(1);
+  expect(m.counts().actors).toBe(1);
+  const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as any;
+    expect(body.questions.intent).toBeDefined();
+    expect(body.state.selected_contract.objective).toBe(goal);
+    const labels = Object.keys(body.questions.intent.criteria);
+    return Response.json({ model: "fixture-classifier", answers: { intent: { type: "choice", choice: intent, confidence: 0.99, probabilities: Object.fromEntries(labels.map(label => [label, label === intent ? 0.99 : 0.01 / (labels.length - 1)])) } } });
+  } });
+  try {
+    blocked = false;
+    const text = { resume: "finish the one already set-up", amend: "Include the changed requirement", new: "Start a separate copy of that work", clarify: "maybe" }[intent];
+    const result = await f.run(["ask", "--resume-id", session, text, "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${classifier.port}`, OMOS_CLASSIFIER_MODEL: "fixture-classifier" }, 120000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    expect(tasks).toHaveLength(intent === "new" ? 2 : 1);
+    const original = tasks.find((task: any) => task.id === before.id);
+    expect(original.definition.version).toBe(intent === "amend" ? before.definition.version + 2 : before.definition.version);
+    expect(plans).toBe(intent === "new" ? 2 : 1);
+    if (intent === "resume") expect(original.state).toBe("accepted");
+    if (intent === "clarify") expect(m.counts().actors).toBe(1);
+  } finally { classifier.stop(true); }
+}, 180000);

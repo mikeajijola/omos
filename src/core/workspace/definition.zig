@@ -40,6 +40,7 @@ fn compactJson(comptime source: []const u8) []const u8 {
 }
 
 pub const Policy = struct {
+    progress_review: enum { events, periodic } = .events,
     progress_interval: usize = 4,
     progress_max_interval: ?usize = null,
     stalled_checks: usize = 3,
@@ -47,6 +48,10 @@ pub const Policy = struct {
 
     pub fn jsonStringify(self: Policy, writer: *std.json.Stringify) !void {
         try writer.beginObject();
+        if (self.progress_review == .periodic) {
+            try writer.objectField("progress_review");
+            try writer.write(self.progress_review);
+        }
         try writer.objectField("progress_interval");
         try writer.write(self.progress_interval);
         if (self.progress_max_interval) |maximum| {
@@ -274,7 +279,7 @@ pub fn compatibleExecution(old: Execution, next: Execution) bool {
     const x = old.review;
     const y = next.review;
     if (!std.mem.eql(u8, old.validationHandle(), next.validationHandle())) return false;
-    return next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and (b.progress_max_interval orelse b.progress_interval) <= (a.progress_max_interval orelse a.progress_interval) and b.stalled_checks <= a.stalled_checks and
+    return !(a.progress_review == .periodic and b.progress_review == .events) and next.reviewWorkers() <= old.reviewWorkers() and b.max_actor_steps <= a.max_actor_steps and b.progress_interval <= a.progress_interval and (b.progress_max_interval orelse b.progress_interval) <= (a.progress_max_interval orelse a.progress_interval) and b.stalled_checks <= a.stalled_checks and
         y.max_calls <= x.max_calls and y.reserved_calls >= x.reserved_calls and y.response_timeout_ms <= x.response_timeout_ms and
         y.attempt_timeout_ms <= x.attempt_timeout_ms and y.max_attempts <= x.max_attempts and y.total_timeout_ms <= x.total_timeout_ms and
         y.max_context_bytes <= x.max_context_bytes and y.max_read_bytes <= x.max_read_bytes and

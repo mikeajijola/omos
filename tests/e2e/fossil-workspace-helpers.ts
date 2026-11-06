@@ -138,3 +138,15 @@ export async function startWorkspaceService(f: ReturnType<typeof fixture>, writa
     reader.releaseLock();
   }
 }
+
+// Legacy cadence remains an explicit policy for assessor-protocol tests. Normal
+// fixtures exercise event-triggered reviews and the independent completion gate.
+export async function periodicReviews(f: ReturnType<typeof fixture>) {
+  const declaration = join(f.home, "periodic-definition.json");
+  const execution = join(f.home, "periodic-execution.json");
+  writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
+  writeFileSync(execution, JSON.stringify({ defaults: { progress_review: "periodic" } }));
+  const result = await f.run(["fossil", "definition", "propose", declaration, "--execution", execution, "--json"]);
+  expect(result.code, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout).model_data.state).toBe("activated");
+}

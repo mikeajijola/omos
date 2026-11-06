@@ -1331,3 +1331,23 @@ This transition dispatches no actor and does not reset a worker invocation
 budget. It requires current scoped submission and compute authority. Only its
 admitted immutable intent permits internal reconciliation without an execution
 fence; publication retains independent verification and current-base checks.
+
+## Conversation continuity and review triggers
+
+Native CLI and UI turns resolve references before creating execution state.
+Exact repeated objectives report the retained contract and its state. The selected
+contract is stored in `runtime/communications/selection-*.json`, so a later
+instruction to finish it survives a process restart. The shared intent classifier
+chooses among status, resume, amendment, separate work, unrelated conversation,
+and clarification. The host validates the selected task and applies its existing
+queue controls; classification never proves completion or answers a permission
+prompt. A resume preserves the contract ID, requirements, and valid plan. Changed
+requirements use contract revision. Explicit separate work creates a new contract.
+Running and queued workers are reported without dispatching a duplicate.
+
+Execution checkpoints remain durable. Full historical evidence is assembled when
+review needs it, rather than before every invocation. Source prerequisites for
+coding tasks are still checked before execution. Event-triggered progress review
+provides guidance after repeated failures or unchanged observations; it does not
+replace independent completion review or the exact-revision publication fence.
+The explicit periodic policy remains available for operators who require it.

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createHash, generateKeyPairSync, sign, verify, createPublicKey, createPrivateKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cleanupFixtures, fixture, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
+import { cleanupFixtures, fixture, periodicReviews, model, writeMemory, startWorkspaceService } from "./fossil-workspace-helpers";
 import { NativeClient } from "./workspace-ui-client.mjs";
 import { TmuxSession, tmuxAvailable, terminalFixtureShell } from "./tmux-helpers";
 
@@ -5375,6 +5375,7 @@ sys.exit(result.returncode)
   test("does not let a progress checkpoint cite a cached large preview as fully inspected evidence", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     const declaration = join(f.home, "definition.json");
     const execution = join(f.home, "execution.json");
     writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
@@ -5403,6 +5404,7 @@ sys.exit(result.returncode)
   test("reviewer pauses a repeated successful search after reassessing three stalled checks", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
+    await periodicReviews(f);
     const m = model(f, (body, count) => !body.tools?.length ? { content: "The search is unfinished. The repeated results are retained." } : {
       tool_calls: [{ index: 0, id: `search-${count}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "read", path: "workspace.json" }) } }],
     }, undefined, { progress: (packet) => ({
@@ -6309,6 +6311,7 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
   test(`workspace governance recovers from ${mode} without replaying actor work`, async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
     let progressCalls = 0;
     const parallel: unknown[] = [];
     const feedback: any[] = [];
@@ -6353,6 +6356,7 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
 test("workspace governance defers rejected assessments with diagnostics until the actor budget", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
   const declaration = join(f.home, "definition.json");
   const execution = join(f.home, "execution.json");
   writeFileSync(declaration, readFileSync(join(import.meta.dir, "../../src/core/workspace/standard/omos.json")));
@@ -6471,6 +6475,7 @@ for (const mode of ["unchanged echo", "large unchanged echo", "protected edit", 
 test("progress readiness requires a specific result and verification and forwards them without replaying work", async () => {
   const f = fixture();
   expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+    await periodicReviews(f);
   let reviews = 0;
   let delivered = false;
   const nextStep = "Write the requested preference checkpoint, then verify its retained result.";
@@ -6521,6 +6526,7 @@ for (const maximum of [4, 12]) {
     fossil("open", "--nosync", join(f.cwd, "omos.fossil"), "trunk");
     const policyPath = join(tree, "execution/omos.json");
     const policy = JSON.parse(readFileSync(policyPath, "utf8"));
+    policy.defaults.progress_review = "periodic";
     policy.defaults.progress_max_interval = maximum;
     writeFileSync(policyPath, JSON.stringify(policy));
     fossil("commit", "--nosync", "--nosign", "--no-verify", "--allow-empty", "-m", "Set isolated cadence fixture");

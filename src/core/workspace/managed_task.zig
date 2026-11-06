@@ -29,6 +29,10 @@ pub const Turn = struct {
     projection_pin: ?@import("../shared/resource_pin.zig").Pin = null,
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
+        return beginResolved(alloc, session, parent_session, project, prompt, false);
+    }
+
+    pub fn beginResolved(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8, continuing: bool) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
         var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
@@ -43,7 +47,7 @@ pub const Turn = struct {
         @import("../shared/io.zig").getIo().random(&invocation);
         turn.invocation_id = try workspace.hash(alloc, &invocation);
         if (task.state == .publication_pending or (task.state == .accepted and try manager.publicationPending(task))) {
-            const steering = parent_session == null and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue") and !std.mem.eql(u8, prompt, task.definition.objective);
+            const steering = !continuing and parent_session == null and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue") and !std.mem.eql(u8, prompt, task.definition.objective);
             if (steering) {
                 if (try manager.publicationCommitted(task)) {
                     _ = try manager.retryPublication(task);
@@ -66,8 +70,8 @@ pub const Turn = struct {
             try turn.selectTask(task);
         }
         turn.task = try manager.setState(task.id, .active);
-        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
-        if (parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
+        if (continuing or std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
+        if (!continuing and parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
             turn.task = try manager.amend(task, prompt);
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
@@ -98,6 +102,15 @@ pub const Turn = struct {
         self.projection_pin = null;
         if (self.execution_lease) |lease| lease.release();
         self.execution_lease = null;
+    }
+
+    /// Check execution prerequisites without assembling historical review pages.
+    pub fn prepareExecution(self: *Turn, alloc: std.mem.Allocator) !void {
+        const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
+        if (coding) self.source_basis = if (self.task.authority != null)
+            try @import("company_validation.zig").fingerprint(self.manager, self.task)
+        else
+            try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
     }
 
     // Checkpoints and reviews share these retained-evidence traversal paths.

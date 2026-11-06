@@ -7252,6 +7252,21 @@ fn processQueuedPromptLoop(
             } else |_| {}
         };
     };
+    var admission: @import("../../workspace/contract_admission.zig").Admission = .{};
+    if (comptime !builtin.target.cpu.arch.isWasm()) {
+        if (config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.background_worker and job.recovery_checkpoint == null and (config.ui_host == null or config.ui_host.?.channel_context == null)) {
+            if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |manager| {
+                admission = try @import("../../workspace/contract_admission.zig").resolve(manager, config.fossil_session_id.?, job.prompt, history_messages.items, config.cancel_flag);
+                if (admission.response) |response| {
+                    try deps.push_text(deps.ctx, .assistant_started);
+                    try deps.push_text(deps.ctx, .{ .assistant_source = response });
+                    try deps.push_text(deps.ctx, .{ .assistant_rendered = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, response) });
+                    try finishCommonAssistantTerminal(deps, finalization, arena, job, within_turn_suffix.items, summary_accumulator_ptr, .{ .history = response }, .completed, null, finish_trace_ptr, "assistant", .{ .role = .assistant, .content = response });
+                    return;
+                }
+            }
+        }
+    }
     var retrieval_turn = false;
     var classified_work = false;
     var lookup_state: lookup_checkpoint.State = .{};
@@ -7284,7 +7299,9 @@ fn processQueuedPromptLoop(
             // advisory classifier must not turn it into a read-only chat and
             // strand the pending review or publication behind another model call.
             const selected_task = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, job.prompt, " \t\r\n"), "continue")) try manager.active(config.fossil_session_id.?) else null;
-            var decision: routing.Decision = if (selected_task != null and selected_task.?.state != .accepted)
+            var decision: routing.Decision = if (admission.task != null or admission.new_goal != null)
+                .{ .route = .work, .reason = "resolved_contract_operation" }
+            else if (selected_task != null and selected_task.?.state != .accepted)
                 .{ .route = .work, .reason = "explicit_contract_continuation" }
             else if (@import("../../workspace/classification.zig").configured())
                 try routing.decide(arena, job.prompt, route_history, config.cancel_flag)
@@ -7359,10 +7376,16 @@ fn processQueuedPromptLoop(
         if (!retrieval_turn and config.origin == .root and config.fossil_session_id != null and !config.fossil_ephemeral and !config.fossil_execution_lease_held) {
             const manager = try @import("../../workspace/fossil_workspace.zig").Manager.ensureBound(arena);
             execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
+            if (admission.task) |id| _ = try manager.resumeTask(config.fossil_session_id.?, id, config.workspace_root);
+            if (admission.new_goal) |goal| {
+                _ = try manager.start(config.fossil_session_id.?, config.workspace_root, goal, null);
+            } else if (admission.independent) {
+                _ = try manager.start(config.fossil_session_id.?, config.workspace_root, job.prompt, null);
+            }
         }
     }
     var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (!retrieval_turn and config.fossil_session_id != null and !config.fossil_ephemeral)
-        try managed_task.Turn.begin(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt)
+        try managed_task.Turn.beginResolved(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt, admission.continuing or admission.new_goal != null)
     else
         null;
     defer if (managed) |*turn| {
@@ -7448,13 +7471,12 @@ fn processQueuedPromptLoop(
     }
     if (managed) |*turn| {
         if (turn.task.model_basis != null) {
-            const retained_evidence = turn.beforeReview(arena, &.{}) catch |err| {
+            turn.prepareExecution(arena) catch |err| {
                 try turn.manager.record(turn.task, "invocation_failure", .{ .phase = "source_evidence_preparation", .reason = @errorName(err), .retained = true });
                 if (err == error.Cancelled or err == error.OutOfMemory) return err;
                 try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, try arena.print("Workspace evidence could not be prepared ({s}). Your task is retained. Check the workspace files and repository boundaries before continuing.", .{@errorName(err)}), "workspace_preparation_pending");
                 return;
             };
-            try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
     }
@@ -7615,11 +7637,7 @@ fn processQueuedPromptLoop(
                 try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
                 return;
             };
-            if (revised_plan) {
-                governance = .{};
-                const retained_evidence = try turn.beforeReview(arena, &.{});
-                try governance.seedWithBacking(arena, retained_evidence, turn.prior_payloads);
-            }
+            if (revised_plan) governance = .{};
             if (try finishBackgroundHandoff(deps, arena, config, job, turn, finalization, &within_turn_suffix, &summary_accumulator, &finish_trace)) return;
             job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
         }
@@ -12969,8 +12987,7 @@ fn processQueuedPromptLoop(
             pending_image_ids = transition.pending_ids;
         }
         if (effective_tool_calls.len > 0) {
-            governance.batches += 1;
-            governance.execution_failed = governance.execution_failed or step_batch.step_error_count > 0;
+            governance.completedBatch(within_turn_suffix.items, step_batch.step_error_count > 0);
         }
         try runtime_tool_batch.appendReviewContinuationSuffix(
             config.review_enabled,
