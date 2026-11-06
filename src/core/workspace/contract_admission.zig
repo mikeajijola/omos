@@ -43,6 +43,7 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
     var selected: ?workspace.Task = null;
     var duplicate = false;
     var matches: usize = 0;
+    var choices: std.ArrayList(u8) = .empty;
     // Explicit IDs and exact repeated objectives do not require inference.
     // Multiple matches are genuinely ambiguous, even if one is more recent.
     for (try manager.tasks()) |task| {
@@ -52,10 +53,11 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
         selected = task;
         duplicate = exact;
         matches += 1;
+        if (matches <= 8) try choices.appendSlice(manager.alloc, try manager.alloc.print("\n{s} ({s})", .{ task.id, @tagName(task.state) }));
     }
     if (matches > 1) {
         try saveFocus(manager, session, null, true);
-        return .{ .response = "Several retained contracts match that request. Specify the contract ID to continue, or explicitly request a separate new task." };
+        return .{ .response = try manager.alloc.print("Several retained contracts match that request:{s}\nSpecify a contract ID to continue. Use /task new to start separate work.{s}", .{ choices.items, if (matches > 8) " More matches are available in the contract list." else "" }) };
     }
     if (selected == null) {
         if (focus.task) |id| selected = try manager.loadTask(id) else selected = active;
