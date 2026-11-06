@@ -349,8 +349,10 @@ describe("portable Fossil workspace recovery", () => {
       expect(readFileSync(join(root, "documents/shared.txt"), "utf8")).toBe(content);
       return { content: "Read verified portable content." };
     });
+    // Exercise separate views explicitly; an identical request selects its retained contract.
+    let readNumber = 0;
     const read = async () => {
-      const result = await f.run(["ask", "Read the shared portable document", "--json"]);
+      const result = await f.run(["ask", `Start independent cache-read task ${++readNumber}: read the shared portable document`, "--json"]);
       expect(result.code, result.stderr).toBe(0);
     };
     await read();

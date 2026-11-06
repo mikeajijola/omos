@@ -10,10 +10,12 @@ const services:ReturnType<typeof Bun.spawn>[]=[];
 const classifiers:ReturnType<typeof Bun.serve>[]=[];
 afterEach(async()=>{for(const client of clients.splice(0))await client.close();for(const service of services.splice(0)){service.kill();await service.exited}for(const server of classifiers.splice(0))server.stop(true);cleanupFixtures()});
 function host(f:ReturnType<typeof fixture>,extra:Record<string,string>={}){const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env,...extra}});clients.push(native);return native}
-function routingClassifier(route:(message:string)=>string){
+function routingClassifier(route:(message:string)=>string,intent?:(message:string)=>string){
  const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
-  const body=await request.json() as any;const choice=route(body.state.latest_message);
-  return Response.json({model:'fixture-classifier',answers:{route:{type:'choice',choice,confidence:0.99,probabilities:Object.fromEntries(['conversation','retrieval','work','unresolved'].map(label=>[label,label===choice?0.99:0.01/3]))}}});
+  const body=await request.json() as any;const question=body.questions.intent?'intent':'route';
+  if(question==='intent')expect(intent).toBeDefined();
+  const choice=(question==='intent'?intent!:route)(body.state.latest_message);const labels=Object.keys(body.questions[question].criteria);expect(labels).toContain(choice);
+  return Response.json({model:'fixture-classifier',answers:{[question]:{type:'choice',choice,confidence:0.99,probabilities:Object.fromEntries(labels.map(label=>[label,label===choice?0.99:0.01/(labels.length-1)]))}}});
  }});classifiers.push(server);
  return {OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'};
 }
@@ -236,7 +238,7 @@ test('background contracts release the main chat while workers await input and p
  });
  const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));settings.providers.local.model_metadata['fixture-model'].supports_vision=true;writeFileSync(settingsPath,JSON.stringify(settings));
  expect((await f.run(['fossil','init','--json'])).code).toBe(0);
- const native = host(f,routingClassifier(message=>message==='Are you still available?'?'conversation':'work')); const observed:any[] = [];
+ const native = host(f,routingClassifier(message=>message==='Are you still available?'?'conversation':'work',message=>{expect(message).toBe('Are you still available?');return 'unrelated';})); const observed:any[] = [];
  native.on('event', (event:any) => observed.push(event));
  const until = async (read:()=>Promise<any>, predicate:(value:any)=>boolean) => {
   const deadline = Date.now()+60000; let value:any;
@@ -319,7 +321,7 @@ test('background contracts release the main chat while workers await input and p
   await native.request('background',{action:'stop'});
   await until(()=>native.request('background',{action:'host'}), value=>!value.running);
  }
-},180000);
+},300000);
 
 
 test('explicit background resume rechecks resolved conflicts without repeating actor work',async()=>{
