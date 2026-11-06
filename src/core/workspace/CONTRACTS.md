@@ -497,7 +497,7 @@ Fossil history are retained.
 Canonical content verification reads up to eight objects of at most 1 MiB per
 query. Larger objects use the individual verified artifact reader. Each object
 must match its manifest identity and the local file hash before a view can be
-removed, including the second verification after quarantine. Batching reduces
+removed, including verification after quarantine. Batching reduces
 Fossil process launches while preserving the same deletion checks.
 
 Fresh execution policies bound clean cached views to 256 MiB and 32 views.

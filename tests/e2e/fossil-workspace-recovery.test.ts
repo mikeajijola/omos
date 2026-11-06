@@ -272,10 +272,12 @@ describe("portable Fossil workspace recovery", () => {
       if (count > 1) return { content: "Saved the requested documents." };
       const text = body.messages.map((message: any) => typeof message.content === "string" ? message.content : "").join("\n");
       root = JSON.parse(text.match(/"workingDirectory":\s*("(?:[^"\\]|\\.)*")/)![1]);
-      return { tool_calls: Array.from({ length: 12 }, (_, index) => ({ index, id: `batch-${index}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: join(root, `documents/batch-${index}.txt`), content: `Canonical ${index}\n`.repeat(index === 11 ? 90000 : 6000) }) } })) };
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+      const program = "import pathlib,sys\nroot=pathlib.Path(sys.argv[1])/'documents'\nroot.mkdir(exist_ok=True)\nfor i in range(12): (root/f'batch-{i}.txt').write_text((f'Canonical {i}\\n')*(90000 if i==11 else 6000))";
+      return { tool_calls: [{ index: 0, id: "cache-fixture-files", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", profile: "clean", command: `python3 -c ${quote(program)} ${quote(root)}`, timeout_ms: 10000 } }) } }] };
     });
     const saved = await f.run(["ask", "Save twelve documents for cache verification", "--json"], {}, 90000);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const realFossil = spawnSync("which", ["fossil"], { encoding: "utf8" }).stdout.trim();
     const helper = join(f.home, "count-cache-reads.py"), log = join(f.home, "cache-reads.jsonl"), fault = join(f.home, "corrupt-cache-batch");
     writeFileSync(fault, "1");
@@ -303,7 +305,7 @@ sys.exit(result.returncode)
     expect(JSON.parse(pruned.stdout).model_data.removed).toBe(1);
     expect(existsSync(root)).toBe(false);
     const calls = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
-    expect(calls.filter(args => args.some((arg: string) => arg.includes("size <= 1048576")))).toHaveLength(4);
+    expect(calls.filter(args => args.some((arg: string) => arg.includes("size <= 1048576")))).toHaveLength(6);
     expect(calls.filter(args => args.includes("cat") && args.some((arg: string) => arg.startsWith("documents/batch-")))).toHaveLength(0);
   }, 180000);
 
@@ -445,7 +447,7 @@ sys.exit(result.returncode)
       return { content: "Retained the complete declared fixture package." };
     });
     const saved = await f.run(["ask", "Save the portable skill fixture", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const result = await f.run(["fossil", "package", "plan", "cv_builder", "--realisation", "cv_builder_skill", "--json"]);
     expect(result.code, result.stderr).toBe(0);
     const snapshot = JSON.parse(result.stdout).model_data;
@@ -485,7 +487,7 @@ sys.exit(result.returncode)
       { path: "documents/unrelated.txt", content: "Outside the selected capability" },
     ].map((args, index) => ({ index, id: `closure-${index}`, type: "function", function: { name: "fossil_workspace", arguments: JSON.stringify({ action: "write", ...args }) } })) } : { content: "Saved the portable fixture and unrelated document." });
     const saved = await f.run(["ask", "Save the declared package inputs", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const admin = async (body: object) => {
       const file = join(f.home, "operator.json"); writeFileSync(file, JSON.stringify({ version: "omos.company-admin/v1", ...body }));
       const result = await f.run(["fossil", "company", file, "--json"]);
@@ -4318,7 +4320,7 @@ sys.exit(result.returncode)
       return { content: "The script text and executable flag are verified in the portable workspace." };
     });
     const saved = await f.run(["ask", "Save and update a portable executable script", "--json"]);
-    expect(saved.code, saved.stderr).toBe(0);
+    expect(saved.code, saved.stderr + saved.stdout).toBe(0);
     const firstRevision = JSON.parse((await f.run(["fossil", "status", "--json"])).stdout).trunk_revision;
     expect(f.fossil("artifact", firstRevision)).toMatch(/^F skills\/portable\/run.sh [a-f0-9]+ x$/m);
     const exported = join(f.home, "executable-package.fossil");
