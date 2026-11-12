@@ -76,8 +76,10 @@ available through the assessor's read-only `omos_review_evidence` interface.
 Records include a stable short reference for reads, checkpoints, and citations.
 The host resolves only exact registered references and retains canonical IDs in
 review receipts. The initial packet can also include complete payload pages for
-context, the candidate, and recent successful tools, within a 32 KiB total budget
-and the configured read limit. Other records remain available through the manifest.
+context, the candidate, and recent successful tools, within a 32 KiB total budget.
+Each page respects the configured read limit. A record spanning several pages is
+included only when all its pages fit; otherwise it remains available through the
+manifest without gaining inspection coverage.
 Its read action returns UTF-8 byte slices of JSON containing the original
 arguments and content. The assessor must inspect every byte of a cited record
 before that record can establish a met obligation. Pagination never grants
@@ -113,6 +115,10 @@ It retains the task and session and acquires a new execution generation. The
 worker must inspect retained evidence and reconcile uncertain external outcomes
 before repeating an action. Recovery is bounded by the pinned stalled-check
 allowance; cancellation, conflicts and blocked tasks are not overridden.
+A bounded summary of recent tool arguments, results, and exact evidence paths
+stays available throughout the resumed invocation. It preserves unresolved
+actions and marks truncated previews. Tool success counts describe executions,
+not completed contract outcomes; newer observations supersede the summary.
 The retained source revision must remain an ancestor of the task head, including
 through merge parents. This check covers the full history regardless of the
 number of checkpoints; an unrelated replacement branch remains stale.
@@ -504,8 +510,11 @@ requested quantities, or the independent completion check. Older retained
 assessments without these fields remain readable.
 
 The execution policy defaults to evidence-triggered progress review: three
-consecutive failed batches or four unchanged observations request an assessment.
-Successful varied work retains checkpoints without a periodic model call.
+failed batches since the last review or four unchanged observations request an
+assessment. Successful reads between failed attempts do not erase the failure
+count. This requests judgment against the contract; it does not declare a stall
+or stop the actor. Successful varied work retains checkpoints without a periodic
+model call.
 An explicitly pinned periodic policy checks every four completed tool batches
 by default. Both modes require reassessment after three consecutive no-progress
 judgments and allow at most 100 actor steps per invocation. The last actor slot

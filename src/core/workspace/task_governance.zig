@@ -24,6 +24,7 @@ pub const State = struct {
     stalls: usize = 0,
     execution_failed: bool = false,
     consecutive_failures: usize = 0,
+    failed_batches_since_review: usize = 0,
     unchanged_batches: usize = 0,
     last_batch: ?[32]u8 = null,
     review_deferred: bool = false,
@@ -40,7 +41,10 @@ pub const State = struct {
         if (policy.progress_review == .events) {
             // A batch count is a resource limit, not evidence of a problem.
             // Give the actor a chance to recover before asking for judgment.
-            return self.consecutive_failures >= policy.stalled_checks or self.unchanged_batches >= policy.progress_interval;
+            // A successful read between failed attempts is not evidence that
+            // their underlying problem was resolved. Ask the contract reviewer
+            // for judgment after repeated failures, including interleaved ones.
+            return self.failed_batches_since_review >= policy.stalled_checks or self.unchanged_batches >= policy.progress_interval;
         }
         const maximum = policy.progress_max_interval orelse policy.progress_interval;
         if (maximum > policy.progress_interval and self.execution_failed) return true;
@@ -55,6 +59,7 @@ pub const State = struct {
         self.batches += 1;
         self.execution_failed = self.execution_failed or failed;
         self.consecutive_failures = if (failed) self.consecutive_failures +| 1 else 0;
+        if (failed) self.failed_batches_since_review +|= 1;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         var count: usize = 0;
         // Only the latest batch, with call IDs excluded. Unchanged observations
@@ -88,6 +93,7 @@ pub const State = struct {
         self.assessed_batches = self.batches;
         self.execution_failed = false;
         self.consecutive_failures = 0;
+        self.failed_batches_since_review = 0;
         self.unchanged_batches = 0;
     }
 
@@ -104,6 +110,7 @@ pub const State = struct {
         self.assessed_batches = self.batches;
         self.execution_failed = false;
         self.consecutive_failures = 0;
+        self.failed_batches_since_review = 0;
         self.unchanged_batches = 0;
         if (result.outcome == .pause) self.pause_reason = result.note;
         self.finalizing = result.outcome == .finalize or self.pause_reason != null;
@@ -491,7 +498,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
                     failure = err;
                     break :blk "";
                 };
-            } else failure = error.InvalidTaskGovernance;
+            } else if (failure == null) failure = error.InvalidTaskGovernance;
             if (failure) |err| {
                 last_reason = @errorName(err);
                 content = try std.json.Stringify.valueAlloc(alloc, .{ .error_code = @errorName(err), .instruction = if (decision and std.mem.eql(u8, function.name, revision_schema.name)) try revisionCorrection(alloc, definition, call.arguments_json) else if (err == error.InvalidProgressObligations) try progressObligationCorrection(alloc, definition) else if (err == error.InvalidProgressReadiness) "Supply execution_readiness, next_step, ready_target, verification and prerequisite. When ready, name the specific evidence-grounded result in ready_target and its observable success evidence in verification; otherwise leave both empty. For continue_work, choose ready and name one executable outcome increment with its verification, or choose prerequisite and explain the specific dependency preventing that increment and the action to resolve it. For finalize or pause use not_applicable. Leave prerequisite empty unless readiness is prerequisite. Correct these fields using the inspected evidence; do not read unrelated records merely to repair the response format." else if (err == error.ProgressReassessmentRequired) "Reassess against progressContext.previousAssessment and the newly presented evidence. Reusing citations does not disprove progress: explain the new inference or changed approach in reassessment, or revise meaningful. Before pausing, explain why recent evidence and viable alternatives cannot support continuation. At the no-progress threshold, justify the next approach or a concrete pause. Do not repeat completed external actions. Return one corrected decision; no task has been paused." else "Correct the reviewer call. Copy an exact evidence ID from the manifest; use list to retrieve available IDs. Inspect all relevant bytes before citing evidence. Return exactly one decision, with only current obligation IDs. No work has been accepted." }, .{});
@@ -1048,6 +1055,31 @@ test "event review does not interrupt successful work and failed review backs of
     try std.testing.expect(state.reviewDue(.{}));
     state.deferUnavailable();
     state.completedBatch(&.{}, false);
+    try std.testing.expect(!state.reviewDue(.{}));
+}
+
+test "interleaved failed attempts request contract judgment without declaring a stall" {
+    var state: State = .{};
+    for (0..2) |_| {
+        state.completedBatch(&.{}, true);
+        state.completedBatch(&.{}, false);
+        try std.testing.expect(!state.reviewDue(.{}));
+    }
+    state.completedBatch(&.{}, true);
+    state.completedBatch(&.{}, false);
+    try std.testing.expectEqual(@as(usize, 0), state.consecutive_failures);
+    try std.testing.expect(state.reviewDue(.{}));
+    try std.testing.expectEqual(@as(usize, 0), state.stalls);
+    try std.testing.expect(!state.finalizing);
+    try std.testing.expect(state.pause_reason == null);
+    state.deferUnavailable();
+    try std.testing.expectEqual(@as(usize, 0), state.failed_batches_since_review);
+    state.completedBatch(&.{}, true);
+    try std.testing.expect(!state.reviewDue(.{}));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try state.observe(arena.allocator(), .{ .outcome = .continue_work, .meaningful = false, .remaining = &.{"request_complete"}, .note = "Use the inspected result format" }, &.{}, .{});
+    try std.testing.expectEqual(@as(usize, 0), state.failed_batches_since_review);
     try std.testing.expect(!state.reviewDue(.{}));
 }
 

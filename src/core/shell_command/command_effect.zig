@@ -189,6 +189,7 @@ const PrintfFormatLanguage = enum {
 
 const PrintfPolicy = struct {
     executable: []const u8,
+    forced_argv: []const []const u8 = &.{},
     format_language: PrintfFormatLanguage = .portable_literal_newline_percent_string,
 };
 
@@ -538,6 +539,7 @@ fn planPrintf(
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(alloc, policy.executable);
+    try argv.appendSlice(alloc, policy.forced_argv);
     try argv.appendSlice(alloc, words[1..]);
     return .{ .direct = .{
         .executable = policy.executable,
@@ -547,7 +549,11 @@ fn planPrintf(
 
 fn printfPolicy(target_os: std.Target.Os.Tag) PrintfPolicy {
     return switch (target_os) {
-        .macos, .linux => .{ .executable = "/usr/bin/printf" },
+        .macos => .{ .executable = "/usr/bin/printf" },
+        // Linux may provide GNU or uutils printf. Some uutils versions parse
+        // --help/--version even after FORMAT; terminate options before FORMAT
+        // so every validated operand remains literal string data.
+        .linux => .{ .executable = "/usr/bin/printf", .forced_argv = &.{"--"} },
         else => unreachable,
     };
 }
@@ -1637,6 +1643,15 @@ test "planner preserves accepted printf argv exactly" {
     try std.testing.expectEqualStrings("caf\u{00e9}", argv[3]);
 }
 
+test "planner Linux printf terminates options before format and preserves data operands" {
+    var admission = try expectDirect("printf '%s:%s:%s:%s' '--help' '--version' '--' '-leading'", .linux);
+    defer admission.deinit(std.testing.allocator);
+    try expectArgv(&.{ "/usr/bin/printf", "--", "%s:%s:%s:%s", "--help", "--version", "--", "-leading" }, admission.direct_read_only.stages[0].argv);
+    // The forced executable delimiter does not expand the admitted shell grammar.
+    try expectApproval("printf -- '%s' '--help'", false, .linux, .unsupported_argument);
+    try expectApproval("printf --help", false, .linux, .unsupported_argument);
+}
+
 test "planner native printf forms match shell-visible execution" {
     const builtin = @import("builtin");
     if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
@@ -1646,6 +1661,9 @@ test "planner native printf forms match shell-visible execution" {
         "printf 'hello\\n'",
         "printf '%%'",
         "printf '%s' '--help'",
+        "printf '%s' '--version'",
+        "printf '%s' '--'",
+        "printf '%s:%s:%s' '--help' '--version' '--'",
         "printf '%s%s' one two",
         "printf '%s' 'caf\u{00e9}'",
     };
@@ -1662,6 +1680,9 @@ test "planner generated native printf matrix matches shell bytes status and stde
     const data_classes = [_][]const u8{
         "",
         "-leading",
+        "--help",
+        "--version",
+        "--",
         "100%",
         "\\x41",
         "printable ASCII",

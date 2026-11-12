@@ -4735,17 +4735,25 @@ sys.exit(result.returncode)
     let held = false;
     let release: (() => void) | undefined;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    const m = model(f, () => ({ content: "An answer with retained inspection progress." }), async packet => {
+    // Exceed the initial inspection budget so this case exercises a durable
+    // explicit evidence page before the server dies, not an inline preview.
+    const candidateText = "An answer with retained inspection progress.\n".repeat(1000);
+    const m = model(f, () => ({ content: candidateText }), async packet => {
       if (phase === "initial") return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["invented"], note: "Fixture retains candidate" }] } };
       if (phase === "interrupt") {
         const candidate = packet.evidence.find((record: any) => record.kind === "candidate");
+        expect(packet.initialInspections.some((page: any) => page.id === candidate.id)).toBe(false);
         if (!packet.currentInspections.some((page: any) => page.id === candidate.id)) return { name: "omos_review_evidence", args: { action: "read", id: candidate.id } };
         held = true;
         await gate;
       }
-      return "met";
+      const candidate = packet.evidence.find((record: any) => record.kind === "candidate");
+      const pages = [...packet.previousInspections, ...packet.currentInspections].filter((page: any) => page.id === candidate.id && typeof page.content === "string");
+      const inspected = Math.max(0, ...pages.map((page: any) => page.offset + Buffer.byteLength(page.content)));
+      if (inspected < candidate.bytes) return { name: "omos_review_evidence", args: { action: "read", id: candidate.id, offset: inspected } };
+      return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: [candidate.id], note: "Inspected the complete retained answer across the interrupted review." }] } };
     });
-    expect((await f.run(["ask", "Give a short informational answer", "--json"])).code).toBe(1);
+    expect((await f.run(["ask", "Give an informational answer", "--json"])).code).toBe(1);
     const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
     const actors = m.counts().actors;
     phase = "interrupt";
@@ -6404,6 +6412,34 @@ for (const mode of ["shortened evidence ID", "parallel evidence reads"]) {
     expect(journal.some((entry: any) => entry.kind === "governance_failure")).toBe(false);
   }, 120000);
 }
+
+test("event governance reviews repeated failures separated by successful reads", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init", "--json"])).code).toBe(0);
+  let progressCalls = 0;
+  const m = model(f, (body, count) => {
+    if (count <= 5) return { tool_calls: [count % 2 === 1
+      ? governanceCall("shell", { action: "run", profile: "clean", command: "printf 'Unexpected input shape\\n' >&2; exit 1" })
+      : governanceCall("fossil_workspace", { action: "read", path: "workspace.json" })] };
+    expect(progressCalls).toBe(1);
+    expect(body.messages.some((message: any) => typeof message.content === "string" && message.content.includes("Host progress assessment:"))).toBe(true);
+    return { content: "The workspace is available; the three parsing attempts failed because the input shape was wrong." };
+  }, undefined, {
+    progress(packet) {
+      progressCalls++;
+      return { outcome: "continue_work", meaningful: false, evidence: [], remaining: packet.context.contract.obligations.map((o: any) => o.id), note: "Successful reads did not resolve the repeated parsing failure.", execution_readiness: "ready", ready_target: "Explain the observed parsing failure", verification: "Compare the explanation with the retained failed tool results", next_step: "Explain the observed parsing failure using the retained results.", prerequisite: "" };
+    },
+  });
+  const result = await f.run(["ask", "Inspect the workspace and explain the observed parser failure", "--json"], {}, 90000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(m.counts()).toEqual({ actors: 6, assessments: 1 });
+  expect(progressCalls).toBe(1);
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("accepted");
+  const journal = governanceJournal(f, task);
+  expect(journal.filter((entry: any) => entry.kind === "progress_assessment")).toHaveLength(1);
+  expect(journal.some((entry: any) => entry.kind === "progress_review_deferred")).toBe(false);
+}, 120000);
 
 test("workspace governance defers rejected assessments with diagnostics until the actor budget", async () => {
   const f = fixture();

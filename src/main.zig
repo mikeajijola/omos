@@ -4888,6 +4888,7 @@ test {
     _ = @import("core/tooling/canonical_tool_output.zig");
     _ = @import("core/mcp/result_projection.zig");
     _ = @import("core/workspace/canonical_tool_outputs.zig");
+    _ = @import("core/workspace/managed_task.zig");
     _ = @import("core/mcp/startup_admission.zig");
     _ = @import("core/workspace/classification.zig");
     _ = @import("core/workspace/attention.zig");
@@ -4949,6 +4950,7 @@ test {
     _ = @import("core/workspace/record_projection.zig");
     _ = @import("core/shared/bounded_operation.zig");
     _ = @import("core/workspace/task_governance.zig");
+    _ = @import("core/workspace/execution_recovery.zig");
     _ = @import("core/agent/runtime/review_evidence.zig");
     _ = @import("core/agent/runtime/review_checkpoints.zig");
     _ = @import("core/workspace/fossil_manifest.zig");

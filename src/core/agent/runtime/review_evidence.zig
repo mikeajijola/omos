@@ -250,17 +250,29 @@ pub const View = struct {
                 cursor -= 1;
                 const record = self.records[cursor];
                 const size = self.payloadSize(cursor);
-                if (record.kind != kind or (kind == .tool and record.status != .success) or self.inspected[cursor] == size or size > @min(8192, self.max_read_bytes) or size > byte_budget - used) continue;
+                if (record.kind != kind or (kind == .tool and record.status != .success) or self.inspected[cursor] == size or size > byte_budget - used or self.max_read_bytes == 0) continue;
                 const previous = self.inspected[cursor];
                 const previous_ranges = self.raw_ranges.items.len;
-                const page_bytes = try self.page(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .action = "read", .id = record.id, .limit = size }, .{}));
-                if (page_bytes.len > byte_budget - used) {
+                const previous_pages = pages.items.len;
+                const previous_used = used;
+                var offset: usize = 0;
+                // A complete record may span several policy-sized pages. The
+                // packet budget, not an extra per-record threshold, controls
+                // inclusion. Roll back coverage if the whole record won't fit.
+                while (offset < size and pages.items.len < 16) {
+                    const page_bytes = try self.page(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .action = "read", .id = record.id, .offset = offset, .limit = size - offset }, .{}));
+                    if (page_bytes.len > byte_budget - used) break;
+                    const page_value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, page_bytes, .{});
+                    offset += page_value.object.get("content").?.string.len;
+                    used += page_bytes.len;
+                    try pages.append(alloc, page_value);
+                }
+                if (offset != size) {
                     self.inspected[cursor] = previous;
                     self.raw_ranges.items.len = previous_ranges;
-                    continue;
+                    pages.items.len = previous_pages;
+                    used = previous_used;
                 }
-                used += page_bytes.len;
-                try pages.append(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, page_bytes, .{}));
             }
         }
         return pages.items;
@@ -525,6 +537,55 @@ test "review initial inspections count only delivered bounded complete payloads"
     try view.requireInspected("result");
     try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("failure"));
     try std.testing.expectEqual(@as(usize, 3), (try view.index(alloc, 0, 3)).len);
+}
+
+test "review initial inspections deliver complete multi-page records or restore coverage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const large = try alloc.alloc(u8, 21797);
+    @memset(large, 'x');
+    const records = [_]Evidence{
+        .{ .id = "large-result", .content = large, .status = .success },
+        .{ .id = "answer", .kind = .candidate, .content = "The requested explanation" },
+    };
+    var view = try View.init(alloc, &records);
+    view.max_read_bytes = 16384;
+    const expected_payload = try view.loadPayload(alloc, 0);
+    const pages = try view.initialInspections(alloc, 32768);
+    try std.testing.expectEqual(@as(usize, 3), pages.len);
+    try view.requireInspected("large-result");
+    try std.testing.expectEqual(@as(i64, 0), pages[1].object.get("offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 16384), pages[2].object.get("offset").?.integer);
+    try std.testing.expectEqualStrings(expected_payload[0..16384], pages[1].object.get("content").?.string);
+    try std.testing.expectEqualStrings(expected_payload[16384..], pages[2].object.get("content").?.string);
+    try std.testing.expect(!pages[1].object.get("fullyInspected").?.bool);
+    try std.testing.expect(pages[2].object.get("fullyInspected").?.bool);
+
+    // Escaping expands the serialized bytes past the packet allowance. Even
+    // though the first page fits, neither page nor its coverage may escape.
+    @memset(large[0..8192], '\n');
+    @memset(large[8192..], 'x');
+    var escaped = try View.init(alloc, &records);
+    escaped.max_read_bytes = 8192;
+    try std.testing.expect(escaped.payloadSize(0) < 32768);
+    const first_escaped_page = try escaped.page(alloc, "{\"action\":\"read\",\"id\":\"large-result\"}");
+    try std.testing.expect(first_escaped_page.len < 32768);
+    escaped.inspected[0] = 0;
+    escaped.raw_ranges.clearRetainingCapacity();
+    const bounded = try escaped.initialInspections(alloc, 32768);
+    try std.testing.expectEqual(@as(usize, 1), bounded.len);
+    try escaped.requireInspected("answer");
+    try std.testing.expectError(error.UninspectedContractEvidence, escaped.requireInspected("large-result"));
+    try std.testing.expectEqual(@as(usize, 1), escaped.raw_ranges.items.len);
+    try std.testing.expectEqual(@as(usize, 0), escaped.inspected[0]);
+
+    var prior = try View.init(alloc, &records);
+    prior.max_read_bytes = 8192;
+    _ = try prior.page(alloc, "{\"action\":\"read\",\"id\":\"large-result\",\"limit\":100}");
+    _ = try prior.initialInspections(alloc, 32768);
+    try std.testing.expectEqual(@as(usize, 100), prior.inspected[0]);
+    try std.testing.expectEqual(@as(usize, 2), prior.raw_ranges.items.len);
 }
 
 test "completion review caps oversized record pages without losing records or inspecting previews" {

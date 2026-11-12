@@ -7758,7 +7758,8 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
-            if (step == 0 and turn.recovery_context.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.recovery_context });
+            // The bounded pre-invocation snapshot remains available after the first tool call.
+            if (turn.recovery_context.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.recovery_context });
         } else if (config.fossil_ephemeral) {
             if (comptime !builtin.target.cpu.arch.isWasm()) {
                 if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |workspace| {

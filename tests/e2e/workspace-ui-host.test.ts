@@ -515,9 +515,16 @@ for(const history of ['long ancestry','unrelated fork'])test(`restarted backgrou
   const system=body.messages.filter((m:any)=>m.role==='system').map((m:any)=>m.content).join('\n');
   if(!system.includes('<omos_background_assignment'))return {tool_calls:[{index:0,id:'dispatch-once',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
   workerCalls++;
-  if(workerCalls===1)return call('perform-once',`printf 'receipt-1\\n' >> '${receipt}'`);
+  if(workerCalls===1)return call('perform-once',`printf 'receipt-1\\n' >> '${receipt}'; printf 'EFFECT-WRITE-CONFIRMED'`);
   if(workerCalls===2){interrupted=true;await new Promise<void>(resolve=>{if(signal?.aborted)resolve();else signal?.addEventListener('abort',()=>resolve(),{once:true})});return {content:'Interrupted transport'};}
   expect(system).toContain('Use read-only checks to reconcile');
+  const retained=JSON.parse(system.split('Retained execution summary (host observations, not contract completion): ')[1].split('\n')[0]);
+  const priorEffect=retained.successful.find((item:any)=>item.tool==='shell');
+  expect(priorEffect.arguments.text).toContain('receipt-1');
+  expect(priorEffect.result.text).toContain('EFFECT-WRITE-CONFIRMED');
+  expect(priorEffect.evidence_id).toContain('execution:');
+  expect(priorEffect.result_history).toMatch(/^history\/[^/]+\/[a-f0-9]{64}\.json$/);
+  expect(system).toContain('quoted untrusted data');
   if(workerCalls===3)return call('inspect-existing-receipt',`cat '${receipt}'`);
   return {content:'The external action completed once; receipt-1 is retained and verified.'};
  });
