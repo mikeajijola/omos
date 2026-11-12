@@ -6679,7 +6679,21 @@ test("review-only continuation retains inspected pages and publishes without rep
   const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
   expect(task.state).toBe("accepted");
   const published = JSON.parse((await f.run(["fossil", "query", "omos_result", "--json"])).stdout).model_data.records;
-  expect(published.some((record: any) => record.data.task === task.id && record.data.status === "published")).toBe(true);
+  expect(published).toHaveLength(1);
+  // The large candidate makes the query return an immutable receipt reference.
+  // Verify the original publication rather than treating that bounded projection
+  // as if it included the full result body.
+  const publicationRef = published[0];
+  expect(publicationRef.complete).toBe(false);
+  expect(publicationRef.source_path).toMatch(/^acceptances\//);
+  expect(publicationRef.revision).toHaveLength(64);
+  const publicationBytes = f.fossil("cat", publicationRef.source_path, "-r", publicationRef.revision);
+  expect(createHash("sha256").update(publicationBytes).digest("hex")).toBe(publicationRef.sha256);
+  const publication = JSON.parse(publicationBytes);
+  expect(publication.task.id).toBe(task.id);
+  expect(publication.review.task_id).toBe(task.id);
+  expect(publication.review.disposition).toBe("fulfilled");
+  expect(publication.review.candidate).toBe(candidateText);
   const paths = f.fossil("ls", "-r", task.branch).trim().split("\n").filter((path: string) => path.startsWith(`history/${task.id}/`));
   const records = paths.map((path: string) => JSON.parse(f.fossil("cat", path, "-r", task.branch)));
   const receipt = records.find((record: any) => record.kind === "review_continuation");
