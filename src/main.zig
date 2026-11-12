@@ -4952,6 +4952,7 @@ test {
     _ = @import("core/workspace/task_governance.zig");
     _ = @import("core/workspace/execution_recovery.zig");
     _ = @import("core/agent/runtime/review_evidence.zig");
+    _ = completion_review;
     _ = @import("core/agent/runtime/review_checkpoints.zig");
     _ = @import("core/workspace/fossil_manifest.zig");
     _ = @import("core/workspace/profile_photo.zig");

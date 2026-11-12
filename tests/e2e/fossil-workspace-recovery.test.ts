@@ -6636,3 +6636,71 @@ for (const maximum of [4, 12]) {
     expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Checkpoint 8");
   }, 240000);
 }
+
+test("review-only continuation retains inspected pages and publishes without replaying an actor effect", async () => {
+  const f = fixture();
+  expect((await f.run(["fossil", "init"])).code).toBe(0);
+  const effect = join(f.home, "one-effect.txt");
+  const candidateText = "Retained verified outcome.\n".repeat(3000);
+  let continued = false;
+  let restored = false;
+  let advertised: string[] = [];
+  const m = model(f, (_body, count) => count === 1 ? {
+    tool_calls: [{ index: 0, id: "single-effect", type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: `printf 'one effect\\n' >> '${effect}'; printf 'Effect receipt retained\\n'`, timeout_ms: 10000 } }) } }],
+  } : { content: candidateText }, packet => {
+    const candidate = packet.evidence.find((entry: any) => entry.kind === "candidate");
+    const successful = packet.evidence.find((entry: any) => entry.kind === "tool" && entry.tool === "shell" && entry.status === "success");
+    expect(candidate).toBeDefined();
+    expect(successful).toBeDefined();
+    const current = packet.currentInspections.filter((page: any) => page.id === candidate.id && typeof page.content === "string");
+    const previous = packet.previousInspections.filter((page: any) => page.id === candidate.id && typeof page.content === "string");
+    if (continued && previous.length > 0) restored = true;
+    const pages = [...previous, ...current];
+    const offset = Math.max(0, ...pages.map((page: any) => page.offset + Buffer.byteLength(page.content)));
+    if (!continued && current.length === 6) {
+      expect(offset).toBeLessThan(candidate.bytes);
+      expect(advertised).toContain("omos_review_continue");
+      expect(advertised).not.toContain("omos_review_evidence");
+      continued = true;
+      return { name: "omos_review_continue", args: { evidence: [candidate.reference] } };
+    }
+    if (offset < candidate.bytes) return { name: "omos_review_evidence", args: { action: "read", id: candidate.reference, offset, limit: 8192 } };
+    return { name: "omos_contract_assessment", args: {
+      contractId: packet.contract.id, version: packet.contract.version,
+      obligations: packet.contract.obligations.map((obligation: any) => ({ id: obligation.id, status: "met", evidence: [candidate.id, successful.id], note: "The effect occurred once and the complete retained answer was independently inspected across attempts." })),
+    } };
+  }, { observe: body => { advertised = body.tools?.map((tool: any) => tool.function?.name) ?? []; } });
+  const result = await f.run(["ask", "Write one effect receipt and give the requested retained outcome explanation", "--json"], {}, 90000);
+  expect(result.code, result.stderr + result.stdout).toBe(0);
+  expect(continued).toBe(true);
+  expect(restored).toBe(true);
+  expect(m.counts().actors).toBe(2);
+  expect(readFileSync(effect, "utf8")).toBe("one effect\n");
+  const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+  expect(task.state).toBe("accepted");
+  const published = JSON.parse((await f.run(["fossil", "query", "omos_result", "--json"])).stdout).model_data.records;
+  expect(published.some((record: any) => record.data.task === task.id && record.data.status === "published")).toBe(true);
+  const paths = f.fossil("ls", "-r", task.branch).trim().split("\n").filter((path: string) => path.startsWith(`history/${task.id}/`));
+  const records = paths.map((path: string) => JSON.parse(f.fossil("cat", path, "-r", task.branch)));
+  const receipt = records.find((record: any) => record.kind === "review_continuation");
+  expect(receipt).toBeDefined();
+  expect(JSON.parse(receipt.value.data)).toMatchObject({ state: "inspection_pending", actor_work_requested: false });
+}, 120000);
+
+for (const target of ["unknown", "fully inspected"]) {
+  test(`review-only continuation rejects ${target} evidence without restarting the actor`, async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let calls = 0;
+    const m = model(f, () => ({ content: "The requested answer." }), packet => {
+      const candidate = packet.evidence.find((entry: any) => entry.kind === "candidate");
+      if (++calls === 1) return { name: "omos_review_continue", args: { evidence: [target === "unknown" ? "invented" : candidate.reference] } };
+      expect(packet.currentInspections.some((page: any) => page.accepted === false && page.error_code === (target === "unknown" ? "InvalidContractEvidence" : "InvalidReviewContinuation"))).toBe(true);
+      return "met";
+    });
+    const result = await f.run(["ask", "Give the requested answer", "--json"], {}, 60000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(calls).toBe(2);
+    expect(m.counts().actors).toBe(1);
+  }, 90000);
+}

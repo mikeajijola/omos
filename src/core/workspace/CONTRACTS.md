@@ -133,6 +133,16 @@ Fresh workspaces store these settings under `review` in `execution/omos.json`:
 }
 ```
 
+When only evidence inspection remains, the reviewer can call
+`omos_review_continue` with exact references to unread evidence. The host
+validates those references and retains the candidate for another bounded review
+attempt without restarting the actor. This call grants no inspection credit and
+does not extend call, attempt, time, or token limits. For evidence larger than a
+single context packet, the reviewer first checkpoints inspected segments so
+later attempts can use their cumulative findings. A `pending` assessment is for
+concrete actor work; a `blocked` assessment requires missing user input or an
+external change.
+
 The host withdraws evidence retrieval during reserved calls. Rejected calls
 are never executed or aliased. Each response is bounded by both its response
 timeout and the remaining attempt allowance. Automatic continuation reuses

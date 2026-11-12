@@ -84,11 +84,27 @@ describe("portable Fossil agent workspace", () => {
       expect(record.status).toBe("success");
       expect(record.reference).toMatch(/^e:[0-9a-f]{16}$/);
       if (blocked) return "blocked";
-      const pages = packet.inspections.filter((page: any) => page.id === canonicalId).sort((a: any, b: any) => a.offset - b.offset);
-      const last = pages.at(-1);
-      if (!last?.fullyInspected) return { name: "omos_review_evidence", args: {
-        action: "read", id: record.reference, offset: last?.nextOffset ?? 0, limit: aboveCap ? 16384 : 8192,
+      const initial = (packet.initialInspections ?? []).filter((page: any) => page.id === canonicalId);
+      // Initial inspections contain a whole record or none of it. Prefer that
+      // complete source over prior/current pages, which may overlap it.
+      const observed = initial.length ? initial : packet.inspections.filter((page: any) => page.id === canonicalId);
+      const unique = new Map<number, any>();
+      for (const page of observed) {
+        const previous = unique.get(page.offset);
+        if (previous) expect(previous.content).toBe(page.content);
+        unique.set(page.offset, page);
+      }
+      const pages = [...unique.values()].sort((a: any, b: any) => a.offset - b.offset);
+      let inspectedBytes = 0;
+      for (const page of pages) {
+        expect(page.offset).toBe(inspectedBytes);
+        inspectedBytes += Buffer.byteLength(page.content);
+      }
+      if (inspectedBytes < record.bytes) return { name: "omos_review_evidence", args: {
+        action: "read", id: record.reference, offset: inspectedBytes, limit: aboveCap ? 16384 : 8192,
       } };
+      expect(inspectedBytes).toBe(record.bytes);
+      expect(pages.at(-1)?.fullyInspected).toBe(true);
       const reviewedPayload = JSON.parse(pages.map((page: any) => page.content).join(""));
       expect(JSON.parse(reviewedPayload.arguments)).toEqual({ text: "Perform the fixture operation once" });
       reviewedRaw = reviewedPayload.content;
