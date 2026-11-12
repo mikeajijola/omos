@@ -58,6 +58,8 @@ pub const Config = struct {
     background_worker: bool = false,
     coordinator_mode: bool = false,
     contract_review_model: []const u8 = "",
+    /// Explicit independent-review effort; null preserves provider defaults.
+    contract_review_effort: ?ReasoningEffort = null,
     contract_review_provider: ?@import("../../config/model_provider.zig").ProviderId = null,
     contract_review_stream_provider: ?stream_provider.Provider = null,
     contract_review_credential: ?types.CredentialLease = null,
@@ -87,6 +89,8 @@ pub const Config = struct {
     current_prompt_is_root_authority: bool = false,
     enforce_response_language: bool = true,
     tool_result_dir: ?[]const u8 = null,
+    /// Optional managed-task evidence retention; never changes tool outcomes.
+    canonical_output_sink: ?@import("../../tooling/canonical_tool_output.zig").Sink = null,
     session_child_capability: ?*session_child_store.SessionChildCapability = null,
     ephemeral_command_replay: ?*command_replay_store.EphemeralStore = null,
     subagent_id: u64 = 0,

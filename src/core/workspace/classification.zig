@@ -5,7 +5,7 @@ const io = @import("../shared/io.zig");
 const bounded = @import("../shared/bounded_operation.zig");
 
 pub const Choice = struct { label: []const u8, description: []const u8 };
-pub const Question = struct { id: []const u8, instructions: []const u8, choices: []const Choice };
+pub const Question = struct { id: []const u8, instructions: []const u8, choices: []const Choice, required: bool = true };
 pub const Request = struct { state: std.json.Value, questions: []const Question };
 pub const Probability = struct { label: []const u8, probability: f64 };
 pub const Decision = struct { question: []const u8, choice: []const u8, confidence: f64, probabilities: []const Probability };
@@ -152,10 +152,13 @@ fn decode(alloc: std.mem.Allocator, request: Request, raw: std.json.Value, elaps
         if (truncated.bool) return error.ClassificationInputRejected;
     };
     const answers = try field(raw, "answers");
-    if (answers != .object or answers.object.count() != request.questions.len) return error.InvalidClassifierResponse;
-    const decisions = try alloc.alloc(Decision, request.questions.len);
-    for (request.questions, decisions) |question, *decision| {
-        const answer = try field(answers, question.id);
+    if (answers != .object or answers.object.count() > request.questions.len) return error.InvalidClassifierResponse;
+    var decisions: std.ArrayList(Decision) = .empty;
+    for (request.questions) |question| {
+        const answer = answers.object.get(question.id) orelse {
+            if (question.required) return error.InvalidClassifierResponse;
+            continue;
+        };
         if (!std.mem.eql(u8, try text(try field(answer, "type")), "choice")) return error.InvalidClassifierResponse;
         const choice = try text(try field(answer, "choice"));
         const probabilities = try field(answer, "probabilities");
@@ -170,9 +173,10 @@ fn decode(alloc: std.mem.Allocator, request: Request, raw: std.json.Value, elaps
             score.* = .{ .label = try alloc.dupe(u8, option.label), .probability = probability };
         }
         if (!found or @abs(sum - 1) > 0.005) return error.InvalidClassifierResponse;
-        decision.* = .{ .question = try alloc.dupe(u8, question.id), .choice = try alloc.dupe(u8, choice), .confidence = try number(try field(answer, "confidence")), .probabilities = scores };
+        try decisions.append(alloc, .{ .question = try alloc.dupe(u8, question.id), .choice = try alloc.dupe(u8, choice), .confidence = try number(try field(answer, "confidence")), .probabilities = scores });
     }
-    return .{ .model = try alloc.dupe(u8, try text(try field(raw, "model"))), .elapsed_ms = elapsed_ms, .decisions = decisions };
+    if (decisions.items.len != answers.object.count()) return error.InvalidClassifierResponse;
+    return .{ .model = try alloc.dupe(u8, try text(try field(raw, "model"))), .elapsed_ms = elapsed_ms, .decisions = try decisions.toOwnedSlice(alloc) };
 }
 
 const Body = struct {
@@ -224,4 +228,27 @@ test "classification rejects duplicate choices and malformed model answers" {
     try std.testing.expectError(error.DuplicateClassificationChoice, validate(duplicate));
     try invalid.object.put(alloc, "state_truncated", .{ .bool = true });
     try std.testing.expectError(error.ClassificationInputRejected, decode(alloc, request, invalid, 0));
+}
+
+test "classification optional questions preserve required decisions without accepting unknown answers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const choices = [_]Choice{ .{ .label = "read", .description = "Read" }, .{ .label = "work", .description = "Work" } };
+    const request: Request = .{ .state = .{ .string = "request" }, .questions = &.{
+        .{ .id = "route", .instructions = "Route", .choices = &choices },
+        .{ .id = "extra", .instructions = "Optional choice", .choices = &choices, .required = false },
+    } };
+    const raw = try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"model\":\"test\",\"answers\":{\"route\":{\"type\":\"choice\",\"choice\":\"read\",\"confidence\":0.9,\"probabilities\":{\"read\":0.9,\"work\":0.1}}}}", .{});
+    const result = try decode(alloc, request, raw, 1);
+    try std.testing.expectEqual(@as(usize, 1), result.decisions.len);
+    try std.testing.expectEqualStrings("route", result.decisions[0].question);
+    const answer = raw.object.get("answers").?.object.get("route").?;
+    var unknown = raw;
+    try unknown.object.getPtr("answers").?.object.put(alloc, "unknown", answer);
+    try std.testing.expectError(error.InvalidClassifierResponse, decode(alloc, request, unknown, 1));
+    _ = unknown.object.getPtr("answers").?.object.swapRemove("unknown");
+    _ = unknown.object.getPtr("answers").?.object.swapRemove("route");
+    try unknown.object.getPtr("answers").?.object.put(alloc, "extra", answer);
+    try std.testing.expectError(error.InvalidClassifierResponse, decode(alloc, request, unknown, 1));
 }

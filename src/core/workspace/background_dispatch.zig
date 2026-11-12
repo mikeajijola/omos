@@ -8,6 +8,14 @@ pub fn digest(manager: workspace.Manager, record: background.Record) ![]const u8
     return workspace.hash(manager.alloc, try std.json.Stringify.valueAlloc(manager.alloc, record, .{}));
 }
 
+/// A new worker has no conversation history. Give it the verified canonical
+/// request, not a synthetic continuation it must reconstruct through tools.
+/// Existing sessions retain their history/recovery state and only continue it.
+pub fn workerPrompt(manager: workspace.Manager, entry: background.Record) ![]const u8 {
+    if (entry.worker_session != null) return "continue";
+    return manager.originalRequest(try manager.loadTask(entry.task));
+}
+
 pub fn prepare(manager: workspace.Manager, task: workspace.Task, session: []const u8, call_id: []const u8) !background.Record {
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     if (task.parent_task_id != null) return error.BackgroundRootTaskRequired;

@@ -2,6 +2,8 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
+const types = @import("../shared/types.zig");
+const model_capabilities = @import("model_capabilities.zig");
 
 const max_providers = 32;
 const max_models = 256;
@@ -28,6 +30,7 @@ pub const ParseError = Allocator.Error || error{
     InvalidToolChoiceMode,
     InvalidModelId,
     InvalidModelMetadata,
+    InvalidReasoningEffort,
 };
 
 pub const Protocol = enum { @"openai-chat-completions" };
@@ -46,6 +49,7 @@ pub const ModelMetadata = struct {
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
     supports_vision: ?bool = null,
+    reasoning_efforts: model_capabilities.ReasoningEffortOptions = .{},
 };
 
 /// Registry owns all slices. Treat definitions as immutable while borrowed by
@@ -57,6 +61,8 @@ pub const Definition = struct {
     auth: Auth,
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
+    /// Explicit independent-review effort, separate from the actor preference.
+    reviewer_effort: ?types.ReasoningEffort = null,
     model_metadata: []const ModelMetadata = &.{},
 
     /// Caller owns the returned URL. base_url is already a validated API prefix.
@@ -165,7 +171,7 @@ pub const Registry = struct {
 
 fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "reviewer_effort", "model_metadata" });
     const protocol = try required(value, "protocol");
     if (protocol != .string or !std.mem.eql(u8, protocol.string, "openai-chat-completions")) return error.InvalidProtocol;
     const url = try required(value, "base_url");
@@ -205,6 +211,7 @@ fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) Par
         .auth = owned_auth,
         .tool_choice_mode = mode,
         .reviewer_model = owned_reviewer,
+        .reviewer_effort = if (value.object.get("reviewer_effort")) |effort| try parse_effort(effort) else null,
         .model_metadata = if (value.object.get("model_metadata")) |metadata| try parse_metadata(alloc, metadata) else &.{},
     };
 }
@@ -241,22 +248,44 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value) ParseError![]const Mo
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision" });
+        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts" });
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
+        const efforts = try parse_efforts(metadata.object.get("reasoning_efforts"));
         models[initialized] = .{
             .id = try alloc.dupe(u8, entry.key_ptr.*),
             .context_window = context,
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .reasoning_efforts = efforts,
         };
         initialized += 1;
     }
     return models;
+}
+
+fn parse_effort(value: std.json.Value) ParseError!types.ReasoningEffort {
+    if (value != .string) return error.InvalidReasoningEffort;
+    const effort = types.ReasoningEffort.parse(value.string) orelse return error.InvalidReasoningEffort;
+    if (effort == .auto) return error.InvalidReasoningEffort;
+    return effort;
+}
+
+fn parse_efforts(value: ?std.json.Value) ParseError!model_capabilities.ReasoningEffortOptions {
+    const present = value orelse return .{};
+    if (present != .array or present.array.items.len > types.ReasoningEffort.max_options) return error.InvalidReasoningEffort;
+    var result: model_capabilities.ReasoningEffortOptions = .{};
+    for (present.array.items) |item| {
+        const effort = try parse_effort(item);
+        for (result.slice()) |existing| if (existing.eql(effort)) return error.InvalidReasoningEffort;
+        result.values[result.len] = effort;
+        result.len += 1;
+    }
+    return result;
 }
 
 fn positive_limit(value: ?std.json.Value) ParseError!?u32 {
@@ -637,4 +666,28 @@ fn test_invalid_allocations(alloc: Allocator) !void {
 
 test "configured provider validation failures release earlier definitions and models" {
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, test_invalid_allocations, .{});
+}
+
+test "configured reasoning efforts are explicit bounded values independent of reviewer effort" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"custom":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"reviewer_effort":"low","model_metadata":{"actor":{"reasoning_efforts":["low","high"]},"reviewer":{"reasoning_efforts":["low"]},"unknown":{},"empty":{"reasoning_efforts":[]}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("custom").?;
+    try std.testing.expectEqualStrings("low", definition.reviewer_effort.?.label());
+    try std.testing.expectEqual(@as(usize, 2), definition.model("actor").?.reasoning_efforts.len);
+    try std.testing.expectEqualStrings("high", definition.model("actor").?.reasoning_efforts.slice()[1].label());
+    try std.testing.expectEqual(@as(usize, 0), definition.model("unknown").?.reasoning_efforts.len);
+    try std.testing.expectEqual(@as(usize, 0), definition.model("empty").?.reasoning_efforts.len);
+    for ([_][]const u8{ "null", "true", "[1]", "[\"\"]", "[\"auto\"]", "[\"low\",\"low\"]" }) |invalid| {
+        const raw = try alloc.print("{{\"custom\":{{{s},\"model_metadata\":{{\"m\":{{\"reasoning_efforts\":{s}}}}}}}}}", .{ test_required_fields, invalid });
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidReasoningEffort, Registry.parse_json(alloc, raw));
+    }
+    for ([_][]const u8{ "null", "true", "\"auto\"", "\"low high\"" }) |invalid| {
+        const raw = try alloc.print("{{\"custom\":{{{s},\"reviewer_effort\":{s}}}}}", .{ test_required_fields, invalid });
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidReasoningEffort, Registry.parse_json(alloc, raw));
+    }
 }

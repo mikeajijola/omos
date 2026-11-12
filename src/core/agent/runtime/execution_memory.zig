@@ -554,6 +554,15 @@ pub fn prepareToolExecutionOutput(
     execution: runtime_tool_contracts.ToolExecutionResult,
     capture: ?*command_replay_store.Capture,
 ) !result_store.PreparedResult {
+    if (execution.model_content_kind == .mcp_envelope) {
+        const prepared = try prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
+        retainCanonicalMcpOutput(arena, config, tool_call, execution, prepared) catch |err| {
+            // The external effect already happened. Keep its original result and
+            // preview; a failed optional optimization must never request replay.
+            debug_trace.logf("workspace", "canonical MCP companion unavailable err={s}", .{@errorName(err)});
+        };
+        return prepared;
+    }
     if (execution.model_content_kind != .complete_skill or execution.status != .success) {
         return prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
     }
@@ -566,6 +575,34 @@ pub fn prepareToolExecutionOutput(
     prepared.model_output = full;
     prepared.memory.truncated = false;
     return prepared;
+}
+
+fn retainCanonicalMcpOutput(
+    arena: Allocator,
+    config: Config,
+    call: ToolCall,
+    execution: runtime_tool_contracts.ToolExecutionResult,
+    prepared: result_store.PreparedResult,
+) !void {
+    const canonical = @import("../../tooling/canonical_tool_output.zig");
+    const sink = config.canonical_output_sink orelse return;
+    // Inline complete results already reach independent review verbatim. Avoid
+    // an extra journal write for small MCP replies such as session metadata.
+    if (!prepared.memory.truncated) return;
+    const capability = config.session_child_capability orelse return;
+    const handle = prepared.memory.output_handle orelse return;
+    if (execution.model_output.len > canonical.max_bytes) return;
+    const content = try tool_result_limits.prepareSanitizedOutput(arena, execution.model_output);
+    defer arena.free(content);
+    if (content.len != prepared.memory.stored_output_bytes) return error.InvalidCanonicalToolEvidence;
+    const captured: canonical.Capture = .{
+        .call = call,
+        .status = if (execution.status == .success) .success else .failure,
+        .handle = handle,
+        .content = content,
+    };
+    try canonical.verifyStored(arena, capability, captured);
+    try sink.capture_fn(sink.context, arena, captured);
 }
 
 pub fn prepareToolModelOutput(

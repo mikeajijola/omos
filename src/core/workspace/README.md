@@ -73,6 +73,11 @@ more results. This bounds inspection work without rejecting a large inventory.
 
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
+Records include a stable short reference for reads, checkpoints, and citations.
+The host resolves only exact registered references and retains canonical IDs in
+review receipts. The initial packet can also include complete payload pages for
+context, the candidate, and recent successful tools, within a 32 KiB total budget
+and the configured read limit. Other records remain available through the manifest.
 Its read action returns UTF-8 byte slices of JSON containing the original
 arguments and content. The assessor must inspect every byte of a cited record
 before that record can establish a met obligation. Pagination never grants
@@ -498,13 +503,15 @@ assessment. This does not change permissions,
 requested quantities, or the independent completion check. Older retained
 assessments without these fields remain readable.
 
-The execution policy defaults to a progress check after every four completed
-tool batches, a required reassessment after three consecutive no-progress
-judgments, and at most 100
-actor steps per invocation. The last actor slot is reserved for a summary with
-tools disabled. The existing global agent-step limit still applies. Continuing
-a paused task starts another bounded invocation with the same contract and
-retained evidence.
+The execution policy defaults to evidence-triggered progress review: three
+consecutive failed batches or four unchanged observations request an assessment.
+Successful varied work retains checkpoints without a periodic model call.
+An explicitly pinned periodic policy checks every four completed tool batches
+by default. Both modes require reassessment after three consecutive no-progress
+judgments and allow at most 100 actor steps per invocation. The last actor slot
+is reserved for a summary with tools disabled. The existing global agent-step
+limit still applies. Continuing a paused task starts another bounded invocation
+with the same contract and retained evidence.
 
 Progress assessment records successful evidence, remaining obligation IDs and
 a reason to continue, finalize or pause. The reviewer receives the previous

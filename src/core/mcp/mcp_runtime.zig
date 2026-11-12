@@ -1575,12 +1575,7 @@ pub const McpRuntime = struct {
                     continue;
                 }
                 if (server.startup_state.load(.acquire) == .complete) continue;
-                switch (startup_admission.decide(
-                    server.config.enabled,
-                    server.config.required,
-                    server.config.workspace_admission,
-                    batch.phase,
-                )) {
+                switch (startup_admission.decideServer(&server.config, batch.phase)) {
                     .disabled => {
                         var name_buf: [256]u8 = undefined;
                         debug_trace.logf(
@@ -1938,6 +1933,7 @@ pub const McpRuntime = struct {
                 if (!tool_catalog.serverCatalogAvailable(server)) continue;
                 if (server.tool_subscription) |subscription| if (subscription.hasInvalidation()) continue;
                 for (server.tool_catalog.tools.items) |tool| {
+                    if (!mcp_contract.preloadSelectionContains(server.config.always_loaded_tools, tool.original_name)) continue;
                     if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                     if (!guard.allows(.{ .tool = tool.prefixed_name })) continue;
                     try loaded.add(alloc, tool, server.instructions, self.bindingForTool(server, tool), limits);

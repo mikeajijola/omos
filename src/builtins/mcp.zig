@@ -1147,6 +1147,11 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
 
         try out.writer.print(",\"enabled\":{s}", .{if (config.enabled) "true" else "false"});
         if (config.required) try out.writer.writeAll(",\"required\":true");
+        if (config.always_loaded) try out.writer.writeAll(",\"always_loaded\":true");
+        if (config.always_loaded_tools) |names| {
+            try out.writer.writeAll(",\"always_loaded_tools\":");
+            try std.json.Stringify.value(names, .{}, &out.writer);
+        }
         if (config.transport == .stdio or
             config.transport == .http or
             config.transport == .sse)
@@ -2202,6 +2207,22 @@ test "loadConfigFromJson parses stdio type as stdio" {
     try std.testing.expectEqual(@as(usize, 1), configs.items.len);
     try std.testing.expectEqual(McpTransport.stdio, configs.items[0].transport);
     try std.testing.expectEqualStrings("node", try configs.items[0].stdioCommand());
+}
+
+test "MCP preload selection roundtrips without changing absent or empty selections" {
+    const alloc = std.testing.allocator;
+    var configs = try loadConfigFromJson(alloc,
+        \\{"mcp":{"all":{"command":["node"],"always_loaded":true},"some":{"command":["node"],"always_loaded":true,"always_loaded_tools":["echo"]},"none":{"command":["node"],"always_loaded":true,"always_loaded_tools":[]}}}
+    );
+    defer freeConfigs(alloc, &configs);
+    const rendered = try renderConfigJson(alloc, configs.items);
+    defer alloc.free(rendered);
+    var reparsed = try loadConfigFromJson(alloc, rendered);
+    defer freeConfigs(alloc, &reparsed);
+    try std.testing.expect(findConfig(reparsed.items, "all").?.always_loaded);
+    try std.testing.expect(findConfig(reparsed.items, "all").?.always_loaded_tools == null);
+    try std.testing.expectEqualStrings("echo", findConfig(reparsed.items, "some").?.always_loaded_tools.?[0]);
+    try std.testing.expectEqual(@as(usize, 0), findConfig(reparsed.items, "none").?.always_loaded_tools.?.len);
 }
 
 test "profile required policy defaults optional and roundtrips canonically" {

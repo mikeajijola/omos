@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, copyFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { cleanupFixtures, fixture, periodicReviews, model, writeMemory } from "./fossil-workspace-helpers";
 
@@ -26,6 +27,189 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
+  for (const resumeWithoutCache of [false, true]) test(`canonical MCP companion preserves raw review evidence${resumeWithoutCache ? " after resume without the result cache" : " while the actor receives a complete factored view"}`, async () => {
+    const f = fixture();
+    const effectLog = join(f.home, "effects.jsonl");
+    writeFileSync(join(f.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { fixture: {
+      type: "local", command: [Bun.which("node"), resolve(import.meta.dir, "fixtures/mcp-modern-stdio.mjs")],
+      always_loaded: true, environment: { FX_MCP_MODE: "structured_result", FX_MCP_EFFECT_LOG: effectLog },
+    } } }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let blocked = resumeWithoutCache;
+    let actorView: any, reviewedRaw = "", canonicalId = "";
+    const provider = model(f, (body, count) => {
+      if (count === 1) return { tool_calls: [{ index: 0, id: "structured-call", type: "function", function: {
+        name: "mcp_fixture_echo", arguments: JSON.stringify({ text: "Perform the fixture operation once" }),
+      } }] };
+      if (count === 2) {
+        const message = body.messages.find((item: any) => item.role === "tool" && item.tool_call_id === "structured-call");
+        expect(Buffer.byteLength(message.content)).toBeLessThan(16384);
+        actorView = JSON.parse(message.content);
+        expect(actorView.kind).toBe("omos.mcp-model-view/v1");
+        expect(actorView.verbatim).toBe(false);
+        expect(actorView.pointer_base).toBe("envelope");
+        expect(actorView.retained_text_prefix).toBe("");
+        expect(actorView.envelope.result.structuredContent.value.receipt).toBe("VERIFIED_TAIL_RECEIPT_731");
+        expect(actorView.envelope.result.content[0].text.factoredText).toEqual([
+          { literal: "Warning unique prefix\nok\nreturn: " },
+          { jsonPointer: "/result/structuredContent/value" },
+          { literal: "\nunique suffix" },
+        ]);
+        expect(actorView.envelope.result.content[1].text).toBe("Independent unique tip");
+        expect(actorView.envelope.result._meta.fixture).toBe("preserve-this-metadata");
+      }
+      return { content: blocked ? "The operation is retained; waiting for continuation." : "Recorded the fixture outcome." };
+    }, packet => {
+      const record = packet.evidence.find((item: any) => item.id.startsWith("canonical-tool-output:"));
+      expect(record).toBeDefined();
+      canonicalId = record.id;
+      expect(record.kind).toBe("tool");
+      expect(record.tool).toBe("mcp_fixture_echo");
+      expect(record.status).toBe("success");
+      expect(record.reference).toMatch(/^e:[0-9a-f]{16}$/);
+      if (blocked) return "blocked";
+      const pages = packet.inspections.filter((page: any) => page.id === canonicalId).sort((a: any, b: any) => a.offset - b.offset);
+      const last = pages.at(-1);
+      if (!last?.fullyInspected) return { name: "omos_review_evidence", args: {
+        action: "read", id: record.reference, offset: last?.nextOffset ?? 0, limit: 8192,
+      } };
+      const reviewedPayload = JSON.parse(pages.map((page: any) => page.content).join(""));
+      expect(JSON.parse(reviewedPayload.arguments)).toEqual({ text: "Perform the fixture operation once" });
+      reviewedRaw = reviewedPayload.content;
+      expect(pages.length).toBeGreaterThan(1);
+      expect(reviewedRaw).toContain("VERIFIED_TAIL_RECEIPT_731");
+      expect(reviewedRaw).not.toContain("omos.mcp-model-view/v1");
+      return { name: "omos_contract_assessment", args: {
+        contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((obligation: any) => ({ id: obligation.id, status: "met", evidence: [record.reference], note: "Inspected the complete canonical fixture receipt." })),
+      } };
+    });
+    const env = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+    const first = await f.run(["ask", "Perform the fixture service operation once and report its result", "--json"], env, 120000);
+    expect(first.code, first.stderr + first.stdout).toBe(resumeWithoutCache ? 1 : 0);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    const tasks = async () => JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+    const before = (await tasks())[0];
+    const history = () => f.fossil("ls", "-r", before.branch).trim().split("\n")
+      .filter(path => path.startsWith(`history/${before.id}/`)).map(path => JSON.parse(f.fossil("cat", path, "-r", before.branch)));
+    const companion = history().find(row => row.kind === "canonical_tool_output").value;
+    expect(companion.id).toBe(canonicalId);
+    expect(companion.binding).toMatchObject({ schema: "omos.canonical-mcp-output/v1", task: before.id, session: sessionId,
+      call_id: "structured-call", tool: "mcp_fixture_echo", status: "success", arguments: JSON.stringify({ text: "Perform the fixture operation once" }) });
+    expect(companion.binding.bytes).toBe(Buffer.byteLength(companion.content));
+    expect(companion.binding.bytes).toBeGreaterThan(16384);
+    expect(companion.binding.sha256).toBe(createHash("sha256").update(companion.content).digest("hex"));
+    expect(actorView.canonical).toEqual({ handle: companion.binding.handle, bytes: companion.binding.bytes, sha256: companion.binding.sha256, evidence_id: companion.id });
+    const effects = () => readFileSync(effectLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    expect(effects()).toHaveLength(1);
+    expect(JSON.parse(companion.content).result).toEqual(effects()[0].result);
+    const sessionPath = join(f.home, ".fx", "sessions", sessionId);
+    const retained = readFileSync(join(sessionPath, "events.jsonl"), "utf8");
+    expect(retained).toContain(companion.binding.handle);
+    expect(retained).not.toContain("omos.mcp-model-view/v1");
+    expect(retained).not.toContain("VERIFIED_TAIL_RECEIPT_731");
+    const retainedResult = retained.trim().split("\n").map(line => JSON.parse(line).event?.tool_result)
+      .find(result => result?.call_id === "structured-call");
+    expect(retainedResult.artifact_ref).toBe(companion.binding.handle);
+    expect(retainedResult.preview).toBe(companion.content.slice(0, 4096));
+    expect(retainedResult.stored_bytes).toBe(companion.binding.bytes);
+    if (resumeWithoutCache) {
+      const cachePath = join(sessionPath, "tool-results", companion.binding.handle);
+      expect(readFileSync(cachePath, "utf8")).toBe(companion.content);
+      unlinkSync(cachePath);
+      blocked = false;
+      const resumed = await f.run(["ask", "--resume-id", sessionId, "continue", "--json"], env, 120000);
+      expect(resumed.code, resumed.stderr + resumed.stdout).toBe(0);
+      expect(existsSync(cachePath)).toBe(false);
+    }
+    const after = await tasks();
+    expect(after).toHaveLength(1);
+    expect(after[0].id).toBe(before.id);
+    expect(after[0].state).toBe("accepted");
+    expect(effects()).toHaveLength(1);
+    expect(provider.counts().actors).toBe(resumeWithoutCache ? 3 : 2);
+    expect(reviewedRaw).toBe(companion.content);
+    expect(history().filter(row => row.kind === "canonical_tool_output").map(row => row.value)).toEqual([companion]);
+  }, 180000);
+
+  for (const routeSource of ["classifier", "resolver"] as const) test(`external read routed by ${routeSource} retains a reviewed work contract`, async () => {
+    const f = fixture();
+    writeFileSync(join(f.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { fixture: {
+      type: "local", command: [Bun.which("node"), resolve(import.meta.dir, "fixtures/mcp-modern-stdio.mjs")],
+      always_loaded: true, environment: { FX_MCP_RESULT_TEXT: "The external service reports version 7." },
+    } } }));
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let externalReads = 0, resolutions = 0;
+    const provider = model(f, body => {
+      if (body.tools.some((tool: any) => tool.function.name === "omos_request_route")) {
+        resolutions++;
+        const instructions = body.messages.filter((message: any) => message.role === "system").map((message: any) => message.content).join("\n");
+        expect(instructions).toContain("browser or external service tools, even read-only inspection");
+        return { tool_calls: [{ index: 0, id: "external-route", type: "function", function: { name: "omos_request_route", arguments: JSON.stringify({ route: "work", reason: "The requested source needs an external service tool." }) } }] };
+      }
+      expect(body.tools.map((tool: any) => tool.function.name)).toContain("mcp_fixture_echo");
+      if (externalReads++ === 0) return { tool_calls: [{ index: 0, id: "external-read", type: "function", function: { name: "mcp_fixture_echo", arguments: JSON.stringify({ text: "Read the current version" }) } }] };
+      return { content: "The external service reports version 7." };
+    });
+    const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const body = await request.json() as any;
+      if (body.questions.stop) return classifierReply();
+      expect(body.questions.route.criteria.retrieval).toContain("local workspace or conversation information");
+      expect(body.questions.route.criteria.work).toContain("including read-only inspection");
+      return routeReply(routeSource === "classifier" ? "work" : "unresolved");
+    } });
+    try {
+      const objective = "Read the current version from the external service using its tool and explain it.";
+      const result = await f.run(["ask", objective, "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${classifier.port}`, FX_MCP_PROTOCOL_VERSION: "2026-07-28" }, 120000);
+      expect(result.code, result.stderr + result.stdout).toBe(0);
+      expect(resolutions).toBe(routeSource === "resolver" ? 1 : 0);
+      expect(externalReads).toBe(2);
+      expect(provider.counts().assessments).toBeGreaterThan(0);
+      expect(provider.packets.at(-1).evidence.some((entry: any) => entry.kind === "tool" && entry.status === "success")).toBe(true);
+      const tasks = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks;
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].definition.objective).toBe(objective);
+      expect(tasks[0].state).toBe("accepted");
+    } finally { classifier.stop(true); }
+  }, 120000);
+
+  for (const capability of ["general_task", "coding_task", "missing", "uncertain"] as const) test(`request contract template ${capability} preserves review and the original outcome`, async () => {
+    const f = fixture();
+    writeFileSync(join(f.cwd, ".gitignore"), "omos.fossil\n");
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let plans = 0;
+    const coding = capability === "coding_task";
+    const objective = coding ? "Implement answer.txt containing verified and test its contents" : "Remember exactly this preference: verify all 200 requested outcomes, including failures.";
+    const commands = ["printf 'verified\\n' > answer.txt", "test \"$(cat answer.txt)\" = verified"];
+    const m = model(f, (_body, count) => coding
+      ? count <= 2 ? { tool_calls: [{ index: 0, id: `coding-${count}`, type: "function", function: { name: "shell", arguments: JSON.stringify({ request: { action: "run", command: commands[count - 1], timeout_ms: 10000 } }) } }] } : { content: "Created and tested answer.txt." }
+      : count === 1 ? writeMemory("Verify all 200 requested outcomes, including failures.") : { content: "Saved the exact preference." }, undefined, {
+      plan: () => { plans++; return { capability: "general_task", summary: "Retain the requested preference", obligations: [], checks: [] }; },
+    });
+    const classifier = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const body = await request.json() as any;
+      if (body.questions.stop) return classifierReply();
+      const answers: Record<string, object> = { route: { type: "choice", choice: "work", confidence: 0.99, probabilities: { conversation: 0.003, retrieval: 0.003, work: 0.99, unresolved: 0.004 } } };
+      if (capability !== "missing") answers.capability = { type: "choice", choice: coding ? "coding_task" : "general_task", confidence: capability === "uncertain" ? 0.6 : 0.99, probabilities: coding ? { coding_task: 0.99, general_task: 0.005, unresolved: 0.005 } : { general_task: 0.99, coding_task: 0.005, unresolved: 0.005 } };
+      return Response.json({ model: "fixture-classifier", answers });
+    } });
+    try {
+      const result = await f.run(["ask", objective, "--json"], { OMOS_CLASSIFIER_URL: `http://127.0.0.1:${classifier.port}` }, 120000);
+      expect(result.code, result.stderr + result.stdout).toBe(0);
+      expect(plans).toBe(capability === "missing" || capability === "uncertain" ? 1 : 0);
+      expect(m.counts().assessments).toBeGreaterThan(0);
+      expect(m.packets.at(-1).evidence.some((entry: any) => entry.kind === "tool" && entry.status === "success")).toBe(true);
+      const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+      expect(task.definition.objective).toBe(objective);
+      expect(task.model_basis.capability).toBe(coding ? "coding_task" : "general_task");
+      expect(task.definition.obligations.map((o: any) => o.id)).toEqual(coding ? ["request_complete", "coding_validation", "coding_summary"] : ["request_complete"]);
+      expect(task.state).toBe("accepted");
+      expect(f.fossil("ls", "-r", "trunk")).toContain("acceptances/");
+      if (coding) expect(readFileSync(join(f.cwd, "answer.txt"), "utf8")).toBe("verified\n");
+      else expect(f.fossil("cat", "memory/preference.md", "-r", "trunk")).toBe("Verify all 200 requested outcomes, including failures.");
+    } finally { classifier.stop(true); }
+  }, 120000);
+
   test("an unavailable progress reviewer defers the check without replaying work or bypassing completion", async () => {
     const f = fixture();
     expect((await f.run(["fossil", "init"])).code).toBe(0);
@@ -234,6 +418,31 @@ describe("portable Fossil agent workspace", () => {
     expect(result.code, result.stderr + result.stdout).toBe(0);
     expect(m.counts()).toEqual({ actors: 2, assessments: 2 });
     expect(JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0].state).toBe("accepted");
+  }, 120000);
+
+  test("completion review resolves short references and publishes canonical evidence receipts", async () => {
+    const f = fixture();
+    expect((await f.run(["fossil", "init"])).code).toBe(0);
+    let canonical = "", reference = "";
+    const m = model(f, (_body, count) => count === 1 ? writeMemory("Verified preference. ".repeat(450)) : { content: "Saved the preference." }, packet => {
+      const record = packet.evidence.find((item: any) => item.kind === "tool" && item.status === "success" && item.tool === "fossil_workspace");
+      canonical = record.id; reference = record.reference;
+      expect(reference).toMatch(/^e:[0-9a-f]{16}$/);
+      const inspected = packet.currentInspections.find((page: any) => page.id === canonical && page.fullyInspected);
+      if (!inspected) return { name: "omos_review_evidence", args: { action: "read", id: reference } };
+      return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version,
+        obligations: packet.contract.obligations.map((o: any) => ({ id: o.id, status: "met", evidence: [reference], note: "Inspected the complete successful write." })),
+      } };
+    });
+    const result = await f.run(["ask", "Save the verified preference text", "--json"], {}, 120000);
+    expect(result.code, result.stderr + result.stdout).toBe(0);
+    expect(m.counts()).toEqual({ actors: 2, assessments: 2 });
+    const task = JSON.parse((await f.run(["fossil", "tasks", "--json"])).stdout).tasks[0];
+    expect(task.state).toBe("accepted");
+    const history = f.fossil("ls", "-r", task.branch).trim().split("\n").filter(path => path.startsWith(`history/${task.id}/`)).map(path => JSON.parse(f.fossil("cat", path, "-r", task.branch)));
+    const assessment = JSON.parse(history.find(row => row.kind === "review_assessment").value.data);
+    expect(assessment.obligations[0].evidence).toEqual([canonical]);
+    expect(assessment.obligations[0].evidence).not.toContain(reference);
   }, 120000);
 
   test("a progress finalize decision still passes the independent completion gate", async () => {

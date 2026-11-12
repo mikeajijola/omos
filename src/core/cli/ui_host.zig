@@ -576,7 +576,8 @@ const BackgroundRun = struct {
         const starting = (try background_dispatch.reserve(manager, entry, owner)) orelse return error.WorkspaceExecutionBusy;
         var context: BackgroundRun = .{ .manager = manager, .entry = starting, .authority = authority, .owner = owner, .cancel = cancel };
         const id = try manager.alloc.print("background-{s}-{d}", .{ entry.task, starting.generation });
-        _ = try server.startWithBackground(manager.alloc, id, try value(manager.alloc, .{ .text = "continue", .session = entry.worker_session, .model = authority.model, .effort = authority.effort.label() }), null, &context);
+        const prompt = try background_dispatch.workerPrompt(manager, starting);
+        _ = try server.startWithBackground(manager.alloc, id, try value(manager.alloc, .{ .text = prompt, .session = starting.worker_session, .model = authority.model, .effort = authority.effort.label() }), null, &context);
         const job = server.job orelse return error.BackgroundHostUnavailable;
         defer job.destroy();
         var monitor_context: Monitor = .{ .run_context = &context, .ui = &job.ui, .checked_at = io.milliTimestamp() };

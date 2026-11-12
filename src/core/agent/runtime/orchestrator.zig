@@ -7040,7 +7040,7 @@ noinline fn assessCompletionAttempt(
             .retry_count = 1,
             .messages = &.{},
             .tool_choice = .required,
-            .provider_options = .{},
+            .provider_options = .{ .reasoning = input.config.contract_review_effort },
             .trace_ctx = .{ .turn_id = input.turn_id },
             .content_capture_limit = work_contract.max_bytes,
             .deadline = if (std.Io.Clock.Timestamp.compare(total_deadline, .lt, attempt_deadline)) total_deadline else attempt_deadline,
@@ -7089,7 +7089,7 @@ noinline fn resolveContractIntent(deps: *const AgentRuntimeDeps, alloc: Allocato
         .retry_count = 0,
         .messages = &.{},
         .tool_choice = .required,
-        .provider_options = .{},
+        .provider_options = .{ .reasoning = config.contract_review_effort },
         .trace_ctx = .{ .turn_id = turn_id },
         .content_capture_limit = 1024,
         .deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(20000) }),
@@ -7124,7 +7124,7 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .retry_count = 1,
         .messages = &.{},
         .tool_choice = .required,
-        .provider_options = .{},
+        .provider_options = .{ .reasoning = input.config.contract_review_effort },
         .trace_ctx = .{ .turn_id = input.turn_id },
         .content_capture_limit = work_contract.max_bytes,
         .delivery = &delivery,
@@ -7315,6 +7315,7 @@ fn processQueuedPromptLoop(
     }
     var retrieval_turn = false;
     var classified_work = false;
+    var request_capability: ?@import("../../workspace/request_plan.zig").Capability = null;
     var lookup_state: lookup_checkpoint.State = .{};
     const lookup_checkpoints_enabled = if (comptime builtin.target.cpu.arch.isWasm()) false else @import("../../workspace/classification.zig").lookupConfigured();
     defer if (comptime !builtin.target.cpu.arch.isWasm()) {
@@ -7400,6 +7401,7 @@ fn processQueuedPromptLoop(
             }
             retrieval_turn = decision.route != .work;
             classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null);
+            if (classified_work) request_capability = decision.capability;
             if (retrieval_turn) {
                 if (contract_selection.lookup_task) |id| {
                     try stable_prefix.append(arena, .{ .role = .system, .content = try arena.print("This read-only request concerns retained contract {s}. Use this exact task ID for workspace_content contracts/background reads; do not inspect unrelated contracts. Start with its current status and inspect receipts or ledgers if the question asks for completed outcomes. A missing publication or null count means unknown, not zero.", .{id}) });
@@ -7457,7 +7459,10 @@ fn processQueuedPromptLoop(
             return;
         }
     }
-    if (managed) |turn| job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+    if (managed) |*turn| {
+        config.canonical_output_sink = turn.canonicalSink(config.fossil_session_id.?);
+        job.workspace_binding_hash = try turn.manager.bindingHash(turn.task);
+    }
     const contract_enabled = deps.assess_contract != null or (config.contract_review_enabled and (config.origin == .root or managed != null));
     var active_api_key: []const u8 = job.api_key;
     var owned_refreshed_api_key: ?[]u8 = null;
@@ -7478,6 +7483,23 @@ fn processQueuedPromptLoop(
     var last_tool_call_id: []const u8 = "none";
     var last_gateway_message_count: usize = stable_prefix.items.len + history_messages.items.len + 1;
     if (managed) |*turn| {
+        if (request_capability) |capability| {
+            const request_plan = @import("../../workspace/request_plan.zig");
+            const basis = turn.task.model_basis;
+            if (basis != null and request_plan.eligible(.{
+                .has_plan = basis.?.capability != null,
+                .revision_pending = turn.task.revision_pending,
+                .amendments = turn.task.amendments.len,
+                .scoped = turn.task.authority != null or turn.task.parent_task_id != null or turn.task.capability_import != null or turn.task.capability_runtime_receipt != null,
+                .request_matches = std.mem.eql(u8, job.prompt, try turn.manager.originalRequest(turn.task)),
+            })) {
+                // Keep the authenticated request as the acceptance criterion.
+                // setPlan adds native coding requirements when applicable;
+                // normal permissions and independent publication still apply.
+                turn.task = try turn.manager.setPlan(turn.task, @tagName(capability), "Retain the complete authenticated request as the work contract; verify every requested outcome independently.", &.{}, &.{});
+                debug_trace.eventf("workspace", "request_contract_bound", .{ .turn_id = turn_id }, "capability={s} task={s}", .{ @tagName(capability), turn.task.id });
+            }
+        }
         _ = planManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = &.{}, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = 0, .managed = turn }) catch |err| {
             if (err != error.TaskGovernancePending and err != error.TaskGovernanceUnavailable) return err;
             try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, governance_pause_notice, "workspace_governance_pending");
@@ -8041,11 +8063,16 @@ fn processQueuedPromptLoop(
                     subagent_request_messages.len,
                 });
             }
-            const result_request_messages = try project_read_tool_result_request_messages(
+            const retained_result_messages = try project_read_tool_result_request_messages(
                 overlay_arena,
                 read_tool_result_request_eligible,
                 subagent_request_messages,
             );
+            // Outgoing actor view only: retained messages and review coverage are unchanged.
+            const result_request_messages = if (managed) |*turn|
+                turn.projectCanonicalMessages(overlay_arena, retained_result_messages, config.max_tool_result_bytes)
+            else
+                retained_result_messages;
             if (!tool_image_capabilities_resolved and request_capabilities.image_input_support == .unknown) {
                 for (result_request_messages) |message| {
                     const memory = message.tool_result_memory orelse continue;

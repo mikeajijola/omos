@@ -17,6 +17,8 @@ const Allocator = std.mem.Allocator;
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    /// Explicit model capability; absent preserves rejection of reasoning options.
+    reasoning_efforts: []const types.ReasoningEffort = &.{},
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -163,11 +165,17 @@ fn validate_dynamic_schema(value: std.json.Value, depth: usize, budget: *SchemaB
     }
 }
 
-fn validate_request(request: stream_provider.RequestData) Error!void {
+fn validate_request(request: stream_provider.RequestData, projection: Options) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.reasoning != null or options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
+    if (options.reasoning) |effort| {
+        if (effort == .auto) return error.UnsupportedProviderOption;
+        for (projection.reasoning_efforts) |allowed| {
+            if (allowed.eql(effort)) break;
+        } else return error.UnsupportedProviderOption;
+    }
+    if (options.fast or options.prompt_caching) return error.UnsupportedProviderOption;
     if (options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.response_format != null) return error.UnsupportedResponseFormat;
     // The vision tool runs through a separate provider request; inline image
@@ -401,7 +409,7 @@ fn write_replay(writer: *std.Io.Writer, replay_fields: std.json.ObjectMap) std.I
 /// max_output_tokens deliberately maps to max_tokens, not max_completion_tokens.
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(input);
+    try validate_request(input, options);
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -628,6 +636,10 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             try std.json.Stringify.value(parallel, .{}, writer);
         }
     }
+    if (request.provider_options.reasoning) |effort| {
+        try writer.writeAll(",\"reasoning_effort\":");
+        try std.json.Stringify.value(effort.label(), .{}, writer);
+    }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
     try writer.writeByte('}');
 }
@@ -698,7 +710,11 @@ pub const Reducer = struct {
     json_bytes: usize = 0,
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
-        try validate_request(request);
+        return init_with_options(alloc, request, limits, .{});
+    }
+
+    pub fn init_with_options(alloc: Allocator, request: stream_provider.RequestData, limits: Limits, options: Options) Error!Reducer {
+        try validate_request(request, options);
         var functions = try select_functions(alloc, request.tools, request.tool_choice);
         defer functions.deinit(alloc);
         var self = Reducer{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
@@ -1110,8 +1126,12 @@ pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_
 }
 
 pub fn consume_stream_diagnostic(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), diagnostic: ?*?stream_provider.ToolIdentityFailure) Error!stream_provider.Result {
+    return consume_stream_with_options(alloc, source, request, limits, events, cancel_flag, diagnostic, .{});
+}
+
+pub fn consume_stream_with_options(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), diagnostic: ?*?stream_provider.ToolIdentityFailure, options: Options) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var reducer = try Reducer.init(alloc, request, limits);
+    var reducer = try Reducer.init_with_options(alloc, request, limits, options);
     defer reducer.deinit();
     errdefer {
         if (diagnostic) |out| {
@@ -2850,4 +2870,32 @@ test "chat completions Gemini signature validation fails closed and stays bounde
         "{\"_tool_call_signatures\":[1],\"_tool_call_ids\":[\"call\"]}",
         "{\"_tool_call_signatures\":[\"signature\"],\"_tool_call_ids\":[]}",
     }) |raw| try std.testing.expectError(error.InvalidProviderState, parse_replay(alloc, raw));
+}
+
+test "chat completions reasoning projection requires an exact declared effort" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    const allowed = [_]types.ReasoningEffort{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") };
+    const omitted = try build_request(alloc, request, .{ .reasoning_efforts = &allowed });
+    defer alloc.free(omitted);
+    try std.testing.expect(std.mem.find(u8, omitted, "reasoning_effort") == null);
+    request.provider_options.reasoning = types.ReasoningEffort.literal("low");
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{}));
+    const body = try build_request(alloc, request, .{ .reasoning_efforts = &allowed });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("low", parsed.value.object.get("reasoning_effort").?.string);
+    var reducer = try Reducer.init_with_options(alloc, request, .{}, .{ .reasoning_efforts = &allowed });
+    defer reducer.deinit();
+    try test_accept(&reducer, test_text);
+    var completed = try test_finish(&reducer, test_stop);
+    defer completed.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", completed.completed.completion.content.?);
+    request.provider_options.reasoning = types.ReasoningEffort.literal("minimal");
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{ .reasoning_efforts = &allowed }));
+    request.provider_options.reasoning = .auto;
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{ .reasoning_efforts = &allowed }));
+    request.provider_options = .{ .reasoning = types.ReasoningEffort.literal("low"), .fast = true };
+    try std.testing.expectError(error.UnsupportedProviderOption, build_request(alloc, request, .{ .reasoning_efforts = &allowed }));
 }

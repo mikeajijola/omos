@@ -1013,6 +1013,12 @@ fn parseServerEntry(
     else
         false;
     const required = if (policy.force_optional) false else configured_required;
+    const always_loaded = if (object.get("always_loaded")) |field|
+        if (field == .bool) field.bool else return failServerConfig(error.McpConfigInvalidAlwaysLoaded)
+    else
+        false;
+    const always_loaded_tools = try parseAlwaysLoadedTools(alloc, object);
+    errdefer if (always_loaded_tools) |names| freeOwnedStrings(alloc, names);
 
     if (transport != .stdio) {
         const url_value = object.get("url") orelse return failServerConfig(error.McpConfigMissingUrl);
@@ -1045,6 +1051,8 @@ fn parseServerEntry(
             .source = policy.source,
             .scope = policy.scope,
             .required = required,
+            .always_loaded = always_loaded,
+            .always_loaded_tools = always_loaded_tools,
             .transport = transport,
             .url = owned_url,
             .env = env,
@@ -1080,6 +1088,8 @@ fn parseServerEntry(
         .source = policy.source,
         .scope = policy.scope,
         .required = required,
+        .always_loaded = always_loaded,
+        .always_loaded_tools = always_loaded_tools,
         .transport = .stdio,
         .command = command.command,
         .args = command.args,
@@ -1090,6 +1100,24 @@ fn parseServerEntry(
         .operation_timeout_ms = timeouts.operation_ms,
         .restart_limit = @intCast(restart_limit),
     };
+}
+
+fn parseAlwaysLoadedTools(alloc: Allocator, object: std.json.ObjectMap) !?[]const []const u8 {
+    const field = object.get("always_loaded_tools") orelse return null;
+    if (field != .array or field.array.items.len > 256) return error.McpConfigInvalidAlwaysLoadedTools;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    for (field.array.items) |item| {
+        if (item != .string or item.string.len == 0 or item.string.len > 256 or std.mem.findScalar(u8, item.string, 0) != null) return error.McpConfigInvalidAlwaysLoadedTools;
+        for (names.items) |name| if (std.mem.eql(u8, name, item.string)) return error.McpConfigInvalidAlwaysLoadedTools;
+        const name = try alloc.dupe(u8, item.string);
+        errdefer alloc.free(name);
+        try names.append(alloc, name);
+    }
+    return try names.toOwnedSlice(alloc);
 }
 
 fn parseTimeouts(object: std.json.ObjectMap) error{
@@ -1536,6 +1564,30 @@ test "profile parser preserves validation precedence for multiply invalid entrie
             case.expected,
             parseProfileJson(std.testing.allocator, case.json),
         );
+    }
+}
+
+test "MCP always loaded configuration is explicit and boolean" {
+    const alloc = std.testing.allocator;
+    var configs = try parseProfileJson(alloc,
+        \\{"mcp":{"loaded":{"command":["echo"],"always_loaded":true,"always_loaded_tools":["run","name_session"]},"lazy":{"type":"http","url":"https://example.test/mcp","always_loaded_tools":[]}}}
+    );
+    defer {
+        for (configs.items) |*config| config.deinit(alloc);
+        configs.deinit(alloc);
+    }
+    try std.testing.expect(configs.items[0].always_loaded);
+    try std.testing.expect(!configs.items[0].required);
+    try std.testing.expect(!configs.items[1].always_loaded);
+    try std.testing.expectEqualStrings("run", configs.items[0].always_loaded_tools.?[0]);
+    try std.testing.expectEqual(@as(usize, 0), configs.items[1].always_loaded_tools.?.len);
+    try std.testing.expectError(error.McpConfigInvalidAlwaysLoaded, parseProfileJson(alloc,
+        \\{"mcp":{"bad":{"command":["echo"],"always_loaded":"yes"}}}
+    ));
+    for ([_][]const u8{ "null", "true", "[1]", "[\"\"]", "[\"echo\",\"echo\"]" }) |invalid| {
+        const input = try alloc.print("{{\"mcp\":{{\"bad\":{{\"command\":[\"echo\"],\"always_loaded_tools\":{s}}}}}}}", .{invalid});
+        defer alloc.free(input);
+        try std.testing.expectError(error.McpConfigInvalidAlwaysLoadedTools, parseProfileJson(alloc, input));
     }
 }
 

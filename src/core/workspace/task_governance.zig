@@ -456,13 +456,21 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
         try messages.append(alloc, .{ .role = .assistant, .content = if (completion.content) |content| try alloc.dupe(u8, content) else null, .tool_calls = try types.dupeToolCallSlice(alloc, completion.tool_calls), .provider_replay = if (completion.provider_state_json) |parts| .{ .source = .{ .provider = provider_id, .model = request.model }, .parts_json = try alloc.dupe(u8, parts) } else null });
         // Providers may ignore the sequential request. Multiple read-only
         // lookups are safe to service in order; decisions must stand alone.
-        for (completion.tool_calls) |call| {
+        for (completion.tool_calls) |raw_call| {
+            var call = raw_call;
             const decision = std.mem.eql(u8, call.name, function.name);
             const page = progress_review and !decision_only and std.mem.eql(u8, call.name, page_schema.name);
             var failure: ?anyerror = null;
             var content: []const u8 = "";
+            if (progress_review and (decision or page)) {
+                call.arguments_json = view.canonicalCall(alloc, call.arguments_json, if (decision) .progress else .evidence) catch |err| blk: {
+                    if (err == error.OutOfMemory) return err;
+                    failure = err;
+                    break :blk call.arguments_json;
+                };
+            }
             if (decision and completion.tool_calls.len == 1) {
-                validateDecision(alloc, function.name, definition, &view, records, call.arguments_json) catch |err| {
+                if (failure == null) validateDecision(alloc, function.name, definition, &view, records, call.arguments_json) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     failure = err;
                 };
@@ -476,7 +484,7 @@ fn invokeAttempt(alloc: std.mem.Allocator, provider: streams.Provider, base: str
                     try journal.record(if (std.mem.eql(u8, function.name, plan_schema.name)) "planning_assessment" else if (std.mem.eql(u8, function.name, revision_schema.name)) "contract_revision_assessment" else "progress_assessment", call.arguments_json);
                     return .{ .raw = try alloc.dupe(u8, call.arguments_json), .usage = usage };
                 }
-            } else if (page) {
+            } else if (page and failure == null) {
                 try journal.record("governance_evidence_access", call.arguments_json);
                 content = view.page(alloc, call.arguments_json) catch |err| blk: {
                     if (err == error.OutOfMemory or err == error.Cancelled) return err;

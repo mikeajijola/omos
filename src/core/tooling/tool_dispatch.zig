@@ -166,7 +166,7 @@ pub const ToolResult = union(enum) {
     }
 };
 
-pub const ModelContentKind = enum { ordinary, complete_skill };
+pub const ModelContentKind = enum { ordinary, complete_skill, mcp_envelope };
 
 /// Arguments: context, allocator, tool name, the model's call id, arguments
 /// JSON, result limit, and cancel flag.
@@ -884,8 +884,8 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const output = result.intoAuthorized();
             return .{
                 .status = output.status,
-                .model_content_kind = if (output.status == .success)
-                    if (admitted.context.model_content_kind_sink) |kind| kind.* else .ordinary
+                .model_content_kind = if (admitted.context.model_content_kind_sink) |kind|
+                    if (output.status == .success or kind.* == .mcp_envelope) kind.* else .ordinary
                 else
                     .ordinary,
                 .body = output.body,

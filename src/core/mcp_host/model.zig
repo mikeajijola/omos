@@ -242,6 +242,7 @@ pub const Catalog = struct {
             const instructions = try c.runtime.instructions(alloc, i);
             defer if (instructions) |text| alloc.free(text);
             for (l.tools) |*tool| {
+                if (!@import("../mcp/mcp_contract.zig").preloadSelectionContains(s.always_loaded_tools, tool.original_name)) continue;
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                 if (!access.allowsTool(c.generation, tool.prefixed_name)) continue;
                 try loaded.add(alloc, tool.*, instructions, c.bindingLocked(i, tool.*), limits);

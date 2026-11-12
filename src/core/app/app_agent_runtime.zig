@@ -1119,6 +1119,7 @@ pub fn Runtime(comptime App: type) type {
                     job.model,
                 );
                 config.contract_review_model = review_sel.model;
+                config.contract_review_effort = completion_review.reviewerEffort(review_sel.provider, app.providerSet().definitions);
                 config.contract_review_provider = review_sel.provider;
                 config.contract_review_stream_provider = app.providerSet().select(review_sel.provider).agent_stream_or_unavailable();
                 if (!review_sel.provider.eql(job.provider)) {
@@ -1361,6 +1362,10 @@ pub fn Runtime(comptime App: type) type {
                     completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).provider
                 else
                     job.provider,
+                .contract_review_effort = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
+                    completion_review.reviewerEffort(completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).provider, app.providerSet().definitions)
+                else
+                    null,
                 .contract_review_stream_provider = if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet"))
                     app.providerSet().select(completion_review.resolveSelection(app.review_model, job.provider, app.providerSet().definitions, job.model).provider).agent_stream_or_unavailable()
                 else

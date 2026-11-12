@@ -4884,6 +4884,11 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 
 test {
     _ = @import("core/workspace/request_routing.zig");
+    _ = @import("core/workspace/request_plan.zig");
+    _ = @import("core/tooling/canonical_tool_output.zig");
+    _ = @import("core/mcp/result_projection.zig");
+    _ = @import("core/workspace/canonical_tool_outputs.zig");
+    _ = @import("core/mcp/startup_admission.zig");
     _ = @import("core/workspace/classification.zig");
     _ = @import("core/workspace/attention.zig");
     _ = @import("core/workspace/retrieval.zig");

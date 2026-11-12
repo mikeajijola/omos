@@ -107,7 +107,11 @@ not silently truncated.
 With the endpoint configured, saved root requests are classified before task
 planning using the latest message and bounded recent conversation. Confident
 conversation and retrieval routes get a read-only tool set and at most six agent
-steps. They do not create task contracts. Uncertain classifications get one bounded contextual model call with recent
+steps. They do not create task contracts. Retrieval is limited to existing local
+workspace and conversation information available through `workspace_content`,
+`read_tool_result`, and `classify`, including recorded task status. Requests that
+need a browser or external service tool use work contracts even when they only
+read information. Uncertain classifications get one bounded contextual model call with recent
 conversation and the active task identity. A resolved work request retains the
 existing governed execution path. If resolution fails, the read-only turn can
 inspect information or ask for missing context without starting actions. Routing records retain the outcome, probability
@@ -115,6 +119,16 @@ scores, reason, and whether context was omitted. Background workers continue the
 existing contracts. Classification remains available as the `classify` tool to
 ordinary, coordinator, read-only, background, and child agent tool projections,
 subject to the normal permission rules.
+
+The routing call also offers an optional deliverable choice: `general_task`,
+`coding_task`, or `unresolved`. A fresh personal work request with complete
+classification context and a confident capability choice binds a host contract
+directly, retaining the authenticated request without rewriting its quantities
+or acceptance criteria. Coding contracts retain the host's source validation
+and final summary requirements. Missing or uncertain capability choices,
+amendments, and scoped work use semantic planning. Existing plans remain pinned.
+Both paths require the same tool permissions and independent evidence review
+before publication.
 
 ## Stop a lookup when its answer is sufficient
 
@@ -257,6 +271,64 @@ Start it with `--operator` only for a trusted human-operated client that needs
 protected input and background mutation controls. Classification output never
 changes that authority. The signed company MCP transport retains its separate
 company scope and grants.
+
+## Load configured MCP tools at startup
+
+Set `always_loaded` on a server in `~/.fx/mcp.json` to make its available tools
+visible to Ask and background workers without a discovery call:
+
+```json
+{
+  "mcp": {
+    "browser": {
+      "type": "http",
+      "url": "https://example.test/mcp",
+      "always_loaded": true,
+      "always_loaded_tools": ["run", "name_session"]
+    }
+  }
+}
+```
+
+Replace the example URL with your configured MCP endpoint. `always_loaded`
+defaults to `false` and does not make an optional server required. Disabled or
+unapproved project servers remain unavailable; project `.mcp.json` entries still
+require the existing trust approval. Complete schemas share the configured
+`mcp_selected_schema_bytes` budget, which defaults to 64 KiB. Tools beyond that
+budget remain discoverable through `capability_search`.
+
+The optional `always_loaded_tools` list selects exact original tool names
+advertised by that server, without the `mcp_<server>_` prefix. Replace the example
+names with tools your server provides. Omitting the list selects all available
+tools within the budget; `[]` selects none. Unknown names select nothing and
+never fall back to loading all tools. Other tools remain discoverable on demand.
+
+Loading a schema grants no permission to call it. Configured denies still apply,
+bindings are rechecked before each model step, and every action follows normal
+permission review. Coordinator turns retain their own tool set.
+
+## Canonical MCP evidence and compact actor views
+
+For managed OMOS tasks, a large MCP result can retain a canonical companion in
+the task journal before the actor receives its next result. The companion binds
+the original task, session, call, exact arguments, status, result handle, byte
+count, and SHA-256 digest. Independent review reads that full companion through
+its normal evidence pages, even when the actor did not call `read_tool_result`.
+Failed tool results remain failed evidence, and partial pages remain partial
+inspection.
+
+An outgoing actor request may factor a JSON object or array repeated in MCP text
+and `structuredContent`. The view says `verbatim: false`, preserves distinct text,
+media notices, errors, and metadata, and replaces only an exactly matching JSON
+value with a pointer to its retained structured value. The canonical result,
+original conversation result, and reviewer inspection coverage stay unchanged.
+The full compact view must fit the existing inline budget; ambiguous matches,
+invalid data, or exhausted processing limits retain the ordinary preview.
+
+Only a successfully retained, validated companion enables this view. If normal
+workspace redaction would change the companion, or retention fails, the host keeps
+the existing result and preview without repeating the external action. Small
+complete results and unmanaged FX conversations use their existing behavior.
 
 ## Contract continuity across channels
 

@@ -333,6 +333,7 @@ pub fn run(
             .cancel_flag = cancel,
             .contract_review_enabled = @import("../agent/runtime/completion_review.zig").enabled(),
             .contract_review_model = review_selection.model,
+            .contract_review_effort = @import("../agent/runtime/completion_review.zig").reviewerEffort(review_selection.provider, config.provider_set.definitions),
             .contract_review_provider = review_selection.provider,
             .contract_review_stream_provider = config.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
             .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{

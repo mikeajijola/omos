@@ -37,6 +37,7 @@ pub const Evidence = struct {
 
 pub const IndexEntry = struct {
     id: []const u8,
+    reference: []const u8,
     kind: @FieldType(Evidence, "kind"),
     tool: ?[]const u8,
     arguments: ?[]const u8,
@@ -58,6 +59,8 @@ pub const View = struct {
     payload_refs: []const ?PayloadRef,
     payload_sizes: []const usize,
     payload_digests: []const []const u8,
+    references: []const []const u8,
+    identities: std.StringHashMapUnmanaged(usize),
     raw_ranges: std.ArrayList(struct { ordinal: usize, start: usize, end: usize }) = .empty,
     max_read_bytes: usize = 16384,
 
@@ -85,6 +88,22 @@ pub const View = struct {
         const refs = try alloc.alloc(?PayloadRef, records.len);
         const sizes = try alloc.alloc(usize, records.len);
         const digests = try alloc.alloc([]const u8, records.len);
+        const references = try alloc.alloc([]const u8, records.len);
+        var identities: std.StringHashMapUnmanaged(usize) = .empty;
+        for (records, 0..) |record, ordinal| {
+            const entry = try identities.getOrPut(alloc, record.id);
+            if (entry.found_existing) return error.InvalidContractEvidence;
+            entry.value_ptr.* = ordinal;
+        }
+        for (records, references, 0..) |record, *reference, ordinal| {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(record.id, &digest, .{});
+            const hex = std.fmt.bytesToHex(&digest, .lower);
+            reference.* = try alloc.print("e:{s}", .{hex[0..16]});
+            const entry = try identities.getOrPut(alloc, reference.*);
+            if (entry.found_existing) return error.InvalidContractEvidence;
+            entry.value_ptr.* = ordinal;
+        }
         var by_id: std.StringHashMapUnmanaged(PayloadRef) = .empty;
         for (backing) |reference| {
             if (reference.bytes <= 2048 or reference.bytes > 64 * 1024 * 1024 or reference.sha256.len != 64 or !std.mem.eql(u8, std.Io.Dir.path.basename(reference.path), reference.sha256)) return error.InvalidContractEvidence;
@@ -112,7 +131,48 @@ pub const View = struct {
             }
         }
         if (matched != backing.len) return error.InvalidContractEvidence;
-        return .{ .records = records, .inspected = inspected, .payloads = payloads, .payload_refs = refs, .payload_sizes = sizes, .payload_digests = digests };
+        return .{ .records = records, .inspected = inspected, .payloads = payloads, .payload_refs = refs, .payload_sizes = sizes, .payload_digests = digests, .references = references, .identities = identities };
+    }
+
+    pub fn canonicalId(self: View, id: []const u8) ![]const u8 {
+        const ordinal = self.identities.get(id) orelse return error.InvalidContractEvidence;
+        return self.records[ordinal].id;
+    }
+
+    /// Resolve only registered identities before persisting reviewer decisions.
+    /// Contract/obligation IDs and untrusted content are never rewritten.
+    pub fn canonicalCall(self: View, alloc: std.mem.Allocator, raw: []const u8, kind: enum { evidence, checkpoint, assessment, progress }) ![]const u8 {
+        var value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{});
+        if (value != .object) return error.InvalidContractEvidence;
+        if (kind == .progress) {
+            if (value.object.getPtr("evidence")) |citations| {
+                if (citations.* != .array) return error.InvalidContractAssessment;
+                for (citations.array.items) |*id| {
+                    if (id.* != .string) return error.InvalidContractEvidence;
+                    id.* = .{ .string = try self.canonicalId(id.string) };
+                }
+            }
+        } else if (kind != .assessment) {
+            if (value.object.getPtr("id")) |id| {
+                if (id.* != .null) {
+                    if (id.* != .string) return error.InvalidContractEvidence;
+                    id.* = .{ .string = try self.canonicalId(id.string) };
+                }
+            }
+        } else {
+            const obligations = value.object.getPtr("obligations") orelse return error.InvalidContractAssessment;
+            if (obligations.* != .array) return error.InvalidContractAssessment;
+            for (obligations.array.items) |*obligation| {
+                if (obligation.* != .object) return error.InvalidContractAssessment;
+                const citations = obligation.object.getPtr("evidence") orelse continue;
+                if (citations.* != .array) return error.InvalidContractAssessment;
+                for (citations.array.items) |*id| {
+                    if (id.* != .string) return error.InvalidContractEvidence;
+                    id.* = .{ .string = try self.canonicalId(id.string) };
+                }
+            }
+        }
+        return std.json.Stringify.valueAlloc(alloc, value, .{});
     }
 
     pub fn payloadSize(self: View, ordinal: usize) usize {
@@ -159,6 +219,7 @@ pub const View = struct {
             }
             entry.* = .{
                 .id = record.id,
+                .reference = self.references[ordinal],
                 .kind = record.kind,
                 .tool = record.tool,
                 .arguments = if (record.arguments) |args| if (complete) args else prefix(args, 512) else null,
@@ -176,6 +237,35 @@ pub const View = struct {
         return result;
     }
 
+    /// Include complete bounded payloads rather than requiring a model round
+    /// trip to read small answers and recent results. The manifest still lists
+    /// every record, including failures and larger or older evidence.
+    pub fn initialInspections(self: *View, alloc: std.mem.Allocator, byte_budget: usize) ![]const std.json.Value {
+        if (byte_budget == 0) return &.{};
+        var pages: std.ArrayList(std.json.Value) = .empty;
+        var used: usize = 0;
+        for ([_]@FieldType(Evidence, "kind"){ .context, .candidate, .tool }) |kind| {
+            var cursor = self.records.len;
+            while (cursor > 0 and pages.items.len < 16) {
+                cursor -= 1;
+                const record = self.records[cursor];
+                const size = self.payloadSize(cursor);
+                if (record.kind != kind or (kind == .tool and record.status != .success) or self.inspected[cursor] == size or size > @min(8192, self.max_read_bytes) or size > byte_budget - used) continue;
+                const previous = self.inspected[cursor];
+                const previous_ranges = self.raw_ranges.items.len;
+                const page_bytes = try self.page(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .action = "read", .id = record.id, .limit = size }, .{}));
+                if (page_bytes.len > byte_budget - used) {
+                    self.inspected[cursor] = previous;
+                    self.raw_ranges.items.len = previous_ranges;
+                    continue;
+                }
+                used += page_bytes.len;
+                try pages.append(alloc, try std.json.parseFromSliceLeaky(std.json.Value, alloc, page_bytes, .{}));
+            }
+        }
+        return pages.items;
+    }
+
     pub fn page(self: *View, alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
         const Command = struct { action: enum { list, read }, id: ?[]const u8 = null, offset: usize = 0, limit: usize = 16384 };
         const command = try record_json.decode(Command, alloc, raw, .{});
@@ -188,7 +278,7 @@ pub const View = struct {
                 .nextOffset = if (command.offset < self.records.len and entries.len < self.records.len - command.offset) command.offset + entries.len else @as(?usize, null),
             }, .{});
         }
-        const id = command.id orelse return error.InvalidContractEvidence;
+        const id = try self.canonicalId(command.id orelse return error.InvalidContractEvidence);
         for (self.records, 0..) |record, ordinal| {
             if (!std.mem.eql(u8, record.id, id)) continue;
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -201,6 +291,7 @@ pub const View = struct {
             if (command.offset <= self.inspected[ordinal]) self.inspected[ordinal] = @max(self.inspected[ordinal], command.offset + chunk.len);
             return std.json.Stringify.valueAlloc(alloc, .{
                 .id = id,
+                .reference = self.references[ordinal],
                 .offset = command.offset,
                 .content = chunk,
                 .bytes = payload.len,
@@ -232,7 +323,7 @@ pub const View = struct {
         if (command.limit == 0) return error.InvalidEvidenceOffset;
         const limit = @min(command.limit, 32);
         if (command.action == .coverage) {
-            const id = command.id orelse return error.InvalidContractEvidence;
+            const id = try self.canonicalId(command.id orelse return error.InvalidContractEvidence);
             for (self.records, 0..) |record, ordinal| {
                 if (!std.mem.eql(u8, record.id, id)) continue;
                 const Gap = struct { offset: usize, bytes: usize };
@@ -253,7 +344,7 @@ pub const View = struct {
                     try gaps.append(alloc, .{ .offset = cursor, .bytes = next - cursor });
                     cursor = next;
                 }
-                return std.json.Stringify.valueAlloc(alloc, .{ .id = id, .sha256 = self.payloadDigest(ordinal), .bytes = self.payloadSize(ordinal), .missing = gaps.items }, .{});
+                return std.json.Stringify.valueAlloc(alloc, .{ .id = id, .reference = self.references[ordinal], .sha256 = self.payloadDigest(ordinal), .bytes = self.payloadSize(ordinal), .missing = gaps.items }, .{});
             }
             return error.InvalidContractEvidence;
         }
@@ -261,7 +352,7 @@ pub const View = struct {
         if (command.action == .search and command.query == null) return error.InvalidEvidenceQuery;
         var related_action: ?[]const u8 = null;
         if (command.action == .related) {
-            const id = command.id orelse return error.InvalidContractEvidence;
+            const id = try self.canonicalId(command.id orelse return error.InvalidContractEvidence);
             const record = for (self.records) |record| {
                 if (std.mem.eql(u8, record.id, id)) break record;
             } else return error.InvalidContractEvidence;
@@ -344,8 +435,9 @@ pub const View = struct {
     }
 
     pub fn requireInspected(self: View, id: []const u8) !void {
+        const canonical = try self.canonicalId(id);
         for (self.records, 0..) |record, i| {
-            if (!std.mem.eql(u8, record.id, id)) continue;
+            if (!std.mem.eql(u8, record.id, canonical)) continue;
             if (self.inspected[i] != self.payloadSize(i)) return error.UninspectedContractEvidence;
             return;
         }
@@ -355,6 +447,84 @@ pub const View = struct {
 
 fn optionalMatch(filter: ?[]const u8, value: ?[]const u8) bool {
     return if (filter) |expected| if (value) |actual| std.mem.eql(u8, expected, actual) else false else true;
+}
+
+test "review references stay exact across pagination reorder and checkpoint restoration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const large = try alloc.alloc(u8, 4000);
+    @memset(large, 'x');
+    const records = [_]Evidence{
+        .{ .id = "execution:canonical:first:tool:complete-identity", .content = large, .status = .success },
+        .{ .id = "execution:canonical:second:tool:complete-identity", .content = "small", .status = .success },
+    };
+    var view = try View.init(alloc, &records);
+    const first = (try view.index(alloc, 0, 1))[0];
+    const second = (try view.index(alloc, 1, 1))[0];
+    try std.testing.expectEqual(@as(usize, 18), first.reference.len);
+    try std.testing.expectEqualStrings(records[0].id, try view.canonicalId(first.reference));
+    try std.testing.expectError(error.InvalidContractEvidence, view.canonicalId("e:0000000000000000"));
+    try std.testing.expectError(error.InvalidContractEvidence, view.canonicalId("execution:canonical:first"));
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected(first.reference));
+    const raw = try std.json.Stringify.valueAlloc(alloc, .{ .action = "read", .id = first.reference, .limit = 100 }, .{});
+    const page_bytes = try view.page(alloc, raw);
+    const page_value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, page_bytes, .{});
+    try std.testing.expectEqualStrings(records[0].id, page_value.object.get("id").?.string);
+    try std.testing.expectEqualStrings(first.reference, page_value.object.get("reference").?.string);
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected(first.reference));
+    var reordered = try View.init(alloc, &.{ records[1], records[0] });
+    try std.testing.expectEqualStrings(first.reference, (try reordered.index(alloc, 1, 1))[0].reference);
+    try std.testing.expectEqualStrings(second.reference, (try reordered.index(alloc, 0, 1))[0].reference);
+    _ = try reordered.restorePages(alloc, &.{page_bytes});
+    try std.testing.expectError(error.UninspectedContractEvidence, reordered.requireInspected(first.reference));
+    const definition: @import("work_contract.zig").Definition = .{ .id = "contract", .version = 1, .objective = "Verify the record", .obligations = &.{.{ .id = "request_complete", .description = "Verify the record" }} };
+    var ledger = try @import("review_checkpoints.zig").Ledger.init(alloc, definition, view);
+    const checkpoint = try std.json.Stringify.valueAlloc(alloc, .{ .id = first.reference, .offset = 0, .bytes = 100, .obligations = &.{.{ .id = "request_complete", .verdict = "supports", .note = "Inspected the first bytes" }} }, .{});
+    const receipt = try ledger.submit(alloc, view, try view.canonicalCall(alloc, checkpoint, .checkpoint));
+    const receipt_value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, receipt, .{});
+    try std.testing.expectEqualStrings(records[0].id, receipt_value.object.get("segment").?.object.get("id").?.string);
+    var restored = try @import("review_checkpoints.zig").Ledger.init(alloc, definition, reordered);
+    try restored.restore(alloc, &reordered, &.{receipt});
+    try std.testing.expectError(error.UninspectedContractEvidence, reordered.requireInspected(first.reference));
+    const assessment = try std.json.Stringify.valueAlloc(alloc, .{ .contractId = "contract", .version = 1, .obligations = &.{.{ .id = "request_complete", .status = "met", .evidence = &.{second.reference}, .note = "Inspected the record" }} }, .{});
+    const canonical = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try view.canonicalCall(alloc, assessment, .assessment), .{});
+    try std.testing.expectEqualStrings(records[1].id, canonical.object.get("obligations").?.array.items[0].object.get("evidence").?.array.items[0].string);
+    const progress = try view.canonicalCall(alloc, try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &.{second.reference}, .remaining = &.{"request_complete"} }, .{}), .progress);
+    const progress_value = try std.json.parseFromSliceLeaky(std.json.Value, alloc, progress, .{});
+    try std.testing.expectEqualStrings(records[1].id, progress_value.object.get("evidence").?.array.items[0].string);
+    try std.testing.expectEqualStrings("request_complete", progress_value.object.get("remaining").?.array.items[0].string);
+    try std.testing.expectError(error.InvalidContractEvidence, view.canonicalCall(alloc, "{\"id\":\"e:0000000000000000\"}", .checkpoint));
+    try std.testing.expectError(error.InvalidContractEvidence, View.init(alloc, &.{ records[0], records[0] }));
+}
+
+test "review initial inspections count only delivered bounded complete payloads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const large = try alloc.alloc(u8, 4000);
+    @memset(large, 'x');
+    const records = [_]Evidence{
+        .{ .id = "answer", .kind = .candidate, .content = large },
+        .{ .id = "result", .content = large, .status = .success },
+        .{ .id = "failure", .content = large, .status = .failure },
+    };
+    var view = try View.init(alloc, &records);
+    _ = try view.index(alloc, 0, 3);
+    try std.testing.expectEqual(@as(usize, 0), (try view.initialInspections(alloc, 0)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try view.initialInspections(alloc, 1)).len);
+    try std.testing.expectEqual(@as(usize, 0), view.raw_ranges.items.len);
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("answer"));
+    view.max_read_bytes = 100;
+    try std.testing.expectEqual(@as(usize, 0), (try view.initialInspections(alloc, 32768)).len);
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("result"));
+    view.max_read_bytes = 8192;
+    const pages = try view.initialInspections(alloc, 32768);
+    try std.testing.expectEqual(@as(usize, 2), pages.len);
+    try view.requireInspected("answer");
+    try view.requireInspected("result");
+    try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("failure"));
+    try std.testing.expectEqual(@as(usize, 3), (try view.index(alloc, 0, 3)).len);
 }
 
 test "completion review caps oversized record pages without losing records or inspecting previews" {

@@ -1054,6 +1054,7 @@ fn toolExecutionResultFromDispatch(
         },
         .failure => .{
             .status = .failure,
+            .model_content_kind = if (metadata.model_content_kind == .mcp_envelope) .mcp_envelope else .ordinary,
             .model_output = result.body,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,

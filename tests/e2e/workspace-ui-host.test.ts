@@ -35,6 +35,24 @@ test('native UI host saves governed turns and replays public events without repe
  expect(native.stderr).toBe('');
 },90000);
 
+test('native UI prompt preserves independent reviewer effort',async()=>{
+ const f=fixture();const wire:any[]=[];
+ model(f,body=>{expect(body.reasoning_effort).toBe('high');return {content:'Hello with independent review settings.'}},undefined,{observe:body=>wire.push(body)});
+ const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));
+ settings.effort='high';settings.providers.local.reviewer_effort='low';settings.providers.local.model_metadata['fixture-model'].reasoning_efforts=['low','high'];
+ writeFileSync(settingsPath,JSON.stringify(settings));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f);const ending=terminal(native,'ui-review-effort');
+ await native.request('prompt',{text:'Say hello with independent review settings.'},{id:'ui-review-effort'});
+ expect((await ending).data.exit_code,native.stderr).toBe(0);
+ const state=await native.request('snapshot',{action:'fossil.status'});expect(state.tasks[0].state).toBe('accepted');
+ for(const name of ['omos_task_plan','omos_contract_assessment']){
+  const reviews=wire.filter(body=>body.tools?.some((tool:any)=>tool.function?.name===name));
+  expect(reviews.length).toBeGreaterThan(0);expect(reviews.every(body=>body.reasoning_effort==='low')).toBe(true);
+ }
+ expect(native.stderr).toBe('');
+},90000);
+
 test('native UI writes require a task fence and compilation evidence before publication',async()=>{
  const f=fixture();let wrote=false;model(f,()=>wrote?{content:'Updated the workspace interface.'}:(wrote=true,{tool_calls:[{index:0,id:'write-ui',type:'function',function:{name:'fossil_workspace',arguments:JSON.stringify({action:'write',path:'ui/manifest.json',content:JSON.stringify({version:'omos.ui-source/v1',bridge:'omos.ui-bridge/v1',renderer:'omos.react/v1',toolchain:'a'.repeat(64),entry:'src/main.tsx',stylesheet:'src/style.css'})})}}]}));expect((await f.run(['fossil','init','--json'])).code).toBe(0);
  const native=new NativeClient({binary:resolve(import.meta.dir,'../../zig-out/bin/fx'),project:f.cwd,env:{...process.env,...f.env,FX_MAX_AGENT_STEPS:'12'}});clients.push(native);const observed:any[]=[];let validation:any;native.on('event',(event:any)=>{observed.push(event);if(event.data.type==='validate_ui'){validation=event;void native.request('validation',{turn:event.turn,request_id:event.data.request_id,receipt:{version:'omos.ui-validation/v1',status:'failed',error:'Missing entry source'}})}});
@@ -210,6 +228,85 @@ test.each(['question','approval'])('scheduled HTTP work retains %s without waiti
  const retained=await(await restarted.request({action:'show',id:created.schedules[0].id})).json();
  expect(retained.schedules[0].state).toBe('waiting');
  expect(provider.counts().actors).toBe(actors);
+},120000);
+
+for (const mode of ['loaded','selected','empty','unknown','lazy','denied']) test(`Ask honors configured always loaded MCP schemas: ${mode}`,async()=>{
+ const f=fixture();let calls=0;const catalogs:string[][]=[];
+ model(f,body=>{
+  calls++;
+  catalogs.push(body.tools.map((tool:any)=>tool.function?.name));
+  if(mode==='selected'&&calls===1)return {tool_calls:[{index:0,id:'select-other',type:'function',function:{name:'mcp_select_tool',arguments:JSON.stringify({name:'mcp_fixture_other'})}}]};
+  return {content:'The configured catalog was inspected.'};
+ });
+ const selection=mode==='loaded'||mode==='lazy'?undefined:mode==='empty'?[]:mode==='unknown'?['does-not-exist']:['echo'];
+ writeFileSync(join(f.home,'.fx','mcp.json'),JSON.stringify({mcp:{fixture:{type:'local',command:[Bun.which('node'),resolve(import.meta.dir,'fixtures/mcp-modern-stdio.mjs')],always_loaded:mode!=='lazy',always_loaded_tools:selection,environment:{FX_MCP_PROTOCOL_VERSION:'2026-07-28',FX_MCP_EXTRA_TOOL_NAME:'other'}}}}));
+ if(mode==='denied'){
+  const path=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(path,'utf8'));
+  settings.permission={'mcp_fixture_echo':'deny'};writeFileSync(path,JSON.stringify(settings));
+ }
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const result=await f.run(['ask','--json','Describe which catalog is available.']);
+ expect(result.code,result.stderr).toBe(0);expect(calls).toBe(mode==='selected'?2:1);
+ for(const [index,catalog] of catalogs.entries()){
+  expect(catalog.includes('mcp_fixture_echo')).toBe(mode==='loaded'||mode==='selected');
+  expect(catalog.includes('mcp_fixture_other')).toBe(mode==='loaded'||(mode==='selected'&&index>0));
+ }
+},90000);
+
+test('fresh background workers receive the full canonical request without amending the contract', async () => {
+ const f=fixture();
+ const request='Explain these retained requirements.\n'+'Keep the original constraints unchanged.\n'.repeat(250)+'FINAL-CANONICAL-REQUIREMENT';
+ let workerRequest='';let workerSystem='';let workerHasEcho=false;const wire:any[]=[];
+ const provider=model(f,body=>{
+  if(body.tools.some((tool:any)=>tool.function?.name==='omos_request_route')) return {tool_calls:[{index:0,id:'route-canonical-work',type:'function',function:{name:'omos_request_route',arguments:JSON.stringify({route:'work',reason:'Produce the requested retained requirements report.'})}}]};
+  if(!body.tools.some((tool:any)=>tool.function?.name==='write_file')) return {tool_calls:[{index:0,id:'dispatch-canonical-contract',type:'function',function:{name:'fossil_workspace',arguments:'{"action":"dispatch"}'}}]};
+  const system=body.messages.filter((m:any)=>m.role==='system').map((m:any)=>String(m.content)).join('\n');
+  workerSystem=system;
+  expect(body.reasoning_effort).toBe('high');
+  workerHasEcho=body.tools.some((tool:any)=>tool.function?.name==='mcp_fixture_echo');
+  workerRequest=String(body.messages.filter((m:any)=>m.role==='user').at(-1)?.content||'');
+  return {content:'The original requirements remain unchanged, including FINAL-CANONICAL-REQUIREMENT.'};
+ },packet=>{
+  const pages=packet.inspections.filter((page:any)=>page.id==='context:original');
+  const last=pages.at(-1);
+  if(!last||last.nextOffset!==null)return {name:'omos_review_evidence',args:{action:'read',id:'context:original',offset:last?.nextOffset??0}};
+  return 'met';
+ },{observe:body=>wire.push(body)});
+ const settingsPath=join(f.home,'.fx','settings.json');const settings=JSON.parse(readFileSync(settingsPath,'utf8'));
+ settings.effort='high';settings.providers.local.reviewer_effort='low';settings.providers.local.model_metadata['fixture-model'].reasoning_efforts=['low','high'];
+ writeFileSync(settingsPath,JSON.stringify(settings));
+ writeFileSync(join(f.home,'.fx','mcp.json'),JSON.stringify({mcp:{fixture:{type:'local',command:[Bun.which('node'),resolve(import.meta.dir,'fixtures/mcp-modern-stdio.mjs')],always_loaded:true,environment:{FX_MCP_PROTOCOL_VERSION:'2026-07-28'}}}}));
+ expect((await f.run(['fossil','init','--json'])).code).toBe(0);
+ const native=host(f,routingClassifier(()=> 'work'));const observed:any[]=[];native.on('event',(event:any)=>observed.push(event));
+ const until=async(read:()=>Promise<any>,predicate:(value:any)=>boolean)=>{const deadline=Date.now()+60000;let value:any;do{value=await read();if(predicate(value))return value;await Bun.sleep(100)}while(Date.now()<deadline);throw Error(`State did not converge: ${JSON.stringify(value)}; ${native.stderr}`)};
+ try {
+  expect((await f.run(['ui-host','--background-start'])).code).toBe(0);
+  const ending=terminal(native,'canonical-request');
+  await native.request('coordinate',{text:request},{id:'canonical-request'});
+  expect((await ending).data.exit_code,JSON.stringify(observed)+'\n'+native.stderr).toBe(0);
+  const original=(await native.request('background')).workers[0].record;
+  const final=await until(()=>native.request('background',{action:'show',task:original.task}),value=>['completed','waiting'].includes(value.state));
+  expect(final.state,JSON.stringify(final)+'\n'+(existsSync(f.env.FX_TRACE_LOG)?readFileSync(f.env.FX_TRACE_LOG,'utf8').slice(-16000):'')).toBe('completed');
+  expect(workerRequest).toBe(request);
+  expect(workerSystem).toContain('<omos_background_assignment');
+  expect(workerHasEcho).toBe(true);
+  expect(final.contract_sha256).toBe(original.contract_sha256);
+  expect(final.contract_version).toBe(original.contract_version);
+  const task=JSON.parse(f.fossil('cat',`tasks/${original.task}.json`,'-r',`task/${original.task}`));
+  expect(task.amendments).toEqual([]);
+  expect(task.definition.version).toBe(original.contract_version);
+  expect(createHash('sha256').update(JSON.stringify(task.definition)).digest('hex')).toBe(original.contract_sha256);
+  expect(task.request_artifact).toBe(`artifacts/${createHash('sha256').update(request).digest('hex')}`);
+  expect(f.fossil('cat',task.request_artifact,'-r',`task/${original.task}`)).toBe(request);
+  expect(provider.revisionPackets).toHaveLength(0);
+  for(const name of ['omos_task_plan','omos_contract_assessment']){
+   const reviews=wire.filter(body=>body.tools?.some((tool:any)=>tool.function?.name===name));
+   expect(reviews.length).toBeGreaterThan(0);expect(reviews.every(body=>body.reasoning_effort==='low')).toBe(true);
+  }
+ } finally {
+  await native.request('background',{action:'stop'});
+  await until(()=>native.request('background',{action:'host'}),value=>!value.running);
+ }
 },120000);
 
 test('background contracts release the main chat while workers await input and publish independently', async () => {

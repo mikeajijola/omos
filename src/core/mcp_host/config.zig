@@ -41,6 +41,7 @@ pub const Server = struct {
     /// An editor's server whose tools go to the model every turn (ACP
     /// `_meta.fx.alwaysLoaded`).
     always_loaded: bool = false,
+    always_loaded_tools: ?[]const []const u8 = null,
     /// The variable a `missing_env` server names.
     missing: ?[]const u8 = null,
 };
@@ -99,6 +100,11 @@ pub fn resolve(
             .command = if (c.command) |command| try commandLine(arena, command, c.args) else null,
             .callback_port = if (c.auth) |a| a.callback_port else null,
             .always_loaded = c.always_loaded,
+            .always_loaded_tools = if (c.always_loaded_tools) |names| selected: {
+                const copy = try arena.alloc([]const u8, names.len);
+                for (names, copy) |name, *owned| owned.* = try arena.dupe(u8, name);
+                break :selected copy;
+            } else null,
         };
         s.held = heldFor(c);
         if (s.held != null) continue;
@@ -201,6 +207,19 @@ const testing = std.testing;
 
 fn envVar(comptime key: []const u8, comptime value: []const u8) mcp_contract.McpEnvVar {
     return .{ .key = @constCast(key), .value = @constCast(value) };
+}
+
+test "MCP preload selection is independently owned by the v2 configuration" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var inherited: std.process.Environ.Map = .init(testing.allocator);
+    defer inherited.deinit();
+    var name = [_]u8{ 'e', 'c', 'h', 'o' };
+    const configs = [_]McpServerConfig{.{ .name = "fixture", .command = "node", .always_loaded = true, .always_loaded_tools = &.{&name} }};
+    const resolved = try resolve(arena.allocator(), &configs, &inherited, null);
+    name[0] = 'X';
+    try testing.expect(resolved.servers[0].always_loaded);
+    try testing.expectEqualStrings("echo", resolved.servers[0].always_loaded_tools.?[0]);
 }
 
 test "stdio and HTTP servers become engine configs; the rest are held back with the reason" {

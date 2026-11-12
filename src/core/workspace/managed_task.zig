@@ -27,6 +27,7 @@ pub const Turn = struct {
     execution_lease: ?workspace.ExecutionLease = null,
     maintenance: ?@import("projection_maintenance.zig").Handle = null,
     projection_pin: ?@import("../shared/resource_pin.zig").Pin = null,
+    canonical_outputs: @import("canonical_tool_outputs.zig").State = .{},
 
     pub fn begin(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8) !?Turn {
         return beginResolved(alloc, session, parent_session, project, prompt, false);
@@ -95,7 +96,25 @@ pub const Turn = struct {
         self.task = task;
     }
 
+    pub fn canonicalSink(self: *Turn, session: []const u8) @import("../tooling/canonical_tool_output.zig").Sink {
+        self.canonical_outputs.session = session;
+        return .{ .context = self, .capture_fn = captureCanonicalOutput };
+    }
+
+    fn captureCanonicalOutput(context: *anyopaque, _: std.mem.Allocator, capture: @import("../tooling/canonical_tool_output.zig").Capture) !void {
+        const self: *Turn = @ptrCast(@alignCast(context));
+        try self.canonical_outputs.capture(self.manager, self.task, capture);
+    }
+
+    pub fn projectCanonicalMessages(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage, cap: usize) []const types.ChatMessage {
+        return self.canonical_outputs.projectMessages(alloc, self.manager, self.task, messages, cap) catch |err| {
+            @import("../shared/debug_trace.zig").logf("workspace", "canonical MCP actor view unavailable err={s}", .{@errorName(err)});
+            return messages;
+        };
+    }
+
     pub fn release(self: *Turn) void {
+        self.canonical_outputs.deinit();
         if (self.maintenance) |maintenance| maintenance.stop();
         self.maintenance = null;
         if (self.projection_pin) |pin| pin.close();
@@ -255,6 +274,15 @@ pub const Turn = struct {
                 const Entry = struct { kind: []const u8, task: []const u8, contract_version: u32, value: std.json.Value };
                 const entry = (try std.json.parseFromSlice(Entry, a, bytes, .{ .ignore_unknown_fields = true })).value;
                 if (!std.mem.eql(u8, entry.task, self.task.id)) return error.InvalidWorkspaceJournal;
+                if (std.mem.eql(u8, entry.kind, "canonical_tool_output")) {
+                    const canonical = @import("../tooling/canonical_tool_output.zig");
+                    const record = try std.json.parseFromValueLeaky(canonical.Record, a, entry.value, .{});
+                    const companion = try @import("canonical_tool_outputs.zig").evidence(a, self.task.id, record);
+                    if (tool_evidence_ids.contains(companion.id)) continue;
+                    try self.appendReviewEvidence(alloc, &evidence, &payloads, companion);
+                    try tool_evidence_ids.put(alloc, try alloc.dupe(u8, companion.id), {});
+                    continue;
+                }
                 if (self.source_basis) |source| {
                     const model = @import("definition.zig");
                     if (std.mem.eql(u8, entry.kind, "source_validation") and

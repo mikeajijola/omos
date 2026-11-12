@@ -11,6 +11,24 @@ async function withReasoning(response: Response, ...deltas: Record<string, unkno
 }
 
 describe("configured providers", () => {
+  test.each(["declared", "unsupported", "absent"])("configured reasoning effort wire behavior: %s", async mode => {
+    const f = fixture();
+    try {
+      if (mode !== "absent") (f.settings.providers.local.model_metadata["local-model"] as any).reasoning_efforts = ["low", "high"];
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "--effort", mode === "unsupported" ? "minimal" : "low", "Say ready"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (mode === "unsupported") {
+        expect(result.code).not.toBe(0);
+        expect(result.stderr + result.stdout).toContain("UnsupportedReasoningEffort");
+        expect(f.requests).toHaveLength(0);
+      } else {
+        expect(result.code, result.stderr).toBe(0);
+        expect(f.requests).toHaveLength(1);
+        expect(f.requests[0].body.reasoning_effort).toBe(mode === "declared" ? "low" : undefined);
+      }
+    } finally { f.close(); }
+  }, 25000);
+
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
     const f = fixture(body => {
@@ -147,9 +165,13 @@ describe("configured providers", () => {
   test("CLI selection persists a configured name and uses only its credential", async () => {
     const f = fixture();
     try {
+      (f.settings.providers.remote.model_metadata["remote-model"] as any).reasoning_efforts = ["low", "high"];
+      (f.settings.providers.remote as any).reviewer_effort = "low";
+      f.save();
       const selection = await runFx(["provider", "remote"], { cwd: f.workspace, env: f.env });
       expect(selection.code).toBe(0);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("remote");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).providers).toEqual(f.settings.providers);
       const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}; paths=${f.requests.map(r => r.path).join(",")}`);
       expect(result.code).toBe(0);
@@ -326,13 +348,17 @@ describe("configured providers", () => {
     try {
       f.settings.permission_mode = "auto";
       (f.settings.providers.local as any).reviewer_model = "review-model";
-      (f.settings.providers.local.model_metadata as any)["review-model"] = { context_window: 262144, max_output_tokens: 512 };
+      (f.settings.providers.local.model_metadata as any)["review-model"] = { context_window: 262144, max_output_tokens: 512, reasoning_efforts: ["low"] };
+      (f.settings.providers.local.model_metadata["local-model"] as any).reasoning_efforts = ["low", "high"];
+      (f.settings.providers.local as any).reviewer_effort = "low";
       f.save();
-      const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      const result = await runFx(["ask", "--json", "--no-save", "--effort", "high", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       const review = f.requests.find(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
       expect(review?.body.model).toBe("review-model");
       expect(review?.body.max_tokens).toBe(512);
+      expect(review?.body.reasoning_effort).toBe("low");
+      expect(f.requests.filter(request => request.body.model === "local-model").every(request => request.body.reasoning_effort === "high")).toBe(true);
       expect(f.requests.every(request => request.authorization === null)).toBe(true);
     } finally { f.close(); }
   }, 35000);
@@ -383,11 +409,14 @@ describe("configured providers", () => {
     try {
       marker = join(f.workspace, "review-must-not-run.txt");
       f.settings.permission_mode = "auto";
+      (f.settings.providers.local.model_metadata["local-model"] as any).reasoning_efforts = ["low"];
+      (f.settings.providers.local as any).reviewer_effort = "low";
       f.save();
       const result = await runFx(["ask", "--json", "--no-save", "Run the Python snippet"], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(f.requests.some(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"))).toBe(true);
       expect(existsSync(marker)).toBe(false);
+      expect(f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision")).every(request => request.body.reasoning_effort === "low")).toBe(true);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
     } finally { f.close(); }
   }, 20000);
@@ -927,25 +956,45 @@ describe("CLI work contracts", () => {
     } finally { f.close(); }
   }, 25000);
 
-  test("uses the configured review model on the same connection", async () => {
+  test.each(["same", "cross", "omitted", "unsupported"])("configured contract reviewer effort is independent: %s", async mode => {
     const f = fixture(body => {
       if (isReview(body)) {
         expect(body.model).toBe("review-model");
+        expect(body.reasoning_effort).toBe(mode === "omitted" ? undefined : "low");
         return assessment(body, "met");
       }
       expect(body.model).toBe("local-model");
+      expect(body.reasoning_effort).toBe("high");
       return completion(body.model, "Hello");
     });
     try {
-      (f.settings.providers.local as any).reviewer_model = "review-model";
+      (f.settings.providers.local.model_metadata["local-model"] as any).reasoning_efforts = ["high"];
+      const reviewer = mode === "cross" ? f.settings.providers.remote : f.settings.providers.local;
+      (reviewer as any).reviewer_model = "review-model";
+      if (mode !== "omitted") (reviewer as any).reviewer_effort = "low";
+      (reviewer.model_metadata as any)["review-model"] = { supports_tool_use: true, context_window: 262144, max_output_tokens: 8192, reasoning_efforts: mode === "unsupported" ? ["high"] : ["low"] };
+      if (mode === "cross") {
+        (f.settings as any).review_model = "remote:review-model";
+        (f.settings.providers.local as any).reviewer_effort = "high";
+      }
       f.save();
-      const result = await runFx(["ask", "--json", "Say hello"], {
-        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 20000,
+      const result = await runFx(["ask", "--json", "--effort", "high", "Say hello"], {
+        cwd: f.workspace, env: { ...f.env, FX_CONTRACT_REVIEW: "1" }, timeoutMs: 60000,
       });
-      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(f.requests).toHaveLength(3);
+      if (mode === "unsupported") {
+        expect(result.code).not.toBe(0);
+        expect(f.requests).toHaveLength(0);
+      } else {
+        if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+        expect(JSON.parse(result.stdout).output).toBe("Hello");
+        expect(f.requests).toHaveLength(3);
+        const reviews = f.requests.filter(request => request.body.model === "review-model");
+        expect(reviews).toHaveLength(2);
+        expect(reviews.every(request => request.body.reasoning_effort === (mode === "omitted" ? undefined : "low"))).toBe(true);
+        expect(reviews.every(request => request.authorization === (mode === "cross" ? "Bearer own-provider-token" : null))).toBe(true);
+      }
     } finally { f.close(); }
-  }, 25000);
+  }, 65000);
 
   test("cancellation stops an in-flight completion review", async () => {
     let started!: () => void;

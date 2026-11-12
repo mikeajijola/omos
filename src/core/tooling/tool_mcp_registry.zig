@@ -93,6 +93,8 @@ fn call(
         return .{ .failure = try ctx.allocator.dupe(u8, "") };
     } orelse return unsupported(ctx);
     const status = output.status;
+    // Only an actually dispatched MCP result can acquire this host marker.
+    if (ctx.model_content_kind_sink) |kind| kind.* = .mcp_envelope;
     if (ctx.mcp_call_status_sink) |sink| sink.* = status;
     const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));

@@ -2200,10 +2200,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .account_id = cred.accountId(),
         .tenant_context = cred.gatewayTeam(),
     } } else null;
+    var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dynamic_tool_arena.deinit();
+    const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
+        .initial_dynamic_tools = initial_dynamic_tools,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -2223,6 +2227,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .fossil_execution_lease_held = cfg.fossil_execution_lease_held,
 
         .contract_review_model = review_selection.model,
+        .contract_review_effort = completion_review.reviewerEffort(review_selection.provider, cfg.provider_set.definitions),
         .contract_review_provider = review_selection.provider,
         .contract_review_stream_provider = cfg.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
         .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
@@ -2744,6 +2749,28 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
         try messages.append(arena, .{ .role = .system, .content = section.text });
     }
     if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+}
+
+fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_stream_provider.DynamicFunctionTool {
+    if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return &.{};
+    const loaded = if (ctx.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
+        arena,
+        ctx.permission_rules,
+        ctx.context_limits,
+        .unrestricted,
+    ) else if (ctx.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
+        arena,
+        ctx.permission_rules,
+        ctx.context_limits,
+        .unrestricted,
+        ctx.cancelFlag(),
+    ) else return &.{};
+    if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
+    var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    for (loaded.tools) |selected| {
+        try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(arena, &tools, selected);
+    }
+    return tools.items;
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {

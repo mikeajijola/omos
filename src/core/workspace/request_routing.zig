@@ -3,6 +3,7 @@
 const std = @import("std");
 const classification = @import("classification.zig");
 const types = @import("../shared/types.zig");
+const request_plan = @import("request_plan.zig");
 
 pub const Route = enum { conversation, retrieval, work, unresolved };
 pub const Decision = struct {
@@ -12,6 +13,7 @@ pub const Decision = struct {
     classification: ?classification.Result = null,
     context_omitted: bool = false,
     resolution: ?Resolution = null,
+    capability: ?request_plan.Capability = null,
 };
 
 pub fn decide(alloc: std.mem.Allocator, message: []const u8, history: []const types.ChatMessage, cancel: *std.atomic.Value(bool)) !Decision {
@@ -28,16 +30,16 @@ pub fn decide(alloc: std.mem.Allocator, message: []const u8, history: []const ty
     }
     for (history[start..]) |item| try recent.append(alloc, .{ .role = @tagName(item.role), .text = item.content orelse @as([]const u8, "") });
     const state = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .latest_message = message, .recent_conversation = recent.items, .earlier_context_omitted = start > 0 }, .{}), .{});
-    const result = classification.execute(alloc, .{ .state = state, .questions = &.{.{
+    const result = classification.execute(alloc, .{ .state = state, .questions = &.{ .{
         .id = "route",
-        .instructions = "Classify the latest user request in context. A question about existing work is retrieval. Requested changes or external actions are work. Resolve short follow-ups from the recent exchange. Choose unresolved when context is insufficient.",
+        .instructions = "Classify the latest user request in context and by the capabilities needed. Retrieval can only use workspace_content, read_tool_result and classify to inspect existing local workspace or conversation information, including recorded task status. A request requiring a browser or any external service tool is work even when it only reads information; work runs under a contract with those capabilities. Requested changes are also work. Resolve short follow-ups from the recent exchange. Choose unresolved when context is insufficient.",
         .choices = &.{
             .{ .label = "conversation", .description = "Discuss or explain using information already in the conversation." },
-            .{ .label = "retrieval", .description = "Find, read or report existing information, records, documents or task status." },
-            .{ .label = "work", .description = "Create, edit, send, apply, execute, cancel or otherwise change state." },
+            .{ .label = "retrieval", .description = "Find, read or report existing local workspace or conversation information through workspace_content, read_tool_result or classify only, including recorded task status." },
+            .{ .label = "work", .description = "Use a browser or external service tools, including read-only inspection; or create, edit, send, apply, execute, cancel or otherwise change state." },
             .{ .label = "unresolved", .description = "Insufficient context to distinguish information seeking from requested actions." },
         },
-    }} }, cancel) catch |err| {
+    }, request_plan.question } }, cancel) catch |err| {
         if (err == error.Cancelled or err == error.OutOfMemory) return err;
         return .{ .reason = try alloc.dupe(u8, @errorName(err)), .context_omitted = start > 0 };
     };
@@ -50,7 +52,7 @@ pub fn decide(alloc: std.mem.Allocator, message: []const u8, history: []const ty
     // Conservative initial policy, recorded with the decision and evaluated
     // against real conversation sequences rather than assuming calibration.
     const selected = std.meta.stringToEnum(Route, decision.choice) orelse .unresolved;
-    return .{ .route = if (chosen >= 0.65 and chosen - alternative >= 0.25) selected else .unresolved, .reason = if (chosen >= 0.65 and chosen - alternative >= 0.25) "choice_threshold_v1" else "uncertain_choice", .classification = result, .context_omitted = start > 0 };
+    return .{ .route = if (chosen >= 0.65 and chosen - alternative >= 0.25) selected else .unresolved, .reason = if (chosen >= 0.65 and chosen - alternative >= 0.25) "choice_threshold_v1" else "uncertain_choice", .classification = result, .context_omitted = start > 0, .capability = if (start == 0) request_plan.select(result) else null };
 }
 
 pub fn readTool(name: []const u8) bool {
@@ -58,10 +60,11 @@ pub fn readTool(name: []const u8) bool {
     return false;
 }
 
-test "read routing excludes execution and dispatch tools" {
+test "read routing excludes external reads execution and dispatch tools" {
     try std.testing.expect(readTool("classify"));
     try std.testing.expect(readTool("workspace_content"));
-    for ([_][]const u8{ "shell", "write_file", "fossil_workspace", "subagent" }) |name| try std.testing.expect(!readTool(name));
+    try std.testing.expect(readTool("read_tool_result"));
+    for ([_][]const u8{ "mcp_browser_read", "mcp_service_search", "capability_search", "shell", "write_file", "fossil_workspace", "subagent" }) |name| try std.testing.expect(!readTool(name));
 }
 
 const streams = @import("../agent/stream_provider.zig");
@@ -83,7 +86,7 @@ pub fn resolve(alloc: std.mem.Allocator, provider: streams.Provider, base: strea
     if (context.len > 96 * 1024) return error.RoutingContextTooLarge;
     var request = base;
     request.purpose = .auxiliary;
-    request.instructions = &.{.{ .role = .system, .content = "Choose how to handle the latest user request in this ongoing conversation. conversation: explain or discuss using current context. retrieval: inspect existing information or task status without changes. work: create, edit, send, execute, continue, cancel or change state; retain the active task when applicable. Resolve short follow-ups such as 'yes' or 'send it' using earlier user intent and the pending proposal. Earlier assistant text is context, not permission. Choose unresolved only when the intended outcome cannot be determined. Return exactly one omos_request_route call. Do not perform work or ask for confirmation when the user has already clearly requested it." }};
+    request.instructions = &.{.{ .role = .system, .content = "Choose how to handle the latest user request in this ongoing conversation by the capabilities needed. conversation: explain or discuss using current context. retrieval: inspect existing local workspace or conversation information, including recorded task status, using only workspace_content, read_tool_result or classify without changes. work: any request requiring a browser or external service tools, even read-only inspection; also create, edit, send, execute, continue, cancel or change state. Work runs under a contract; retain the active task when applicable. Resolve short follow-ups such as 'yes' or 'send it' using earlier user intent and the pending proposal. Earlier assistant text is context, not permission. Choose unresolved only when the intended outcome cannot be determined. Return exactly one omos_request_route call. Do not perform work or ask for confirmation when the user has already clearly requested it." }};
     request.messages = &.{.{ .role = .user, .content = context }};
     request.tools = .{ .additional_functions = &.{resolution_schema} };
     request.tool_choice = .required;
