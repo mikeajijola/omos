@@ -27,12 +27,17 @@ function routeReply(choice = "retrieval") {
 
 // Profile routine workspace and coding flows; recovery cases have their own verification owner.
 describe("portable Fossil agent workspace", () => {
-  for (const resumeWithoutCache of [false, true]) test(`canonical MCP companion preserves raw review evidence${resumeWithoutCache ? " after resume without the result cache" : " while the actor receives a complete factored view"}`, async () => {
+  for (const { resumeWithoutCache, engine, aboveCap } of [
+    { resumeWithoutCache: false, engine: "v1", aboveCap: false },
+    { resumeWithoutCache: true, engine: "v1", aboveCap: false },
+    { resumeWithoutCache: false, engine: "v1", aboveCap: true },
+    { resumeWithoutCache: false, engine: "v2", aboveCap: true },
+  ]) test(`canonical MCP companion preserves raw review evidence${aboveCap ? ` above the display cap via ${engine}` : resumeWithoutCache ? " after resume without the result cache" : " while the actor receives a complete factored view"}`, async () => {
     const f = fixture();
     const effectLog = join(f.home, "effects.jsonl");
     writeFileSync(join(f.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { fixture: {
       type: "local", command: [Bun.which("node"), resolve(import.meta.dir, "fixtures/mcp-modern-stdio.mjs")],
-      always_loaded: true, environment: { FX_MCP_MODE: "structured_result", FX_MCP_EFFECT_LOG: effectLog },
+      always_loaded: true, environment: { FX_MCP_MODE: aboveCap ? "structured_result_above_cap" : "structured_result", FX_MCP_EFFECT_LOG: effectLog },
     } } }));
     expect((await f.run(["fossil", "init"])).code).toBe(0);
     let blocked = resumeWithoutCache;
@@ -56,7 +61,18 @@ describe("portable Fossil agent workspace", () => {
           { literal: "\nunique suffix" },
         ]);
         expect(actorView.envelope.result.content[1].text).toBe("Independent unique tip");
-        expect(actorView.envelope.result._meta.fixture).toBe("preserve-this-metadata");
+        if (engine === "v1") expect(actorView.envelope.result._meta.fixture).toBe("preserve-this-metadata");
+        if (aboveCap) {
+          expect(actorView.canonical.bytes).toBeGreaterThan(65535);
+          return { tool_calls: [{ index: 0, id: "read-complete-tail", type: "function", function: {
+            name: "read_tool_result", arguments: JSON.stringify({ handle: actorView.canonical.handle, start_byte: actorView.canonical.bytes - 256, byte_count: 257 }),
+          } }] };
+        }
+      }
+      if (aboveCap && count === 3) {
+        const tail = body.messages.find((item: any) => item.role === "tool" && item.tool_call_id === "read-complete-tail");
+        expect(tail.content).toContain("VERIFIED_TAIL_RECEIPT_731");
+        expect(tail.content).not.toContain("truncated for");
       }
       return { content: blocked ? "The operation is retained; waiting for continuation." : "Recorded the fixture outcome." };
     }, packet => {
@@ -71,7 +87,7 @@ describe("portable Fossil agent workspace", () => {
       const pages = packet.inspections.filter((page: any) => page.id === canonicalId).sort((a: any, b: any) => a.offset - b.offset);
       const last = pages.at(-1);
       if (!last?.fullyInspected) return { name: "omos_review_evidence", args: {
-        action: "read", id: record.reference, offset: last?.nextOffset ?? 0, limit: 8192,
+        action: "read", id: record.reference, offset: last?.nextOffset ?? 0, limit: aboveCap ? 16384 : 8192,
       } };
       const reviewedPayload = JSON.parse(pages.map((page: any) => page.content).join(""));
       expect(JSON.parse(reviewedPayload.arguments)).toEqual({ text: "Perform the fixture operation once" });
@@ -84,7 +100,7 @@ describe("portable Fossil agent workspace", () => {
         obligations: packet.contract.obligations.map((obligation: any) => ({ id: obligation.id, status: "met", evidence: [record.reference], note: "Inspected the complete canonical fixture receipt." })),
       } };
     });
-    const env = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
+    const env = { FX_MCP_PROTOCOL_VERSION: "2026-07-28", FX_MCP_ENGINE: engine };
     const first = await f.run(["ask", "Perform the fixture service operation once and report its result", "--json"], env, 120000);
     expect(first.code, first.stderr + first.stdout).toBe(resumeWithoutCache ? 1 : 0);
     const sessionId = JSON.parse(first.stdout).session_id;
@@ -102,20 +118,22 @@ describe("portable Fossil agent workspace", () => {
     expect(actorView.canonical).toEqual({ handle: companion.binding.handle, bytes: companion.binding.bytes, sha256: companion.binding.sha256, evidence_id: companion.id });
     const effects = () => readFileSync(effectLog, "utf8").trim().split("\n").map(line => JSON.parse(line));
     expect(effects()).toHaveLength(1);
-    expect(JSON.parse(companion.content).result).toEqual(effects()[0].result);
+    const original = effects()[0].result;
+    const sanitized = engine === "v2" ? { content: original.content, structuredContent: original.structuredContent, isError: original.isError } : original;
+    expect(JSON.parse(companion.content).result).toEqual(sanitized);
     const sessionPath = join(f.home, ".fx", "sessions", sessionId);
     const retained = readFileSync(join(sessionPath, "events.jsonl"), "utf8");
     expect(retained).toContain(companion.binding.handle);
     expect(retained).not.toContain("omos.mcp-model-view/v1");
-    expect(retained).not.toContain("VERIFIED_TAIL_RECEIPT_731");
+    if (!aboveCap) expect(retained).not.toContain("VERIFIED_TAIL_RECEIPT_731");
     const retainedResult = retained.trim().split("\n").map(line => JSON.parse(line).event?.tool_result)
       .find(result => result?.call_id === "structured-call");
     expect(retainedResult.artifact_ref).toBe(companion.binding.handle);
     expect(retainedResult.preview).toBe(companion.content.slice(0, 4096));
     expect(retainedResult.stored_bytes).toBe(companion.binding.bytes);
+    const cachePath = join(sessionPath, "tool-results", companion.binding.handle);
+    expect(readFileSync(cachePath, "utf8")).toBe(companion.content);
     if (resumeWithoutCache) {
-      const cachePath = join(sessionPath, "tool-results", companion.binding.handle);
-      expect(readFileSync(cachePath, "utf8")).toBe(companion.content);
       unlinkSync(cachePath);
       blocked = false;
       const resumed = await f.run(["ask", "--resume-id", sessionId, "continue", "--json"], env, 120000);
@@ -127,7 +145,7 @@ describe("portable Fossil agent workspace", () => {
     expect(after[0].id).toBe(before.id);
     expect(after[0].state).toBe("accepted");
     expect(effects()).toHaveLength(1);
-    expect(provider.counts().actors).toBe(resumeWithoutCache ? 3 : 2);
+    expect(provider.counts().actors).toBe(resumeWithoutCache || aboveCap ? 3 : 2);
     expect(reviewedRaw).toBe(companion.content);
     expect(history().filter(row => row.kind === "canonical_tool_output").map(row => row.value)).toEqual([companion]);
   }, 180000);

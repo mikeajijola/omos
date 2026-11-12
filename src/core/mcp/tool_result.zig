@@ -68,15 +68,19 @@ pub fn extract(alloc: Allocator, options: ExtractOptions) !tool_mcp_runtime.Call
                 if (content.* == .array) images = try image_data.parseToolImages(alloc, content.array.items);
                 try tool_content.projectMediaForText(parsed.arena.allocator(), content);
             }
+            var retained_output: ?[]const u8 = null;
+            const model_output = try serialize_capped(
+                alloc,
+                options.server_name,
+                options.tool_name,
+                parsed.value,
+                options.max_tool_result_bytes,
+                &retained_output,
+            );
             break :blk .{
                 .images = images,
-                .model_output = try serialize_capped(
-                    alloc,
-                    options.server_name,
-                    options.tool_name,
-                    parsed.value,
-                    options.max_tool_result_bytes,
-                ),
+                .model_output = model_output,
+                .retained_output = retained_output,
                 .status = if (complete.is_error) .tool_failure else .success,
             };
         },
@@ -331,6 +335,7 @@ fn serialize_capped(
     tool_name: []const u8,
     result: std.json.Value,
     max_tool_result_bytes: usize,
+    retained_output: *?[]const u8,
 ) ![]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(arena_impl);
@@ -392,7 +397,13 @@ fn serialize_capped(
             max_tool_result_bytes,
         );
     }
-    return try alloc.dupe(u8, best);
+    const model_output = try alloc.dupe(u8, best);
+    // Preserve the complete sanitized JSON before the display projection drops
+    // structuredContent. Retention is optional after an external effect.
+    if (full_output.len <= tool_mcp_runtime.max_retained_output_bytes) {
+        retained_output.* = alloc.dupe(u8, full_output) catch null;
+    }
+    return model_output;
 }
 
 fn write_envelope(
@@ -730,4 +741,56 @@ test "large tool results stay valid, bounded, and verbatim" {
     try std.testing.expect(
         parsed.value.object.get("result").?.object.get("truncated").?.bool,
     );
+}
+
+test "MCP results retain complete structured JSON before the display cap" {
+    const alloc = std.testing.allocator;
+    const padding = try alloc.alloc(u8, 70000);
+    defer alloc.free(padding);
+    @memset(padding, 'x');
+    for ([_]tools_feature.Protocol{ .legacy, .modern }) |protocol| {
+        const response = try alloc.print(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"structuredContent\":{{\"receipt\":\"complete-tail-receipt\",\"exact\":9007199254740993}},\"isError\":false}}}}",
+            .{padding},
+        );
+        defer alloc.free(response);
+        var result = try extract(alloc, .{
+            .server_name = "fixture",
+            .tool_name = "mcp_fixture_echo",
+            .response = response,
+            .max_tool_result_bytes = 65535,
+            .protocol = protocol,
+        });
+        defer result.deinit(alloc);
+        try std.testing.expect(result.model_output.len <= 65535);
+        const complete = result.retained_output orelse return error.TestUnexpectedResult;
+        try std.testing.expect(complete.len > 65535);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, complete, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        const source = parsed.value.object.get("result").?.object;
+        try std.testing.expect(source.get("truncated") == null);
+        try std.testing.expectEqualStrings(padding, source.get("content").?.array.items[0].object.get("text").?.string);
+        try std.testing.expectEqualStrings("complete-tail-receipt", source.get("structuredContent").?.object.get("receipt").?.string);
+        try std.testing.expectEqualStrings("9007199254740993", source.get("structuredContent").?.object.get("exact").?.number_string);
+        var display = try std.json.parseFromSlice(std.json.Value, alloc, result.model_output, .{});
+        defer display.deinit();
+        try std.testing.expect(display.value.object.get("result").?.object.get("truncated").?.bool);
+    }
+}
+
+test "MCP retained envelopes respect the independent eight MiB bound" {
+    const alloc = std.testing.allocator;
+    const padding = try alloc.alloc(u8, tool_mcp_runtime.max_retained_output_bytes);
+    defer alloc.free(padding);
+    @memset(padding, 'x');
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var result: std.json.Value = .{ .object = .empty };
+    try result.object.put(arena, "structuredContent", .{ .string = padding });
+    var retained: ?[]const u8 = null;
+    const display = try serialize_capped(alloc, "fixture", "mcp_fixture_echo", result, 1024, &retained);
+    defer alloc.free(display);
+    try std.testing.expect(display.len <= 1024);
+    try std.testing.expect(retained == null);
 }

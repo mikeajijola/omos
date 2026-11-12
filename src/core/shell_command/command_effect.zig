@@ -1310,13 +1310,16 @@ test "planner preserves quoted shell metacharacters as literal argv" {
         .{ .command = "printf '%s' ';'", .expected = ";" },
         .{ .command = "printf '%s' '&'", .expected = "&" },
     };
-    for (cases) |case| {
-        var admission = try expectDirect(case.command, .linux);
-        defer admission.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings(
-            case.expected,
-            admission.direct_read_only.stages[0].argv[2],
-        );
+    for ([_]std.Target.Os.Tag{ .linux, .macos }) |target_os| {
+        for (cases) |case| {
+            var admission = try expectDirect(case.command, target_os);
+            defer admission.deinit(std.testing.allocator);
+            const expected: []const []const u8 = if (target_os == .linux)
+                &.{ "/usr/bin/printf", "--", "%s", case.expected }
+            else
+                &.{ "/usr/bin/printf", "%s", case.expected };
+            try expectArgv(expected, admission.direct_read_only.stages[0].argv);
+        }
     }
 
     try expectApproval(

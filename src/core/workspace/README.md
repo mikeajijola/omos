@@ -73,6 +73,12 @@ more results. This bounds inspection work without rejecting a large inventory.
 
 Completion review receives a bounded evidence manifest. Larger records remain
 available through the assessor's read-only `omos_review_evidence` interface.
+MCP results retain their complete sanitized JSON envelope, up to 8 MiB, before
+the display limit is applied. Structured fields remain readable through the
+stored output handle. Eligible results up to 256 KiB can also retain a canonical
+task evidence record for review and recovery. These limits do not recover bytes
+already omitted by the MCP server. Optional storage failures preserve the bounded
+tool result without repeating the operation.
 Records include a stable short reference for reads, checkpoints, and citations.
 The host resolves only exact registered references and retains canonical IDs in
 review receipts. The initial packet can also include complete payload pages for

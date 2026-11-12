@@ -4735,14 +4735,14 @@ sys.exit(result.returncode)
     let held = false;
     let release: (() => void) | undefined;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    // Exceed the initial inspection budget so this case exercises a durable
-    // explicit evidence page before the server dies, not an inline preview.
-    const candidateText = "An answer with retained inspection progress.\n".repeat(1000);
+    // Exceed the manifest's inline threshold so restoring the journaled page
+    // cannot be skipped as redundant with an already-complete manifest entry.
+    const candidateText = "An answer with retained inspection progress.\n".repeat(100);
     const m = model(f, () => ({ content: candidateText }), async packet => {
       if (phase === "initial") return { name: "omos_contract_assessment", args: { contractId: packet.contract.id, version: packet.contract.version, obligations: [{ id: "request_complete", status: "met", evidence: ["invented"], note: "Fixture retains candidate" }] } };
       if (phase === "interrupt") {
         const candidate = packet.evidence.find((record: any) => record.kind === "candidate");
-        expect(packet.initialInspections.some((page: any) => page.id === candidate.id)).toBe(false);
+        expect(candidate.complete).toBe(false);
         if (!packet.currentInspections.some((page: any) => page.id === candidate.id)) return { name: "omos_review_evidence", args: { action: "read", id: candidate.id } };
         held = true;
         await gate;

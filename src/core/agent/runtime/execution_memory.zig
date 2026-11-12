@@ -555,8 +555,32 @@ pub fn prepareToolExecutionOutput(
     capture: ?*command_replay_store.Capture,
 ) !result_store.PreparedResult {
     if (execution.model_content_kind == .mcp_envelope) {
-        const prepared = try prepareCapturedToolModelOutput(arena, config, tool_call, execution.model_output, capture);
-        retainCanonicalMcpOutput(arena, config, tool_call, execution, prepared) catch |err| {
+        const storage_available = config.session_child_capability != null or config.tool_result_dir != null;
+        const complete = if (execution.mcp_retained_output) |output|
+            if (storage_available and output.len <= @import("../../tooling/tool_mcp_runtime.zig").max_retained_output_bytes) output else execution.model_output
+        else
+            execution.model_output;
+        var prepared = prepareCapturedToolModelOutput(arena, config, tool_call, complete, capture) catch |err| blk: {
+            if (complete.ptr == execution.model_output.ptr) return err;
+            // Do not turn an optional retention failure into another invocation
+            // of a tool whose external effect has already happened.
+            debug_trace.logf("session", "complete MCP output unavailable call_id={s} err={s}", .{ tool_call.id, @errorName(err) });
+            var fallback = config;
+            fallback.session_child_capability = null;
+            fallback.tool_result_dir = null;
+            var bounded = try prepareCapturedToolModelOutput(arena, fallback, tool_call, execution.model_output, null);
+            bounded.memory.output_bytes = complete.len;
+            bounded.memory.truncated = true;
+            break :blk bounded;
+        };
+        if (execution.mcp_retained_output != null and prepared.model_output.len > config.max_tool_result_bytes) {
+            // A stored result normally has a 4KiB preview. Retaining a complete
+            // MCP envelope must not enlarge a smaller configured display cap.
+            const bounded = try tool_result_limits.prepareModelOutput(arena, tool_call.name, prepared.model_output, config.max_tool_result_bytes);
+            arena.free(prepared.model_output);
+            prepared.model_output = bounded;
+        }
+        retainCanonicalMcpOutput(arena, config, tool_call, execution, complete, prepared) catch |err| {
             // The external effect already happened. Keep its original result and
             // preview; a failed optional optimization must never request replay.
             debug_trace.logf("workspace", "canonical MCP companion unavailable err={s}", .{@errorName(err)});
@@ -582,6 +606,7 @@ fn retainCanonicalMcpOutput(
     config: Config,
     call: ToolCall,
     execution: runtime_tool_contracts.ToolExecutionResult,
+    raw_output: []const u8,
     prepared: result_store.PreparedResult,
 ) !void {
     const canonical = @import("../../tooling/canonical_tool_output.zig");
@@ -591,8 +616,8 @@ fn retainCanonicalMcpOutput(
     if (!prepared.memory.truncated) return;
     const capability = config.session_child_capability orelse return;
     const handle = prepared.memory.output_handle orelse return;
-    if (execution.model_output.len > canonical.max_bytes) return;
-    const content = try tool_result_limits.prepareSanitizedOutput(arena, execution.model_output);
+    if (raw_output.len > canonical.max_bytes) return;
+    const content = try tool_result_limits.prepareSanitizedOutput(arena, raw_output);
     defer arena.free(content);
     if (content.len != prepared.memory.stored_output_bytes) return error.InvalidCanonicalToolEvidence;
     const captured: canonical.Capture = .{
@@ -2032,4 +2057,75 @@ test "transcript does not mark native web_search as provider resource placeholde
 
     try std.testing.expect(!records[0].provider_native);
     try std.testing.expectEqualStrings("bounded search output", records[0].output);
+}
+
+test "MCP preparation stores the complete envelope before the display cap" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel = std.atomic.Value(bool).init(false);
+    var config = testImageConfig(&cancel);
+    config.tool_result_dir = result_dir;
+    const complete = try arena.alloc(u8, 70000);
+    @memset(complete, 'x');
+    @memcpy(complete[69990..], "tail-value");
+    const execution: runtime_tool_contracts.ToolExecutionResult = .{
+        .model_content_kind = .mcp_envelope,
+        .model_output = "bounded MCP display",
+        .mcp_retained_output = complete,
+    };
+    for ([_]usize{ tool_result_limits.min_configured_tool_result_bytes, 65535 }) |cap| {
+        config.max_tool_result_bytes = cap;
+        const prepared = try prepareToolExecutionOutput(arena, config, toolCall("retained", "mcp_fixture_echo", "{}"), execution, null);
+        try std.testing.expect(prepared.model_output.len <= config.max_tool_result_bytes);
+        try std.testing.expectEqual(complete.len, prepared.memory.output_bytes);
+        try std.testing.expectEqual(complete.len, prepared.memory.stored_output_bytes);
+        const handle = prepared.memory.output_handle orelse return error.TestExpectedStoredResult;
+        try std.testing.expect(std.mem.find(u8, prepared.model_output, handle) != null);
+        try std.testing.expectEqualStrings(complete[0..4096], prepared.memory.preview.?);
+        const first = try result_store.readByRange(arena, result_dir, handle, 1, 60000);
+        const last = try result_store.readByRange(arena, result_dir, handle, 60001, 10000);
+        const first_body = first[std.mem.findScalar(u8, first, '\n').? + 1 .. first.len - "\n</tool_result>".len];
+        const last_body = last[std.mem.findScalar(u8, last, '\n').? + 1 .. last.len - "\n</tool_result>".len];
+        const restored = try std.mem.concat(arena, u8, &.{ first_body, last_body });
+        try std.testing.expectEqualStrings(complete, restored);
+
+        // A result-shaped body from an ordinary tool cannot activate MCP retention.
+        var ordinary = execution;
+        ordinary.model_content_kind = .ordinary;
+        const unchanged = try prepareToolExecutionOutput(arena, config, toolCall("ordinary", "read_file", "{}"), ordinary, null);
+        try std.testing.expectEqualStrings(execution.model_output, unchanged.model_output);
+        try std.testing.expectEqual(execution.model_output.len, unchanged.memory.stored_output_bytes);
+    }
+}
+
+test "optional complete MCP storage failure preserves the bounded tool outcome" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocked = try std.fs.path.join(arena, &.{ root, "blocked" });
+    try io_mod.writeFileAtomic(arena, blocked, "A file cannot serve as a result directory.");
+    var cancel = std.atomic.Value(bool).init(false);
+    var config = testImageConfig(&cancel);
+    config.tool_result_dir = blocked;
+    const complete = try arena.alloc(u8, 70000);
+    @memset(complete, 'x');
+    const prepared = try prepareToolExecutionOutput(arena, config, toolCall("retained", "mcp_fixture_echo", "{}"), .{
+        .model_content_kind = .mcp_envelope,
+        .model_output = "MCP result truncated; external operation already completed",
+        .mcp_retained_output = complete,
+    }, null);
+    try std.testing.expectEqualStrings("MCP result truncated; external operation already completed", prepared.model_output);
+    try std.testing.expect(prepared.memory.output_handle == null);
+    try std.testing.expect(prepared.memory.stored_output_bytes < complete.len);
 }

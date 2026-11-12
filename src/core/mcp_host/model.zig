@@ -782,3 +782,30 @@ test "a search says why a server it names has no tools, and calls that end say h
     try testing.expect(std.mem.find(u8, lost.model_output, "the server went away. The tool may have run.") != null);
     try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096));
 }
+
+test "MCP-v2 retains complete structured JSON before the display cap" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const padding = try arena.alloc(u8, 70000);
+    @memset(padding, 'x');
+    const content = try arena.print("[{{\"type\":\"text\",\"text\":\"{s}\"}}]", .{padding});
+    const structured = "{\"receipt\":\"complete-v2-tail\",\"exact\":9007199254740993}";
+    var result = (try render(arena, "fixture", "mcp_fixture_echo", .{ .result = .{
+        .content = content,
+        .structured = structured,
+        .is_error = false,
+    } }, 65535)).?;
+    defer result.deinit(arena);
+    try std.testing.expect(result.model_output.len <= 65535);
+    const complete = result.retained_output orelse return error.TestUnexpectedResult;
+    try std.testing.expect(complete.len > 65535);
+    const expected = try arena.print("{{\"server\":\"fixture\",\"tool\":\"mcp_fixture_echo\",\"result\":{{\"content\":{s},\"structuredContent\":{s},\"isError\":false}}}}", .{ content, structured });
+    // V2 intentionally normalizes its result to content, structuredContent and
+    // isError. Retention preserves that complete sanitized host envelope.
+    try std.testing.expectEqualStrings(expected, complete);
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, complete, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("complete-v2-tail", parsed.value.object.get("result").?.object.get("structuredContent").?.object.get("receipt").?.string);
+}

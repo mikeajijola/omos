@@ -93,6 +93,8 @@ pub const ToolFailureKind = enum(u8) {
 
 pub const ToolExecutionResult = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
+    /// Host-authenticated complete MCP envelope, owned by the execution arena.
+    mcp_retained_output: ?[]const u8 = null,
     model_output: []const u8,
     status: ToolExecutionStatus = .success,
     cancelled: bool = false,
