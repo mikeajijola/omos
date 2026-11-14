@@ -9,7 +9,7 @@ pub const ParsedCommand = union(enum) {
     clear_screen,
     new_session,
     reset_session,
-    resume_session,
+    resume_session: []const u8,
     rename_session: []const u8,
     help,
     login,
@@ -52,7 +52,7 @@ pub const CommandHandlers = struct {
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
-    resume_session: *const fn (ctx: *anyopaque) anyerror!void,
+    resume_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_help: *const fn (ctx: *anyopaque) anyerror!void,
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -99,7 +99,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .clear_screen => .clear_screen,
         .new_session => .new_session,
         .reset_session => .reset_session,
-        .resume_session => .resume_session,
+        .resume_session => .{ .resume_session = payload },
         .rename_session => .{ .rename_session = payload },
         .help => .help,
         .login => .login,
@@ -155,7 +155,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
-        .resume_session => try handlers.resume_session(handlers.ctx),
+        .resume_session => |rest| try handlers.resume_session(handlers.ctx, rest),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
@@ -245,7 +245,14 @@ test "parse distinguishes new and reset lifecycle commands" {
 }
 
 test "parse recognizes interactive resume" {
-    try std.testing.expectEqual(ParsedCommand.resume_session, parse(testSlashRegistry(), "/resume"));
+    switch (parse(testSlashRegistry(), "/resume")) {
+        .resume_session => |q| try std.testing.expectEqualStrings("", q),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/resume my-query")) {
+        .resume_session => |q| try std.testing.expectEqualStrings("my-query", q),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse recognizes logout" {
@@ -440,8 +447,9 @@ fn recordCopy(ctx: *anyopaque) anyerror!void {
     testContext(ctx).called = "copy";
 }
 
-fn recordResumeSession(ctx: *anyopaque) anyerror!void {
+fn recordResumeSession(ctx: *anyopaque, value: []const u8) anyerror!void {
     testContext(ctx).called = "resume";
+    testContext(ctx).payload = value;
 }
 
 fn recordModel(ctx: *anyopaque, value: []const u8) anyerror!void {
@@ -486,7 +494,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
-        .resume_session = unexpectedNoPayload,
+        .resume_session = unexpectedPayload,
         .show_help = unexpectedNoPayload,
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
@@ -552,6 +560,12 @@ test "route calls interactive resume handler" {
     try route(testSlashRegistry(), &handlers, "/resume");
 
     try std.testing.expectEqualStrings("resume", ctx.called);
+    try std.testing.expectEqualStrings("", ctx.payload);
+
+    try route(testSlashRegistry(), &handlers, "/resume all");
+
+    try std.testing.expectEqualStrings("resume", ctx.called);
+    try std.testing.expectEqualStrings("all", ctx.payload);
 }
 
 test "route forwards borrowed payload slice" {

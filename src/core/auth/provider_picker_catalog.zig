@@ -20,7 +20,7 @@ pub const Method = enum {
     api_key,
 };
 
-pub const max_provider_options = provider_catalog.entries.len;
+pub const max_provider_options = provider_catalog.entries.len + 32;
 const max_method_options = 2;
 /// The team column lists at most this many teams; accounts beyond it see the
 /// first 128 and can still change teams through the sign-in flow.
@@ -125,6 +125,30 @@ pub fn providerOptions(out: *[max_provider_options][]const u8) usize {
     return count;
 }
 
+/// Writes the visible built-in provider slugs followed by configured provider
+/// connection IDs into `out` and returns how many landed.
+pub fn providerOptionsWithConfigured(
+    definitions: []const @import("../config/configured_provider.zig").Definition,
+    out: *[max_provider_options][]const u8,
+) usize {
+    var count = providerOptions(out);
+    for (definitions) |*definition| {
+        if (count >= max_provider_options) break;
+        if (provider_catalog.parse(definition.id) != null) continue;
+        var duplicate = false;
+        for (out[0..count]) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, definition.id)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        out[count] = definition.id;
+        count += 1;
+    }
+    return count;
+}
+
 pub fn providerMethods(id: model_provider.ProviderId) []const Method {
     return switch (id) {
         .gateway => &.{ .oauth, .api_key },
@@ -197,4 +221,28 @@ test "key source slugs round trip and map to their credentials" {
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, keySourceCredential(.env).?);
     try std.testing.expectEqual(types.CredentialSource.stored_key, keySourceCredential(.saved).?);
     try std.testing.expect(keySourceCredential(.new) == null);
+}
+
+test "provider options with configured definitions append configured ids without duplicates" {
+    const configured_provider = @import("../config/configured_provider.zig");
+    const defs = [_]configured_provider.Definition{
+        .{
+            .id = "gemini",
+            .protocol = .@"openai-chat-completions",
+            .base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
+            .auth = .{ .bearer = "GEMINI_API_KEY" },
+        },
+        .{
+            .id = "gemini",
+            .protocol = .@"openai-chat-completions",
+            .base_url = "https://generativelanguage.googleapis.com/v1beta/openai",
+            .auth = .{ .bearer = "GEMINI_API_KEY" },
+        },
+    };
+    var base_buf: [max_provider_options][]const u8 = undefined;
+    const base_count = providerOptions(&base_buf);
+    var buf: [max_provider_options][]const u8 = undefined;
+    const count = providerOptionsWithConfigured(&defs, &buf);
+    try std.testing.expectEqual(base_count + 1, count);
+    try std.testing.expectEqualStrings("gemini", buf[count - 1]);
 }

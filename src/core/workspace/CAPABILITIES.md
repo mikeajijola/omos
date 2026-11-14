@@ -71,9 +71,9 @@ export OMOS_CLASSIFIER_MODEL=laya:en
 ```
 
 Alternatively, save `{"version":"omos.classifier/v1","endpoint":"http://127.0.0.1:11435","model":"laya:en"}`
-in the private profile file `~/.fx/classifier.json` with mode `0600`. That setting
-applies to CLI and UI hosts using the same profile. Environment endpoint
-configuration overrides the profile file.
+in the private profile file `~/.omos/classifier.json` (or `~/.fx/classifier.json`)
+with mode `0600`. That setting applies to CLI and UI hosts using the same
+profile. Environment endpoint configuration overrides the profile file.
 
 `OMOS_CLASSIFIER_TOKEN`, when needed, supplies the bearer token. Keep credentials
 and private endpoints out of workspace files and Git. The endpoint must implement
@@ -121,8 +121,12 @@ ordinary, coordinator, read-only, background, and child agent tool projections,
 subject to the normal permission rules.
 
 The routing call also offers an optional deliverable choice: `general_task`,
-`coding_task`, or `unresolved`. A fresh personal work request with complete
-classification context and a confident capability choice binds a host contract
+`coding_task`, or `unresolved`. When the classifier returns a work route with a
+flat secondary capability distribution, `realisation_selection.resolveCapability`
+applies deterministic deliverable analysis to distinguish software engineering
+changes (`coding_task`) from operational, browser, research, and document
+delivery (`general_task`). A fresh personal work request with complete
+classification context and a resolved capability choice binds a host contract
 directly, retaining the authenticated request without rewriting its quantities
 or acceptance criteria. Coding contracts retain the host's source validation
 and final summary requirements. Missing or uncertain capability choices,

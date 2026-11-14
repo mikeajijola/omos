@@ -1569,7 +1569,7 @@ fn shutdownCleanupRow(shell: *const TranscriptRuntime) u16 {
 
 fn loadPermissionMode(configured: ?PermissionMode) PermissionMode {
     const fallback = configured orelse default_permission_mode;
-    const mode = io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
+    const mode = io_mod.getenv("OMOS_PERMISSION_MODE") orelse io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
     return config_runtime.parsePermissionMode(mode) orelse fallback;
 }
 
@@ -1630,7 +1630,7 @@ fn loadAgentStepLimit(fallback: usize, configured: ?usize) usize {
     return agent_steps.resolveMaxAgentStepsWithOverride(
         configured,
         fallback,
-        io_mod.getenv("FX_MAX_AGENT_STEPS"),
+        io_mod.getenv("OMOS_MAX_AGENT_STEPS") orelse io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
 }
 
@@ -1786,7 +1786,7 @@ fn credentialOnboardingDisabled() bool {
 const SoundEnvLevel = enum { off, on, max };
 
 fn soundEnvOverride() ?SoundEnvLevel {
-    const value = io_mod.getenv("FX_SOUND") orelse return null;
+    const value = io_mod.getenv("OMOS_SOUND") orelse io_mod.getenv("FX_SOUND") orelse return null;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return null;
     if (std.ascii.eqlIgnoreCase(trimmed, "max")) return .max;

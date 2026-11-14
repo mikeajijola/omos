@@ -604,6 +604,9 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return workspaceArgCompletionCount(query);
     }
+    if (taskArgCompletionPrefix(prefix)) |query| {
+        return taskArgCompletionCount(query);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return 0;
     var count: usize = 0;
     for (registry.commands) |spec| {
@@ -632,6 +635,9 @@ pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize)
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgCompletion(query, n);
     }
+    if (taskArgCompletionPrefix(prefix)) |query| {
+        return nthTaskArgCompletion(query, n);
+    }
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).command;
 }
@@ -645,6 +651,7 @@ pub fn argCompletionAnchor(prefix: []const u8) usize {
     if (notificationsArgCompletionPrefix(prefix) != null) return "/sound ".len;
     if (permissionsArgCompletionPrefix(prefix) != null) return "/permissions ".len;
     if (workspaceArgCompletionPrefix(prefix) != null) return "/workspace ".len;
+    if (taskArgCompletionPrefix(prefix) != null) return "/task ".len;
     if (allowlistArgCompletionAnchor(prefix)) |anchor| return anchor;
     return 0;
 }
@@ -673,6 +680,9 @@ pub fn nthSlashCompletionLabel(registry: SlashRegistry, prefix: []const u8, n: u
     if (workspaceArgCompletionPrefix(prefix)) |query| {
         return nthWorkspaceArgLabel(query, n);
     }
+    if (taskArgCompletionPrefix(prefix)) |query| {
+        return nthTaskArgLabel(query, n);
+    }
     return nthSlashCompletion(registry, prefix, n);
 }
 
@@ -685,6 +695,7 @@ pub fn nthSlashCompletionDescription(registry: SlashRegistry, prefix: []const u8
     if (notificationsArgCompletionPrefix(prefix) != null) return null;
     if (permissionsArgCompletionPrefix(prefix) != null) return null;
     if (workspaceArgCompletionPrefix(prefix) != null) return null;
+    if (taskArgCompletionPrefix(prefix) != null) return null;
     if (prefix.len == 0 or prefix[0] != '/') return null;
     return (nthSlashCommandCompletionMatch(registry, prefix, n) orelse return null).spec.completion_description;
 }
@@ -699,6 +710,10 @@ pub fn slashCompletionHasArgs(registry: SlashRegistry, command: []const u8) bool
     if (allowlistCompletionHasArgs(command)) return true;
     if (std.mem.eql(u8, command, "/workspace add") or
         std.mem.eql(u8, command, "/workspace remove")) return true;
+    if (std.mem.eql(u8, command, "/task new") or
+        std.mem.eql(u8, command, "/task resume") or
+        std.mem.eql(u8, command, "/task workers") or
+        std.mem.eql(u8, command, "/task diff")) return true;
     for (registry.commands) |spec| {
         if (std.mem.eql(u8, spec.command, command)) return spec.has_args;
         for (spec.aliases) |alias| {
@@ -779,6 +794,16 @@ const workspace_arg_completions = [_][]const u8{
     "/workspace add",
     "/workspace remove",
     "/workspace clear",
+};
+
+const task_arg_completions = [_][]const u8{
+    "/task status",
+    "/task list",
+    "/task new",
+    "/task resume",
+    "/task workers",
+    "/task diff",
+    "/task recover",
 };
 
 const allowlist_action_completions = [_][]const u8{
@@ -877,7 +902,7 @@ const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user"
 /// MCP-v2's `/mcp` completes its verbs and server names. The
 /// check goes with FX_MCP_ENGINE when v1 is removed.
 fn mcpVerbsOn() bool {
-    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
+    const value = io_mod.getenv("OMOS_MCP_ENGINE") orelse io_mod.getenv("FX_MCP_ENGINE") orelse return false;
     return std.mem.eql(u8, value, "v2");
 }
 
@@ -950,6 +975,10 @@ pub fn workspaceArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
     return argCompletionPrefix(prefix, "/workspace");
 }
 
+pub fn taskArgCompletionPrefix(prefix: []const u8) ?[]const u8 {
+    return argCompletionPrefix(prefix, "/task");
+}
+
 fn argCompletionCount(completions: []const []const u8, command_with_space_len: usize, query: []const u8) usize {
     var count: usize = 0;
     for (completions) |completion| {
@@ -972,6 +1001,10 @@ fn permissionsArgCompletionCount(query: []const u8) usize {
 
 fn workspaceArgCompletionCount(query: []const u8) usize {
     return argCompletionCount(&workspace_arg_completions, "/workspace ".len, query);
+}
+
+fn taskArgCompletionCount(query: []const u8) usize {
+    return argCompletionCount(&task_arg_completions, "/task ".len, query);
 }
 
 fn allowlistArgCompletionCount(query: []const u8) usize {
@@ -1023,6 +1056,15 @@ fn nthWorkspaceArgCompletion(query: []const u8, n: usize) ?[]const u8 {
 fn nthWorkspaceArgLabel(query: []const u8, n: usize) ?[]const u8 {
     const full = nthWorkspaceArgCompletion(query, n) orelse return null;
     return full["/workspace ".len..];
+}
+
+fn nthTaskArgCompletion(query: []const u8, n: usize) ?[]const u8 {
+    return nthArgCompletion(&task_arg_completions, "/task ".len, query, n);
+}
+
+fn nthTaskArgLabel(query: []const u8, n: usize) ?[]const u8 {
+    const full = nthTaskArgCompletion(query, n) orelse return null;
+    return full["/task ".len..];
 }
 
 fn nthAllowlistArgCompletion(query: []const u8, n: usize) ?[]const u8 {
@@ -2089,6 +2131,21 @@ test "workspace completions expose actions and keep path actions open" {
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/workspace add"));
     try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/workspace remove"));
     try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/workspace clear"));
+}
+
+test "task completions expose actions and keep parameterized actions open" {
+    try std.testing.expectEqual(@as(usize, 7), slashCompletionCount(testSlashRegistry(), "/task "));
+    try std.testing.expectEqualStrings("/task status", nthSlashCompletion(testSlashRegistry(), "/task ", 0).?);
+    try std.testing.expectEqualStrings("/task new", nthSlashCompletion(testSlashRegistry(), "/task n", 0).?);
+    try std.testing.expectEqualStrings("new", nthSlashCompletionLabel(testSlashRegistry(), "/task n", 0).?);
+    try std.testing.expectEqual(@as(usize, "/task ".len), argCompletionAnchor("/task "));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/task new"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/task resume"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/task workers"));
+    try std.testing.expect(slashCompletionHasArgs(testSlashRegistry(), "/task diff"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/task status"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/task list"));
+    try std.testing.expect(!slashCompletionHasArgs(testSlashRegistry(), "/task recover"));
 }
 
 test "slash completions include sound controls" {

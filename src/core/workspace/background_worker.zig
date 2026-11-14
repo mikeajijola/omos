@@ -215,7 +215,7 @@ pub const Worker = struct {
             };
             // Canonical scans are bounded by a host cadence, never tied to
             // animation frames or individual model tokens.
-            io.sleep(std.time.ns_per_s);
+            io.sleep(200 * std.time.ns_per_ms);
         }
     }
 };

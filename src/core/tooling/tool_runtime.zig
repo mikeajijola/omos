@@ -2235,6 +2235,21 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
     }
     const entry = try dispatch.prepare(manager, task, session_id, call_id);
     const state = if (ctx.permission_state_override) |override| override.* else try ctx.session.snapshotPermissionState(arena);
+    const catalog_skills = if (ctx.skill_locations) |locations| locations.skills else &.{};
+    const assignment = try @import("../workspace/realisation_selection.zig").assignForTask(
+        arena,
+        manager,
+        task,
+        task.project_root,
+        catalog_skills,
+    );
+    try manager.record(task, "realisation_assigned", .{
+        .operation = entry.operation,
+        .capability = assignment.capability,
+        .realisation = assignment.realisation,
+        .ranking = assignment.ranking,
+        .bound_skills = assignment.skill_bindings.len,
+    });
     try control.activate(manager, entry, .{
         .workspace = manager.manifest.id,
         .task = task.id,
@@ -2255,6 +2270,10 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
         .permission_rules = ctx.permission_rules,
         .session_rules = state.rules.items,
         .session_generation = state.next_generation,
+        .capability = assignment.capability,
+        .realisation = assignment.realisation,
+        .skill_bindings = assignment.skill_bindings,
+        .execution_guidance = assignment.guidance,
     });
     try control.ensureHost(manager);
     const previous = try manager.backgroundRecord(task.id);

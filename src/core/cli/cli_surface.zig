@@ -895,7 +895,15 @@ fn activateProviderSelectionFallible(
 
     if (target == .configured) {
         const bound = try target.bind(settings.providers orelse .{});
-        const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
+        const selected_model = settings.models.get(bound) orelse blk: {
+            if (settings.providers) |providers| {
+                if (providers.get(bound.label())) |def| {
+                    if (def.model_metadata.len > 0) break :blk def.model_metadata[0].id;
+                }
+            }
+            if (std.mem.eql(u8, bound.label(), "gemini")) break :blk gemini_setup.default_model;
+            return error.ConfiguredModelNotSelected;
+        };
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
             .model_preference = .{ .provider = bound, .model = selected_model },
@@ -1381,7 +1389,7 @@ fn runNonInteractiveWithDeps(
                 try writeStderr(deps, "usage: fx provider <name>\n");
                 return .handled_failure;
             }
-            const target = model_provider.parse(rest[0]) orelse {
+            const target = provider_catalog.parse(rest[0]) orelse model_provider.parse(rest[0]) orelse {
                 try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
                 return .handled_failure;
             };
@@ -1392,7 +1400,19 @@ fn runNonInteractiveWithDeps(
         },
         .setup => |rest| {
             const gemini = rest.len == 1 and std.mem.eql(u8, rest[0], "gemini");
-            if (rest.len != 0 and !gemini) {
+            var configured_providers = if (rest.len == 1 and !gemini)
+                config_runtime.loadConfiguredProviders(alloc) catch null
+            else
+                null;
+            defer if (configured_providers) |*reg| reg.deinit(alloc);
+            const configured_env_slot: ?[]const u8 = if (configured_providers) |reg| blk: {
+                const def = reg.get(rest[0]) orelse break :blk null;
+                break :blk switch (def.auth) {
+                    .bearer => |env_slot| env_slot,
+                    .none => null,
+                };
+            } else null;
+            if (rest.len != 0 and !gemini and configured_env_slot == null) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
                 return .handled_failure;
             }
@@ -1401,6 +1421,7 @@ fn runNonInteractiveWithDeps(
                 return .handled_success;
             }
             if (gemini) return if (try runGeminiSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            if (configured_env_slot) |env_slot| return if (try runConfiguredProviderSetup(alloc, rest[0], env_slot, cfg.secret_store, deps)) .handled_success else .handled_failure;
             return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
         },
         .status => |rest| {
@@ -1833,7 +1854,7 @@ fn runNonInteractiveWithDeps(
                         if (startup.model_requests_blocked) return error.ModelRequestsBlocked;
                         var providers = self.config.provider_set;
                         providers.definitions = startup.configured_providers.definitions;
-                        const review_override = io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse startup.review_model;
+                        const review_override = io_mod.getenv("OMOS_CONTRACT_REVIEW_MODEL") orelse io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse startup.review_model;
                         const review_selection = @import("../agent/runtime/completion_review.zig").resolveSelection(review_override, startup.provider, startup.configured_providers.definitions, startup.selected_model);
                         var cross_credential: ?credentials.Credential = null;
                         defer if (cross_credential) |*cred| cred.deinit(worker_manager.alloc);
@@ -2277,6 +2298,62 @@ fn writeStdout(deps: RunDeps, text: []const u8) !void {
 
 fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
+}
+
+fn runConfiguredProviderSetup(
+    alloc: Allocator,
+    provider_name: []const u8,
+    env_slot: []const u8,
+    secret_store: host.SecretStore,
+    deps: RunDeps,
+) !bool {
+    const env_key = deps.getenv(deps.env_ctx, env_slot) orelse io_mod.getenv(env_slot);
+    if (env_key == null or std.mem.trim(u8, env_key.?, " \t\r\n").len == 0) {
+        if (secret_store.isDisabled()) {
+            const msg = try alloc.print("fx setup {s}: stored API keys are disabled by FX_DISABLE_KEYCHAIN; set {s} instead\n", .{ provider_name, env_slot });
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        }
+        if (!deps.setup_terminal_available(deps.setup_ctx)) {
+            const msg = try alloc.print("fx setup {s}: use an interactive terminal to paste a key, or set {s}\n", .{ provider_name, env_slot });
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        }
+        const prompt = try alloc.print("Paste {s} API key ({s}, input hidden): ", .{ provider_name, env_slot });
+        defer alloc.free(prompt);
+        const key = deps.read_masked_key(deps.setup_ctx, alloc, deps.write_stderr, deps.stderr_ctx, prompt) catch {
+            const msg = try alloc.print("\nfx setup {s}: API key was not saved\n", .{provider_name});
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        };
+        defer secret.zeroAndFree(alloc, key);
+        try writeStderr(deps, "\n");
+        if (key.len == 0 or std.mem.trim(u8, key, " \t\r\n").len != key.len) {
+            const msg = try alloc.print("fx setup {s}: API key must be nonempty and contain no whitespace\n", .{provider_name});
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        }
+        for (key) |byte| if (byte <= 0x20 or byte >= 0x7f) {
+            const msg = try alloc.print("fx setup {s}: API key must contain printable characters without whitespace\n", .{provider_name});
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        };
+        secret_store.storeNamed(alloc, env_slot, key) catch {
+            const msg = try alloc.print("fx setup {s}: API key was not saved\n", .{provider_name});
+            defer alloc.free(msg);
+            try writeStderr(deps, msg);
+            return false;
+        };
+    }
+    const msg = try alloc.print("Saved API key for {s} ({s}).\n", .{ provider_name, env_slot });
+    defer alloc.free(msg);
+    try writeStdout(deps, msg);
+    return true;
 }
 
 fn runGeminiSetup(alloc: Allocator, secret_store: host.SecretStore, deps: RunDeps) !bool {
@@ -3134,7 +3211,7 @@ fn openTopLevelMcpUrl(
     try writeStdout(presentation.deps, "Open this URL to authenticate the MCP server:\n");
     try writeStdout(presentation.deps, encoded_url.bytes);
     try writeStdout(presentation.deps, "\n\nWaiting for browser authorization...\n");
-    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) {
+    if ((io_mod.getenv("OMOS_NO_OPEN_BROWSER") orelse io_mod.getenv("FX_NO_OPEN_BROWSER")) == null) {
         _ = try presentation.opener.open(alloc, url);
     }
     return true;

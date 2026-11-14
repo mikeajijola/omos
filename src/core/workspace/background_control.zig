@@ -29,6 +29,10 @@ pub const Authority = struct {
     permission_rules: types.PermissionRuleSet,
     session_rules: []const @import("../permissions/session_permission_state.zig").Rule,
     session_generation: u64,
+    capability: ?[]const u8 = null,
+    realisation: ?[]const u8 = null,
+    skill_bindings: []const @import("../skills/skill_invocation.zig").ExplicitBinding = &.{},
+    execution_guidance: []const u8 = "",
 };
 
 pub const Command = struct {

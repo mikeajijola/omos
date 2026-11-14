@@ -4,6 +4,7 @@ const std = @import("std");
 const config = @import("config_runtime.zig");
 const store = @import("settings_store.zig");
 const providers = @import("model_provider.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
 const catalog = @import("settings_catalog.zig");
 const types = @import("../shared/types.zig");
 const io = @import("../shared/io.zig");
@@ -24,8 +25,18 @@ fn boolean(value: []const u8) !bool {
 fn patchFor(settings: *const config.Settings, key: []const u8, value: []const u8) !store.UserSettingsPatch {
     var patch: store.UserSettingsPatch = .{};
     if (std.mem.eql(u8, key, "provider")) {
-        const selected = providers.parse(value) orelse return error.InvalidProvider;
-        patch.provider = try selected.bind(settings.providers orelse .{});
+        const selected = provider_catalog.parse(value) orelse providers.parse(value) orelse return error.InvalidProvider;
+        const bound = try selected.bind(settings.providers orelse .{});
+        patch.provider = bound;
+        if (bound == .configured and settings.models.get(bound) == null) {
+            if (settings.providers) |registry| {
+                if (registry.get(bound.label())) |def| {
+                    if (def.model_metadata.len > 0) {
+                        patch.model_preference = .{ .provider = bound, .model = def.model_metadata[0].id };
+                    }
+                }
+            }
+        }
     } else if (std.mem.eql(u8, key, "review_model")) {
         if (value.len == 0) patch.clear_review_model = true else {
             try store.validateModel(value);
@@ -84,8 +95,18 @@ pub fn execute(alloc: std.mem.Allocator, request: Request) ![]const u8 {
         return std.json.Stringify.valueAlloc(alloc, .{ .saved = true, .applies = "next_turn" }, .{});
     }
     const provider = settings.provider orelse .gateway;
+    const default_configured_model = if (provider == .configured)
+        if (settings.providers) |registry|
+            if (registry.get(provider.label())) |def|
+                if (def.model_metadata.len > 0) def.model_metadata[0].id else ""
+            else
+                ""
+        else
+            ""
+    else
+        "";
     const snapshot: catalog.Snapshot = .{
-        .model = settings.models.get(provider) orelse "",
+        .model = settings.models.get(provider) orelse default_configured_model,
         .effort = if (settings.effort) |effort| effort.label() else "default",
         .permission_mode = @tagName(settings.permission_mode orelse config.default_permission_mode),
         .fast_mode = settings.fast_mode orelse false,
@@ -119,4 +140,25 @@ test "host settings reject unknown keys and invalid values before mutation" {
     try std.testing.expectError(error.InvalidSettingValue, patchFor(&settings, "permission_mode", "anything"));
     try std.testing.expect((try patchFor(&settings, "review_model", "")).clear_review_model);
     try std.testing.expectEqual(false, (try patchFor(&settings, "prompt_history", "off")).prompt_history_enabled.?);
+}
+
+test "host settings provider patch accepts catalog aliases and seeds configured provider default model" {
+    const alloc = std.testing.allocator;
+    const configured_provider = @import("configured_provider.zig");
+    const gemini_setup = @import("../auth/gemini_setup.zig");
+
+    var settings: config.Settings = .{};
+    defer settings.deinit(alloc);
+    settings.providers = try configured_provider.Registry.parse_json(alloc, "{\"gemini\":" ++ gemini_setup.definition_json ++ "}");
+
+    const vercel_patch = try patchFor(&settings, "provider", "vercel");
+    try std.testing.expectEqual(providers.ProviderId.gateway, vercel_patch.provider.?);
+    try std.testing.expect(vercel_patch.model_preference == null);
+
+    const ai_gateway_patch = try patchFor(&settings, "provider", "ai-gateway");
+    try std.testing.expectEqual(providers.ProviderId.gateway, ai_gateway_patch.provider.?);
+
+    const gemini_patch = try patchFor(&settings, "provider", "gemini");
+    try std.testing.expectEqualStrings("gemini", gemini_patch.provider.?.label());
+    try std.testing.expectEqualStrings(gemini_setup.default_model, gemini_patch.model_preference.?.model);
 }

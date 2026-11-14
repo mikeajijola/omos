@@ -164,6 +164,7 @@ pub fn status(manager: workspace.Manager, task: workspace.Task) !std.json.Value 
 }
 
 fn sameRequest(a: []const u8, b: []const u8) bool {
+    if (@import("contract_admission.zig").isConversationalGreeting(a)) return false;
     return std.ascii.eqlIgnoreCase(std.mem.trim(u8, a, " \t\r\n"), std.mem.trim(u8, b, " \t\r\n"));
 }
 
@@ -213,6 +214,19 @@ fn resolution(manager: workspace.Manager, kind: []const u8, task: ?workspace.Tas
     return value(manager.alloc, .{ .kind = kind, .task = if (task) |selected| @as(?[]const u8, selected.id) else null, .message = message, .status = if (task) |selected| try status(manager, selected) else @as(?std.json.Value, null), .requires_choice = std.mem.eql(u8, kind, "duplicate") or std.mem.eql(u8, kind, "clarify"), .execution_authorized = false });
 }
 
+fn stripSlashPrefixArg(text: []const u8, prefixes: []const []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    for (prefixes) |cmd| {
+        if (std.mem.startsWith(u8, trimmed, cmd)) {
+            if (trimmed.len == cmd.len) return "";
+            if (std.ascii.isWhitespace(trimmed[cmd.len])) {
+                return std.mem.trim(u8, trimmed[cmd.len..], " \t\r\n");
+            }
+        }
+    }
+    return null;
+}
+
 fn resolve(manager: workspace.Manager, request: Request) !std.json.Value {
     if (request.task) |id| return resolution(manager, "selected", try personal(manager, id), "This message refers to the selected contract.");
     if (request.reply_to) |reply| {
@@ -223,6 +237,48 @@ fn resolve(manager: workspace.Manager, request: Request) !std.json.Value {
         return resolution(manager, "clarify", null, "That message has no selected contract yet. Which retained contract do you mean, or is this new work?");
     }
     if (!validText(request.text, 8192)) return error.InvalidChannelMessage;
+    const trimmed = std.mem.trim(u8, request.text, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "/")) {
+        if (std.mem.eql(u8, trimmed, "/status") or std.mem.eql(u8, trimmed, "/task") or std.mem.eql(u8, trimmed, "/task status")) {
+            const candidates = try list(manager, 0);
+            const items = candidates.object.get("items").?.array.items;
+            if (items.len > 0) {
+                const latest_task_id = model.text(items[0], "task");
+                return resolution(manager, "selected", try personal(manager, latest_task_id), "Status for your latest contract.");
+            }
+            return resolution(manager, "clarify", null, "No retained contracts found.");
+        }
+        if (std.mem.eql(u8, trimmed, "/tasks") or std.mem.eql(u8, trimmed, "/list") or std.mem.eql(u8, trimmed, "/task list") or std.mem.eql(u8, trimmed, "/task tasks")) {
+            const candidates = try list(manager, 0);
+            const items = candidates.object.get("items").?.array.items;
+            if (items.len == 0) return resolution(manager, "clarify", null, "No retained contracts found.");
+            var summary: std.Io.Writer.Allocating = .init(manager.alloc);
+            errdefer summary.deinit();
+            try summary.writer.writeAll("Retained contracts:");
+            for (items[0..@min(items.len, 10)]) |item| {
+                try summary.writer.print("\n- {s} [{s}]: {s}", .{
+                    model.text(item, "task"),
+                    model.text(item, "state"),
+                    prefix(model.text(item, "objective"), 120),
+                });
+            }
+            return resolution(manager, "clarify", null, try summary.toOwnedSlice());
+        }
+        if (stripSlashPrefixArg(trimmed, &.{ "/task new", "/new" })) |goal| {
+            if (goal.len > 0) return resolution(manager, "new", null, "This is new work; create a contract through the normal governed execution path.");
+            return resolution(manager, "clarify", null, "Usage: /new <goal>");
+        }
+        if (stripSlashPrefixArg(trimmed, &.{ "/task resume", "/resume" })) |target_id| {
+            if (target_id.len == 0) return resolution(manager, "clarify", null, "Usage: /resume <task-id>");
+            for (try manager.tasks()) |task| {
+                if (task.authority != null or task.parent_task_id != null) continue;
+                if (std.mem.eql(u8, task.id, target_id) or std.mem.startsWith(u8, task.id, target_id)) {
+                    return resolution(manager, "selected", task, "Continuing the selected contract.");
+                }
+            }
+            return resolution(manager, "clarify", null, "No matching retained contract found.");
+        }
+    }
     // Scan all retained contracts for exact repeats before bounded classification.
     for (try manager.tasks()) |task| {
         if (task.authority != null or task.parent_task_id != null) continue;
@@ -371,7 +427,15 @@ pub fn bindCommand(manager: workspace.Manager, id: []const u8, session: []const 
 fn intent(manager: workspace.Manager, request: Request) !std.json.Value {
     const raw = (try manager.communication(request.key orelse return error.ChannelMessageIdRequired)) orelse return error.UnknownReplyReference;
     const message = try decode(Message, manager.alloc, raw);
-    if (message.task == null or !std.mem.eql(u8, model.text(message.resolution, "kind"), "selected") or !classification.configured()) return value(manager.alloc, .{ .choice = "clarify" });
+    if (message.task == null or !std.mem.eql(u8, model.text(message.resolution, "kind"), "selected")) return value(manager.alloc, .{ .choice = "clarify" });
+    const trimmed_msg = std.mem.trim(u8, message.text, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed_msg, "/status") or std.mem.startsWith(u8, trimmed_msg, "/task status") or std.mem.eql(u8, trimmed_msg, "/task")) {
+        return value(manager.alloc, .{ .choice = "status", .advisory = true });
+    }
+    if (std.mem.startsWith(u8, trimmed_msg, "/resume ") or std.mem.startsWith(u8, trimmed_msg, "/task resume ")) {
+        return value(manager.alloc, .{ .choice = "resume", .advisory = true });
+    }
+    if (!classification.configured()) return value(manager.alloc, .{ .choice = "clarify" });
     var stopped = std.atomic.Value(bool).init(false);
     const choice = try interpretIntent(manager, try personal(manager, message.task.?), message.text, if (manager.operation_control) |c| c.cancel else &stopped);
     return value(manager.alloc, .{ .choice = @tagName(choice), .advisory = true });
@@ -395,12 +459,18 @@ fn command(manager: workspace.Manager, request: Request) !std.json.Value {
         return value(manager.alloc, .{ .key = id, .command = retained, .already_accepted = true });
     }
     if (choice == .status) return status(manager, try personal(manager, message.task orelse return error.MissingTaskId));
-    var record: Command = .{ .message = message_id, .choice = @tagName(choice), .task = message.task, .text = message.text };
+    const effective_text = if (choice == .new) blk: {
+        if (stripSlashPrefixArg(message.text, &.{ "/task new", "/new" })) |stripped| {
+            if (stripped.len > 0) break :blk stripped;
+        }
+        break :blk message.text;
+    } else message.text;
+    var record: Command = .{ .message = message_id, .choice = @tagName(choice), .task = message.task, .text = effective_text };
     if (choice == .new) {
         record.task = null;
         // A deliberate separate-work choice must not be mistaken for a repeat
         // by the foreground duplicate guard.
-        if (message.task != null) record.text = try manager.alloc.print("Create a separate contract for this request:\n{s}", .{message.text});
+        if (message.task != null) record.text = try manager.alloc.print("Create a separate contract for this request:\n{s}", .{effective_text});
     } else {
         const task = try personal(manager, message.task orelse return error.MissingTaskId);
         if (task.state == .accepted and !try manager.publicationPending(task)) return error.ContractAlreadyCompleted;
@@ -567,6 +637,67 @@ test "contract channel routing distinguishes human repeats from transport identi
     try std.testing.expect(mutates(.{ .action = .receive }));
     try std.testing.expect(mutates(.{ .action = .acknowledge }));
     try std.testing.expectError(error.InvalidChannelDestination, validateDestination(.{ .channel = "telegram", .address = "" }));
+}
+
+test "contract channel resolve handles /status, /tasks, and /new slash commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const io_handle = io.getIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_handle, "tasks");
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const ws_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const manager: workspace.Manager = .{
+        .alloc = alloc,
+        .repository = root,
+        .root = root,
+        .manifest = .{ .id = ws_id },
+    };
+
+    const empty_status = try resolve(manager, .{ .action = .resolve, .text = "/status" });
+    try std.testing.expectEqualStrings("clarify", model.text(empty_status, "kind"));
+    try std.testing.expectEqualStrings("No retained contracts found.", model.text(empty_status, "message"));
+
+    const empty_tasks = try resolve(manager, .{ .action = .resolve, .text = "/tasks" });
+    try std.testing.expectEqualStrings("clarify", model.text(empty_tasks, "kind"));
+    try std.testing.expectEqualStrings("No retained contracts found.", model.text(empty_tasks, "message"));
+
+    const task_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const sess_hash = try workspace.hash(alloc, "session-channel");
+    const task: workspace.Task = .{
+        .id = task_id,
+        .created_at_ms = 1000,
+        .workspace_id = ws_id,
+        .session = sess_hash,
+        .branch = "task/" ++ task_id,
+        .base_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .project_root = root,
+        .definition = .{
+            .id = task_id,
+            .version = 1,
+            .objective = "Verify channel slash commands",
+            .obligations = &.{.{ .id = "request_complete", .description = "Complete" }},
+        },
+        .state = .active,
+    };
+    {
+        var task_file = try tmp.dir.createFile(io_handle, "tasks/" ++ task_id ++ ".json", .{});
+        defer task_file.close(io_handle);
+        try task_file.writeStreamingAll(io_handle, try encode(alloc, task));
+    }
+
+    const listed = try resolve(manager, .{ .action = .resolve, .text = "/tasks" });
+    try std.testing.expectEqualStrings("clarify", model.text(listed, "kind"));
+    try std.testing.expect(std.mem.find(u8, model.text(listed, "message"), task_id) != null);
+    try std.testing.expect(std.mem.find(u8, model.text(listed, "message"), "Verify channel slash commands") != null);
+
+    const new_work = try resolve(manager, .{ .action = .resolve, .text = "/new Build messaging commands" });
+    try std.testing.expectEqualStrings("new", model.text(new_work, "kind"));
+    try std.testing.expectEqualStrings("Build messaging commands", stripSlashPrefixArg("/new Build messaging commands", &.{ "/task new", "/new" }).?);
+    try std.testing.expectEqualStrings("Build messaging commands", stripSlashPrefixArg("/task new Build messaging commands", &.{ "/task new", "/new" }).?);
 }
 
 pub const Intent = enum { status, @"resume", amend, new, unrelated, clarify };

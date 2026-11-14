@@ -29,7 +29,29 @@ fn saveFocus(manager: workspace.Manager, session: []const u8, task: ?[]const u8,
     if (raw) |previous| if (std.mem.eql(u8, previous, bytes)) return;
     try manager.saveCommunications(&.{.{ .key = id, .expected = if (raw) |previous| try workspace.hash(manager.alloc, previous) else null, .content = bytes }});
 }
+pub fn isConversationalGreeting(message: []const u8) bool {
+    const trimmed = std.mem.trim(u8, message, " \t\r\n!?.");
+    for ([_][]const u8{
+        "hi",
+        "hello",
+        "hey",
+        "hi there",
+        "hello there",
+        "hey there",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "how are you",
+        "thanks",
+        "thank you",
+    }) |greeting| {
+        if (std.ascii.eqlIgnoreCase(trimmed, greeting)) return true;
+    }
+    return false;
+}
+
 fn sameRequest(a: []const u8, b: []const u8) bool {
+    if (isConversationalGreeting(a)) return false;
     var left = std.mem.tokenizeAny(u8, a, " \t\r\n");
     var right = std.mem.tokenizeAny(u8, b, " \t\r\n");
     while (left.next()) |word| if (!std.ascii.eqlIgnoreCase(word, right.next() orelse return false)) return false;
@@ -40,6 +62,10 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
     const active = try manager.active(session);
     const raw = try manager.communication(try focusKey(manager, session));
     const focus = if (raw) |bytes| try std.json.parseFromSliceLeaky(Focus, manager.alloc, bytes, .{}) else Focus{ .task = null };
+    if (isConversationalGreeting(message)) {
+        if (focus.pending) try saveFocus(manager, session, null, false);
+        return .{};
+    }
     var selected: ?workspace.Task = null;
     var duplicate = false;
     var matches: usize = 0;
@@ -54,6 +80,19 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
         duplicate = exact;
         matches += 1;
         if (matches <= 8) try choices.appendSlice(manager.alloc, try manager.alloc.print("\n{s} ({s})", .{ task.id, @tagName(task.state) }));
+    }
+    if (duplicate and classification.configured()) {
+        const routed = @import("request_routing.zig").decide(manager.alloc, message, history, cancel) catch null;
+        if (routed) |decision| {
+            if (decision.route == .conversation or decision.route == .retrieval) {
+                selected = null;
+                duplicate = false;
+                matches = 0;
+                choices.clearRetainingCapacity();
+                if (focus.pending) try saveFocus(manager, session, null, false);
+                return .{};
+            }
+        }
     }
     if (matches > 1) {
         try saveFocus(manager, session, null, true);
@@ -75,11 +114,31 @@ pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const
                 selected = task;
                 matches += 1;
             }
-            if (matches > 1) return .{ .response = "The previous answer mentioned several contracts. Specify which contract you want to continue." };
+            if (matches > 1) {
+                if (classification.configured()) {
+                    if (@import("request_routing.zig").decide(manager.alloc, message, history, cancel) catch null) |decision| {
+                        if (decision.route == .conversation or decision.route == .retrieval) {
+                            if (focus.pending) try saveFocus(manager, session, null, false);
+                            return .{};
+                        }
+                    }
+                }
+                return .{ .response = "The previous answer mentioned several contracts. Specify which contract you want to continue." };
+            }
             break;
         }
     }
-    if (selected == null and focus.pending) return .{ .response = "Several contracts were in scope. Specify a contract ID, or use /task new to start separate work." };
+    if (selected == null and focus.pending) {
+        if (classification.configured()) {
+            if (@import("request_routing.zig").decide(manager.alloc, message, history, cancel) catch null) |decision| {
+                if (decision.route == .conversation or decision.route == .retrieval) {
+                    try saveFocus(manager, session, null, false);
+                    return .{};
+                }
+            }
+        }
+        return .{ .response = "Several contracts were in scope. Specify a contract ID, or use /task new to start separate work." };
+    }
     const task = selected orelse return .{};
     if (task.authority != null or task.parent_task_id != null) return .{};
     if (duplicate) {

@@ -241,12 +241,61 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
     return .{ .workspace = snapshot };
 }
 
+fn formatTaskSummary(alloc: std.mem.Allocator, task: workspace.Task) ![]const u8 {
+    return alloc.print("Task {s}\nBranch: {s}\nState: {s}\nGoal: {s}", .{ task.id, task.branch, @tagName(task.state), task.definition.objective });
+}
+
 pub fn taskCommand(alloc: std.mem.Allocator, session: []const u8, project: []const u8, rest: []const u8) ![]const u8 {
     const manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
+    return taskCommandWithManager(alloc, manager, session, project, rest);
+}
+
+fn taskCommandWithManager(alloc: std.mem.Allocator, manager: workspace.Manager, session: []const u8, project: []const u8, rest: []const u8) ![]const u8 {
     const text = std.mem.trim(u8, rest, " \t");
     const split = std.mem.findScalar(u8, text, ' ') orelse text.len;
     const action = text[0..split];
     const argument = std.mem.trim(u8, text[split..], " \t");
+    if (action.len == 0 or std.mem.eql(u8, action, "status")) {
+        if (argument.len > 0) {
+            const task = try manager.loadTask(argument);
+            return formatTaskSummary(alloc, task);
+        }
+        if (try manager.active(session)) |task| {
+            return formatTaskSummary(alloc, task);
+        }
+        const snap = try manager.snapshot("");
+        return alloc.print("Workspace {s}\nRepository: {s}\nTrunk: {s}\nTasks: {d}", .{ snap.workspace_id, snap.repository, snap.trunk_revision, snap.tasks.len });
+    }
+    if (std.mem.eql(u8, action, "list") or std.mem.eql(u8, action, "tasks")) {
+        if (argument.len != 0) return error.InvalidTaskCommand;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        var count: usize = 0;
+        for (try manager.tasks()) |t| {
+            if (t.authority != null or t.parent_task_id != null) continue;
+            if (count > 0) try out.writer.writeByte('\n');
+            try out.writer.print("{s}  {s}  {s}", .{ t.id, @tagName(t.state), t.definition.objective });
+            count += 1;
+            if (count >= 20) break;
+        }
+        if (count == 0) {
+            out.deinit();
+            return alloc.dupe(u8, "No retained tasks.");
+        }
+        return out.toOwnedSlice();
+    }
+    if (std.mem.eql(u8, action, "diff")) {
+        const task = if (argument.len > 0)
+            try manager.loadTask(argument)
+        else
+            (try manager.active(session)) orelse return error.TaskIdRequired;
+        return manager.diff(task);
+    }
+    if (std.mem.eql(u8, action, "recover")) {
+        if (argument.len != 0) return error.InvalidTaskCommand;
+        try manager.recover();
+        return alloc.dupe(u8, "Recovered pending evidence and publication receipts.");
+    }
     if (std.mem.eql(u8, action, "workers")) {
         const api = @import("background_api.zig");
         const request = if (argument.len == 0) api.Request{} else try @import("../shared/record_json.zig").decode(api.Request, alloc, argument, .{});
@@ -258,7 +307,7 @@ pub fn taskCommand(alloc: std.mem.Allocator, session: []const u8, project: []con
         const selection = try parseTaskSelection(argument);
         break :blk try manager.resumeTaskInProject(session, selection.id, project, selection.rebind_project);
     } else return error.InvalidTaskCommand;
-    return alloc.print("Task {s}\nBranch: {s}\nState: {s}\nGoal: {s}", .{ task.id, task.branch, @tagName(task.state), task.definition.objective });
+    return formatTaskSummary(alloc, task);
 }
 
 fn parseTaskSelection(argument: []const u8) !struct { id: []const u8, rebind_project: bool } {
@@ -330,4 +379,66 @@ test "local workspace requests require a file and cannot enable writes" {
     try std.testing.expectError(error.MissingPath, parse(&.{"request"}));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "request", "request.json", "--write" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "request", "request.json", "extra" }));
+}
+
+test "taskCommand handles status, list, tasks, and diff argument validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const io = @import("../shared/io.zig").getIo();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tasks");
+    try tmp.dir.createDirPath(io, "sessions");
+    const root = try @import("../shared/io.zig").dirRealpathAlloc(alloc, tmp.dir, ".");
+    const ws_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const manager: workspace.Manager = .{
+        .alloc = alloc,
+        .repository = root,
+        .root = root,
+        .manifest = .{ .id = ws_id },
+    };
+
+    try std.testing.expectEqualStrings("No retained tasks.", try taskCommandWithManager(alloc, manager, "session-1", root, "list"));
+    try std.testing.expectEqualStrings("No retained tasks.", try taskCommandWithManager(alloc, manager, "session-1", root, "tasks"));
+    try std.testing.expectError(error.InvalidTaskCommand, taskCommandWithManager(alloc, manager, "session-1", root, "list extra"));
+    try std.testing.expectError(error.InvalidTaskCommand, taskCommandWithManager(alloc, manager, "session-1", root, "recover extra"));
+    try std.testing.expectError(error.TaskIdRequired, taskCommandWithManager(alloc, manager, "session-1", root, "diff"));
+
+    const task_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const sess_hash = try workspace.hash(alloc, "session-1");
+    const task: workspace.Task = .{
+        .id = task_id,
+        .workspace_id = ws_id,
+        .session = sess_hash,
+        .branch = "task/" ++ task_id,
+        .base_revision = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        .project_root = root,
+        .definition = .{
+            .id = task_id,
+            .version = 1,
+            .objective = "Expand slash task commands",
+            .obligations = &.{.{ .id = "request_complete", .description = "Complete task" }},
+        },
+        .state = .active,
+    };
+    const task_json = try std.json.Stringify.valueAlloc(alloc, task, .{});
+    {
+        var task_file = try tmp.dir.createFile(io, "tasks/" ++ task_id ++ ".json", .{});
+        defer task_file.close(io);
+        try task_file.writeStreamingAll(io, task_json);
+    }
+    {
+        const session_rel = try alloc.print("sessions/{s}", .{sess_hash});
+        var sess_file = try tmp.dir.createFile(io, session_rel, .{});
+        defer sess_file.close(io);
+        try sess_file.writeStreamingAll(io, task_id);
+    }
+
+    const expected_summary = "Task " ++ task_id ++ "\nBranch: task/" ++ task_id ++ "\nState: active\nGoal: Expand slash task commands";
+    try std.testing.expectEqualStrings(expected_summary, try taskCommandWithManager(alloc, manager, "session-1", root, ""));
+    try std.testing.expectEqualStrings(expected_summary, try taskCommandWithManager(alloc, manager, "session-1", root, "status"));
+    try std.testing.expectEqualStrings(expected_summary, try taskCommandWithManager(alloc, manager, "other-session", root, "status " ++ task_id));
+    try std.testing.expectEqualStrings(task_id ++ "  active  Expand slash task commands", try taskCommandWithManager(alloc, manager, "session-1", root, "list"));
 }

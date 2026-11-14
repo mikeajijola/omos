@@ -48,17 +48,38 @@ pub fn execute(manager: workspace.Manager, request: Request) !std.json.Value {
     }
     const entry = (try manager.backgroundRecord(request.task orelse return error.MissingTaskId)) orelse return error.BackgroundDispatchRequired;
     if (request.action == .show) {
+        const task = try manager.loadTask(entry.task);
         var result = try value(manager, entry);
-        try result.object.put(manager.alloc, "execution", try value(manager, try @import("contract_execution.zig").inspect(manager, try manager.loadTask(entry.task), entry)));
+        try result.object.put(manager.alloc, "execution", try value(manager, try @import("contract_execution.zig").inspect(manager, task, entry)));
         try result.object.put(manager.alloc, "activity", try activity(manager, entry));
+        if (task.state == .accepted and !try manager.publicationPending(task)) {
+            const publication = try manager.publicationSummary(task);
+            try result.object.put(manager.alloc, "publication", publication);
+            const model = @import("definition.zig");
+            const accepted = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, try manager.contentAt(model.text(publication, "receipt_path"), model.text(publication, "revision")), .{});
+            if (model.field(accepted, "review")) |review| {
+                const candidate = model.text(review, "candidate");
+                if (candidate.len > 0) try result.object.put(manager.alloc, "reviewed_outcome", .{ .string = candidate });
+            }
+        }
         return result;
     }
     if (request.action == .events) return events(manager, entry, request.generation orelse entry.generation, request.offset);
     if (request.action == .receipt) {
-        const operation = request.operation orelse return error.BackgroundOperationRequired;
+        const operation = request.operation orelse entry.operation;
         if (try manager.backgroundOperation(operation)) |retained| {
             if (!std.mem.eql(u8, retained.task, entry.task)) return error.BackgroundOperationConflict;
             return value(manager, .{ .accepted = true, .fulfilled = false, .receipt = retained });
+        }
+        if (request.operation == null or std.mem.eql(u8, operation, entry.operation)) {
+            const task = try manager.loadTask(entry.task);
+            if (task.state == .accepted and !try manager.publicationPending(task)) {
+                const publication = try manager.publicationSummary(task);
+                const model = @import("definition.zig");
+                const accepted = try std.json.parseFromSliceLeaky(std.json.Value, manager.alloc, try manager.contentAt(model.text(publication, "receipt_path"), model.text(publication, "revision")), .{});
+                const candidate = if (model.field(accepted, "review")) |review| model.text(review, "candidate") else "";
+                return value(manager, .{ .accepted = true, .fulfilled = true, .operation = operation, .publication = publication, .reviewed_outcome = candidate });
+            }
         }
         const result = control.read(manager, try control.path(manager, "receipts", operation)) catch |err| switch (err) {
             error.FileNotFound => return value(manager, .{ .operation = operation, .pending = true, .note = "Do not replay a claimed operation without reconciling its outcome." }),

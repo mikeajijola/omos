@@ -1056,11 +1056,20 @@ pub fn Runtime(comptime App: type) type {
 
             var skill_catalog = app.skills.acquireCatalog();
             defer skill_catalog.deinit();
-            const explicit_bindings = try std.heap.c_allocator.alloc(skill_invocation.ExplicitBinding, job.skill_bindings.len);
-            defer std.heap.c_allocator.free(explicit_bindings);
-            for (job.skill_bindings, 0..) |binding, index| {
-                explicit_bindings[index] = .{ .name = binding.name, .path = binding.path };
-            }
+            var prompt_binding_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            defer prompt_binding_arena.deinit();
+            const explicit_bindings = if (job.skill_bindings.len > 0) blk: {
+                const copied = try prompt_binding_arena.allocator().alloc(skill_invocation.ExplicitBinding, job.skill_bindings.len);
+                for (job.skill_bindings, 0..) |binding, index| {
+                    copied[index] = .{ .name = binding.name, .path = binding.path };
+                }
+                break :blk copied;
+            } else try @import("../workspace/realisation_selection.zig").resolvePromptSkillBindings(
+                prompt_binding_arena.allocator(),
+                job.prompt,
+                turnWorkspace(app).root,
+                skill_catalog.items,
+            );
             if (preflight_context_notices.written().len > 0) {
                 try app_worker_runtime.Runtime(App).pushSemanticNotice(app, .{
                     .topic = "context",
@@ -1109,6 +1118,23 @@ pub fn Runtime(comptime App: type) type {
                 &tool_projection,
                 session_child_capability,
             );
+            if (!completion_review.coordinatorEnabled() and comptime @hasDecl(App, "acquireMcpRuntime")) {
+                if (app.acquireMcpRuntime()) |mcp_lease_value| {
+                    var mcp_lease = mcp_lease_value;
+                    defer mcp_lease.deinit();
+                    const loaded = try mcp_lease.runtime.snapshotAlwaysLoadedTools(
+                        prompt_binding_arena.allocator(),
+                        app.permission_engine.rules,
+                        config.context_limits,
+                        .unrestricted,
+                    );
+                    var dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+                    for (loaded.tools) |selected| {
+                        try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(prompt_binding_arena.allocator(), &dynamic_tools, selected);
+                    }
+                    config.initial_dynamic_tools = dynamic_tools.items;
+                }
+            }
             var cross_review_credential: ?credentials.Credential = null;
             defer if (cross_review_credential) |*cred| cred.deinit(std.heap.c_allocator);
             if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet")) {

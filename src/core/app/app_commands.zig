@@ -709,7 +709,7 @@ pub fn Handlers(comptime App: type) type {
             try app.newSession();
         }
 
-        fn commandResumeSession(ctx: *anyopaque) !void {
+        fn commandResumeSession(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime !runtime_profile.allows(App, .durable_sessions)) {
                 try app.writeDomainNotice(.{
@@ -719,7 +719,17 @@ pub fn Handlers(comptime App: type) type {
                 }, true);
                 return;
             }
+            const query = std.mem.trim(u8, rest, " \t");
+            if (std.mem.eql(u8, query, "all") or std.mem.eql(u8, query, "--all")) {
+                try app_session_runtime.Runtime(App).openAllSessionPicker(app);
+                return;
+            }
             try app_session_runtime.Runtime(App).openSessionPicker(app);
+            if (query.len > 0 and app.session_persistence.session_picker.active) {
+                try app.input_runtime.textReplacementState().replace(app.alloc, query);
+                app.session_persistence.session_picker.setQuery(app.input_runtime.edit_state.input.items);
+                app.shell.render_requests.request(.footer);
+            }
         }
 
         fn commandRenameSession(ctx: *anyopaque, rest: []const u8) !void {

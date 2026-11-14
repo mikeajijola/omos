@@ -288,7 +288,8 @@ reconcile any records created after cutover before rollback.
 ## Personal instance and filesystem views
 
 `omos fossil ensure` creates an empty personal instance under
-`~/.fx/instances/personal.fossil` when no repository is bound. Saved native turns
+`~/.omos/instances/personal.fossil` (or `~/.fx/instances/personal.fossil`) when
+no repository is bound. Saved native turns, `omos acp`, child sub-agent tasks,
 and the UI host use the same bootstrap. Existing bindings remain unchanged.
 Each fresh instance receives a unique workspace identity, a declaration, and an
 execution policy. Unlike `fossil init`, bootstrap never imports old sessions.

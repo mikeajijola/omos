@@ -12,9 +12,13 @@
 
 const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
+const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const gemini_setup = @import("../auth/gemini_setup.zig");
+const io_mod = @import("../shared/io.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const provider_picker_catalog = @import("../auth/provider_picker_catalog.zig");
+const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
 const picker_state = @import("../input/picker_state.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -51,6 +55,43 @@ pub fn supported(comptime App: type) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn configuredDefinitions(app: *const App) []const @import("../config/configured_provider.zig").Definition {
+            if (comptime @hasField(App, "provider_selection")) {
+                return app.provider_selection.definitions.definitions;
+            }
+            return &.{};
+        }
+
+        fn parseProviderSelection(app: *const App, slug: []const u8) ?model_provider.ProviderId {
+            if (provider_catalog.parse(slug)) |id| return id;
+            if (comptime @hasField(App, "provider_selection")) {
+                const parsed = model_provider.parse(slug) orelse return null;
+                return parsed.bind(app.provider_selection.definitions) catch null;
+            }
+            return null;
+        }
+
+        fn maybeBootstrapGemini(app: *App) void {
+            if (comptime !@hasField(App, "provider_selection")) return;
+            const env_present = if (io_mod.getenv(gemini_setup.key_slot)) |val|
+                std.mem.trim(u8, val, " \t\r\n").len > 0
+            else
+                false;
+            const stored_present = if (env_present)
+                false
+            else if (comptime @hasDecl(@TypeOf(app.auth), "secretStore")) blk: {
+                const token = (app.auth.secretStore().loadNamed(app.alloc, gemini_setup.key_slot) catch null) orelse break :blk false;
+                secret.zeroAndFree(app.alloc, token);
+                break :blk true;
+            } else false;
+            if (!env_present and !stored_present) return;
+            gemini_setup.checkConnection(app.alloc) catch return;
+            gemini_setup.saveConnection(app.alloc) catch return;
+            const reloaded = config_runtime.loadConfiguredProviders(app.alloc) catch return;
+            app.provider_selection.definitions.deinit(app.alloc);
+            app.provider_selection.definitions = reloaded;
+        }
+
         /// Fills one column with its options and their `current` annotations,
         /// then narrows both to what the typed query matches.
         pub fn columnOptions(
@@ -73,10 +114,10 @@ pub fn Runtime(comptime App: type) type {
             switch (query.stage) {
                 .provider => {
                     var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-                    count = provider_picker_catalog.providerOptions(&slugs);
+                    count = provider_picker_catalog.providerOptionsWithConfigured(configuredDefinitions(app), &slugs);
                     for (slugs[0..count], 0..) |slug, i| {
                         column.labels[i] = slug;
-                        const id = provider_catalog.parse(slug) orelse .gateway;
+                        const id = parseProviderSelection(app, slug) orelse .gateway;
                         column.annotations[i] = if (id.eql(active_provider) and
                             model_provider.authorizesCredential(id, app.auth.credentialSource())) "current" else "";
                     }
@@ -232,7 +273,7 @@ pub fn Runtime(comptime App: type) type {
             const selected = exactLabel(query.query, &column) orelse return false;
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
+                    const provider = parseProviderSelection(app, selected) orelse return false;
                     if (provider_picker_catalog.providerMethods(provider).len == 0) return false;
                 },
                 .method => {
@@ -252,13 +293,21 @@ pub fn Runtime(comptime App: type) type {
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};
             _ = columnOptions(app, query, &column);
-            // No matching option: let Enter fall through so the router reports
-            // the unknown text instead of silently eating the key.
-            const selected = selectedLabel(app, query, &column) orelse return false;
 
             switch (query.stage) {
                 .provider => {
-                    const provider = provider_catalog.parse(selected) orelse return false;
+                    const trimmed = std.mem.trim(u8, query.query, " \t");
+                    if (std.ascii.eqlIgnoreCase(trimmed, "gemini") and parseProviderSelection(app, "gemini") == null) {
+                        maybeBootstrapGemini(app);
+                        _ = columnOptions(app, query, &column);
+                    }
+                    // No matching option: let Enter fall through so the router reports
+                    // the unknown text instead of silently eating the key.
+                    const selected = if (provider_catalog.parse(trimmed)) |id|
+                        provider_catalog.find(id).slug
+                    else
+                        selectedLabel(app, query, &column) orelse return false;
+                    const provider = parseProviderSelection(app, selected) orelse return false;
                     if (provider_picker_catalog.providerMethods(provider).len == 0) {
                         try commit(app, .{ .provider = provider });
                         return true;
@@ -272,6 +321,7 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
                 .method => {
+                    const selected = selectedLabel(app, query, &column) orelse return false;
                     const method = provider_picker_catalog.parseMethod(selected) orelse return false;
                     // The inventory is what says whether this method already
                     // has a credential to switch to; it goes stale the moment
@@ -336,6 +386,7 @@ pub fn Runtime(comptime App: type) type {
                     return true;
                 },
                 .key_source => {
+                    const selected = selectedLabel(app, query, &column) orelse return false;
                     const key_source = provider_picker_catalog.parseKeySource(selected) orelse return false;
                     const pending_provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
@@ -351,6 +402,7 @@ pub fn Runtime(comptime App: type) type {
                 // runtime routes before the composer ever sees the byte.
                 .api_key => return false,
                 .team => {
+                    const selected = selectedLabel(app, query, &column) orelse return false;
                     const index = teamIndex(app, selected) orelse return false;
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
@@ -551,7 +603,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn syncProviderSelection(app: *App, slug: []const u8) void {
             var slugs: [provider_picker_catalog.max_provider_options][]const u8 = undefined;
-            const count = provider_picker_catalog.providerOptions(&slugs);
+            const count = provider_picker_catalog.providerOptionsWithConfigured(configuredDefinitions(app), &slugs);
             for (slugs[0..count], 0..) |candidate, index| {
                 if (!std.mem.eql(u8, candidate, slug)) continue;
                 app.input_runtime.picker.provider_column_index = index;
@@ -806,4 +858,32 @@ test "key source column offers only detected keys plus new" {
     try std.testing.expect(std.mem.find(u8, full.annotations[0], "current") != null);
     try std.testing.expectEqualStrings("saved", full.labels[1]);
     try std.testing.expect(std.mem.find(u8, full.annotations[1], "current") == null);
+}
+
+test "provider column includes configured providers and marks current when active" {
+    const alloc = std.testing.allocator;
+    const configured_provider = @import("../config/configured_provider.zig");
+    var app = ColumnTestApp.init(alloc);
+    defer app.deinit();
+
+    app.provider_selection.definitions = try configured_provider.Registry.parse_json(
+        alloc,
+        "{\"gemini\":" ++ gemini_setup.definition_json ++ "}",
+    );
+    const gemini_id = try model_provider.parse("gemini").?.bind(app.provider_selection.definitions);
+    try app.provider_selection.replaceSelection(gemini_id, gemini_setup.default_model);
+    app.auth.source = .configured;
+
+    const column = columnFor(&app, .provider, "");
+    try std.testing.expect(column.count >= 4);
+    try std.testing.expectEqualStrings("gemini", column.labels[column.count - 1]);
+    try std.testing.expectEqualStrings("current", column.annotations[column.count - 1]);
+
+    const narrowed = columnFor(&app, .provider, "gem");
+    try std.testing.expectEqual(@as(usize, 1), narrowed.count);
+    try std.testing.expectEqualStrings("gemini", narrowed.labels[0]);
+
+    try app.input_runtime.textReplacementState().replace(alloc, "/provider gem");
+    try Runtime(ColumnTestApp).autocomplete(&app);
+    try std.testing.expectEqualStrings("/provider gemini", app.input_runtime.edit_state.input.items);
 }

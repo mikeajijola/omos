@@ -34,6 +34,14 @@ const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const tool_host = @import("tool_host.zig");
+const completion_review = if (@import("builtin").target.cpu.arch.isWasm())
+    struct {}
+else
+    @import("../agent/runtime/completion_review.zig");
+const realisation_selection = if (@import("builtin").target.cpu.arch.isWasm())
+    struct {}
+else
+    @import("../workspace/realisation_selection.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -71,6 +79,53 @@ pub const Config = struct {
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
 };
 
+const ChildFossilRouting = struct {
+    fossil_workspace_available: bool,
+    coordinator_mode: bool,
+    contract_review_enabled: bool,
+    fossil_session_id: ?[]const u8,
+    fossil_parent_session_id: ?[]const u8,
+    fossil_ephemeral: bool,
+};
+
+fn resolveChildFossilRouting(
+    contract_review_active: bool,
+    child_id: ?[]const u8,
+    parent_id: []const u8,
+) ChildFossilRouting {
+    return .{
+        .fossil_workspace_available = contract_review_active,
+        .coordinator_mode = false,
+        .contract_review_enabled = contract_review_active,
+        .fossil_session_id = if (contract_review_active) child_id else null,
+        .fossil_parent_session_id = if (contract_review_active) parent_id else null,
+        .fossil_ephemeral = false,
+    };
+}
+
+test "subagent child contract routing binds child session to parent task under omos and stays disabled under fx" {
+    if (comptime @import("builtin").target.cpu.arch.isWasm()) return;
+    defer completion_review.configureInvocation("fx");
+
+    completion_review.configureInvocation("omos");
+    const omos_routing = resolveChildFossilRouting(completion_review.enabled(), "child-session-1", "parent-session-1");
+    try std.testing.expect(omos_routing.fossil_workspace_available);
+    try std.testing.expect(!omos_routing.coordinator_mode);
+    try std.testing.expect(omos_routing.contract_review_enabled);
+    try std.testing.expectEqualStrings("child-session-1", omos_routing.fossil_session_id.?);
+    try std.testing.expectEqualStrings("parent-session-1", omos_routing.fossil_parent_session_id.?);
+    try std.testing.expect(!omos_routing.fossil_ephemeral);
+
+    completion_review.configureInvocation("fx");
+    const fx_routing = resolveChildFossilRouting(completion_review.enabled(), "child-session-1", "parent-session-1");
+    try std.testing.expect(!fx_routing.fossil_workspace_available);
+    try std.testing.expect(!fx_routing.coordinator_mode);
+    try std.testing.expect(!fx_routing.contract_review_enabled);
+    try std.testing.expect(fx_routing.fossil_session_id == null);
+    try std.testing.expect(fx_routing.fossil_parent_session_id == null);
+    try std.testing.expect(!fx_routing.fossil_ephemeral);
+}
+
 const Context = struct {
     config: Config,
     turn: *execution.TurnContext,
@@ -84,6 +139,10 @@ const Context = struct {
 
     fn toolContext(self: *Context) tool_runtime.Context {
         var result = self.config.tool_context;
+        if (comptime !@import("builtin").target.cpu.arch.isWasm()) {
+            result.fossil_workspace_available = completion_review.enabled();
+            result.coordinator_mode = false;
+        }
         result.worker = self.turn.workerRuntime();
         result.session = self.turn.sessionRuntime();
         result.cancel_flag = self.cancel;
@@ -291,7 +350,7 @@ pub fn run(
             turn.active_work_id orelse "unknown",
         },
     );
-    const review_selection = @import("../agent/runtime/completion_review.zig").resolveSelection(config.tool_context.reviewer_model, admission.provider, config.provider_set.definitions, admission.model);
+    const review_selection = completion_review.resolveSelection(config.tool_context.reviewer_model, admission.provider, config.provider_set.definitions, admission.model);
     const cross_review_credential = if (!review_selection.provider.eql(admission.provider))
         @import("../auth/auth_runtime.zig").prepareCredential(
             arena,
@@ -302,6 +361,20 @@ pub fn run(
         ) catch null
     else
         null;
+    const skill_bindings = if (comptime @import("builtin").target.cpu.arch.isWasm())
+        &.{}
+    else
+        realisation_selection.resolvePromptSkillBindings(
+            arena,
+            prompt.prompt,
+            config.tool_context.workspace_root,
+            config.skill_catalog.skills,
+        ) catch return error.OutOfMemory;
+    const child_fossil = resolveChildFossilRouting(
+        if (comptime @import("builtin").target.cpu.arch.isWasm()) false else completion_review.enabled(),
+        turn.child_id,
+        admission.parent_id,
+    );
     const deps = runtimeDeps(&context);
     agent_runtime.processAgentPrompt(
         &turn.sessionRuntime().agent,
@@ -321,6 +394,7 @@ pub fn run(
             .system_prompt = child_system_prompt,
             .model_prompt_overlay = config.model_prompt_overlay,
             .skill_catalog = config.skill_catalog,
+            .skill_bindings = skill_bindings,
             .gateway_retry_count = config.tool_context.gateway_retry_count,
             .gateway_chat_url = config.tool_context.gateway_chat_url,
             .advertised_tool_names = child_tool_names,
@@ -331,9 +405,9 @@ pub fn run(
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
-            .contract_review_enabled = @import("../agent/runtime/completion_review.zig").enabled(),
+            .contract_review_enabled = child_fossil.contract_review_enabled,
             .contract_review_model = review_selection.model,
-            .contract_review_effort = @import("../agent/runtime/completion_review.zig").reviewerEffort(review_selection.provider, config.provider_set.definitions),
+            .contract_review_effort = completion_review.reviewerEffort(review_selection.provider, config.provider_set.definitions),
             .contract_review_provider = review_selection.provider,
             .contract_review_stream_provider = config.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
             .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
@@ -342,9 +416,9 @@ pub fn run(
                 .account_id = cred.accountId(),
                 .tenant_context = cred.gatewayTeam(),
             } } else null,
-            .fossil_session_id = if (config.tool_context.fossil_workspace_available) turn.child_id else null,
-            .fossil_parent_session_id = config.tool_context.subagent_caller_id orelse config.tool_context.lifecycle_scope.session_id,
-            .fossil_ephemeral = config.tool_context.fossil_workspace_available and config.tool_context.lifecycle_scope.session_id == null,
+            .fossil_session_id = child_fossil.fossil_session_id,
+            .fossil_parent_session_id = child_fossil.fossil_parent_session_id,
+            .fossil_ephemeral = child_fossil.fossil_ephemeral,
             .fast_mode = config.tool_context.fast_mode,
             .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,

@@ -1422,7 +1422,11 @@ pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_
     }
     var ui_cfg = cfg;
     const assignment = if (ui.background_authority) |authority|
-        try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. When resuming after interruption, first inspect the retained task history and external receipts. A missing tool response means the outcome is uncertain, not that the action failed. Use read-only checks to reconcile it before any repeat submission or other external mutation; if no check can establish a safe next action, report that specific blocker. Reconnect tools and rediscover browser tabs when handles are stale. Preserve confirmed outcomes and continue only the remaining obligations. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.\n</omos_background_assignment>", .{authority.task})
+        try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. When resuming after interruption, first inspect the retained task history and external receipts. A missing tool response means the outcome is uncertain, not that the action failed. Use read-only checks to reconcile it before any repeat submission or other external mutation; if no check can establish a safe next action, report that specific blocker. Reconnect tools and rediscover browser tabs when handles are stale. Preserve confirmed outcomes and continue only the remaining obligations. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.{s}{s}\n</omos_background_assignment>", .{
+            authority.task,
+            if (authority.execution_guidance.len > 0) "\n" else "",
+            authority.execution_guidance,
+        })
     else
         null;
     defer if (assignment) |text| alloc.free(text);
@@ -2203,10 +2207,28 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
+    const effective_skill_bindings = if (inherited_authority) |authority|
+        if (authority.skill_bindings.len > 0)
+            authority.skill_bindings
+        else
+            try @import("../workspace/realisation_selection.zig").resolvePromptSkillBindings(
+                dynamic_tool_arena.allocator(),
+                owned_prompt,
+                ctx.workspace_root,
+                loaded_skills.skills,
+            )
+    else
+        try @import("../workspace/realisation_selection.zig").resolvePromptSkillBindings(
+            dynamic_tool_arena.allocator(),
+            owned_prompt,
+            ctx.workspace_root,
+            loaded_skills.skills,
+        );
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
+        .skill_bindings = effective_skill_bindings,
         .initial_dynamic_tools = initial_dynamic_tools,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,

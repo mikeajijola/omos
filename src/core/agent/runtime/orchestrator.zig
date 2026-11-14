@@ -264,11 +264,11 @@ noinline fn finishBackgroundHandoff(
         return false;
     }
     _ = (try control.activation(turn.manager, entry)) orelse return error.BackgroundActivationRequired;
-    try control.ensureHost(turn.manager);
     try turn.progress(arena, suffix.items);
     try turn.manager.record(turn.task, "background_handoff", .{ .operation = entry.operation, .contract_version = entry.contract_version, .contract_sha256 = entry.contract_sha256, .fulfilled = false });
     try turn.retain();
     const queued = try dispatch.seal(turn.manager, turn.task, session);
+    try control.ensureHost(turn.manager);
     if (deps.background_dispatched) |publish| try publish(deps.ctx, queued);
     const text = try arena.print("Queued task {s} for a background agent. You can keep chatting. The original contract remains pending until independent review and publication pass.", .{queued.task});
     try deps.push_text(deps.ctx, .assistant_started);
@@ -7346,7 +7346,9 @@ fn processQueuedPromptLoop(
             // advisory classifier must not turn it into a read-only chat and
             // strand the pending review or publication behind another model call.
             const selected_task = if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, job.prompt, " \t\r\n"), "continue")) try manager.active(config.fossil_session_id.?) else null;
-            var decision: routing.Decision = if (contract_selection.lookup_task != null)
+            var decision: routing.Decision = if (@import("../../workspace/contract_admission.zig").isConversationalGreeting(job.prompt))
+                .{ .route = .conversation, .reason = "conversational_greeting" }
+            else if (contract_selection.lookup_task != null)
                 .{ .route = .retrieval, .reason = "selected_contract_status" }
             else if (contract_selection.task != null or contract_selection.new_goal != null)
                 .{ .route = .work, .reason = "resolved_contract_operation" }
@@ -7356,6 +7358,13 @@ fn processQueuedPromptLoop(
                 try routing.decide(arena, job.prompt, route_history, config.cancel_flag)
             else
                 .{ .route = .work, .reason = "classifier_not_configured" };
+            if (decision.route == .unresolved and route_history.len == 0) {
+                if (@import("../../workspace/realisation_selection.zig").classifyDeliverable(job.prompt)) |cap| {
+                    decision.route = .work;
+                    decision.capability = cap;
+                    decision.reason = "deliverable_classification_v1";
+                }
+            }
             if (decision.route == .unresolved) {
                 try deps.push_system_notice(deps.ctx, "Resolving this request against the conversation...");
                 const active = try manager.active(config.fossil_session_id.?);
@@ -7400,11 +7409,16 @@ fn processQueuedPromptLoop(
                 }
             }
             retrieval_turn = decision.route != .work;
-            classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null);
-            if (classified_work) request_capability = decision.capability;
+            classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null or decision.capability != null);
+            if (classified_work) request_capability = decision.capability orelse @import("../../workspace/realisation_selection.zig").resolveCapability(decision.classification, job.prompt);
             if (retrieval_turn) {
                 if (contract_selection.lookup_task) |id| {
-                    try stable_prefix.append(arena, .{ .role = .system, .content = try arena.print("This read-only request concerns retained contract {s}. Use this exact task ID for workspace_content contracts/background reads; do not inspect unrelated contracts. Start with its current status and inspect receipts or ledgers if the question asks for completed outcomes. A missing publication or null count means unknown, not zero.", .{id}) });
+                    const looked_up = manager.loadTask(id) catch null;
+                    const status_summary = if (looked_up) |t| blk: {
+                        const st = @import("../../workspace/contract_channels.zig").status(manager, t) catch break :blk "";
+                        break :blk @import("../../workspace/definition.zig").text(st, "text");
+                    } else "";
+                    try stable_prefix.append(arena, .{ .role = .system, .content = try arena.print("This read-only request concerns retained contract {s}. Use this exact task ID for workspace_content contracts/background reads; do not inspect unrelated contracts. Start with its current status and inspect receipts or ledgers if the question asks for completed outcomes. A missing publication or null count means unknown, not zero.{s}{s}", .{ id, if (status_summary.len > 0) "\n\nVerified contract status and reviewed outcome:\n" else "", status_summary }) });
                 }
                 config.contract_review_enabled = false;
                 config.coordinator_mode = true;
@@ -7558,7 +7572,24 @@ fn processQueuedPromptLoop(
     for (config.initial_dynamic_tools) |tool| {
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
-    const current_user_effective = current_user_message;
+    const current_user_effective: ChatMessage = if (config.background_worker) blk: {
+        const guidance = if (config.ui_host) |host| if (host.background_authority) |auth| auth.execution_guidance else "" else "";
+        const skill_text = if (skills.explicit) |sec| sec.text else "";
+        if (skill_text.len > 0) {
+            break :blk .{
+                .role = .user,
+                .content = try arena.print("{s}\n\n{s}{s}{s}", .{
+                    current_user_message.content orelse "",
+                    skill_text,
+                    if (guidance.len > 0) "\n\n" else "",
+                    guidance,
+                }),
+                .images = current_user_message.images,
+                .context_origin = current_user_message.context_origin,
+            };
+        }
+        break :blk current_user_message;
+    } else current_user_message;
     const initial_pending_image_ids = try arena.alloc(usize, job.images.len);
     for (job.images, 0..) |attachment, index| initial_pending_image_ids[index] = attachment.id;
     if (initial_pending_image_ids.len > 0) {
@@ -7716,12 +7747,13 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| if (turn.task.model_basis) |basis| {
             const policy = basis.execution.defaults;
-            if (step >= policy.max_actor_steps) {
+            const max_actor_steps = if (config.background_worker) @max(policy.max_actor_steps, 250) else policy.max_actor_steps;
+            if (step >= max_actor_steps) {
                 try turn.manager.record(turn.task, "invocation_stopped", .{ .step = step, .reason = "Actor-step budget exhausted; final summary was not verifiable." });
                 try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The actor-step budget is exhausted. This task is paused with its completed work and evidence retained. Continue to resume remaining obligations.", "workspace_invocation_budget");
                 return;
             }
-            if (!governance.finalizing and step + 1 >= policy.max_actor_steps) {
+            if (!governance.finalizing and step + 1 >= max_actor_steps) {
                 governance.pause_reason = "This invocation reached its actor-step budget. The task and evidence are retained; continue to resume with a fresh bounded invocation.";
                 governance.finalizing = true;
                 try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
@@ -7753,8 +7785,10 @@ fn processQueuedPromptLoop(
             if (governance.finalizing) try within_turn_suffix.append(arena, .{ .role = .user, .content = if (governance.pause_reason) |reason| try arena.print("The host is pausing this invocation: {s} Provide an honest partial summary of completed work, remaining obligations, and retained evidence. Do not claim acceptance. Tools are disabled for this final summary.", .{reason}) else "The progress assessor requests a final candidate now. Summarize verified outcomes and limitations. Tools are disabled; the normal completion assessment will verify the fixed contract." });
         };
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        if (skills.explicit) |section| {
-            if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
+        if (!config.background_worker) {
+            if (skills.explicit) |section| {
+                if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
+            }
         }
         if (managed) |*turn| {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });

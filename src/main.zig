@@ -737,7 +737,7 @@ const App = struct {
                 SessionAppRuntime.syncTerminalTitle(&app);
             }
         }
-        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
+        const env_disabled = if (io_mod.getenv("OMOS_AUTO_UPGRADE") orelse io_mod.getenv("FX_AUTO_UPGRADE")) |val|
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
         else
             false;
@@ -4885,6 +4885,7 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 test {
     _ = @import("core/workspace/request_routing.zig");
     _ = @import("core/workspace/request_plan.zig");
+    _ = @import("core/workspace/realisation_selection.zig");
     _ = @import("core/tooling/canonical_tool_output.zig");
     _ = @import("core/mcp/result_projection.zig");
     _ = @import("core/workspace/canonical_tool_outputs.zig");

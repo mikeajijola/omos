@@ -453,11 +453,13 @@ pub const ExecutionLease = struct {
 };
 
 fn profile(alloc: Allocator) ![]const u8 {
-    return join(alloc, io_mod.getenv("HOME") orelse return error.HomeUnavailable, ".fx");
+    const home = io_mod.getenv("HOME") orelse return error.HomeUnavailable;
+    return @import("../shared/profile_paths.zig").rootDir(alloc, home);
 }
 
 fn bindingPath(alloc: Allocator) ![]const u8 {
-    return join(alloc, try profile(alloc), "omos-workspace.json");
+    const home = io_mod.getenv("HOME") orelse return error.HomeUnavailable;
+    return @import("../shared/profile_paths.zig").workspaceBindingPath(alloc, home);
 }
 
 pub fn configured(alloc: Allocator) !?Binding {
@@ -3650,6 +3652,10 @@ pub const Manager = struct {
         var skill_count: usize = 0;
         var total: usize = 0;
         for ([_][]const u8{ "ui/AGENTS.md", "ui/manifest.json" }) |path| {
+            const in_inventory = for (inventory_paths) |candidate| {
+                if (std.mem.eql(u8, candidate, path)) break true;
+            } else false;
+            if (!in_inventory) continue;
             const bytes = self.readContent(task, path) catch continue;
             if (bytes.len > 4096) continue;
             total += bytes.len;

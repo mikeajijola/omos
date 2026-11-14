@@ -13,6 +13,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
+const provider_catalog = @import("../auth/provider_catalog.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const prompt_history_runtime = @import("../app/prompt_history_runtime.zig");
 const provider_runtime = @import("../app/provider_runtime.zig");
@@ -358,6 +359,38 @@ pub fn Commands(comptime App: type) type {
             if (query.len == 0) {
                 try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
                 return;
+            }
+
+            const trimmed = std.mem.trim(u8, query, " \t\r\n");
+            if (std.mem.findScalar(u8, trimmed, ':')) |colon_idx| {
+                const prefix = trimmed[0..colon_idx];
+                const model_part = trimmed[colon_idx + 1 ..];
+                if (prefix.len > 0 and model_part.len > 0 and std.mem.findAny(u8, model_part, " \t\r\n") == null) {
+                    if (parseProviderPrefix(app, prefix)) |target_provider| {
+                        if (target_provider.eql(provider_runtime.provider(app))) {
+                            const resolved = try resolveModelQuery(app, model_part);
+                            defer app.alloc.free(resolved);
+                            try setResolvedModel(app, resolved, true);
+                            return;
+                        }
+                        var attempt = config_runtime.attemptUserPreferences(app.alloc, .{
+                            .model_preference = .{
+                                .provider = target_provider,
+                                .model = model_part,
+                            },
+                        });
+                        defer attempt.deinit(app.alloc);
+                        if (comptime @hasDecl(App, "applyAuthPickerChoice")) {
+                            try app.applyAuthPickerChoice(.{ .provider = target_provider });
+                        } else {
+                            if (app.fast_mode) try applyFastMode(app, false, false, false);
+                            if (app.worker.agent_turn_settings.ultrafast_mode) try applyUltrafastMode(app, false, false, false);
+                            try provider_runtime.replaceSelection(app, target_provider, model_part);
+                            try setResolvedModel(app, model_part, true);
+                        }
+                        return;
+                    }
+                }
             }
 
             const resolved = try resolveModelQuery(app, query);
@@ -1199,6 +1232,15 @@ pub fn Commands(comptime App: type) type {
                 return app.provider_selection.definitions.definitions;
             }
             return &.{};
+        }
+
+        fn parseProviderPrefix(app: *const App, prefix: []const u8) ?model_provider.ProviderId {
+            if (provider_catalog.parse(prefix)) |id| return id;
+            const parsed = model_provider.parse(prefix) orelse return null;
+            if (comptime @hasField(App, "provider_selection")) {
+                return parsed.bind(app.provider_selection.definitions) catch null;
+            }
+            return null;
         }
 
         fn fetchModelIds(app: *App) !std.ArrayList([]u8) {
@@ -3514,4 +3556,24 @@ test "session_commands startsWithWord matches word boundary" {
     try std.testing.expect(!startsWithWord("ad", "add"));
     try std.testing.expect(startsWithWord("add", "add"));
     try std.testing.expect(startsWithWord("Add bash", "add"));
+}
+
+test "session_commands handleModel accepts provider:model syntax across providers" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
+    defer app.deinit();
+    app.fail_fetch = true;
+
+    try Commands(FakeApp).handleModel(&app, "codex:gpt-5.4-mini");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.selected_provider);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.selected_model.items);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
+    try std.testing.expectEqualStrings("gpt-5.4-mini", app.last_preference_model.items);
+    try expectTranscriptContains(&app, "* Switched to gpt-5.4-mini");
+
+    app.clearTranscript();
+    try Commands(FakeApp).handleModel(&app, "vercel:anthropic/claude-sonnet-4");
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, app.selected_provider);
+    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4", app.selected_model.items);
+    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4");
 }

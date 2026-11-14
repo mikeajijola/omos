@@ -326,6 +326,7 @@ pub const ServerState = struct {
     account_id: ?[]u8 = null,
     gateway_team: ?[]u8 = null,
     selected_model: []u8 = &.{},
+    review_model: []u8 = &.{},
     provider: model_provider.ProviderId = .gateway,
     configured_model: []u8 = &.{},
     process_model_override: bool = false,
@@ -400,6 +401,7 @@ pub const ServerState = struct {
         if (self.gateway_team) |team| self.alloc.free(team);
         if (self.account_id) |account_id| self.alloc.free(account_id);
         if (self.selected_model.len > 0) self.alloc.free(self.selected_model);
+        if (self.review_model.len > 0) self.alloc.free(self.review_model);
         if (self.configured_model.len > 0) self.alloc.free(self.configured_model);
         self.permission_rules.deinit(self.alloc);
         self.skills.deinit(self.alloc);
@@ -2697,6 +2699,8 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     startup.configured_providers = .{};
     state.cfg.provider_set.definitions = state.configured_providers.definitions;
     state.gateway_source_preference = startup.credential_source_preference;
+    if (state.review_model.len > 0) alloc.free(state.review_model);
+    state.review_model = startup.takeReviewModel();
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
     if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, state.provider)) {

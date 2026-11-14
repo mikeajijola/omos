@@ -2,8 +2,10 @@
 
 Git owns project source. The bound Fossil repository owns saved task contracts,
 memory, skills, artifacts, execution evidence, and publication receipts. Native
-`omos` and `omo` turns use the same workspace binding. Saved turns initialize
-an empty personal instance automatically when no repository is bound.
+`omos`, `omo`, `fxos`, and `ui-host` turns use the same workspace binding in
+`~/.omos/omos-workspace.json` (with fallback to `~/.fx/omos-workspace.json`), or
+when `OMOS_CONTRACT_REVIEW=1` (`FX_CONTRACT_REVIEW=1`) is set. Saved turns
+initialize an empty personal instance automatically when no repository is bound.
 `omos fossil ensure --json` performs the same bootstrap without importing
 existing sessions.
 
@@ -580,17 +582,31 @@ not replay completed external actions.
 
 The optional [workspace UI host](ui-host.md) stores its complete frontend under `ui/`. Native `ui-host --stdio` owns saved turns, approval boundaries, replay and source validation. Agent edits remain on their task branch until independent review and normal Fossil publication succeed. A fresh host compilation receipt covers the exact current UI files and pinned compiler; changed source cannot publish using stale validation. Interface builds and public delivery journals remain disposable cache and operational profile state respectively.
 
-### Background contract workers
+### Background contract workers and realisation assignment
 
-Interactive `omos` and `omo` conversations coordinate work through read-only
-inspection and `fossil_workspace(action="dispatch")`. The browser uses the native
-`coordinate` method. Dispatch checkpoints and transfers the original task, with
-its contract and model basis, to an independent native session. It releases the
-foreground selection, so another message can start a separate task while the
-worker continues. A dispatch acknowledgement does not satisfy the contract.
-The worker receives an explicit host assignment identifying its task and its
-fulfillment role. The original handoff remains recorded evidence; the worker
-performs the remaining work rather than waiting for its own worker record.
+Interactive `omos`, `omo`, and `fxos` conversations, `omos acp`, and the
+workspace UI coordinate work through read-only inspection and
+`fossil_workspace(action="dispatch")`. The browser uses the native `coordinate`
+method. Before dispatching the worker, the parent coordinator runs
+`realisation_selection.assignForTask` to identify the affected capability
+(`general_task` or `coding_task`) and select its preferred realisation path
+using the OmniForm declaration's `semantic.search.ranking` weights (`relevance`,
+`precedent`, `evidence`, `recency`). The coordinator resolves unambiguous
+workspace skill bindings (preferring workspace-local skill paths over global
+copies) and attaches an `<omos_realisation_assignment>` block to the worker's
+authority so the worker starts with its bound skills, always-loaded MCP tools,
+and execution guidance already prepared on step 1.
+
+Dispatch checkpoints and transfers the original task, with its contract and
+model basis, to an independent native session. It releases the foreground
+selection, so another message can start a separate task while the worker
+continues. A dispatch acknowledgement does not satisfy the contract. The worker
+receives an explicit host assignment identifying its task and its fulfillment
+role. The original handoff remains recorded evidence; the worker performs the
+remaining work rather than waiting for its own worker record. Synchronous child
+sub-agents spawned through the `subagent` tool under OMOS also branch from their
+parent task in `omos.fossil`, receive pre-bound realisation skills, verify
+against their child contract, and publish back to the parent task branch.
 
 One instance host runs at most four workers. It reserves an invocation generation
 before session preparation, so a startup failure cannot reuse an earlier

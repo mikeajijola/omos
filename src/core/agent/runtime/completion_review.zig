@@ -19,13 +19,38 @@ var named_invocation = false;
 
 pub fn configureInvocation(program: []const u8) void {
     const name = std.Io.Dir.path.basename(program);
-    named_invocation = std.mem.eql(u8, name, "omos") or std.mem.eql(u8, name, "omo") or std.mem.eql(u8, name, "ui-host");
+    named_invocation = std.mem.eql(u8, name, "omos") or
+        std.mem.eql(u8, name, "omo") or
+        std.mem.eql(u8, name, "fxos") or
+        std.mem.eql(u8, name, "ui-host");
+}
+
+fn parseEnvToggle(value: []const u8) ?bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "0") or std.ascii.eqlIgnoreCase(trimmed, "false")) return false;
+    if (std.mem.eql(u8, trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true")) return true;
+    return null;
 }
 
 pub fn enabled() bool {
+    if (io.getenv("OMOS_CONTRACT_REVIEW")) |value| {
+        if (parseEnvToggle(value)) |override| return override;
+    }
     if (named_invocation) return true;
-    const value = io.getenv("FX_CONTRACT_REVIEW") orelse return false;
-    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+    if (io.getenv("FX_CONTRACT_REVIEW")) |value| {
+        if (parseEnvToggle(value)) |override| return override;
+    }
+    return false;
+}
+
+test "configureInvocation enables contract review for omos, omo, fxos, and ui-host" {
+    defer configureInvocation("fx");
+    for ([_][]const u8{ "omos", "omo", "fxos", "ui-host", "/usr/local/bin/omos", "/usr/local/bin/fxos" }) |program| {
+        configureInvocation(program);
+        try std.testing.expect(named_invocation);
+    }
+    configureInvocation("fx");
+    try std.testing.expect(!named_invocation);
 }
 
 pub fn coordinatorEnabled() bool {
