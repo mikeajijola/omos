@@ -657,7 +657,7 @@ function occurrenceCount(text: string, needle: string): number {
 
 function writeMcpFixture(
   root: FixtureRoot,
-  options: { required?: boolean; toolCount?: number; toolDescription?: string; initializeDelayMs?: number } = {},
+  options: { required?: boolean; toolCount?: number; toolDescription?: string; serverInstructions?: string; protocolVersion?: string; initializeDelayMs?: number } = {},
 ) {
   const toolCount = options.toolCount ?? 1;
   const toolDescription = JSON.stringify(
@@ -692,10 +692,10 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: ${JSON.stringify(options.protocolVersion ?? "2024-11-05")},
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
-        instructions: "SECRET_SERVER_INSTRUCTION_SENTINEL",
+        instructions: ${JSON.stringify(options.serverInstructions ?? "SECRET_SERVER_INSTRUCTION_SENTINEL")},
       },
     };
     if (${options.initializeDelayMs ?? 0} > 0) setTimeout(() => send(response), ${options.initializeDelayMs ?? 0});
@@ -1159,10 +1159,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(16);
+      expect(request.tools).toHaveLength(AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.length);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [13],
+        providerToolIndices: [AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES.indexOf("exa_search")],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -7440,7 +7440,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("bounded MCP search loads schemas and executes without a selection round trip", async () => {
+  for (const engine of ["v1", "v2"]) test(`bounded MCP search loads complete instructions and executes without a selection round trip (${engine})`, async () => {
     const root = createFixtureRoot("mcp-lazy-context");
     const tracePath = join(root.root, "trace.log");
     const distractorSkill = join(root.workspace, ".agents", "skills", "prompt-master");
@@ -7449,7 +7449,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       join(distractorSkill, "SKILL.md"),
       "---\nname: prompt-master\ndescription: Write prompts for tools and servers\n---\n\nDISTRACTOR_SKILL_BODY\n",
     );
-    const mcp = writeMcpFixture(root, { toolCount: 28 });
+    const mcp = writeMcpFixture(root, {
+      toolCount: 28,
+      protocolVersion: "2025-03-26",
+      toolDescription: "Echo fixture input " + "d".repeat(9000) + " TOOL_DESCRIPTION_TAIL",
+      serverInstructions: "SECRET_SERVER_INSTRUCTION_SENTINEL " + "i".repeat(8000) + " SERVER_INSTRUCTION_TAIL",
+    });
     const searchCallId = "mcp_search_targeted_1";
     let requestIndex = 0;
     const gateway = startDynamicFakeGateway(() => {
@@ -7478,7 +7483,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         ["ask", "--json", "--auto", "--no-save", "Discover the MCP fixture lazily."],
         {
           cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_MCP_ENGINE: engine },
           timeoutMs: 20_000,
         },
       );
@@ -7497,12 +7502,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
-      expect(existsSync(mcp.readyPath)).toBe(true);
+      expect(existsSync(mcp.readyPath), toolResultOutput(gateway.requests[1]!.body, searchCallId)).toBe(true);
 
       const searchOutput = toolResultOutput(gateway.requests[1]!.body, searchCallId);
       const searchTools = JSON.stringify(JSON.parse(searchOutput).mcp_tools);
       expect(searchOutput).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(searchTools).not.toContain("inputSchema");
+      expect(searchTools).not.toContain("TOOL_DESCRIPTION_TAIL");
+      expect(searchTools).not.toContain("SERVER_INSTRUCTION_TAIL");
       expect(searchTools).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
       expect(searchTools).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
 
@@ -7524,6 +7531,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         tool.name === DYNAMIC_MCP_TOOL_NAME
       );
       expect(selectedTool).toBeDefined();
+      expect(selectedTool?.description).toContain("TOOL_DESCRIPTION_TAIL");
+      expect(selectedTool?.description).toContain("SERVER_INSTRUCTION_TAIL");
+      expect(selectedTool?.description).not.toContain("instructions truncated");
       expect(selectedTool?.inputSchema.properties.text.description).toBe(
         "EXACT_SCHEMA_QUERY_SENTINEL",
       );

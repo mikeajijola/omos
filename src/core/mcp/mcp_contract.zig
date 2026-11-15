@@ -238,6 +238,9 @@ pub const McpServerConfig = struct {
     /// Advertise this server's tool schemas on every model turn instead of
     /// loading them on demand through capability search.
     always_loaded: bool = false,
+    /// Exact server-native tool names to preload. Null means all; an empty
+    /// selection means none. Other tools remain available through discovery.
+    always_loaded_tools: ?[]const []const u8 = null,
     /// Host-issued registration for a server the host serves over its own
     /// connection. Such a server speaks modern MCP through the runtime's
     /// message carrier; `url` is only a placeholder.
@@ -278,6 +281,7 @@ pub const McpServerConfig = struct {
         alloc.free(self.name);
         if (self.command) |command| alloc.free(command);
         freeOwnedStrings(alloc, self.args);
+        if (self.always_loaded_tools) |names| freeOwnedStrings(alloc, names);
         if (self.cwd) |cwd| alloc.free(cwd);
         if (self.url) |url| alloc.free(url);
         if (self.acp_server_id) |server_id| alloc.free(server_id);
@@ -289,6 +293,20 @@ pub const McpServerConfig = struct {
         self.* = undefined;
     }
 };
+
+pub fn preloadSelectionContains(selection: ?[]const []const u8, name: []const u8) bool {
+    const names = selection orelse return true;
+    for (names) |selected| if (std.mem.eql(u8, selected, name)) return true;
+    return false;
+}
+
+test "MCP preload selection is exact and never expands an empty or missing name" {
+    try std.testing.expect(preloadSelectionContains(null, "anything"));
+    try std.testing.expect(!preloadSelectionContains(&.{}, "echo"));
+    try std.testing.expect(preloadSelectionContains(&.{"echo"}, "echo"));
+    try std.testing.expect(!preloadSelectionContains(&.{"echo"}, "echo_more"));
+    try std.testing.expect(!preloadSelectionContains(&.{"unknown"}, "echo"));
+}
 
 test "MCP server configuration exposes only the active transport target" {
     const stdio: McpServerConfig = .{ .name = "stdio", .command = "node" };

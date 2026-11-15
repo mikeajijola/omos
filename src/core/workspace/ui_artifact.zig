@@ -35,16 +35,14 @@ pub fn immutableRevision(revision: []const u8) bool {
 
 pub fn inspect(manager: workspace.Manager, revision: []const u8) ![]const u8 {
     if (!immutableRevision(revision)) return error.ImmutableRevisionRequired;
-    const inventory = try manager.inventory(revision);
     var files: std.ArrayList(struct { path: []const u8, sha256: []const u8, bytes: usize }) = .empty;
-    for (inventory) |path| {
-        if (!safePath(path)) continue;
-        const content = try manager.contentAt(path, revision);
-        try files.append(manager.alloc, .{ .path = path, .sha256 = try workspace.hash(manager.alloc, content), .bytes = content.len });
+    var manifest: ?[]const u8 = null;
+    for (try manager.uiSourceFiles(revision)) |file| {
+        try files.append(manager.alloc, .{ .path = file.path, .sha256 = try workspace.hash(manager.alloc, file.content), .bytes = file.content.len });
+        if (std.mem.eql(u8, file.path, "ui/manifest.json")) manifest = file.content;
     }
     if (files.items.len == 0) return error.UiNotInstalled;
-    const manifest = try manager.contentAt("ui/manifest.json", revision);
-    const value = try std.json.parseFromSlice(std.json.Value, manager.alloc, manifest, .{});
+    const value = try std.json.parseFromSlice(std.json.Value, manager.alloc, manifest orelse return error.InvalidUiManifest, .{});
     return std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .revision = revision, .manifest = value.value, .files = files.items }, .{});
 }
 

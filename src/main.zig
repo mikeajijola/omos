@@ -737,7 +737,7 @@ const App = struct {
                 SessionAppRuntime.syncTerminalTitle(&app);
             }
         }
-        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
+        const env_disabled = if (io_mod.getenv("OMOS_AUTO_UPGRADE") orelse io_mod.getenv("FX_AUTO_UPGRADE")) |val|
             std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
         else
             false;
@@ -4883,6 +4883,18 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/workspace/request_routing.zig");
+    _ = @import("core/workspace/request_plan.zig");
+    _ = @import("core/workspace/realisation_selection.zig");
+    _ = @import("core/tooling/canonical_tool_output.zig");
+    _ = @import("core/mcp/result_projection.zig");
+    _ = @import("core/workspace/canonical_tool_outputs.zig");
+    _ = @import("core/workspace/managed_task.zig");
+    _ = @import("core/mcp/startup_admission.zig");
+    _ = @import("core/workspace/classification.zig");
+    _ = @import("core/workspace/attention.zig");
+    _ = @import("core/workspace/retrieval.zig");
+    _ = @import("core/workspace/retrieval_database.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");
@@ -4932,15 +4944,24 @@ test {
     _ = @import("core/workspace/workspace_client.zig");
     _ = @import("core/workspace/review_spool.zig");
     _ = @import("core/workspace/record_query.zig");
+    _ = @import("core/workspace/lookup_checkpoint.zig");
     _ = @import("core/workspace/object_cache.zig");
     _ = @import("core/workspace/fossil_commands.zig");
     _ = @import("core/workspace/ui_session.zig");
     _ = @import("core/workspace/record_projection.zig");
     _ = @import("core/shared/bounded_operation.zig");
     _ = @import("core/workspace/task_governance.zig");
+    _ = @import("core/workspace/execution_recovery.zig");
     _ = @import("core/agent/runtime/review_evidence.zig");
+    _ = completion_review;
     _ = @import("core/agent/runtime/review_checkpoints.zig");
     _ = @import("core/workspace/fossil_manifest.zig");
+    _ = @import("core/workspace/fossil_sqlite_reader.zig");
+    _ = @import("core/workspace/three_way_merge.zig");
+    _ = @import("core/workspace/company_views.zig");
+    _ = @import("core/workspace/company_service.zig");
+    _ = @import("core/workspace/fossil_workspace.zig");
+    _ = @import("core/workspace/schedule_worker.zig");
     _ = @import("core/workspace/profile_photo.zig");
     _ = @import("core/workspace/declaration_schema.zig");
     _ = @import("core/workspace/workspace_access.zig");
@@ -4979,6 +5000,7 @@ test {
     _ = @import("core/workspace/change_tracker.zig");
     _ = @import("core/shared/collections.zig");
     _ = @import("core/slash_commands/command_router.zig");
+    _ = @import("core/subagent/worktree_isolation.zig");
     _ = @import("core/slash_commands/command_specs.zig");
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");

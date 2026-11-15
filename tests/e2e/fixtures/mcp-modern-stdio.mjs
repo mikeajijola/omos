@@ -293,7 +293,11 @@ function handle(message) {
                     },
                   }
                 : {}),
-            }],
+            }, ...(process.env.FX_MCP_EXTRA_TOOL_NAME ? [{
+              name: process.env.FX_MCP_EXTRA_TOOL_NAME,
+              description: "Additional independently discoverable fixture tool",
+              inputSchema: { type: "object", properties: {} },
+            }] : [])],
         ttlMs: 60_000,
         cacheScope: "public",
       },
@@ -571,6 +575,29 @@ function handle(message) {
   }
   if (message.method === "tools/call") {
     if (mode === "stall_operation") return;
+    if (mode === "structured_result" || mode === "structured_result_above_cap") {
+      const value = { padding: "x".repeat(13000), receipt: "VERIFIED_TAIL_RECEIPT_731" };
+      const result = {
+        resultType: "complete",
+        content: [
+          { type: "text", text: `Warning unique prefix\nok\nreturn: ${JSON.stringify(value, null, 2)}\nunique suffix` },
+          { type: "text", text: "Independent unique tip" },
+        ],
+        structuredContent: { value },
+        isError: false,
+        _meta: { fixture: "preserve-this-metadata" },
+      };
+      if (mode === "structured_result_above_cap") {
+        for (let index = 0; index < 5; index++) result.content.push({
+          type: "text", text: `Repeated source ${index}\n${JSON.stringify(value, null, 2)}\nEnd source ${index}`,
+        });
+      }
+      if (process.env.FX_MCP_EFFECT_LOG) {
+        appendFileSync(process.env.FX_MCP_EFFECT_LOG, `${JSON.stringify({ arguments: message.params?.arguments, result })}\n`);
+      }
+      send({ jsonrpc: "2.0", id: message.id, result });
+      return;
+    }
     if (mode === "image_result") {
       send({
         jsonrpc: "2.0",

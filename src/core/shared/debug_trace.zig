@@ -411,10 +411,10 @@ fn appendLineToFile(zio: std.Io, path: []const u8, line: []const u8) void {
 }
 
 fn loadOptionsFromEnv(alloc: Allocator, workspace_root: []const u8) !Options {
-    const trace_log = loadOptionalEnv("FX_TRACE_LOG");
-    const trace_flag = loadOptionalEnv("FX_TRACE");
-    const trace_stderr = loadOptionalEnv("FX_TRACE_STDERR");
-    const trace_scopes = loadOptionalEnv("FX_TRACE_SCOPES");
+    const trace_log = loadOptionalEnv("OMOS_TRACE_LOG") orelse loadOptionalEnv("FX_TRACE_LOG");
+    const trace_flag = loadOptionalEnv("OMOS_TRACE") orelse loadOptionalEnv("FX_TRACE");
+    const trace_stderr = loadOptionalEnv("OMOS_TRACE_STDERR") orelse loadOptionalEnv("FX_TRACE_STDERR");
+    const trace_scopes = loadOptionalEnv("OMOS_TRACE_SCOPES") orelse loadOptionalEnv("FX_TRACE_SCOPES");
     const stderr_enabled = isTruthy(trace_stderr);
 
     if (trace_log) |raw_path| {

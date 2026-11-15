@@ -54,7 +54,24 @@ pub fn decideServer(config: *const mcp_contract.McpServerConfig, phase: Phase) D
         .acp_host_channel => if (!host_channel) return .deferred,
         else => {},
     }
-    return decide(config.enabled, config.required, config.workspace_admission, phase);
+    return decide(config.enabled, config.required or config.always_loaded, config.workspace_admission, phase);
+}
+
+test "always loaded MCP servers connect for Ask without admitting disabled or untrusted servers" {
+    const testing = @import("std").testing;
+    var config: mcp_contract.McpServerConfig = .{ .name = "fixture", .always_loaded = true };
+    try testing.expectEqual(Decision.connect, decideServer(&config, .ask_startup));
+    try testing.expect(!config.required);
+    config.always_loaded = false;
+    try testing.expectEqual(Decision.deferred, decideServer(&config, .ask_startup));
+    config.always_loaded = true;
+    config.enabled = false;
+    try testing.expectEqual(Decision.disabled, decideServer(&config, .ask_startup));
+    config.enabled = true;
+    config.workspace_admission = .pending;
+    try testing.expectEqual(Decision.disabled, decideServer(&config, .ask_startup));
+    config.workspace_admission = .rejected;
+    try testing.expectEqual(Decision.disabled, decideServer(&config, .ask_startup));
 }
 
 test "startup admission keeps Ask required servers eager and optional servers deferred" {

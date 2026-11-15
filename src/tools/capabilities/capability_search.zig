@@ -169,15 +169,18 @@ fn addWorkspaceResults(ctx: tool_dispatch.DispatchContext, input: *const Input, 
                     const declaration_value = model.field(snapshot, "declaration").?;
                     const declaration = try model.parse(arena.allocator(), try std.json.Stringify.valueAlloc(arena.allocator(), declaration_value, .{}));
                     var declared: std.ArrayList(std.json.Value) = .empty;
+                    const current_rev = if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk");
                     for (model.items(model.spec(declaration.value), "capabilities")) |capability| {
                         const id = model.text(capability, "id");
                         if (lexical_relevance.score(&input.prepared, &.{id}, &.{ model.text(capability, "name"), model.text(capability, "description") }, &.{}) == null) continue;
                         if (declared.items.len >= 16) break;
                         var row = capability;
                         const native = model.nativeCapability(declaration, id);
-                        const verified = if (native) false else try @import("../../core/workspace/capability_runtime.zig").available(manager, declaration, id, if (task) |selected| try manager.currentRevision(selected) else try manager.revision("trunk"));
+                        const verified = if (native) false else try @import("../../core/workspace/capability_runtime.zig").available(manager, declaration, id, current_rev);
+                        const scored = try @import("../../core/workspace/realisation_selection.zig").scoreCapability(arena.allocator(), manager, declaration, capability, input.query, current_rev);
                         try row.object.put(arena.allocator(), "host_binding", .{ .string = if (native) "native_task_runtime" else if (verified) "verified_workspace_implementation" else "unbound" });
                         try row.object.put(arena.allocator(), "availability", .{ .string = if (native or verified) "available_subject_to_host_permissions" else "declared_only" });
+                        try row.object.put(arena.allocator(), "preferred_realisation", .{ .string = scored.realisation });
                         try declared.append(arena.allocator(), row);
                     }
                     var parsed_output = try std.json.parseFromSlice(std.json.Value, arena.allocator(), combined, .{});

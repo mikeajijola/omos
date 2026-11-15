@@ -6794,3 +6794,73 @@ test "child live authority allow to ask requires current approval before effect"
         hooks.successful_effect_count.load(.seq_cst),
     );
 }
+
+test "optional canonical MCP retention failure never replays the completed tool" {
+    const alloc = std.testing.allocator;
+    const canonical = @import("../../../tooling/canonical_tool_output.zig");
+    const RefusingSink = struct {
+        attempts: usize = 0,
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, input: canonical.Capture) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.attempts += 1;
+            try std.testing.expectEqualStrings("effect-once", input.call.id);
+            try std.testing.expectEqual(types.PersistedToolStatus.success, input.status);
+            return error.InjectedRetentionFailure;
+        }
+    };
+    var refusing: RefusingSink = .{};
+    var blobs = session_child_store.MemoryBlobsForTesting.init(alloc);
+    defer blobs.deinit();
+    var capability = try session_child_store.SessionChildCapability.initBlobs(alloc, blobs.blobs(), "", .writable);
+    defer capability.deinit();
+    const padding = try alloc.alloc(u8, 18 * 1024);
+    defer alloc.free(padding);
+    @memset(padding, 'x');
+    const raw = try std.json.Stringify.valueAlloc(alloc, .{
+        .server = "fixture",
+        .tool = "mcp_fixture_echo",
+        .result = .{ .content = .{.{ .type = "text", .text = padding }}, .structuredContent = .{ .receipt = "effect completed exactly once" } },
+    }, .{});
+    defer alloc.free(raw);
+    const select_calls = [_]ToolCall{toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}")};
+    const effect_calls = [_]ToolCall{toolCall("effect-once", "mcp_fixture_echo", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &effect_calls },
+        .{ .content = "Completed once." },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.permission_decisions = &.{ .once, .once };
+    hooks.validation_mcp_tool_name = "mcp_fixture_echo";
+    hooks.validation_mcp_runtime_generation = 41;
+    hooks.exec_plans = &.{
+        .{ .result = .{
+            .model_output = "selected",
+            .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_echo", .schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}" }},
+        } },
+        .{ .result = .{ .model_content_kind = .mcp_envelope, .model_output = raw } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.session_child_capability = &capability;
+    config.canonical_output_sink = .{ .context = &refusing, .capture_fn = RefusingSink.capture };
+    var job = fixture.job();
+    job.permission_mode = .auto;
+    try runFakePrompt(&gateway, &hooks, config, job);
+    try std.testing.expectEqual(@as(usize, 1), refusing.attempts);
+    try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("mcp_fixture_echo", hooks.executed_names.items[1]);
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    try expectBodyContains(&gateway, 2, "tool_result_preview");
+    try expectBodyNotContains(&gateway, 2, "InjectedRetentionFailure");
+    try expectBodyNotContains(&gateway, 2, "omos.mcp-model-view");
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
+    const result = hooks.history_turns.items[0].assistant.execution.tool_steps[1].tool_results[0];
+    try std.testing.expectEqual(types.PersistedToolStatus.success, result.status);
+    const restored = try result_store.readForReplayManaged(alloc, &capability, result.output_handle.?, result.stored_output_bytes);
+    defer alloc.free(restored);
+    try std.testing.expectEqualStrings(raw, restored);
+}

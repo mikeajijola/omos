@@ -330,9 +330,17 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) DeliverySummary {
         var summary: DeliverySummary = .{};
-        var index = self.processes.items.len;
-        while (index > 0) {
-            index -= 1;
+        // Killing a child first can release its parent's wait and let the
+        // parent execute another command before its own kill is delivered.
+        // Witness discovery can report descendants before their parents.
+        // Order current parent links before delivering any force-kill.
+        const root_first = signal == std.posix.SIG.KILL;
+        if (root_first) {
+            self.orderAncestorsFirstWith(Effects);
+            if (self.root) |root| self.signalTrackedProcessWith(root, signal, preserved_group, &summary, Effects);
+        }
+        for (0..self.processes.items.len) |offset| {
+            const index = if (root_first) offset else self.processes.items.len - 1 - offset;
             self.signalTrackedProcessWith(
                 self.processes.items[index],
                 signal,
@@ -341,7 +349,7 @@ pub const Tracker = struct {
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (!root_first) if (self.root) |root| {
             self.signalTrackedProcessWith(
                 root,
                 signal,
@@ -349,8 +357,27 @@ pub const Tracker = struct {
                 &summary,
                 Effects,
             );
-        }
+        };
         return summary;
+    }
+
+    fn orderAncestorsFirstWith(self: *Tracker, comptime Effects: type) void {
+        for (0..self.processes.items.len) |index| {
+            var remaining = self.processes.items.len - index;
+            while (remaining > 0) : (remaining -= 1) {
+                const process = self.processes.items[index];
+                const snapshot = Effects.capture(self.alloc, process.pid) catch break;
+                if (!process.identity.eql(snapshot.identity)) break;
+                const parent_index = for (self.processes.items[index + 1 ..], index + 1..) |parent, offset| {
+                    if (parent.pid != snapshot.parent_pid) continue;
+                    if (snapshot.parent_unique_id) |id| if (!identityHasMacOSUniqueId(parent.identity, id)) continue;
+                    break offset;
+                } else break;
+                const parent = self.processes.items[parent_index];
+                std.mem.copyBackwards(TrackedProcess, self.processes.items[index + 1 .. parent_index + 1], self.processes.items[index..parent_index]);
+                self.processes.items[index] = parent;
+            }
+        }
     }
 
     fn signalTrackedProcessWith(
@@ -425,9 +452,13 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) CompletionDelivery {
         var result: CompletionDelivery = .{};
-        var index = self.processes.items.len;
-        while (index > 0) {
-            index -= 1;
+        const root_first = signal == std.posix.SIG.KILL;
+        if (root_first) {
+            self.orderAncestorsFirstWith(Effects);
+            if (self.root) |root| self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
+        }
+        for (0..self.processes.items.len) |offset| {
+            const index = if (root_first) offset else self.processes.items.len - 1 - offset;
             self.signalIfAttachedWith(
                 self.processes.items[index],
                 signal,
@@ -436,9 +467,9 @@ pub const Tracker = struct {
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (!root_first) if (self.root) |root| {
             self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
-        }
+        };
         return result;
     }
 
@@ -925,6 +956,53 @@ test "checked signal delivery distinguishes vanished stale and failed targets" {
     try std.testing.expect(summary.incomplete);
 }
 
+test "force kill cannot release a waiting ancestor into a delayed effect" {
+    const FakeEffects = struct {
+        var root_running: bool = true;
+        var child_running: bool = true;
+        var delayed_effect: bool = false;
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return .{ .identity = .{ .linux_start_ticks = @intCast(pid) }, .parent_pid = pid - 1 };
+        }
+
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            return .{ .found = pid };
+        }
+
+        fn session(_: std.posix.pid_t) SessionState {
+            return .{ .found = 100 };
+        }
+
+        fn send(pid: std.posix.pid_t, _: std.posix.SIG) std.posix.KillError!void {
+            switch (pid) {
+                10 => root_running = false,
+                11 => {
+                    if (root_running) delayed_effect = true;
+                    child_running = false;
+                },
+                12 => if (child_running) {
+                    delayed_effect = true;
+                },
+                else => unreachable,
+            }
+        }
+    };
+    for ([_][2]std.posix.pid_t{ .{ 11, 12 }, .{ 12, 11 } }) |discovery| {
+        for ([_]bool{ false, true }) |attached_only| {
+            FakeEffects.root_running = true;
+            FakeEffects.child_running = true;
+            FakeEffects.delayed_effect = false;
+            var tracker = Tracker{ .alloc = std.testing.allocator, .root = .{ .pid = 10, .identity = .{ .linux_start_ticks = 10 } } };
+            defer tracker.deinit();
+            for (discovery) |pid| try tracker.processes.append(std.testing.allocator, .{ .pid = pid, .identity = .{ .linux_start_ticks = @intCast(pid) } });
+            const delivery = if (attached_only) tracker.signalAttachedWith(std.posix.SIG.KILL, 100, FakeEffects).delivery else tracker.signalProcessesWith(std.posix.SIG.KILL, null, FakeEffects);
+            try std.testing.expectEqual(@as(usize, 3), delivery.delivered);
+            try std.testing.expect(!FakeEffects.delayed_effect);
+        }
+    }
+}
+
 test "checked signal delivery keeps vanished stale and excluded targets complete" {
     const FakeEffects = struct {
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -1037,7 +1115,7 @@ test "natural completion stops attached processes and keeps detached daemons" {
     const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
     try std.testing.expectEqualSlices(
         std.posix.pid_t,
-        &.{ 37, 32, 30 },
+        &.{ 30, 32, 37 },
         FakeEffects.sent[0..FakeEffects.sent_count],
     );
     try std.testing.expectEqual(@as(usize, 3), completed.delivery.delivered);

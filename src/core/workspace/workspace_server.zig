@@ -10,9 +10,12 @@ pub fn run(original: workspace.Manager, port: u16, writable: bool, context: *any
     var live_hosts: @import("company_runtime.zig").LiveHosts = .{};
     var shared_reads: @import("immutable_read_cache.zig").Shared = .{ .cache = .{ .alloc = std.heap.c_allocator } };
     defer shared_reads.deinit();
+    var writer_queue: workspace.WriterQueue = .{};
+    defer writer_queue.deinit();
     var manager = original;
     manager.company_runtime_live = &live_hosts;
     manager.shared_immutable_reads = &shared_reads;
+    manager.writer_queue = &writer_queue;
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     @import("../shared/debug_trace.zig").configureFromEnv(manager.alloc, std.Io.Dir.path.dirname(manager.repository) orelse ".");
     defer @import("../shared/debug_trace.zig").shutdown();
@@ -205,6 +208,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .workspace = manager.manifest.id, .definition = snapshot, .revision = try manager.revision("trunk") }, .{}), .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
     }
     const schedules = std.mem.eql(u8, request.head.target, "/v1/schedules");
+    const recurring = std.mem.eql(u8, request.head.target, "/v1/schedule-series");
     const workers = std.mem.eql(u8, request.head.target, "/v1/company/workers");
     const evaluation = std.mem.eql(u8, request.head.target, "/v1/company/evaluation");
     const runtimes = std.mem.eql(u8, request.head.target, "/v1/company/runtimes");
@@ -212,7 +216,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
     const desired = std.mem.eql(u8, request.head.target, "/v1/company/desired");
     const controls = std.mem.eql(u8, request.head.target, "/v1/company/controls");
     const activity = std.mem.eql(u8, request.head.target, "/v1/company/activity");
-    if (request.head.method != .POST or (!company and !schedules and !workers and !evaluation and !runtimes and !archives and !desired and !activity and !controls and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
+    if (request.head.method != .POST or (!company and !schedules and !recurring and !workers and !evaluation and !runtimes and !archives and !desired and !activity and !controls and !std.mem.eql(u8, request.head.target, "/v1/workspace"))) return request.respond("{\"error\":\"NotFound\"}", .{ .status = .not_found, .keep_alive = keep_alive.* });
     if (request.head.content_length) |length| if (length > 1024 * 1024) {
         keep_alive.* = false;
         return request.respond("{\"error\":\"RequestTooLarge\"}", .{ .status = .payload_too_large, .keep_alive = false });
@@ -229,7 +233,7 @@ fn dispatch(manager: workspace.Manager, request: *std.http.Server.Request, strea
         subscription.respond(request) catch return error.HttpConnectionClosing;
         return;
     }
-    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else if (runtimes) service.executeRuntimes(manager, raw, writable) else if (archives) service.executeArchives(manager, raw, writable) else if (desired) service.executeDesired(manager, raw, writable) else if (controls) service.executeControls(manager, raw, writable) else if (activity) service.executeActivity(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules)) catch |err| {
+    const response = (if (company) @import("company_service.zig").execute(manager, raw, writable) else if (workers) service.executeWorkers(manager, raw, writable) else if (evaluation) service.executeEvaluation(manager, raw, writable) else if (runtimes) service.executeRuntimes(manager, raw, writable) else if (archives) service.executeArchives(manager, raw, writable) else if (desired) service.executeDesired(manager, raw, writable) else if (controls) service.executeControls(manager, raw, writable) else if (activity) service.executeActivity(manager, raw, writable) else ownerRequest(manager, raw, writable, schedules, recurring)) catch |err| {
         return reject(manager, request, keep_alive.*, err);
     };
     try request.respond(response, .{ .keep_alive = keep_alive.*, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
@@ -241,19 +245,19 @@ fn reject(manager: workspace.Manager, request: *std.http.Server.Request, keep_al
     const status: std.http.Status = switch (err) {
         error.CompanySubscriptionsBusy => .too_many_requests,
         error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceMergeConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
         else => .bad_request,
     };
     return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive });
 }
 
-fn ownerRequest(original: workspace.Manager, raw: []const u8, writable: bool, schedules: bool) ![]const u8 {
+fn ownerRequest(original: workspace.Manager, raw: []const u8, writable: bool, schedules: bool, recurring: bool) ![]const u8 {
     var manager = original;
     const lease = try manager.companyOperationLease();
     defer lease.release();
     manager.company_operation_held = true;
     try @import("company_service.zig").validateInstance(manager);
-    return if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable);
+    return if (recurring) service.executeScheduleSeries(manager, raw, writable) else if (schedules) service.executeSchedule(manager, raw, writable) else service.execute(manager, raw, writable);
 }
 
 fn authenticated(value: ?[]const u8, token: []const u8) bool {

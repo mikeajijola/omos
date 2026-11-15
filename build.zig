@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
             .strip = optimize != .debug,
         }),
     });
+    exe.root_module.linkSystemLibrary("sqlite3", .{});
     exe.root_module.addImport("build_options", build_options.createModule());
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null);
 

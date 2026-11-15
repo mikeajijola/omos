@@ -93,7 +93,10 @@ fn call(
         return .{ .failure = try ctx.allocator.dupe(u8, "") };
     } orelse return unsupported(ctx);
     const status = output.status;
+    // Only an actually dispatched MCP result can acquire this host marker.
+    if (ctx.model_content_kind_sink) |kind| kind.* = .mcp_envelope;
     if (ctx.mcp_call_status_sink) |sink| sink.* = status;
+    if (ctx.mcp_retained_output_sink) |sink| sink.* = output.takeRetainedOutput();
     const images = output.takeImages();
     const body = @constCast(output.takeModelOutput(ctx.allocator));
     if (images.len > 0) return .{ .rich = .{ .text = body, .images = images, .is_error = status != .success } };
@@ -172,5 +175,27 @@ fn callFixture(
     _: usize,
     _: tool_mcp_runtime.CallOptions,
 ) anyerror!?tool_mcp_runtime.CallResult {
-    return .{ .model_output = try alloc.dupe(u8, "mcp ok") };
+    return .{ .model_output = try alloc.dupe(u8, "mcp ok"), .retained_output = try alloc.dupe(u8, "complete MCP fixture") };
+}
+
+test "dynamic MCP dispatch transfers complete output only through host metadata" {
+    const alloc = std.testing.allocator;
+    var fixture: u8 = 0;
+    const advertised = [_][]const u8{"mcp_fs_read"};
+    const tool = switch (resolve(&advertised, .{ .context = &fixture, .call_tool = callFixture }, "mcp_fs_read")) {
+        .registered => |registered| registered,
+        else => return error.TestUnexpectedResult,
+    };
+    const tools = [_]tool_dispatch.Tool{tool};
+    const result = try tool_dispatch.dispatchToolCall(.{
+        .allocator = alloc,
+        .permission_mode = .yolo,
+        .tool_call_name = "mcp_fs_read",
+        .mcp_ctx = &fixture,
+        .mcp_call_tool = callFixture,
+    }, .{ .tools = &tools }, .{ .id = "retained", .name = "mcp_fs_read", .arguments_json = "{}" });
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(tool_dispatch.ModelContentKind.mcp_envelope, result.model_content_kind);
+    try std.testing.expectEqualStrings("mcp ok", result.body);
+    try std.testing.expectEqualStrings("complete MCP fixture", result.mcp_retained_output.?);
 }

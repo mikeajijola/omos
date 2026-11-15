@@ -566,7 +566,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     if (mutation and retained == null) try saveJournal(manager, path, journal);
     const result = perform(manager, current, grant, request, request_hash, writable) catch |err| {
         if (mutation) {
-            journal.state = if (err == error.InvalidCompanyReviewResume or err == error.InvalidCompanyTaskAmendment or err == error.InvalidCompanyTaskScope or err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execute_task and request.content != null and @import("company_control.zig").rejected(err)) or (request.action == .execute_task and (err == error.CompanyImplementationUnavailable or err == error.CompanyWorkerInvocationBudget or err == error.CompanyWorkerCancelled or err == error.TaskIsReadOnly)) or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
+            journal.state = if (err == error.InvalidCompanyReviewResume or err == error.InvalidCompanyTaskAmendment or err == error.InvalidCompanyTaskScope or err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execute_task and request.content != null and @import("company_control.zig").rejected(err)) or (request.action == .execute_task and (err == error.CompanyImplementationUnavailable or err == error.CompanyWorkerInvocationBudget or err == error.CompanyWorkerCancelled or err == error.TaskIsReadOnly)) or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or err == error.WorkspaceMergeConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
             journal.failure = @errorName(err);
             journal.receipt = try signed(manager, current, request, request_hash, try encode(manager.alloc, .{ .operation = request.operation, .state = @tagName(journal.state), .failure = journal.failure }));
             try saveJournal(manager, path, journal);
@@ -697,7 +697,7 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
                 if (!retained_amendment and !retained_review) try requireExecution(manager, view.view, grant, request.execution);
             }
             const result = perform(manager, current, grant, original_request, journal.request_hash, writable) catch |err| {
-                journal.state = if (err == error.WorkspaceReadDependencyChanged) .failed else .uncertain;
+                journal.state = if (err == error.WorkspaceReadDependencyChanged or err == error.WorkspaceMergeConflict) .failed else .uncertain;
                 journal.failure = @errorName(err);
                 journal.reconciled_by = request.operation;
                 journal.receipt = try signed(manager, current, original_request, journal.request_hash, try encode(alloc, .{ .operation = id, .state = @tagName(journal.state), .failure = journal.failure }));
@@ -864,7 +864,7 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
         const path = request.path orelse return error.MissingPath;
         if ((request.remove and request.executable != null) or (request.previous_executable != null and request.previous_hash == null) or (request.executable != null and request.previous_hash != null and request.previous_executable == null)) return error.InvalidCompanyFileAttributes;
         if (!authority.permitsPath(grant, path)) return error.CompanyAccessDenied;
-        if (view.task.state == .accepted or view.task.state == .publication_pending or view.task.state == .conflict) return error.TaskIsReadOnly;
+        if (view.task.state == .accepted or view.task.state == .publication_pending) return error.TaskIsReadOnly;
         if (view.task.review_job) |id| {
             const job = try manager.loadReviewJob(view.task, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
@@ -912,6 +912,7 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
         }
         const submission = try prepareSubmission(manager, view.view, view.task, request, operation_hash, candidate);
         const frozen = try manager.freezeCompanyReads(view.task, submission.reads);
+        if (frozen.state == .conflict) try manager.reconcileConflict(frozen);
         const integrated = try manager.refresh(frozen);
         const integration_revision = try manager.currentRevision(integrated);
         try manager.record(integrated, "company_proposal", .{ .actor = grant.actor, .grant = grant.id, .candidate_revision = revision_id, .integration_revision = integration_revision, .operation = request.operation });
@@ -1045,4 +1046,204 @@ test "company outcome inspection retains the selected view boundary" {
     try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "first"));
     journal.request = null;
     try std.testing.expectError(error.CompanyAccessDenied, requireOutcomeView(alloc, journal, "first"));
+}
+
+test "company_service: conflict on submit allows checkpoint resolution and re-submit without deadlock" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try std.Io.Dir.path.join(alloc, &.{ root, "repo.fossil" });
+    const project_dir = try std.Io.Dir.path.join(alloc, &.{ root, "project" });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, project_dir);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    const prev_environ = io.environMap();
+    io.setEnvironMap(&environ);
+    defer if (prev_environ) |prev| io.setEnvironMap(prev);
+
+    var writer_queue: workspace.WriterQueue = .{};
+    defer writer_queue.deinit();
+
+    var manager = try workspace.Manager.init(alloc, repo_path);
+    manager.writer_queue = &writer_queue;
+
+    // Seed documents/shared.txt on trunk.
+    const seed = try manager.start("seed", project_dir, "Seed document", null);
+    try manager.writeContent(seed, "documents/shared.txt", "line 1\nshared line\nline 3\n");
+    const seed_assessment = try encode(alloc, .{
+        .contractId = seed.id,
+        .version = seed.definition.version,
+        .obligations = &.{.{ .id = "request_complete", .status = "met", .evidence = &.{"documents/shared.txt"}, .note = "Seeded document" }},
+    });
+    _ = try manager.publish(seed, .{
+        .task_id = seed.id,
+        .revision = try manager.revision(seed.branch),
+        .contract_version = seed.definition.version,
+        .disposition = "fulfilled",
+        .candidate = "Seeded document",
+        .assessment = seed_assessment,
+    });
+
+    // Initialize company authority and grant an actor keypair.
+    const init_res = try administer(manager, try encode(alloc, .{ .version = "omos.company-admin/v1", .action = "initialize" }));
+    const init_rev = model.text(try parse(alloc, init_res), "revision");
+
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(std.testing.io);
+    const pub_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(kp.public_key.toBytes(), .lower));
+    const grant_obj: authority.Grant = .{
+        .id = "worker_grant",
+        .actor = "worker",
+        .public_key = pub_hex,
+        .paths = &.{"documents/"},
+        .actions = &.{ .create_view, .checkpoint, .read, .status, .submit },
+        .expires_ms = io.milliTimestamp() + 3600_000,
+    };
+    _ = try administer(manager, try encode(alloc, .{
+        .version = "omos.company-admin/v1",
+        .action = "grant",
+        .revision = init_rev,
+        .grant = grant_obj,
+    }));
+
+    const callCompany = struct {
+        fn send(m: workspace.Manager, a: std.mem.Allocator, signer: std.crypto.sign.Ed25519.KeyPair, payload_val: anytype) !std.json.Value {
+            const payload = try encode(a, payload_val);
+            const sig = try signer.sign(payload, null);
+            const sig_hex = std.fmt.bytesToHex(sig.toBytes(), .lower);
+            const env = try encode(a, .{ .payload = payload, .signature = &sig_hex });
+            const resp = try execute(m, env, true);
+            const envelope = try parse(a, resp);
+            const receipt = try parse(a, model.text(envelope, "payload"));
+            return model.field(receipt, "result").?;
+        }
+    }.send;
+
+    const trunk_base = try manager.revision("trunk");
+    const expires = io.milliTimestamp() + 60_000;
+
+    // Create a view for worker from trunk_base.
+    const created = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-create-view",
+        .expires_ms = expires,
+        .action = "create_view",
+        .revision = trunk_base,
+        .objective = "Update shared document",
+    });
+    const view_id = model.text(created, "view");
+    const view_rev = model.text(created, "revision");
+
+    // Checkpoint an edit on the view's branch.
+    const ckpt1 = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-ckpt-1",
+        .expires_ms = expires,
+        .action = "checkpoint",
+        .view = view_id,
+        .revision = view_rev,
+        .path = "documents/shared.txt",
+        .previous_hash = try workspace.hash(alloc, "line 1\nshared line\nline 3\n"),
+        .content = "line 1\nfrom company worker\nline 3\n",
+    });
+    const ckpt1_rev = model.text(ckpt1, "revision");
+
+    // Meanwhile, advance trunk on the exact same line so submit hits a true conflict.
+    const other = try manager.start("other", project_dir, "Advance trunk", null);
+    try manager.writeContent(other, "documents/shared.txt", "line 1\nfrom trunk\nline 3\n");
+    const other_assessment = try encode(alloc, .{
+        .contractId = other.id,
+        .version = other.definition.version,
+        .obligations = &.{.{ .id = "request_complete", .status = "met", .evidence = &.{"documents/shared.txt"}, .note = "Updated trunk" }},
+    });
+    _ = try manager.publish(other, .{
+        .task_id = other.id,
+        .revision = try manager.revision(other.branch),
+        .contract_version = other.definition.version,
+        .disposition = "fulfilled",
+        .candidate = "Updated trunk",
+        .assessment = other_assessment,
+    });
+
+    // Submit fails with WorkspaceMergeConflict, NOT leaving view.pending stuck in .uncertain.
+    try std.testing.expectError(error.WorkspaceMergeConflict, callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-submit-1",
+        .expires_ms = expires,
+        .action = "submit",
+        .view = view_id,
+        .revision = ckpt1_rev,
+        .candidate = "Attempted update",
+    }));
+
+    const after_conflict_status = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-status-1",
+        .expires_ms = expires,
+        .action = "status",
+        .view = view_id,
+    });
+    try std.testing.expectEqualStrings("conflict", model.text(after_conflict_status, "state"));
+    try std.testing.expect(model.field(after_conflict_status, "pending_operation").? == .null);
+
+    // Checkpoint is NOT deadlocked by .conflict; actor resolves the file and re-submits!
+    const ckpt2 = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-ckpt-2",
+        .expires_ms = expires,
+        .action = "checkpoint",
+        .view = view_id,
+        .revision = ckpt1_rev,
+        .path = "documents/shared.txt",
+        .previous_hash = try workspace.hash(alloc, "line 1\nfrom company worker\nline 3\n"),
+        .content = "line 1\nmerged trunk and company worker\nline 3\n",
+    });
+    const ckpt2_rev = model.text(ckpt2, "revision");
+
+    const submitted = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-submit-2",
+        .expires_ms = expires,
+        .action = "submit",
+        .view = view_id,
+        .revision = ckpt2_rev,
+        .candidate = "Resolved conflict and saved merged content.",
+    });
+    try std.testing.expectEqualStrings("verification_pending", model.text(submitted, "state"));
+
+    const after_resubmit_status = try callCompany(manager, alloc, kp, .{
+        .version = "omos.company/v1",
+        .workspace = manager.manifest.id,
+        .actor = "worker",
+        .grant = "worker_grant",
+        .operation = "op-status-2",
+        .expires_ms = expires,
+        .action = "status",
+        .view = view_id,
+    });
+    try std.testing.expectEqualStrings("active", model.text(after_resubmit_status, "state"));
+    try std.testing.expectEqualStrings(try manager.revision("trunk"), model.text(after_resubmit_status, "base"));
 }

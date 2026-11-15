@@ -136,8 +136,9 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
         await session.waitForComposer(10_000);
         await session.sendText("/help");
+        // Autocomplete contains the same row text before the submitted catalog opens.
         const wide = await session.waitForPane(
-          (pane) => pane.includes("/help") && pane.includes("show available slash commands"),
+          (pane) => pane.includes("tab category") && pane.includes("/help") && pane.includes("show available slash commands"),
           5_000,
         );
         const wideHelp = wide.split("\n").find(
@@ -145,11 +146,11 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         expect(wideHelp).toBeDefined();
         const wideDescriptionColumn = wideHelp!.indexOf("show available slash commands");
-        expect(wideDescriptionColumn).toBe(19);
+        expect(wideDescriptionColumn, wide).toBe(19);
 
         await session.resizeWindow(60, 40);
         const narrow = await session.waitForPane(
-          (pane) => pane.split("\n").some(
+          (pane) => pane.includes("tab category") && pane.split("\n").some(
             (line) => line.includes("/help") && line.includes("show available"),
           ),
           5_000,

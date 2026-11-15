@@ -300,14 +300,19 @@ test "MCP hook statuses normalize tool and protocol failures" {
     try std.testing.expectEqual(observation.McpStatus.input_required, CallStatus.input_required.observed());
 }
 
+pub const max_retained_output_bytes: usize = 8 * 1024 * 1024;
+
 pub const CallResult = struct {
     model_output: []const u8,
+    /// Complete sanitized envelope, when the display envelope was capped.
+    retained_output: ?[]const u8 = null,
     images: []types.ToolImage = &.{},
     status: CallStatus = .success,
     input_required: ?InputRequired = null,
 
     pub fn deinit(self: *CallResult, alloc: Allocator) void {
         alloc.free(self.model_output);
+        if (self.retained_output) |output| alloc.free(output);
         types.freeToolImages(alloc, self.images);
         self.deinitInputRequired(alloc);
         self.* = undefined;
@@ -319,8 +324,15 @@ pub const CallResult = struct {
         return images;
     }
 
+    pub fn takeRetainedOutput(self: *CallResult) ?[]const u8 {
+        const output = self.retained_output;
+        self.retained_output = null;
+        return output;
+    }
+
     pub fn takeModelOutput(self: *CallResult, alloc: Allocator) []const u8 {
         const model_output = self.model_output;
+        if (self.retained_output) |output| alloc.free(output);
         types.freeToolImages(alloc, self.images);
         self.deinitInputRequired(alloc);
         self.* = undefined;

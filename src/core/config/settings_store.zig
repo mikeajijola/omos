@@ -360,7 +360,8 @@ pub const Store = struct {
         };
         defer home.close(zio);
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        const active_root = profile_paths.activeRootDirName(home_path);
+        var durable_home = home.openDir(zio, active_root, .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -371,7 +372,7 @@ pub const Store = struct {
                     .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
                 };
                 defer verified_home.close();
-                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.root_dir_name);
+                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, active_root);
                 break :blk created.dir;
             },
             error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,

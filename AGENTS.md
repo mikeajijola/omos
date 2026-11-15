@@ -30,7 +30,7 @@ When running fx for verification, **always use the freshly-built binary at** **`
 
 This fork uses Fossil for agent state and Git for project source. `omos.fossil` is personal state and must remain ignored by Git. Do not add credentials, provider key files, opaque recovery checkpoints, or checkout caches to Fossil.
 
-Native interactive and `ask` turns started with `omos` or `omo` use the absolute workspace binding in `~/.fx/omos-workspace.json`. A saved turn creates an empty personal instance when none is bound. Explicit `omos fossil init` also archives existing public session history. Each saved task has a persistent contract, its own Fossil branch, an isolated filesystem view, and host-recorded evidence. The host reuses scratch checkouts for mutations and integration. Paused or blocked work continues on that branch. `/task new [goal]` pauses the previous task; `/task resume <id>` selects retained work. Child tasks branch from their parent's revision and publish to the parent.
+Native interactive, `ask`, and `acp` turns started with `omos`, `omo`, `fxos`, or `ui-host` (or with `OMOS_CONTRACT_REVIEW=1` / `FX_CONTRACT_REVIEW=1`) use the absolute workspace binding in `~/.omos/omos-workspace.json` (falling back to `~/.fx/omos-workspace.json`). A saved turn creates an empty personal instance when none is bound. Explicit `omos fossil init` also archives existing public session history. Each saved task has a persistent contract, its own Fossil branch, an isolated filesystem view, and host-recorded evidence. The host reuses scratch checkouts for mutations and integration. Paused or blocked work continues on that branch. `/task new [goal]` pauses the previous task; `/task resume <id>` selects retained work. Parent coordinators resolve the affected capability and preferred realisation (`src/core/workspace/realisation_selection.zig`, ranked by `relevance`, `precedent`, `evidence`, and `recency`) before dispatching pre-equipped background workers (`<omos_realisation_assignment>`). Child sub-agent tasks branch from their parent's revision, receive pre-bound realisation skills, verify against their child contract, and publish to the parent.
 
 Managed turns automatically checkpoint changes made by normal file and shell tools inside their projected `memory/`, `skills/`, `documents/`, `artifacts/`, and `ui/` directories. Use `fossil_workspace` for explicit content operations, typed records, and workspace inspection. The host creates branches, checkpoints evidence, verifies contracts, and publishes the exact reviewed revision. Do not ask the model to declare its own contract fulfilled or run manual merges to bypass publication. Completion requires a verified Fossil receipt. Preserve conflicted and pending branches; `omos fossil recover` retries durable publication without repeating model actions. `--no-save` turns have read-only workspace access.
 
@@ -144,17 +144,17 @@ Do not scatter help text or argument parsing across multiple files.
 
 ## Configuration and State
 
-Profile configuration and runtime state lives under `~/.fx/`. Project `.fx.json` contains committed project defaults only.
+Profile configuration and runtime state lives under `~/.omos/` (when `OMOS_PROFILE_DIR=.omos` is set or `~/.omos` exists on disk) with automatic fallback to `~/.fx/`. Project `<workspace>/.omos.json` (falling back to `<workspace>/.fx.json`) contains committed project defaults only.
 
 Config precedence (highest wins):
 
-1. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
-4. `<workspace>/.fx.json` (committed project defaults)
+1. Environment variables such as `OMOS_PROVIDER` (`FX_PROVIDER`), `OMOS_MODEL` (`FX_MODEL`), `OMOS_PERMISSION_MODE` (`FX_PERMISSION_MODE`), `OMOS_MAX_AGENT_STEPS` (`FX_MAX_AGENT_STEPS`), `OMOS_CONTRACT_REVIEW` (`FX_CONTRACT_REVIEW`), and `OMOS_CONTRACT_REVIEW_MODEL` (`FX_CONTRACT_REVIEW_MODEL`)
+2. `~/.omos/settings.json` or `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
+3. `~/.omos/settings.json` or `~/.fx/settings.json` top-level (profile global settings)
+4. `<workspace>/.omos.json` or `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`, parsed by `parseProjectSafeFields` in `src/core/config/config_runtime.zig`. The project layer never parses profile-owned keys, such as provider and model selection, permissions, and interface preferences.
+Project `.omos.json` / `.fx.json` accepts only repo-safe defaults: `max_agent_steps`, `max_tool_result_bytes`, `context`, `provider_order`, and `provider_strict`, parsed by `parseProjectSafeFields` in `src/core/config/config_runtime.zig`. The project layer never parses profile-owned keys, such as provider and model selection, permissions, and interface preferences.
 
 Runtime state lives under `~/.fx/sessions/<session-id>/` (`session.json`, `background/`, `subagent/`, `logs/`). Sessions are global and portable across workspaces. Each session tracks its `workspace_root`, which updates when resumed in a different workspace. Subagent children are internal sessions registered in their parent's `subagent/children.json`. They stay out of session discovery and cannot be resumed directly.
 

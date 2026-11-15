@@ -23,6 +23,10 @@ const js_host_steering = if (host_target.is_wasm)
     @import("../core/hosts/js_host_steering.zig")
 else
     struct {};
+const completion_review = if (host_target.is_wasm)
+    struct {}
+else
+    @import("../core/agent/runtime/completion_review.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -517,6 +521,9 @@ const AcpContext = struct {
             },
         };
         if (comptime !host_target.is_wasm) {
+            tc.fossil_workspace_available = completion_review.enabled();
+            tc.coordinator_mode = completion_review.coordinatorEnabled();
+            tc.reviewer_model = self.state.review_model;
             if (session.mcp_host) |h| {
                 h.catalog.wire(&tc);
             } else if (session.mcp != null) {
@@ -1056,6 +1063,8 @@ pub fn handlePrompt(
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
+        .fossil_workspace_available = if (comptime !host_target.is_wasm) completion_review.enabled() else false,
+        .coordinator_mode = if (comptime !host_target.is_wasm) completion_review.coordinatorEnabled() else false,
     });
     defer tool_projection.deinit(alloc);
 
@@ -1126,8 +1135,18 @@ pub fn handlePrompt(
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialDynamicTools(&ctx, dynamic_tool_arena.allocator());
+    const effective_skill_bindings = if (comptime host_target.is_wasm)
+        &.{}
+    else
+        try @import("../core/workspace/realisation_selection.zig").resolvePromptSkillBindings(
+            dynamic_tool_arena.allocator(),
+            owned_prompt,
+            session.workspace_root,
+            skill_catalog.items,
+        );
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
+        .skill_bindings = effective_skill_bindings,
         .host_instructions = host_instructions,
         .initial_dynamic_tools = initial_dynamic_tools,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -1135,6 +1154,47 @@ pub fn handlePrompt(
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
     agent_config.session_child_capability = sessionChildCapability(session);
+    var cross_review_credential: ?credentials.Credential = null;
+    defer if (cross_review_credential) |*cred| cred.deinit(alloc);
+    if (comptime !host_target.is_wasm) {
+        if (completion_review.enabled()) {
+            const review_override = io_mod.getenv("OMOS_CONTRACT_REVIEW_MODEL") orelse
+                io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse
+                state.review_model;
+            const review_selection = completion_review.resolveSelection(
+                review_override,
+                session.provider,
+                state.cfg.provider_set.definitions,
+                session.model,
+            );
+            if (!review_selection.provider.eql(session.provider)) {
+                cross_review_credential = auth_runtime.prepareCredential(
+                    alloc,
+                    state.cfg.gateway_provider.oauth_transport,
+                    state.cfg.secret_store,
+                    review_selection.provider,
+                    null,
+                ) catch null;
+            }
+            agent_config.contract_review_enabled = true;
+            agent_config.coordinator_mode = completion_review.coordinatorEnabled();
+            agent_config.fossil_session_id = session.session_id;
+            agent_config.fossil_ephemeral = session.writable == null;
+            agent_config.contract_review_model = review_selection.model;
+            agent_config.contract_review_effort = completion_review.reviewerEffort(
+                review_selection.provider,
+                state.cfg.provider_set.definitions,
+            );
+            agent_config.contract_review_provider = review_selection.provider;
+            agent_config.contract_review_stream_provider = server.streamProviderFor(state, review_selection.provider);
+            agent_config.contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
+                .secret_bytes = cred.token,
+                .source = cred.source,
+                .account_id = cred.accountId(),
+                .tenant_context = cred.gatewayTeam(),
+            } } else null;
+        }
+    }
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
     defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
@@ -1309,6 +1369,7 @@ pub fn runSubagentChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .fossil_workspace_available = if (comptime !host_target.is_wasm) completion_review.enabled() else false,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -1404,6 +1465,7 @@ const AgentConfigSections = struct {
     host_instructions: []const u8 = "",
     initial_dynamic_tools: ?[]const agent_stream_provider.DynamicFunctionTool = null,
     skill_catalog: skill_invocation.Catalog = .{ .skills = &.{} },
+    skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     advertised_tool_names: []const []const u8 = &.{},
     advertised_functions: []const model_tool_schema.FunctionSchema = &.{},
     custom_tool_guidance: []const u8,
@@ -1420,6 +1482,7 @@ fn buildAgentConfig(
         .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,
+        .skill_bindings = sections.skill_bindings,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
         .advertised_tool_names = sections.advertised_tool_names,

@@ -29,6 +29,10 @@ pub const Authority = struct {
     permission_rules: types.PermissionRuleSet,
     session_rules: []const @import("../permissions/session_permission_state.zig").Rule,
     session_generation: u64,
+    capability: ?[]const u8 = null,
+    realisation: ?[]const u8 = null,
+    skill_bindings: []const @import("../skills/skill_invocation.zig").ExplicitBinding = &.{},
+    execution_guidance: []const u8 = "",
 };
 
 pub const Command = struct {
@@ -194,7 +198,9 @@ pub fn launchHost(manager: workspace.Manager) !void {
     lock.unlock(io.getIo());
     const executable = try std.process.executablePathAlloc(io.getIo(), manager.alloc);
     _ = try std.process.spawn(io.getIo(), .{ .argv = &.{ executable, "ui-host", "--background-serve" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = 0 });
-    const until = io.milliTimestamp() + 5000;
+    // The child validates the binding through Fossil before taking host.lock.
+    // Its command lease alone may wait 30 seconds behind a foreground commit.
+    const until = io.milliTimestamp() + 45_000;
     while (io.milliTimestamp() < until) {
         if (!try lock.tryLock(io.getIo(), .exclusive)) return;
         lock.unlock(io.getIo());

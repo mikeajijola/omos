@@ -483,20 +483,32 @@ fn cleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8)
     if (files.items.len != saved.entries.len) return error.WorkspaceProjectionConflict;
     const revision = try manager.currentRevision(task);
     const manifest = try manager.fileManifest(revision);
-    for (files.items) |file| {
-        if (manager.operation_control) |control| try control.check();
-        if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
-        const canonical = for (manifest) |entry| {
-            if (std.mem.eql(u8, entry.path, file.path)) break entry;
-        } else return error.WorkspaceProjectionConflict;
-        if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+    var offset: usize = 0;
+    while (offset < files.items.len) {
         var page = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer page.deinit();
         var reader = manager;
         reader.alloc = page.allocator();
-        const body = try reader.contentAt(file.path, revision);
-        try @import("fossil_manifest.zig").verifyObject(canonical.artifact orelse return error.WorkspaceProjectionConflict, body);
-        if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        const batch = files.items[offset..@min(offset + 8, files.items.len)];
+        var identities: [8][]const u8 = undefined;
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            if (!equal(state(file), lookup(saved.entries, file.path))) return error.WorkspaceProjectionConflict;
+            const canonical = for (manifest) |entry| {
+                if (std.mem.eql(u8, entry.path, file.path)) break entry;
+            } else return error.WorkspaceProjectionConflict;
+            if (canonical.mode == .symlink or (canonical.mode == .executable) != file.executable) return error.WorkspaceProjectionConflict;
+            identities[i] = canonical.artifact orelse return error.WorkspaceProjectionConflict;
+        }
+        const objects = try reader.projectionObjects(identities[0..batch.len]);
+        for (batch, 0..) |file, i| {
+            if (manager.operation_control) |control| try control.check();
+            const body = for (objects) |object| {
+                if (std.mem.eql(u8, identities[i], object.artifact)) break object.bytes;
+            } else try reader.retrievalArtifact(identities[i]);
+            if (!std.mem.eql(u8, try workspace.hash(reader.alloc, body), file.sha256)) return error.WorkspaceProjectionConflict;
+        }
+        offset += batch.len;
     }
     return total;
 }
@@ -528,6 +540,68 @@ pub fn collect(source: workspace.Manager, mode: CacheMode) anyerror!CacheReport 
     return collectControlled(manager, mode);
 }
 
+// A conservative upper bound is enough to decide that eviction is unnecessary.
+// This pass never labels content clean, takes writer locks, or deletes anything.
+// Concurrent growth can defer collection until the next pass, not authorize it.
+fn footprintFits(manager: workspace.Manager, dir: std.Io.Dir, remaining: *u64, visited: *usize) anyerror!bool {
+    var iterator = dir.iterate();
+    while (try iterator.next(io_mod.getIo())) |entry| {
+        if (manager.operation_control) |control| try control.check();
+        visited.* += 1;
+        if (visited.* > max_files) return false;
+        switch (entry.kind) {
+            .file => {
+                var file = try dir.openFile(io_mod.getIo(), entry.name, .{ .allow_directory = false, .follow_symlinks = false });
+                defer file.close(io_mod.getIo());
+                const stat = try file.stat(io_mod.getIo());
+                if (stat.kind != .file or stat.size > remaining.*) return false;
+                remaining.* -= stat.size;
+            },
+            .directory => {
+                var child = try dir.openDir(io_mod.getIo(), entry.name, .{ .iterate = true, .follow_symlinks = false });
+                defer child.close(io_mod.getIo());
+                if (!try footprintFits(manager, child, remaining, visited)) return false;
+            },
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn retainedWithinBudget(manager: workspace.Manager, tasks: []const workspace.Task, policy: @import("definition.zig").ProjectionPolicy) !?CacheReport {
+    var report: CacheReport = .{};
+    var entries: std.ArrayList(CacheEntry) = .empty;
+    var remaining = policy.max_clean_bytes;
+    var candidates: usize = 0;
+    for (tasks) |task| {
+        if (manager.operation_control) |control| try control.check();
+        if (task.authority != null) continue;
+        const root = try directory(manager, task);
+        var dir = io_mod.openDirAbsoluteNoFollow(root, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer dir.close(io_mod.getIo());
+        var state_name: []const u8 = @tagName(task.state);
+        if (task.state == .accepted) {
+            if (std.mem.eql(u8, std.Io.Dir.path.basename(root), task.id)) {
+                state_name = "legacy_resources";
+            } else {
+                candidates += 1;
+                if (candidates > policy.max_clean_views) return null;
+                var visited: usize = 0;
+                if (!try footprintFits(manager, dir, &remaining, &visited)) return null;
+                state_name = "unverified_within_budget";
+            }
+        }
+        report.views += 1;
+        report.retained += 1;
+        try entries.append(manager.alloc, .{ .task = task.id, .path = root, .state = state_name });
+    }
+    report.entries = entries.items;
+    return report;
+}
+
 fn collectControlled(manager: workspace.Manager, mode: CacheMode) anyerror!CacheReport {
     const basis = try manager.modelBasis(try manager.revision("trunk"));
     const policy = if (basis) |value| value.execution.projections else null;
@@ -538,6 +612,13 @@ fn collectControlled(manager: workspace.Manager, mode: CacheMode) anyerror!Cache
             return a.created_at_ms > b.created_at_ms;
         }
     }.less);
+    if (mode == .trim) {
+        const retained = retainedWithinBudget(manager, tasks, policy.?) catch |err| switch (err) {
+            error.Timeout, error.Cancelled, error.OutOfMemory => return err,
+            else => null,
+        };
+        if (retained) |report| return report;
+    }
     var report: CacheReport = .{};
     var entries: std.ArrayList(CacheEntry) = .empty;
     for (tasks) |task| {
@@ -640,13 +721,18 @@ pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: [
     if (arguments.value != .object) return;
     var manager = (try workspace.Manager.bound(alloc)) orelse return;
     var cancelled = std.atomic.Value(bool).init(false);
-    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(30) }) };
+    // Opaque commands hydrate every managed file, including cold binary objects.
+    // Keep cancellation and a finite bound without applying the single-path
+    // deadline to an entire workspace.
+    manager.operation_control = .{ .cancel = cancel_flag orelse &cancelled, .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(if (process_access) 120 else 30) }) };
     const task = (try manager.active(id)) orelse return;
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
     const root = try directory(manager, task);
-    var selection: Selection = .{ .all = process_access };
-    if (skill) {
+    var selection: Selection = .{};
+    if (process_access) {
+        selection = (try processSelection(alloc, project, root, arguments.value.object)) orelse return;
+    } else if (skill) {
         // Discovery reads only SKILL.md. Loading or installing a package makes
         // its executable resources available to the unchanged skill runtime.
         selection.path = "skills";
@@ -690,6 +776,51 @@ fn relativeManagedPath(alloc: std.mem.Allocator, project: []const u8, root: []co
     if (!std.mem.startsWith(u8, resolved, root) or resolved.len <= root.len or resolved[root.len] != '/') return null;
     const path = resolved[root.len + 1 ..];
     for (roots) |prefix| if (std.mem.eql(u8, path, prefix[0 .. prefix.len - 1]) or std.mem.startsWith(u8, path, prefix)) return path;
+    return null;
+}
+
+fn isInsidePath(parent: []const u8, child: []const u8) bool {
+    if (std.mem.eql(u8, parent, "/")) return child.len > 1 and child[0] == '/';
+    return std.mem.startsWith(u8, child, parent) and child.len > parent.len and child[parent.len] == '/';
+}
+
+fn matchedManagedRootSelection(command: []const u8) ?Selection {
+    var matched: ?[]const u8 = null;
+    for (roots) |prefix| {
+        if (std.mem.find(u8, command, prefix) != null) {
+            if (matched != null) return .{ .all = true };
+            matched = prefix[0 .. prefix.len - 1];
+        }
+    }
+    return if (matched) |path| .{ .path = path } else null;
+}
+
+fn processSelection(alloc: std.mem.Allocator, project: []const u8, root: []const u8, outer: std.json.ObjectMap) !?Selection {
+    const args_object = if (outer.get("request")) |request| switch (request) {
+        .object => |obj| obj,
+        else => outer,
+    } else outer;
+    const cwd = blk: {
+        if (args_object.get("cwd")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
+        if (args_object.get("workdir")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
+        break :blk project;
+    };
+    if (try relativeManagedPath(alloc, project, root, cwd)) |managed_path| {
+        if (managed_path.len == 0) return .{ .all = true };
+        return .{ .path = managed_path };
+    }
+    const command = if (args_object.get("command")) |value| switch (value) {
+        .string => |s| s,
+        else => return null,
+    } else return null;
+    if (std.mem.find(u8, command, root) != null or std.mem.find(u8, command, ".fx/workspaces") != null) {
+        return matchedManagedRootSelection(command) orelse .{ .all = true };
+    }
+    const resolved_project = try std.Io.Dir.path.resolve(alloc, &.{project});
+    const resolved_cwd = try std.Io.Dir.path.resolve(alloc, &.{ project, cwd });
+    if (std.mem.eql(u8, resolved_cwd, resolved_project) and isInsidePath(resolved_project, root)) {
+        return matchedManagedRootSelection(command);
+    }
     return null;
 }
 
@@ -852,4 +983,53 @@ test "filesystem projection collection rejects ignored execution caches and unkn
     var root = try temporary.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer root.close(std.testing.io);
     try std.testing.expectError(error.WorkspacePathDenied, scan(alloc, root, "", &files, &total, true));
+}
+
+fn parseTestSelection(alloc: std.mem.Allocator, project: []const u8, root: []const u8, raw: []const u8) !?Selection {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    return processSelection(alloc, project, root, parsed.value.object);
+}
+
+test "shell and run_command projection scoping skips external git worktrees and scopes managed paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const project = "/Users/example/project";
+    const root = "/Users/example/project/.fx/workspaces/workspace/task";
+
+    // External git repository / worktree or project root without managed refs skips hydration.
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"git status\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"zig build test\",\"workdir\":\"/Users/example/worktree\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"cat documents/readme.md\",\"cwd\":\"/Users/example/worktree\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"request\":{\"action\":\"interact\",\"session_id\":\"s1\"}}")) == null);
+
+    // Managed cwd scopes to that managed path, or .all = true only for root itself.
+    const at_root = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"cwd\":\".fx/workspaces/workspace/task\"}")).?;
+    try std.testing.expect(at_root.all);
+    try std.testing.expect(at_root.path == null);
+
+    const at_docs = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"cwd\":\".fx/workspaces/workspace/task/documents/sub\"}")).?;
+    try std.testing.expect(!at_docs.all);
+    try std.testing.expectEqualStrings("documents/sub", at_docs.path.?);
+
+    const at_skills_workdir = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"workdir\":\"/Users/example/project/.fx/workspaces/workspace/task/skills\"}")).?;
+    try std.testing.expect(!at_skills_workdir.all);
+    try std.testing.expectEqualStrings("skills", at_skills_workdir.path.?);
+
+    // External cwd whose command references root or .fx/workspaces hydrates.
+    const ref_root = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls /Users/example/project/.fx/workspaces/workspace/task\",\"cwd\":\"/Users/example/worktree\"}")).?;
+    try std.testing.expect(ref_root.all);
+
+    const ref_workspaces = (try parseTestSelection(alloc, project, root, "{\"command\":\"cat .fx/workspaces/workspace/task/memory/notes.md\",\"cwd\":\".\"}")).?;
+    try std.testing.expect(!ref_workspaces.all);
+    try std.testing.expectEqualStrings("memory", ref_workspaces.path.?);
+
+    // Project cwd with managed subdir in command triggers scoped hydration, and multi-subdir triggers .all.
+    const proj_single = (try parseTestSelection(alloc, project, root, "{\"request\":{\"action\":\"run\",\"command\":\"cat documents/plan.md\",\"cwd\":\".\"}}")).?;
+    try std.testing.expect(!proj_single.all);
+    try std.testing.expectEqualStrings("documents", proj_single.path.?);
+
+    const proj_multi = (try parseTestSelection(alloc, project, root, "{\"command\":\"cp documents/a.md artifacts/b.md\"}")).?;
+    try std.testing.expect(proj_multi.all);
 }

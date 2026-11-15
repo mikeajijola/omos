@@ -5,6 +5,17 @@ const workspace = @import("fossil_workspace.zig");
 const model = @import("definition.zig");
 const records = @import("../shared/record_json.zig");
 
+pub fn executeScheduleSeries(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
+    if (raw.len > 16384) return error.ServiceRequestTooLarge;
+    const recurring = @import("schedule_series.zig");
+    const Envelope = struct { version: []const u8, workspace: []const u8, request: recurring.Request };
+    const envelope = try records.decode(Envelope, manager.alloc, raw, .{});
+    if (!std.mem.eql(u8, envelope.version, recurring.api_version)) return error.UnsupportedScheduleSeriesApi;
+    if (!std.mem.eql(u8, envelope.workspace, manager.manifest.id)) return error.WorkspaceIdentityMismatch;
+    if (recurring.mutation(envelope.request) and !writable) return error.ServiceReadOnly;
+    return std.json.Stringify.valueAlloc(manager.alloc, try manager.scheduleSeriesSnapshot(envelope.request), .{});
+}
+
 /// Scheduling is an additive transport, independent of a task's pinned
 /// OmniForm declaration. It grants no authority to execute actor tools.
 pub fn executeSchedule(manager: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {

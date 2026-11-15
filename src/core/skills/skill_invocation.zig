@@ -342,6 +342,8 @@ test "explicit skills include complete instructions beyond the default chunk" {
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "BEGIN INSTRUCTIONS") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "COMPLETE TAIL") != null);
+    try expectContains(section.text, "The complete primary SKILL.md below is already loaded");
+    try expectContains(section.text, "Load required references or resources not included here");
     try std.testing.expectEqualStrings("1 requested skill loaded\n└ Loaded skill workflow", section.load_notice.?.body);
     try std.testing.expect(section.load_details == null);
     const bindings = [_]ExplicitBinding{ .{ .name = "workflow", .path = path }, .{ .name = "workflow", .path = path } };
@@ -588,7 +590,12 @@ fn appendExplicitSkill(
 ) !bool {
     const result = try loadByIdentityWithOptions(alloc, catalog, name, location, null, 0, limits, null, .{ .mode = .whole, .cancel_flag = cancel_flag });
     defer freeExecuteResult(alloc, result);
-    if (result.modelOutput().len +| 1 > remaining_bytes) return error.SkillContextTooLarge;
+    const loaded_notice = if (result == .loaded and result.loaded.complete)
+        "The complete primary SKILL.md below is already loaded; use these instructions directly. Load required references or resources not included here, or refresh the skill if its source has changed.\n"
+    else
+        "";
+    if (loaded_notice.len +| result.modelOutput().len +| 1 > remaining_bytes) return error.SkillContextTooLarge;
+    try out.writeAll(loaded_notice);
     try out.writeAll(result.modelOutput());
     try out.writeByte('\n');
     if (result.contextNotice()) |notice| {

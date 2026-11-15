@@ -24,6 +24,8 @@ const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
 const read_file_impl = @import("../tools/filesystem/read_file.zig");
 const write_file_impl = @import("../tools/filesystem/write_file.zig");
 const fossil_workspace_impl = @import("../tools/session/fossil_workspace.zig");
+const workspace_content_impl = @import("../tools/session/workspace_content.zig");
+const classify_impl = @import("../tools/session/classify.zig");
 const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
@@ -872,7 +874,130 @@ pub const fossil_workspace = ToolSpec{
     .irreversible_fn = fossil_workspace_impl.irreversible,
 };
 
+// Host-consumed checkpoint, not an executable tool or an authority grant.
+pub const lookup_checkpoint_schema: @import("../core/tooling/model_tool_schema.zig").FunctionSchema = .{
+    .name = "omos_lookup_step",
+    .description = "Provide a provisional answer and the next reads that could materially improve it. The host decides whether to deliver, continue or ask the supplied clarification.",
+    .input_schema = .{ .properties = &.{
+        .{ .name = "answer", .json_type = .string, .description = "Ready-to-send answer, not progress or plans, at most 4096 UTF-8 bytes. Empty until a useful answer is supported. Put human-readable source paths here, not in sources.", .bounds = &.{ .max_length = 4096 } },
+        .{ .name = "sources", .json_type = .array, .description = "Host observation IDs only, such as e0 and e1. Never file paths, citations, or explanations. Use an empty array when no observation is cited.", .bounds = &.{ .max_items = 8 }, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "limitations", .json_type = .array, .description = "At most eight material limitations, each at most 512 UTF-8 bytes.", .bounds = &.{ .max_items = 8 }, .shape = &.{ .array_values = .{ .json_type = .string } } },
+        .{ .name = "clarification", .json_type = .string, .description = "A necessary question for the user, at most 1024 UTF-8 bytes; otherwise empty.", .bounds = &.{ .max_length = 1024 } },
+        .{ .name = "next_actions", .json_type = .array, .description = "At most four proposed reads that could materially change the answer; empty when no useful read remains.", .bounds = &.{ .max_items = 4 }, .shape = &.{ .array_objects = &.{ .properties = &.{
+            .{ .name = "tool", .json_type = .string, .shape = &.{ .enum_values = &.{ "workspace_content", "read_tool_result", "classify" } } },
+            .{ .name = "arguments", .json_type = .string, .description = "JSON object encoded as a string, using the supplied tool schema. At most 8192 UTF-8 bytes." },
+            .{ .name = "resolves", .json_type = .string, .description = "The material gap this action could resolve, at most 512 UTF-8 bytes.", .bounds = &.{ .max_length = 512 } },
+        }, .required = &.{ "tool", "arguments", "resolves" }, .additional_properties = false } } },
+    }, .required = &.{ "answer", "sources", "limitations", "clarification", "next_actions" }, .additional_properties = false },
+};
+
+pub const classify = ToolSpec{
+    .name = "classify",
+    .description = "Ask the configured decision model bounded choice questions about supplied state. Include relevant context and describe each choice. Uncertain decisions require further reasoning, not automatic action. No endpoint or model override is accepted.",
+    .model_schema = .{
+        .name = "classify",
+        .description = "Ask the configured decision model bounded choice questions about supplied state. Include relevant context and describe each choice. Uncertain decisions require further reasoning, not automatic action. No endpoint or model override is accepted.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "state", .json_type = .object, .description = "Relevant message, recent context and candidate records. Do not include unrelated content." },
+                .{ .name = "questions", .json_type = .array, .shape = &.{ .array_objects = &.{
+                    .properties = &.{
+                        .{ .name = "id", .json_type = .string },
+                        .{ .name = "instructions", .json_type = .string },
+                        .{ .name = "choices", .json_type = .array, .shape = &.{ .array_objects = &.{
+                            .properties = &.{ .{ .name = "label", .json_type = .string }, .{ .name = "description", .json_type = .string } },
+                            .required = &.{ "label", "description" },
+                            .additional_properties = false,
+                        } } },
+                    },
+                    .required = &.{ "id", "instructions", "choices" },
+                    .additional_properties = false,
+                } } },
+            },
+            .required = &.{ "state", "questions" },
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .host,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Classifying",
+    .completed_action_label = "Classified",
+    .decode = classify_impl.decode,
+    .call = classify_impl.call,
+    .reads_only_fn = classify_impl.readsOnly,
+    .irreversible_fn = classify_impl.irreversible,
+};
+
+pub const workspace_content = ToolSpec{
+    .name = "workspace_content",
+    .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
+    .model_schema = .{
+        .name = "workspace_content",
+        .description = "Retrieve bounded source evidence and inspect conversations or human attention. Query a JSON array by path/pointer, or a SQLite path with entity omitted to list tables, then entity to read a table with exact filters and order_by. Search previews and conversation claims are not proof of completed actions. Follow next_offset and disclose coverage gaps.",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "catalog", "search", "read", "query", "attention", "conversations", "conversation", "background", "contracts" } } },
+                .{ .name = "contracts", .json_type = .object, .description = "Resolve a message against retained contracts across channels, or inspect status and scheduled updates. Repeated user requests require a visible choice, never silent suppression. Routing does not grant execution or approval authority.", .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "list", "status", "context", "resolve", "subscriptions", "outbox", "commands" } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "text", .json_type = .string },
+                        .{ .name = "reply_to", .json_type = .string },
+                        .{ .name = "offset", .json_type = .integer },
+                    },
+                    .required = &.{"action"},
+                    .additional_properties = false,
+                } } },
+                .{ .name = "background", .json_type = .object, .description = "Inspect workers and their live event evidence without waiting for publication. Running and checkpoint counts are not proof of progress. workspace_governance_pending means review failed to finish, not that work completed. Read events before reporting outcomes; follow next_offset until coverage is complete.", .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "host", "list", "show", "events", "receipt" } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "generation", .json_type = .integer },
+                        .{ .name = "offset", .json_type = .integer },
+                        .{ .name = "operation", .json_type = .string },
+                    },
+                    .required = &.{"action"},
+                    .additional_properties = false,
+                } } },
+                .{ .name = "session", .json_type = .string },
+                .{ .name = "offset", .json_type = .integer },
+                .{ .name = "retrieval", .json_type = .object, .shape = &.{ .object = &.{
+                    .properties = &.{
+                        .{ .name = "query", .json_type = .string },
+                        .{ .name = "path", .json_type = .string },
+                        .{ .name = "revision", .json_type = .string },
+                        .{ .name = "runtime_revision", .json_type = .string },
+                        .{ .name = "pointer", .json_type = .string, .description = "Slash-separated field path to the JSON array when querying a document." },
+                        .{ .name = "order_by", .json_type = .string },
+                        .{ .name = "descending", .json_type = .boolean },
+                        .{ .name = "filters", .json_type = .array, .shape = &.{ .array_objects = &.{ .properties = &.{ .{ .name = "field", .json_type = .string }, .{ .name = "equals", .json_type = .string } }, .required = &.{ "field", "equals" }, .additional_properties = false } } },
+                        .{ .name = "task", .json_type = .string },
+                        .{ .name = "offset", .json_type = .integer },
+                        .{ .name = "limit", .json_type = .integer, .description = "Search/query result count, 1 to 32 (default 10). Omit for read: reads return up to 16384 bytes; continue with next_offset." },
+                        .{ .name = "entity", .json_type = .string },
+                    },
+                    .additional_properties = false,
+                } } },
+            },
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .host,
+    .activity_kind = .read,
+    .requires_approval = false,
+    .action_label = "Retrieving workspace content",
+    .completed_action_label = "Retrieved workspace content",
+    .decode = workspace_content_impl.decode,
+    .call = workspace_content_impl.call,
+    .reads_only_fn = workspace_content_impl.readsOnly,
+    .irreversible_fn = workspace_content_impl.irreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
+    classify,
+    workspace_content,
     fossil_workspace,
     glob_files,
     grep_files,
@@ -896,6 +1021,8 @@ pub const all = [_]tool_dispatch.Tool{
 pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
 
 pub const advertisement_order = [_][]const u8{
+    "classify",
+    "workspace_content",
     "read_file",
     "glob_files",
     "grep_files",
@@ -914,6 +1041,8 @@ pub const advertisement_order = [_][]const u8{
 };
 
 pub const read_only_tool_names = [_][]const u8{
+    "classify",
+    "workspace_content",
     "read_file",
     "glob_files",
     "grep_files",
@@ -981,7 +1110,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "9f90fc07dfb140d7aea5de77c1295f16bbc8481ef9f05bf1445a492f8e067bb1",
+        "e893eb49b258a02c2619d6a45a264c8b4063b858fe4db5dfd669f749a518c11b",
         &actual_hex,
     );
 }
@@ -1020,6 +1149,8 @@ fn nameInSet(names: []const []const u8, wanted: []const u8) bool {
 
 test "built-in tools register exact active local order" {
     const expected_names = [_][]const u8{
+        "classify",
+        "workspace_content",
         "fossil_workspace",
         "glob_files",
         "grep_files",
@@ -1805,6 +1936,8 @@ test "built-in registry uses executable web_fetch implementation" {
 
 test "built-in read-only tool set matches plan inspection tools" {
     const expected_names = [_][]const u8{
+        "classify",
+        "workspace_content",
         "read_file",
         "glob_files",
         "grep_files",

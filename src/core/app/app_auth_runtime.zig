@@ -1189,13 +1189,27 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
+            const configured_default_model: ?[]const u8 = if (target == .configured) blk: {
+                if (settings.providers) |reg| {
+                    if (reg.get(target.label())) |def| {
+                        if (def.model_metadata.len > 0) break :blk def.model_metadata[0].id;
+                    }
+                }
+                if (comptime @hasField(App, "provider_selection")) {
+                    if (app.provider_selection.definitions.get(target.label())) |def| {
+                        if (def.model_metadata.len > 0) break :blk def.model_metadata[0].id;
+                    }
+                }
+                break :blk null;
+            } else null;
+            const saved_or_default_model = settings.models.get(target) orelse configured_default_model;
             try beginPreparation(app, .{
                 .intent = .{ .provider = .{ .target = target, .allow_login = allow_login, .origin = intent, .fallback = fallback } },
                 .catalog_provider = catalog_provider,
                 .models_path = app.model_cache.models_path,
                 .preferred_source = if (target == .gateway) settings.credential_source else null,
                 .primary_model = if (intent == .post_oauth and provider_runtime.provider(app).eql(target)) provider_runtime.model(app) else null,
-                .preferred_model = if (intent == .post_oauth) settings.models.get(target) else io_mod.getenv("FX_MODEL") orelse settings.models.get(target),
+                .preferred_model = if (intent == .post_oauth) saved_or_default_model else io_mod.getenv("FX_MODEL") orelse saved_or_default_model,
             });
         }
 
@@ -1319,11 +1333,20 @@ pub fn Runtime(comptime App: type) type {
                         .gateway, .configured => {},
                     }
                 }
-                if (target == .gateway or !request.allow_login) {
+                if (target == .gateway or target == .configured or !request.allow_login) {
                     try app.writeDomainNotice(.{
                         .topic = "provider",
                         .tone = .warning,
-                        .body = if (intent == .post_oauth) "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged." else if (target == .codex) "Run fx login codex, then try switching again." else if (target == .grok) "Run fx login grok, then try switching again." else credentials.missing_interactive_credential_message,
+                        .body = if (intent == .post_oauth)
+                            "Subscription sign-in completed, but its saved credential is unavailable. The current provider is unchanged."
+                        else if (target == .codex)
+                            "Run fx login codex, then try switching again."
+                        else if (target == .grok)
+                            "Run fx login grok, then try switching again."
+                        else if (target == .configured)
+                            "Run fx setup gemini or set the configured provider's bearer environment variable, then try switching again."
+                        else
+                            credentials.missing_interactive_credential_message,
                     }, true);
                 }
                 return false;
@@ -1343,14 +1366,19 @@ pub fn Runtime(comptime App: type) type {
                 },
             };
             defer model_catalog.freeModelCatalog(app.alloc, &catalog);
-            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
-                }, true);
-                return false;
-            };
+            const selected_model = selectCatalogModel(catalog.items, task.input.primary_model, task.input.preferred_model) orelse
+                (if (target == .configured and catalog.items.len == 0)
+                    task.input.preferred_model orelse task.input.primary_model
+                else
+                    null) orelse
+                {
+                    try app.writeDomainNotice(.{
+                        .topic = "provider",
+                        .tone = .@"error",
+                        .body = providerFailureMessage(intent, "The target provider returned no supported models. The current provider is unchanged.", "Subscription sign-in completed, but its model catalog returned no supported models. The current provider is unchanged."),
+                    }, true);
+                    return false;
+                };
             var credential = task.credential;
             task.credential = null;
             defer if (credential) |*value| value.deinit(app.alloc);

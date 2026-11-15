@@ -47,7 +47,7 @@ pub fn signalServersForExit() void {
 
 /// FX_MCP_ENGINE=v2 selects MCP-v2.
 pub fn selected() bool {
-    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
+    const value = io_mod.getenv("OMOS_MCP_ENGINE") orelse io_mod.getenv("FX_MCP_ENGINE") orelse return false;
     return std.mem.eql(u8, value, "v2");
 }
 

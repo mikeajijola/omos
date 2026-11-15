@@ -170,7 +170,7 @@ pub const Scheduler = struct {
             };
             if (job) |claimed| {
                 self.executor.run(self.executor.context, manager, claimed, &self.stopping) catch |err| {
-                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.TaskGovernancePending or err == error.Timeout) .pending else if (err == error.CompanyApprovalRequired or err == error.CompanyApprovalDenied or err == error.CompanyApprovalExpired or err == error.CompanyApprovalStale) .blocked else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.WorkspaceReadDependencyChanged or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
+                    manager.finishReviewJob(claimed, if (err == error.Cancelled or err == error.WorkspaceExecutionBusy) .queued else if (err == error.TaskGovernancePending or err == error.TaskGovernanceUnavailable or err == error.Timeout) .pending else if (err == error.CompanyApprovalRequired or err == error.CompanyApprovalDenied or err == error.CompanyApprovalExpired or err == error.CompanyApprovalStale) .blocked else if (err == error.StaleWorkContract or err == error.StaleWorkspaceDefinition or err == error.WorkspaceReadDependencyChanged or err == error.CompanyReconciliationRequired) .changes_required else .failed, @errorName(err)) catch {};
                 };
             } else std.Io.sleep(io.getIo(), .fromSeconds(1), .awake) catch {};
         }

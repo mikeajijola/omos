@@ -2600,7 +2600,10 @@ fn writeFunctionTool(
     try std.json.Stringify.value(name, .{}, writer);
     if (description.len > 0) {
         try writer.writeAll(",\"description\":");
-        try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description);
+        switch (input_schema) {
+            .static => try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description),
+            .dynamic => try std.json.Stringify.value(description, .{}, writer),
+        }
     }
     try writer.writeAll(",\"parameters\":");
     switch (input_schema) {
@@ -2658,6 +2661,7 @@ test "Responses tools serialize typed static and dynamic functions once" {
     );
     defer dynamic_schema.deinit();
 
+    const complete_description = @import("../core/shared/text_utils.zig").repeat("d", 9000) ++ " TOOL_DESCRIPTION_TAIL " ++ @import("../core/shared/text_utils.zig").repeat("i", 8000) ++ " SERVER_INSTRUCTION_TAIL";
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try std.testing.expectEqual(@as(usize, 2), try writeTools(
@@ -2669,13 +2673,18 @@ test "Responses tools serialize typed static and dynamic functions once" {
             .advertised_functions = &.{registered[0].model_schema},
             .selected_dynamic = &.{.{
                 .name = "mcp_search",
-                .description = "Search.",
+                .description = complete_description,
                 .input_schema = dynamic_schema.value,
             }},
         },
     ));
     try std.testing.expect(std.mem.find(u8, out.written(), "\"name\":\"read_file\"") != null);
     try std.testing.expect(std.mem.find(u8, out.written(), "\"name\":\"mcp_search\"") != null);
+    const envelope = try std.testing.allocator.print("{{{s}}}", .{out.written()[1..]});
+    defer std.testing.allocator.free(envelope);
+    var parsed_tools = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, envelope, .{});
+    defer parsed_tools.deinit();
+    try std.testing.expectEqualStrings(complete_description, parsed_tools.value.object.get("tools").?.array.items[1].object.get("description").?.string);
 }
 
 test "Responses usage projection retains optional cached and reasoning detail" {

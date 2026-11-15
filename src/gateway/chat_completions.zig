@@ -60,7 +60,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
+    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity, .reasoning_efforts = if (definition.model(request.model)) |metadata| metadata.reasoning_efforts.slice() else &.{} });
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -197,7 +197,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
 
         return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    return consume(alloc, reader, request);
+    return consumeWithOptions(alloc, reader, request, .{ .reasoning_efforts = if (definition.model(request.model)) |metadata| metadata.reasoning_efforts.slice() else &.{} });
 }
 
 pub fn failure_kind(status: std.http.Status) streams.FailureKind {
@@ -217,18 +217,24 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
 
 /// Parses a successful streamed reply from `reader`.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest) !streams.Result {
+    return consumeWithOptions(alloc, reader, request, .{});
+}
+
+fn consumeWithOptions(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, options: codec.Options) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream_diagnostic(alloc, reader, request.data(), limits, request.events, request.cancel_flag, &request.attempt_evidence.tool_identity_failure);
+    return codec.consume_stream_with_options(alloc, reader, request.data(), limits, request.events, request.cancel_flag, &request.attempt_evidence.tool_identity_failure, options);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
-fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+fn metadata_entry(metadata: *const definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
+        .has_reasoning = metadata.reasoning_efforts.len > 0,
+        .reasoning_efforts = .fromOwnedSlice(@constCast(metadata.reasoning_efforts.slice())),
         // Chat completions sends images as inline base64 content parts, so
         // vision support implies file input through the same path.
         .has_vision = vision,
@@ -240,7 +246,7 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 
 fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const metadata = definition_at(raw).model(model) orelse return .{};
-    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
+    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata)));
 }
 
 fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) Allocator.Error!catalog.ProviderResult {
@@ -248,12 +254,14 @@ fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInput) 
     const definition = definition_at(raw);
     var entries: std.ArrayList(catalog.ModelCatalogEntry) = .empty;
     errdefer catalog.freeModelCatalog(alloc, &entries);
-    for (definition.model_metadata) |metadata| {
+    for (definition.model_metadata) |*metadata| {
         var entry = metadata_entry(metadata);
         entry.id = try alloc.dupe(u8, entry.id);
         errdefer alloc.free(entry.id);
         entry.model_type = try alloc.dupe(u8, entry.model_type);
         errdefer alloc.free(entry.model_type);
+        entry.reasoning_efforts = .fromOwnedSlice(try alloc.dupe(types.ReasoningEffort, entry.reasoning_efforts.items));
+        errdefer entry.reasoning_efforts.deinit(alloc);
         try entries.append(alloc, entry);
     }
     return .{ .catalog = entries };
@@ -338,7 +346,7 @@ fn build_review(raw: *anyopaque, alloc: Allocator, model: []const u8, _: []const
     defer alloc.free(projected);
     projected[projected.len - 1] = .{ .role = .user, .content = action };
     const output_limit = if (state.definition.model(model)) |metadata| @min(metadata.max_output_tokens orelse 2048, 2048) else 2048;
-    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = projected, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{}, .max_output_tokens = output_limit });
+    return build(@ptrCast(@constCast(state.definition)), alloc, .{ .model = model, .instructions = instructions, .messages = projected, .tools = .{ .additional_functions = &.{classifier.function_schema} }, .tool_choice = .required, .provider_options = .{ .reasoning = state.definition.reviewer_effort }, .max_output_tokens = output_limit });
 }
 
 test "chat completions review carries exact pending action as data without synthetic tool history" {
@@ -405,7 +413,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         .messages = &.{},
         .tools = .{ .additional_functions = &.{classifier.function_schema} },
         .tool_choice = .required,
-        .provider_options = .{},
+        .provider_options = .{ .reasoning = state.definition.reviewer_effort },
         .prepared_request_body = payload,
         .trace_ctx = .{},
         .content_capture_limit = 16 * 1024,
@@ -429,4 +437,51 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
     const owned = try alloc.create(streams.Result);
     owned.* = result;
     return .{ .completion = .{ .completion = owned.completed.completion, .context = owned, .deinit_fn = free_result } };
+}
+
+test "configured reasoning catalog and permission reviewer preserve independent efforts" {
+    const alloc = std.testing.allocator;
+    var registry = try definitions.Registry.parse_json(alloc,
+        \\{"custom":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"tool_choice_mode":"send","reviewer_effort":"low","model_metadata":{"model":{"supports_tool_use":true,"reasoning_efforts":["low","high"]},"unknown":{}}}}
+    );
+    defer registry.deinit(alloc);
+    const definition = registry.get("custom").?;
+    const provider = bundle(definition).model_catalog.?;
+    const capabilities = provider.lookupCapabilities("model").?;
+    try std.testing.expect(capabilities.supports_reasoning);
+    try std.testing.expectEqualStrings("low", capabilities.reasoning_efforts.slice()[0].label());
+    try std.testing.expect(!provider.lookupCapabilities("unknown").?.supports_reasoning);
+    var fetched = try provider.fetch(alloc, .{ .endpoint = "unused" });
+    defer catalog.freeModelCatalog(alloc, &fetched.catalog);
+    try std.testing.expectEqualStrings("high", fetched.catalog.items[0].reasoning_efforts.items[1].label());
+    try std.testing.expect(fetched.catalog.items[0].reasoning_efforts.items.ptr != definition.model("model").?.reasoning_efforts.slice().ptr);
+
+    const actor_request: streams.RequestData = .{ .model = "model", .messages = &.{.{ .role = .user, .content = "Read the page." }}, .tool_choice = .auto, .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high") } };
+    const actor = try build_for(definition, alloc, actor_request);
+    defer alloc.free(actor);
+    var parsed_actor = try std.json.parseFromSlice(std.json.Value, alloc, actor, .{});
+    defer parsed_actor.deinit();
+    try std.testing.expectEqualStrings("high", parsed_actor.value.object.get("reasoning_effort").?.string);
+
+    var state = Review{ .definition = definition, .input = .{} };
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the exact action against authenticated user intent." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "Read the page." },
+        .{ .role = .assistant, .content = null, .tool_calls = &.{.{ .id = "target", .name = "browser_read", .arguments_json = "{\"url\":\"https://example.test\"}" }} },
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = phase_deadline(30_000, null);
+    const review_body = try build_review(&state, alloc, "model", "", &instructions, &messages, "target", deadline, &cancel);
+    defer alloc.free(review_body);
+    var parsed_review = try std.json.parseFromSlice(std.json.Value, alloc, review_body, .{});
+    defer parsed_review.deinit();
+    try std.testing.expectEqualStrings("low", parsed_review.value.object.get("reasoning_effort").?.string);
+    try std.testing.expectEqualStrings("required", parsed_review.value.object.get("tool_choice").?.string);
+    try std.testing.expectError(error.UnsupportedProviderOption, build_review(&state, alloc, "unknown", "", &instructions, &messages, "target", deadline, &cancel));
+    var default_definition = definition.*;
+    default_definition.reviewer_effort = null;
+    state.definition = &default_definition;
+    const default_body = try build_review(&state, alloc, "model", "", &instructions, &messages, "target", deadline, &cancel);
+    defer alloc.free(default_body);
+    try std.testing.expect(std.mem.find(u8, default_body, "reasoning_effort") == null);
 }

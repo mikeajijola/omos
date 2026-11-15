@@ -77,7 +77,7 @@ fn presenceInProfile() host.SecretStorePresence {
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
         return .unavailable;
     defer home_dir.close(io_mod.getIo());
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.activeRootDirName(home), .{
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
@@ -123,7 +123,7 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
     };
     defer home_dir.close(io_mod.getIo());
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.activeRootDirName(home), .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -194,7 +194,7 @@ fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     };
     defer home_dir.close();
 
-    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch |err| {
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.activeRootDirName(home)) catch |err| {
         return writeFailed("open_profile", err);
     };
     defer fx_dir.close();
@@ -306,7 +306,7 @@ fn loadNamedCallback(_: ?*anyopaque, alloc: Allocator, name: []const u8) LoadErr
     const home = io_mod.homeDir() orelse return error.StoredKeyUnreadable;
     var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch return error.StoredKeyUnreadable;
     defer home_dir.close(io_mod.getIo());
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.activeRootDirName(home), .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return error.StoredKeyUnreadable,
     };
@@ -324,7 +324,7 @@ fn storeNamedCallback(_: ?*anyopaque, alloc: Allocator, name: []const u8, value:
     const home = io_mod.homeDir() orelse return error.StoredKeyWriteFailed;
     var home_dir = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return error.StoredKeyWriteFailed };
     defer home_dir.close();
-    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch return error.StoredKeyWriteFailed;
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.activeRootDirName(home)) catch return error.StoredKeyWriteFailed;
     defer fx_dir.close();
     var keys_dir = io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, "provider-keys") catch return error.StoredKeyWriteFailed;
     defer keys_dir.close();

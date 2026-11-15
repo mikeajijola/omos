@@ -122,10 +122,10 @@ pub fn configureFromEnv(
     fx_version: []const u8,
 ) !void {
     const policy = resolve_startup_policy(.{
-        .debug_record = io_mod.getenv("FX_DEBUG_RECORD"),
-        .configured_path = io_mod.getenv("FX_RECORD"),
-        .record_input = io_mod.getenv("FX_RECORD_INPUT"),
-        .silent_banner = io_mod.getenv("FX_DEBUG_RECORD_SILENT_BANNER"),
+        .debug_record = io_mod.getenv("OMOS_DEBUG_RECORD") orelse io_mod.getenv("FX_DEBUG_RECORD"),
+        .configured_path = io_mod.getenv("OMOS_RECORD") orelse io_mod.getenv("FX_RECORD"),
+        .record_input = io_mod.getenv("OMOS_RECORD_INPUT") orelse io_mod.getenv("FX_RECORD_INPUT"),
+        .silent_banner = io_mod.getenv("OMOS_DEBUG_RECORD_SILENT_BANNER") orelse io_mod.getenv("FX_DEBUG_RECORD_SILENT_BANNER"),
     });
     switch (policy.destination) {
         .inactive => return,

@@ -2,6 +2,14 @@
 const std = @import("std");
 
 pub const State = enum { prepared, queued, starting, running, waiting, cancelled, completed, superseded };
+pub const WaitCondition = enum { input, validation };
+
+/// Host-owned continuation, persisted with the invocation fence. A retry resumes
+/// the session or review; it never replays an individual external tool call.
+pub const Retry = struct {
+    kind: enum { execution, review, interrupted, publication },
+    due_ms: i64,
+};
 
 pub const Record = struct {
     version: []const u8 = "omos.background-contract/v1",
@@ -18,11 +26,27 @@ pub const Record = struct {
     owner: ?[]const u8 = null,
     generation: u64 = 0,
     invocations: u32 = 0,
+    recoveries: u32 = 0,
     cancel_requested: bool = false,
     publication_revision: ?[]const u8 = null,
     updated_ms: i64,
     reason: []const u8 = "",
+    retry: ?Retry = null,
+    wait_condition: ?WaitCondition = null,
 };
+
+pub fn retryDelay(recoveries: u32) i64 {
+    return @as(i64, 1000) << @as(u6, @intCast(@min(recoveries, 6)));
+}
+
+/// Translate transport outcomes once, at the boundary that retains the failure.
+/// Older records use this same translation when first read by the scheduler.
+pub fn retryFor(reason: []const u8, recoveries: u32, now: i64) ?Retry {
+    const kind: @FieldType(Retry, "kind") = if (interruptedExecution(reason)) .execution else if (std.mem.eql(u8, reason, "verification_pending") or
+        std.mem.eql(u8, reason, "ContractReviewPending") or
+        std.mem.eql(u8, reason, "RequiredToolMissing")) .review else return null;
+    return .{ .kind = kind, .due_ms = now +| retryDelay(recoveries) };
+}
 
 pub const Operation = struct {
     version: []const u8 = "omos.background-operation/v1",
@@ -39,6 +63,33 @@ pub fn validateOperation(operation: Operation) !void {
 }
 
 pub const Fence = struct { owner: []const u8, generation: u64 };
+
+/// Transport interruption can occur before any completion-review candidate
+/// exists. Resume the session, never the last tool call in isolation.
+pub fn interruptedExecution(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "IncompleteStream") or std.mem.eql(u8, reason, "Timeout") or std.mem.eql(u8, reason, "OutputTruncated");
+}
+
+test "execution recovery is limited to transport failures, not task or permission failures" {
+    for ([_][]const u8{ "IncompleteStream", "Timeout", "OutputTruncated" }) |reason|
+        try std.testing.expect(interruptedExecution(reason));
+    for ([_][]const u8{ "Cancelled", "RequiredToolMissing", "PermissionDenied", "workspace_governance_pending", "verification_pending", "" }) |reason|
+        try std.testing.expect(!interruptedExecution(reason));
+}
+
+test "durable retry deadlines survive serialization and preserve exponential backoff" {
+    const first = retryFor("IncompleteStream", 0, 100).?;
+    try std.testing.expectEqual(@as(i64, 1100), first.due_ms);
+    const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, first, .{});
+    defer std.testing.allocator.free(bytes);
+    const restored = try std.json.parseFromSlice(Retry, std.testing.allocator, bytes, .{});
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(first, restored.value);
+    try std.testing.expectEqual(@as(i64, 2100), retryFor("IncompleteStream", 1, 100).?.due_ms);
+    try std.testing.expectEqual(@as(i64, 64100), retryFor("IncompleteStream", 100, 100).?.due_ms);
+    try std.testing.expect(retryFor("PermissionDenied", 0, 100) == null);
+    try std.testing.expect(retryFor("WorkspaceMergeConflict", 0, 100) == null);
+}
 
 fn hex(value: []const u8, length: usize) bool {
     if (value.len != length) return false;
@@ -57,6 +108,8 @@ pub fn validate(record: Record) !void {
         !hex(record.dispatcher_session, 64) or !hex(record.contract_sha256, 64) or
         record.contract_version == 0 or record.updated_ms < 0 or
         record.reason.len > 2048 or !std.unicode.utf8ValidateSlice(record.reason)) return error.InvalidBackgroundContract;
+    if (record.retry) |retry| if (retry.due_ms < 0 or record.state != .waiting) return error.InvalidBackgroundContract;
+    if (record.wait_condition != null and record.state != .running) return error.InvalidBackgroundContract;
     if (record.source_revision) |source| {
         if (!revision(source)) return error.InvalidBackgroundContract;
     } else if (record.state != .prepared and record.state != .superseded) return error.BackgroundCheckpointRequired;
@@ -101,6 +154,7 @@ pub fn reserve(previous: Record, owner: []const u8, now: i64) !Record {
     next.invocations = std.math.add(u32, previous.invocations, 1) catch return error.BackgroundInvocationExhausted;
     next.updated_ms = now;
     next.reason = "";
+    next.retry = null;
     try validate(next);
     return next;
 }
@@ -129,6 +183,11 @@ pub fn wait(previous: Record, fence: Fence, reason: []const u8, now: i64) !Recor
     next.state = if (previous.cancel_requested) .cancelled else .waiting;
     next.updated_ms = now;
     next.reason = reason;
+    next.wait_condition = null;
+    next.retry = if (previous.cancel_requested) null else retryFor(reason, previous.recoveries, now);
+    if (next.retry) |*retry| if (retry.kind == .execution and next.worker_session == null) {
+        retry.kind = .interrupted;
+    };
     try validate(next);
     return next;
 }
@@ -146,6 +205,8 @@ pub fn complete(previous: Record, fence: Fence, publication: []const u8, now: i6
     next.cancel_requested = false;
     next.updated_ms = now;
     next.reason = "Verified task publication accepted.";
+    next.retry = null;
+    next.wait_condition = null;
     try validate(next);
     return next;
 }
@@ -159,7 +220,20 @@ pub fn resumeRecord(previous: Record, now: i64) !Record {
     next.owner = null;
     next.updated_ms = now;
     next.reason = "";
+    next.retry = null;
+    next.wait_condition = null;
     try validate(next);
+    return next;
+}
+
+/// Recovery advances ownership through the normal queue. It never invokes a
+/// retained tool call and cannot override cancellation or an exhausted budget.
+pub fn recover(previous: Record, limit: usize, now: i64) !Record {
+    try validate(previous);
+    if (previous.cancel_requested or previous.state != .waiting or previous.recoveries >= limit) return error.BackgroundRecoveryUnavailable;
+    var next = try resumeRecord(previous, now);
+    next.recoveries += 1;
+    next.reason = "Recovering retained work; inspect uncertain outcomes before repeating any external action.";
     return next;
 }
 
@@ -169,6 +243,8 @@ pub fn didNotStart(previous: Record, reason: []const u8, now: i64) !Record {
     var next = previous;
     next.state = .waiting;
     next.reason = reason;
+    next.retry = retryFor(reason, previous.recoveries, now);
+    if (next.retry) |*retry| retry.kind = .interrupted;
     next.updated_ms = now;
     try validate(next);
     return next;
@@ -195,7 +271,11 @@ test "background resumption fences old runtimes and retains contract and invocat
     const prepared: Record = .{ .workspace = hash, .task = hash, .operation = hash, .request_sha256 = hash, .dispatcher_session = hash, .contract_version = 2, .contract_sha256 = hash, .updated_ms = 1 };
     const first = try claim(try seal(prepared, hash, 2), hash, "worker-session", 3);
     const old: Fence = .{ .owner = hash, .generation = 1 };
-    const paused = try wait(first, old, "External effect requires reconciliation.", 4);
+    const input = try setWaitCondition(first, old, .input, 4);
+    try std.testing.expectEqual(WaitCondition.input, input.wait_condition.?);
+    try std.testing.expectError(error.StaleBackgroundOwner, setWaitCondition(input, .{ .owner = hash, .generation = 2 }, null, 4));
+    const paused = try wait(input, old, "External effect requires reconciliation.", 4);
+    try std.testing.expect(paused.wait_condition == null);
     const resumed = try claim(try resumeRecord(paused, 5), hash, "worker-session", 6);
     try std.testing.expectEqual(@as(u64, 2), resumed.generation);
     try std.testing.expectEqual(@as(u32, 2), resumed.invocations);
@@ -217,6 +297,18 @@ pub fn reconcilePublished(previous: Record, publication: []const u8, now: i64) !
     next.cancel_requested = false;
     next.updated_ms = now;
     next.reason = "Verified publication reconciled without repeating execution.";
+    next.retry = null;
+    next.wait_condition = null;
+    try validate(next);
+    return next;
+}
+
+pub fn setWaitCondition(previous: Record, fence: Fence, condition: ?WaitCondition, now: i64) !Record {
+    try validate(previous);
+    if (previous.state != .running or !owns(previous, fence)) return error.StaleBackgroundOwner;
+    var next = previous;
+    next.wait_condition = condition;
+    next.updated_ms = now;
     try validate(next);
     return next;
 }
@@ -231,6 +323,25 @@ test "background recovery reconciles an existing publication without another inv
     try std.testing.expectEqual(paused.invocations, reconciled.invocations);
     try std.testing.expectEqual(paused.generation, reconciled.generation);
     try std.testing.expectError(error.InvalidBackgroundTransition, reconcilePublished(paused, "success", 5));
+}
+
+test "automatic recovery preserves the session and cannot override cancellation or its budget" {
+    const hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prepared: Record = .{ .workspace = hash, .task = hash, .operation = hash, .request_sha256 = hash, .dispatcher_session = hash, .contract_version = 1, .contract_sha256 = hash, .updated_ms = 1 };
+    const running = try claim(try seal(prepared, hash, 2), hash, "retained-session", 3);
+    const waiting = try wait(running, .{ .owner = hash, .generation = 1 }, "Interrupted", 4);
+    const recovered = try recover(waiting, 1, 5);
+    try std.testing.expectEqual(State.queued, recovered.state);
+    try std.testing.expectEqualStrings("retained-session", recovered.worker_session.?);
+    try std.testing.expectEqual(@as(u32, 1), recovered.recoveries);
+    const restarted = try claim(recovered, hash, "retained-session", 6);
+    try std.testing.expectEqual(@as(u64, 2), restarted.generation);
+    try std.testing.expectError(error.StaleBackgroundOwner, wait(restarted, .{ .owner = hash, .generation = 1 }, "Late result", 7));
+    const exhausted = try wait(restarted, .{ .owner = hash, .generation = 2 }, "Interrupted again", 7);
+    try std.testing.expectError(error.BackgroundRecoveryUnavailable, recover(exhausted, 1, 8));
+    var cancelled = waiting;
+    cancelled.cancel_requested = true;
+    try std.testing.expectError(error.BackgroundRecoveryUnavailable, recover(cancelled, 3, 8));
 }
 
 test "background startup failures consume their invocation identity before another retry" {

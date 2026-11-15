@@ -214,7 +214,10 @@ pub fn resolveUltrafastProviderOptions(
     effort: types.ReasoningEffort,
     fast_mode: bool,
     ultrafast_mode: bool,
-) error{UltrafastUnavailable}!ResolvedProviderOptions {
+) error{ UltrafastUnavailable, UnsupportedReasoningEffort }!ResolvedProviderOptions {
+    // Explicit configured catalogs are a wire contract, not a preference list.
+    // Unconfigured models retain their previous omission behavior.
+    if (provider == .configured and capabilities.reasoning_efforts.len > 0 and !reasoningEffortSupported(capabilities, effort)) return error.UnsupportedReasoningEffort;
     var options = resolveProviderOptionsForCapabilities(capabilities, effort, fast_mode);
     if (!ultrafast_mode) return options;
     if (provider != .gateway or !std.mem.startsWith(u8, model, "openai/") or !capabilities.supports_ultrafast_mode) {
@@ -394,4 +397,17 @@ test "request controls remain safe across repeated state transitions" {
 test "generic fallback capabilities contain no vendor policy" {
     const fallback = capabilitiesForModel("anthropic/claude-any");
     try std.testing.expect(fallback.context_window == null);
+}
+
+test "configured reasoning selection rejects undeclared effort instead of silently falling back" {
+    const custom = model_provider.parse("custom").?;
+    const allowed = [_]types.ReasoningEffort{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") };
+    const caps: Capabilities = .{ .supports_reasoning = true, .reasoning_efforts = .fromSlice(&allowed) };
+    const selected = try resolveUltrafastProviderOptions(caps, custom, "opaque-model", types.ReasoningEffort.literal("low"), false, false);
+    try std.testing.expectEqualStrings("low", selected.reasoning.?.label());
+    try std.testing.expectError(error.UnsupportedReasoningEffort, resolveUltrafastProviderOptions(caps, custom, "opaque-model", types.ReasoningEffort.literal("minimal"), false, false));
+    const default = try resolveUltrafastProviderOptions(caps, custom, "opaque-model", .auto, false, false);
+    try std.testing.expect(default.reasoning == null);
+    const legacy = try resolveUltrafastProviderOptions(.{}, custom, "opaque-model", types.ReasoningEffort.literal("low"), false, false);
+    try std.testing.expect(legacy.reasoning == null);
 }

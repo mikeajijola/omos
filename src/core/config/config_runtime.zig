@@ -298,14 +298,14 @@ pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_r
 }
 
 pub fn providerEnvOverride() ?[]const u8 {
-    const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
+    const raw = io_mod.getenv("OMOS_PROVIDER") orelse io_mod.getenv("FX_PROVIDER") orelse return null;
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
     return raw;
 }
 
-/// Trimmed FX_MODEL, or null when unset or blank. Borrows process environment storage.
+/// Trimmed OMOS_MODEL or FX_MODEL, or null when unset or blank. Borrows process environment storage.
 pub fn modelEnvOverride() ?[]const u8 {
-    const raw = io_mod.getenv("FX_MODEL") orelse return null;
+    const raw = io_mod.getenv("OMOS_MODEL") orelse io_mod.getenv("FX_MODEL") orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return if (trimmed.len > 0) trimmed else null;
 }
@@ -520,9 +520,11 @@ fn loadMergedSettingsDetailedWithOptionalHome(
         }
     }
 
+    const omos_project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".omos.json" });
+    defer alloc.free(omos_project_path);
     const project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
-    const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
+    const project_text = (readOptionalFile(alloc, omos_project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
         try diagnostics.append(alloc, .{
             .layer = .project,
@@ -533,7 +535,18 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             },
         });
         break :blk null;
-    };
+    }) orelse (readOptionalFile(alloc, project_path) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        try diagnostics.append(alloc, .{
+            .layer = .project,
+            .cause = switch (err) {
+                error.StreamTooLong => .settings_too_large,
+                error.DurablePathUnsafe => .durable_path_unsafe,
+                else => .malformed_settings,
+            },
+        });
+        break :blk null;
+    });
     defer if (project_text) |text| alloc.free(text);
     if (project_text) |text| {
         if (std.json.parseFromSlice(std.json.Value, alloc, text, .{})) |parsed_value| {
@@ -641,7 +654,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             ),
         };
     }
-    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
+    if (io_mod.getenv("OMOS_PROVIDER_ORDER") orelse io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
         switch (parseProviderOrderList(alloc, order_override)) {
             .ok => |maybe_order| {
                 if (maybe_order) |order| {
@@ -655,7 +668,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
         }
     }
-    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
+    if (io_mod.getenv("OMOS_PROVIDER_STRICT") orelse io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
         const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
         if (parseEnvBool(trimmed)) |strict| {
             settings.provider_strict = strict;
@@ -663,7 +676,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
         }
     }
-    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
+    if (io_mod.getenv("OMOS_CONTRACT_REVIEW_MODEL") orelse io_mod.getenv("OMOS_REVIEW_MODEL") orelse io_mod.getenv("FX_CONTRACT_REVIEW_MODEL") orelse io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
         const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
         if (trimmed.len > 0) {
             if (settings_store.validateModel(trimmed)) |_| {
@@ -743,7 +756,7 @@ pub const UltrafastModeEnvError = error{InvalidUltrafastMode};
 /// Reads the process-only paid lane override using the repository's standard
 /// environment-boolean vocabulary. A malformed value cannot widen cost.
 pub fn ultrafastModeEnvOverride() UltrafastModeEnvError!?bool {
-    const raw = io_mod.getenv("FX_ULTRAFAST") orelse return null;
+    const raw = io_mod.getenv("OMOS_ULTRAFAST") orelse io_mod.getenv("FX_ULTRAFAST") orelse return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return parseEnvBool(trimmed) orelse error.InvalidUltrafastMode;
 }
@@ -1292,7 +1305,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSettingsShape;
 
-        try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+        try mergeProjectSettingsFromPaths(&settings, alloc, paths);
 
         var user_settings = try parseSettingsValueForLayer(alloc, parsed.value, .profile, false, true);
         defer user_settings.deinit(alloc);
@@ -1304,7 +1317,7 @@ pub fn loadMergedSettingsFromPaths(alloc: Allocator, paths: Paths) !Settings {
         return settings;
     }
 
-    try mergeSettingsFile(&settings, alloc, paths.workspace_settings);
+    try mergeProjectSettingsFromPaths(&settings, alloc, paths);
     try resolve_provider_selection(&settings);
     return settings;
 }
@@ -1320,6 +1333,24 @@ pub fn loadStartupStatusSettingsFromPaths(alloc: Allocator, paths: Paths) !Start
     };
 }
 
+fn readOptionalProjectFile(alloc: Allocator, paths: Paths) !?[]u8 {
+    if (paths.workspace_root.len > 0) {
+        const omos_path = try std.Io.Dir.path.join(alloc, &.{ paths.workspace_root, ".omos.json" });
+        defer alloc.free(omos_path);
+        if (try readOptionalFile(alloc, omos_path)) |bytes| return bytes;
+    }
+    return readOptionalFile(alloc, paths.workspace_settings);
+}
+
+fn mergeProjectSettingsFromPaths(target: *Settings, alloc: Allocator, paths: Paths) !void {
+    const bytes = (try readOptionalProjectFile(alloc, paths)) orelse return;
+    defer alloc.free(bytes);
+
+    var parsed = try parseSettingsJsonForLayer(alloc, bytes, .project);
+    defer parsed.deinit(alloc);
+    try mergeSettings(target, &parsed, alloc);
+}
+
 fn loadStartupStatusSettingsFromPathsFast(alloc: Allocator, paths: Paths) !StartupStatusSettings {
     var settings = StartupStatusSettings{};
     errdefer settings.deinit(alloc);
@@ -1327,7 +1358,7 @@ fn loadStartupStatusSettingsFromPathsFast(alloc: Allocator, paths: Paths) !Start
     const user_text = try readOptionalUserSettingsFile(alloc, paths);
     defer if (user_text) |owned| alloc.free(owned);
 
-    if (try readOptionalFile(alloc, paths.workspace_settings)) |workspace_text| {
+    if (try readOptionalProjectFile(alloc, paths)) |workspace_text| {
         defer alloc.free(workspace_text);
         var workspace_settings = try parseStartupStatusSettingsJson(alloc, workspace_text, null, .project);
         defer workspace_settings.deinit(alloc);

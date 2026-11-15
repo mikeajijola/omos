@@ -93,13 +93,15 @@ fn planUnderLease(original: workspace.Manager, job: jobs.Job, provider: anytype)
         .cancel_flag = provider.cancel,
         .content_capture_limit = 64 * 1024,
     };
-    const reply = if (revising)
-        try governance.revise(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal())
+    var usage: @import("../shared/types.zig").Usage = .{};
+    const reply_result = if (revising)
+        governance.revise(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal(), .{ .usage_out = &usage })
     else
-        try governance.plan(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal());
-    const reported = job.reported_tokens +| (reply.usage.input_tokens orelse 0) +| (reply.usage.output_tokens orelse 0);
+        governance.plan(manager.alloc, provider.provider, request, provider.provider_id, packet, turn.journal(), .{ .usage_out = &usage });
+    const reported = job.reported_tokens +| (usage.input_tokens orelse 0) +| (usage.output_tokens orelse 0);
     try turn.journal().record("review_usage", try std.json.Stringify.valueAlloc(manager.alloc, .{ .reported_tokens = reported }, .{}));
     if (policy.max_tokens) |limit| if (reported > limit) return error.TaskGovernancePending;
+    const reply = try reply_result;
 
     try manager.validateTaskBasis(task);
     try authorize(manager, task, job.kind);

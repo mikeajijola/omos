@@ -545,7 +545,7 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
     const fallback = configured orelse config_runtime.default_permission_mode;
-    const raw = io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
+    const raw = io_mod.getenv("OMOS_PERMISSION_MODE") orelse io_mod.getenv("FX_PERMISSION_MODE") orelse return fallback;
     return config_runtime.parsePermissionMode(raw) orelse fallback;
 }
 
@@ -553,7 +553,7 @@ fn resolveAgentStepLimit(fallback: usize, configured: ?usize) !usize {
     return agent_steps.resolveMaxAgentStepsWithOverride(
         configured,
         fallback,
-        io_mod.getenv("FX_MAX_AGENT_STEPS"),
+        io_mod.getenv("OMOS_MAX_AGENT_STEPS") orelse io_mod.getenv("FX_MAX_AGENT_STEPS"),
     );
 }
 

@@ -1,4 +1,6 @@
 export const CANONICAL_BUILTIN_NAMES = [
+  "classify",
+  "workspace_content",
   "read_file",
   "glob_files",
   "grep_files",

@@ -104,6 +104,7 @@ const terminal_client_runtime = @import("../terminal/client.zig");
 const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 
 test {
+    _ = tool_mcp_registry;
     _ = tool_admission;
     _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
@@ -871,6 +872,7 @@ fn executeRegisteredTool(
     var mcp_call_status: ?tool_mcp_runtime.CallStatus = null;
     var mcp_execution_error: ?anyerror = null;
     var dispatch_metadata: DispatchMetadata = .{};
+    errdefer if (dispatch_metadata.mcp_retained_output) |output| arena.free(output);
     var subagent_provider = SubagentProviderState{
         .runtime = ctx,
         .call = call,
@@ -1014,6 +1016,7 @@ fn executeRunCommandBackend(
 
 const DispatchMetadata = struct {
     model_content_kind: tool_dispatch.ModelContentKind = .ordinary,
+    mcp_retained_output: ?[]const u8 = null,
     inner_usage: ?types.ToolUsage = null,
     web_search_completion: ?types.WebSearchCompletion = null,
     web_fetch_completion: ?types.WebFetchCompletion = null,
@@ -1023,6 +1026,7 @@ const DispatchMetadata = struct {
 
     fn attach(self: *DispatchMetadata, ctx: *tool_dispatch.DispatchContext) void {
         ctx.model_content_kind_sink = &self.model_content_kind;
+        ctx.mcp_retained_output_sink = &self.mcp_retained_output;
         ctx.inner_usage_sink = &self.inner_usage;
         ctx.web_search_completion_sink = &self.web_search_completion;
         ctx.web_fetch_completion_sink = &self.web_fetch_completion;
@@ -1045,6 +1049,7 @@ fn toolExecutionResultFromDispatch(
         .success => .{
             .model_content_kind = metadata.model_content_kind,
             .model_output = result.body,
+            .mcp_retained_output = metadata.mcp_retained_output,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -1054,7 +1059,9 @@ fn toolExecutionResultFromDispatch(
         },
         .failure => .{
             .status = .failure,
+            .model_content_kind = if (metadata.model_content_kind == .mcp_envelope) .mcp_envelope else .ordinary,
             .model_output = result.body,
+            .mcp_retained_output = metadata.mcp_retained_output,
             .inner_usage = metadata.inner_usage,
             .web_search_completion = metadata.web_search_completion,
             .web_fetch_completion = metadata.web_fetch_completion,
@@ -2228,6 +2235,21 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
     }
     const entry = try dispatch.prepare(manager, task, session_id, call_id);
     const state = if (ctx.permission_state_override) |override| override.* else try ctx.session.snapshotPermissionState(arena);
+    const catalog_skills = if (ctx.skill_locations) |locations| locations.skills else &.{};
+    const assignment = try @import("../workspace/realisation_selection.zig").assignForTask(
+        arena,
+        manager,
+        task,
+        task.project_root,
+        catalog_skills,
+    );
+    try manager.record(task, "realisation_assigned", .{
+        .operation = entry.operation,
+        .capability = assignment.capability,
+        .realisation = assignment.realisation,
+        .ranking = assignment.ranking,
+        .bound_skills = assignment.skill_bindings.len,
+    });
     try control.activate(manager, entry, .{
         .workspace = manager.manifest.id,
         .task = task.id,
@@ -2248,6 +2270,10 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
         .permission_rules = ctx.permission_rules,
         .session_rules = state.rules.items,
         .session_generation = state.next_generation,
+        .capability = assignment.capability,
+        .realisation = assignment.realisation,
+        .skill_bindings = assignment.skill_bindings,
+        .execution_guidance = assignment.guidance,
     });
     try control.ensureHost(manager);
     const previous = try manager.backgroundRecord(task.id);

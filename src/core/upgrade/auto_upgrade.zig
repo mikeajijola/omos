@@ -494,7 +494,7 @@ test "development build paths disable auto upgrade" {
 test "workspace invocations disable upstream auto upgrade" {
     const review = @import("../agent/runtime/completion_review.zig");
     defer review.configureInvocation("fx");
-    for ([_][]const u8{ "omos", "omo", "ui-host" }) |program| {
+    for ([_][]const u8{ "omos", "omo", "fxos", "ui-host" }) |program| {
         review.configureInvocation(program);
         try std.testing.expect(!shouldEnableForCurrentExecutable());
     }

@@ -166,7 +166,7 @@ pub const ToolResult = union(enum) {
     }
 };
 
-pub const ModelContentKind = enum { ordinary, complete_skill };
+pub const ModelContentKind = enum { ordinary, complete_skill, mcp_envelope };
 
 /// Arguments: context, allocator, tool name, the model's call id, arguments
 /// JSON, result limit, and cancel flag.
@@ -333,6 +333,7 @@ pub const DispatchContext = struct {
     web_fetch_completion_sink: ?*?core_types.WebFetchCompletion = null,
     tool_result_memory_sink: ?*?core_types.ToolResultMemory = null,
     model_content_kind_sink: ?*ModelContentKind = null,
+    mcp_retained_output_sink: ?*?[]const u8 = null,
     command_result_json_sink: ?*?[]const u8 = null,
     result_commit_sink: ?*?result_commit.Token = null,
 };
@@ -806,6 +807,7 @@ pub fn admitToolCall(ctx: DispatchContext, registry: Registry, call: message.Too
 /// Owned tool-result message body produced by dispatch.
 pub const DispatchResult = struct {
     model_content_kind: ModelContentKind = .ordinary,
+    mcp_retained_output: ?[]const u8 = null,
     status: Status,
     body: []u8,
     images: []core_types.ToolImage = &.{},
@@ -825,6 +827,7 @@ pub const DispatchResult = struct {
     /// Frees the owned tool-result body and optional diagnostic detail.
     pub fn deinit(self: DispatchResult, alloc: Allocator) void {
         alloc.free(self.body);
+        if (self.mcp_retained_output) |output| alloc.free(output);
         core_types.freeToolImages(alloc, self.images);
         if (self.status_detail) |detail| alloc.free(detail);
         if (self.command_result_json) |json| alloc.free(@constCast(json));
@@ -858,6 +861,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     var captured_web_fetch_completion: ?core_types.WebFetchCompletion = null;
     var captured_tool_result_memory: ?core_types.ToolResultMemory = null;
     var captured_model_content_kind: ModelContentKind = .ordinary;
+    var captured_mcp_retained_output: ?[]const u8 = null;
     var captured_command_result_json: ?[]const u8 = null;
     var call_ctx = ctx;
     if (call_ctx.inner_usage_sink == null) call_ctx.inner_usage_sink = &captured_usage;
@@ -866,6 +870,8 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
     if (call_ctx.tool_result_memory_sink == null) call_ctx.tool_result_memory_sink = &captured_tool_result_memory;
     if (call_ctx.model_content_kind_sink == null) call_ctx.model_content_kind_sink = &captured_model_content_kind;
     call_ctx.model_content_kind_sink.?.* = .ordinary;
+    if (call_ctx.mcp_retained_output_sink == null) call_ctx.mcp_retained_output_sink = &captured_mcp_retained_output;
+    call_ctx.mcp_retained_output_sink.?.* = null;
     if (call_ctx.command_result_json_sink == null) call_ctx.command_result_json_sink = &captured_command_result_json;
 
     const admission = try admitToolCall(call_ctx, registry, call);
@@ -884,11 +890,12 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
             const output = result.intoAuthorized();
             return .{
                 .status = output.status,
-                .model_content_kind = if (output.status == .success)
-                    if (admitted.context.model_content_kind_sink) |kind| kind.* else .ordinary
+                .model_content_kind = if (admitted.context.model_content_kind_sink) |kind|
+                    if (output.status == .success or kind.* == .mcp_envelope) kind.* else .ordinary
                 else
                     .ordinary,
                 .body = output.body,
+                .mcp_retained_output = admitted.context.mcp_retained_output_sink.?.*,
                 .images = output.images,
                 .inner_usage = inner_usage,
                 .web_search_completion = web_search_completion,
