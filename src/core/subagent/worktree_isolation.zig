@@ -41,6 +41,23 @@ pub const Lease = struct {
         })) orelse return noop;
         defer alloc.free(raw_toplevel);
 
+        var real_toplevel: ?[]u8 = io_mod.realpathAlloc(alloc, raw_toplevel) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return noop,
+        };
+        defer if (real_toplevel) |p| alloc.free(p);
+
+        const real_parent = io_mod.realpathAlloc(alloc, parent_workspace_root) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return noop,
+        };
+        defer alloc.free(real_parent);
+
+        const rel_subdir = relativeSubdir(real_toplevel.?, real_parent);
+        if (isInsideZigCache(rel_subdir)) {
+            return noop;
+        }
+
         const raw_common_dir = (try runGitCapture(alloc, parent_workspace_root, &.{
             "rev-parse",
             "--git-common-dir",
@@ -54,18 +71,6 @@ pub const Lease = struct {
             "HEAD",
         })) orelse return noop;
         alloc.free(head_rev);
-
-        var real_toplevel: ?[]u8 = io_mod.realpathAlloc(alloc, raw_toplevel) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return noop,
-        };
-        defer if (real_toplevel) |p| alloc.free(p);
-
-        const real_parent = io_mod.realpathAlloc(alloc, parent_workspace_root) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return noop,
-        };
-        defer alloc.free(real_parent);
 
         const common_dir_abs = if (std.Io.Dir.path.isAbsolute(raw_common_dir))
             try alloc.dupe(u8, raw_common_dir)
@@ -101,7 +106,6 @@ pub const Lease = struct {
         };
         defer if (real_wt_path) |p| alloc.free(p);
 
-        const rel_subdir = relativeSubdir(real_toplevel.?, real_parent);
         var effective_root: ?[]u8 = if (rel_subdir.len > 0) blk: {
             const joined = try std.Io.Dir.path.join(alloc, &.{ real_wt_path.?, rel_subdir });
             errdefer alloc.free(joined);
@@ -167,6 +171,13 @@ pub const Lease = struct {
         self.* = undefined;
     }
 };
+
+fn isInsideZigCache(rel_subdir: []const u8) bool {
+    if (std.mem.eql(u8, rel_subdir, ".zig-cache")) return true;
+    if (rel_subdir.len <= ".zig-cache".len) return false;
+    return std.mem.startsWith(u8, rel_subdir, ".zig-cache") and
+        rel_subdir[".zig-cache".len] == std.Io.Dir.path.sep;
+}
 
 fn relativeSubdir(toplevel: []const u8, parent: []const u8) []const u8 {
     if (std.mem.eql(u8, toplevel, parent)) return "";
@@ -417,4 +428,24 @@ test "worktree_isolation preserves subdirectory offset and falls back on non-git
     defer plain_lease.deinit();
     try std.testing.expect(!plain_lease.isolated);
     try std.testing.expectEqualStrings(non_git_path, plain_lease.workspace_root);
+}
+
+test "worktree_isolation skips enclosing repo when workspace is inside .zig-cache" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(tmp_root);
+
+    var lease = try Lease.acquire(alloc, tmp_root, "child-tmp");
+    defer lease.deinit();
+    try std.testing.expect(!lease.isolated);
+    try std.testing.expectEqualStrings(tmp_root, lease.workspace_root);
+
+    try std.testing.expect(isInsideZigCache(".zig-cache"));
+    try std.testing.expect(isInsideZigCache(".zig-cache/tmp/abc123"));
+    try std.testing.expect(!isInsideZigCache(".zig-cache-other/tmp"));
+    try std.testing.expect(!isInsideZigCache("packages/sub"));
+    try std.testing.expect(!isInsideZigCache(""));
 }

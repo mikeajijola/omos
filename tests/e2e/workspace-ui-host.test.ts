@@ -110,7 +110,8 @@ test('temporary workspace contention does not cancel an active UI conversation',
  const blocker=Bun.spawn(['python3','-u','-c',"import fcntl,sys\nwith open(sys.argv[1],'r+') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n print('locked',flush=True)\n sys.stdin.read()\n",commandLock],{stdin:'pipe',stdout:'pipe',stderr:'pipe'});
  try{
   const reader=blocker.stdout.getReader();let signal='';while(!signal.includes('\n')){const chunk=await reader.read();if(chunk.done)break;signal+=new TextDecoder().decode(chunk.value);}reader.releaseLock();expect(signal).toBe('locked\n');
-  await expect(native.request('initialize',{}, {timeout:60000})).rejects.toThrow('WorkspaceBusy');
+  expect((await native.request('initialize')).workspace).toBeString();
+  await expect(native.request('ui.import_legacy',{content:JSON.stringify({version:'omos.ui-legacy-input/v1',status:'unpublished_input',files:[{path:'.revisions/old.json',content:'Retained local appearance input'}]})},{timeout:60000})).rejects.toThrow('WorkspaceBusy');
  }finally{blocker.stdin.end();await blocker.exited;release();}
  expect((await ending).data.exit_code).toBe(0);
  const result=observed.find(e=>e.data.type==='result');
@@ -726,12 +727,7 @@ test('UI continuation selects the retained contract while its session lease is h
  const goal='Produce the saved result for the UI continuation';
  expect((await f.run(['ask',goal,'--json'])).code).toBe(1);
  const original=JSON.parse((await f.run(['fossil','tasks','--json'])).stdout).tasks[0];
- const server=Bun.serve({hostname:'127.0.0.1',port:0,async fetch(request){
-  const body=await request.json() as any; expect(body.questions.intent).toBeDefined();
-  const labels=Object.keys(body.questions.intent.criteria);
-  return Response.json({model:'fixture-classifier',answers:{intent:{type:'choice',choice:'resume',confidence:0.99,probabilities:Object.fromEntries(labels.map(label=>[label,label==='resume'?0.99:0.01/(labels.length-1)]))}}});
- }});classifiers.push(server);
- const native=host(f,{OMOS_CLASSIFIER_URL:`http://127.0.0.1:${server.port}`,OMOS_CLASSIFIER_MODEL:'fixture-classifier'});
+ const native=host(f,routingClassifier(()=>'work',()=>'resume'));
  const events:any[]=[];native.on('event',(event:any)=>events.push(event));
  const firstEnd=terminal(native,'select-retained');
  await native.request('prompt',{text:goal,coordinator:false},{id:'select-retained'});
