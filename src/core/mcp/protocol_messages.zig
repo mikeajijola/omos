@@ -104,7 +104,7 @@ pub fn writeModernRequestMetadataWithProgress(
 ) !void {
     try writer.writeAll("{\"io.modelcontextprotocol/protocolVersion\":\"");
     try writer.writeAll(modern_protocol_version);
-    try writer.writeAll("\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"fx\",\"version\":");
+    try writer.writeAll("\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"omos\",\"version\":");
     try std.json.Stringify.value(build_options.app_version, .{}, writer);
     try writer.writeAll("},\"io.modelcontextprotocol/clientCapabilities\":{");
     if (capabilities.any()) {
@@ -166,7 +166,7 @@ pub fn buildLegacyInitializeRequest(
     } else if (negotiated_wire == .legacy_mcp_2025_11 and elicitation_capabilities.url) {
         try out.writer.writeAll("\"elicitation\":{\"url\":{}}");
     }
-    try out.writer.writeAll("},\"clientInfo\":{\"name\":\"fx\",\"version\":");
+    try out.writer.writeAll("},\"clientInfo\":{\"name\":\"omos\",\"version\":");
     try std.json.Stringify.value(build_options.app_version, .{}, &out.writer);
     try out.writer.writeAll("}}}");
     return out.toOwnedSlice();

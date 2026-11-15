@@ -307,7 +307,7 @@ pub const Runtime = struct {
         for (r.flags) |*f| f.* = .{};
         for (r.resolved.engine, r.resolved.engine_server) |c, i| r.flags[i].signed_in = c.auth.saved != null;
         try r.engine.init(io, gpa, .{ .context = r, .allow = allow, .log = log }, .{
-            .client = .{ .info = .{ .name = "fx", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
+            .client = .{ .info = .{ .name = "omos", .version = options.client_version }, .capabilities = declaredCapabilities(options.questions) },
         }, r.resolved.engine);
         errdefer r.engine.deinit();
         // The engine has its own copies now.

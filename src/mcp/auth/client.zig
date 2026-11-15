@@ -26,7 +26,7 @@ pub const Options = struct {
     /// The client ID metadata document's URL, used when the
     /// authorization server supports them. None until fx hosts one.
     client_metadata_url: ?[]const u8 = null,
-    client_name: []const u8 = "fx",
+    client_name: []const u8 = "omos",
     flow: core.FlowConfig = .{},
     /// A credential `save` wrote before, which the host kept
     /// securely; its tokens are used again.

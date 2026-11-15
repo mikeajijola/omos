@@ -445,8 +445,8 @@ test "registration, and the client authentication it leads to" {
     defer arena.deinit();
     const a = arena.allocator();
     var out: std.Io.Writer.Allocating = .init(a);
-    try writeRegistration(&out.writer, "fx", "http://127.0.0.1:5000/callback");
-    try testing.expectEqualStrings("{\"client_name\":\"fx\",\"redirect_uris\":[\"http://127.0.0.1:5000/callback\"],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"none\",\"application_type\":\"native\"}", out.written());
+    try writeRegistration(&out.writer, "omos", "http://127.0.0.1:5000/callback");
+    try testing.expectEqualStrings("{\"client_name\":\"omos\",\"redirect_uris\":[\"http://127.0.0.1:5000/callback\"],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"token_endpoint_auth_method\":\"none\",\"application_type\":\"native\"}", out.written());
     const r = try parseRegistration(a, "{\"client_id\":\"c\",\"client_secret\":\"s\",\"token_endpoint_auth_method\":\"client_secret_post\"}");
     try testing.expectEqual(Method.client_secret_post, chooseMethod(r.method, true, "[\"client_secret_basic\"]"));
     try testing.expectEqual(Method.none, chooseMethod(null, false, "[\"client_secret_basic\"]"));
