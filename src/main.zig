@@ -4956,6 +4956,9 @@ test {
     _ = completion_review;
     _ = @import("core/agent/runtime/review_checkpoints.zig");
     _ = @import("core/workspace/fossil_manifest.zig");
+    _ = @import("core/workspace/fossil_sqlite_reader.zig");
+    _ = @import("core/workspace/fossil_workspace.zig");
+    _ = @import("core/workspace/schedule_worker.zig");
     _ = @import("core/workspace/profile_photo.zig");
     _ = @import("core/workspace/declaration_schema.zig");
     _ = @import("core/workspace/workspace_access.zig");

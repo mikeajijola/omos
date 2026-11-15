@@ -34,10 +34,12 @@ pub const Scheduler = struct {
         manager.alloc = arena.allocator();
         if (!try manager.hasDueSchedules() and !try manager.hasDueScheduleSeries()) return;
         if (self.executor.available) |available| if (!available(self.executor.context)) return;
-        const lease = (try manager.tryExecutionLease()) orelse return;
-        defer lease.release();
-        _ = try manager.materializeScheduleSeries(&lease);
-        const schedule = (try manager.claimSchedule(owner)) orelse return;
+        const schedule = blk: {
+            const lease = (try manager.tryExecutionLease()) orelse return;
+            defer lease.release();
+            _ = try manager.materializeScheduleSeries(&lease);
+            break :blk (try manager.claimSchedule(owner)) orelse return;
+        };
         var heartbeat: Heartbeat = .{ .manager = self.manager, .schedule = schedule, .host_stopping = &self.stopping };
         var monitor: ?std.Thread = try std.Thread.spawn(.{}, Heartbeat.loop, .{&heartbeat});
         defer heartbeat.stop(&monitor);
@@ -51,6 +53,16 @@ pub const Scheduler = struct {
             try manager.finishSchedule(schedule, .completed, "The contract already has a verified publication.");
             return;
         }
+        const session_lease = (manager.trySessionExecutionLease(before.session) catch |err| {
+            heartbeat.stop(&monitor);
+            try manager.finishSchedule(schedule, failureState(err), @errorName(err));
+            return;
+        }) orelse {
+            heartbeat.stop(&monitor);
+            try manager.finishSchedule(schedule, failureState(error.WorkspaceExecutionBusy), @errorName(error.WorkspaceExecutionBusy));
+            return;
+        };
+        defer session_lease.release();
         self.executor.run(self.executor.context, manager, schedule, &heartbeat.cancel) catch |err| {
             heartbeat.stop(&monitor);
             try manager.finishSchedule(schedule, failureState(err), @errorName(err));
@@ -249,4 +261,65 @@ test "headless scheduled permission prompts preserve the unresolved approval" {
     try std.testing.expect(!try host.ui.approve("Write the requested report"));
     try std.testing.expect(host.blocked.load(.acquire));
     try std.testing.expect(host.ui.cancel.load(.acquire));
+}
+
+test "scheduler tick releases exclusive workspace lease before executor runs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io.dirRealpathAlloc(alloc, tmp.dir, ".");
+
+    io.setLibcEnviron();
+    var env = std.process.Environ.Map.init(alloc);
+    if (io.getenv("PATH")) |path| try env.put("PATH", path);
+    try env.put("HOME", root);
+    io.setEnvironMap(&env);
+    defer io.setLibcEnviron();
+
+    const repo_path = try alloc.print("{s}/omos.fossil", .{root});
+    const manager = try workspace.Manager.init(alloc, repo_path);
+
+    const task = try manager.start("scheduled-session", root, "Scheduled work", null);
+    _ = try manager.scheduleSnapshot(.{ .action = .add, .task = task.id, .at = "2020-01-01T00:00:00Z" });
+
+    const Context = struct {
+        ran: bool = false,
+        expected_session: []const u8,
+        other_lease_acquired: bool = false,
+        same_session_busy: bool = false,
+        exclusive_busy: bool = false,
+
+        fn run(raw: *anyopaque, exec_manager: workspace.Manager, _: scheduling.Schedule, _: *std.atomic.Value(bool)) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ran = true;
+            if (try exec_manager.trySessionExecutionLease("other-session")) |other_lease| {
+                self.other_lease_acquired = true;
+                other_lease.release();
+            }
+            if ((try exec_manager.trySessionExecutionLease(self.expected_session)) == null) {
+                self.same_session_busy = true;
+            }
+            if ((try exec_manager.tryExecutionLease()) == null) {
+                self.exclusive_busy = true;
+            }
+        }
+    };
+
+    var ctx: Context = .{ .expected_session = task.session };
+    var scheduler: Scheduler = .{
+        .manager = manager,
+        .executor = .{ .context = &ctx, .run = Context.run },
+    };
+    const owner = ownerIdentity();
+    try scheduler.tick(&owner);
+
+    try std.testing.expect(ctx.ran);
+    try std.testing.expect(ctx.other_lease_acquired);
+    try std.testing.expect(ctx.same_session_busy);
+    try std.testing.expect(ctx.exclusive_busy);
+
+    const after_lease = (try manager.tryExecutionLease()) orelse return error.TestUnexpectedResult;
+    after_lease.release();
 }

@@ -16,6 +16,7 @@ const series_session = @import("schedule_series_session.zig");
 const background_contract = @import("background_contract.zig");
 const company_publication = @import("company_publication.zig");
 const fossil_manifest = @import("fossil_manifest.zig");
+const fossil_sqlite_reader = @import("fossil_sqlite_reader.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -595,6 +596,8 @@ pub const Manager = struct {
 
     fn ancestorRevision(self: Manager, head: []const u8, candidate: []const u8) !?[]const u8 {
         if (!immutableRevision(head) or !immutableRevision(candidate)) return error.InvalidFossilRevision;
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
         // Fossil timeline limits the ancestor set before applying its offset, so
         // pagination cannot establish ancestry beyond the first page. Traverse
         // every parent (including merges), returning only the matching identity.
@@ -604,9 +607,13 @@ pub const Manager = struct {
                 "SELECT uuid FROM blob JOIN ancestors USING(rid) WHERE uuid='{s}' OR (length('{s}')=40 AND length(uuid)=64 AND substr(uuid,1,40)='{s}') LIMIT 2;",
             .{ head, head, head, candidate, candidate, candidate },
         );
-        const raw = try self.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", self.repository, query });
-        const rows = try parse(self.alloc, []const struct { uuid: []const u8 }, if (std.mem.trim(u8, raw, " \t\r\n").len == 0) "[]" else raw);
-        return if (rows.len == 1) rows[0].uuid else null;
+        const qr = fossil_sqlite_reader.queryReadOnly(self.alloc, self.repository, query) catch |err| return mapSqliteReaderError(err);
+        defer qr.deinit(self.alloc);
+        if (qr.rows.len != 1 or qr.rows[0].len != 1) return null;
+        return switch (qr.rows[0][0]) {
+            .text => |uuid| try self.alloc.dupe(u8, uuid),
+            else => null,
+        };
     }
 
     pub fn companyContent(self: Manager, path: []const u8) ![]const u8 {
@@ -1847,7 +1854,8 @@ pub const Manager = struct {
             .root = try join(alloc, try join(alloc, try profile(alloc), "fossil"), try hash(alloc, repository)),
             .manifest = undefined,
         };
-        self.manifest = try parse(alloc, Manifest, try self.run(null, &.{ "cat", manifest_path, "-r", "trunk", "-R", repository }));
+        ensureWalMode(alloc, repository);
+        self.manifest = try parse(alloc, Manifest, try self.trunkContent(manifest_path));
         if ((self.manifest.format != 1 and self.manifest.format != 2) or !std.mem.eql(u8, self.manifest.kind, "omos-agent-workspace") or !safeId(self.manifest.id)) return error.InvalidWorkspaceFormat;
         return self;
     }
@@ -1917,6 +1925,9 @@ pub const Manager = struct {
         try repository_file.setPermissions(io_mod.getIo(), .fromMode(0o600));
         // A repository copied to another computer must never automatically sync.
         _ = try self.run(null, &.{ "settings", "autosync", "off", "-R", absolute });
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            fossil_sqlite_reader.enableWalMode(alloc, absolute) catch {};
+        }
         const tree = try self.checkout("trunk");
         try atomicWrite(alloc, try join(alloc, tree, manifest_path), try json(alloc, self.manifest));
         try atomicWrite(alloc, try join(alloc, tree, model.declaration_path), model.initial_declaration);
@@ -1988,23 +1999,33 @@ pub const Manager = struct {
     }
 
     fn fullRevision(self: Manager, cwd: ?[]const u8, selected: []const u8) ![]const u8 {
-        // `info` abbreviates SHA3 identities, and a timeline is ordered by
-        // dates. `whatis` resolves the exact check-in to its canonical hash.
-        const output = if (cwd != null and std.mem.eql(u8, selected, "current"))
-            try self.run(cwd, &.{ "whatis", "--type", "ci", "current" })
-        else
-            try self.run(cwd, &.{ "whatis", "--type", "ci", selected, "-R", self.repository });
-        var lines = std.mem.splitScalar(u8, output, '\n');
-        var result: ?[]const u8 = null;
-        while (lines.next()) |line| {
-            if (!std.mem.startsWith(u8, line, "artifact:")) continue;
-            const value = std.mem.trim(u8, line[9..], " \r\t");
-            if (result != null or !immutableRevision(value)) return error.InvalidFossilRevision;
-            result = value;
+        if (cwd != null and std.mem.eql(u8, selected, "current")) {
+            // `info` abbreviates SHA3 identities, and a timeline is ordered by
+            // dates. `whatis` resolves the exact check-in to its canonical hash.
+            const output = try self.run(cwd, &.{ "whatis", "--type", "ci", "current" });
+            var lines = std.mem.splitScalar(u8, output, '\n');
+            var result: ?[]const u8 = null;
+            while (lines.next()) |line| {
+                if (!std.mem.startsWith(u8, line, "artifact:")) continue;
+                const value = std.mem.trim(u8, line[9..], " \r\t");
+                if (result != null or !immutableRevision(value)) return error.InvalidFossilRevision;
+                result = value;
+            }
+            // Unlike info, whatis can exit successfully when a symbol is absent.
+            // Preserve the manager's existing not-found contract for branch creation.
+            return result orelse error.FossilCommandFailed;
         }
-        // Unlike info, whatis can exit successfully when a symbol is absent.
-        // Preserve the manager's existing not-found contract for branch creation.
-        return result orelse error.FossilCommandFailed;
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
+        const value = fossil_sqlite_reader.fullRevision(self.alloc, self.repository, selected) catch |err| return mapSqliteReaderError(err);
+        if (!immutableRevision(value)) return error.InvalidFossilRevision;
+        return value;
+    }
+
+    fn readAtRevision(self: Manager, path: []const u8, revision_id: []const u8) ![]const u8 {
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
+        return fossil_sqlite_reader.readFileAtRevision(self.alloc, self.repository, revision_id, path) catch |err| return mapSqliteReaderError(err);
     }
 
     pub fn sameRevision(self: Manager, left: []const u8, right: []const u8) !bool {
@@ -2871,7 +2892,7 @@ pub const Manager = struct {
         const revision_id = try self.revision(task.branch);
         for (names) |name| {
             const relative = try self.alloc.print("history/{s}/{s}.json", .{ task.id, name });
-            const bytes = try self.run(null, &.{ "cat", relative, "-r", revision_id, "-R", self.repository });
+            const bytes = try self.readAtRevision(relative, revision_id);
             if (!std.mem.eql(u8, name, try hash(self.alloc, bytes))) return error.WorkspaceVerificationFailed;
             try remove(try join(self.alloc, directory, name));
         }
@@ -2905,7 +2926,7 @@ pub const Manager = struct {
 
     pub fn content(self: Manager, task: Task, path: []const u8) ![]const u8 {
         if (!allowedPath(path)) return error.WorkspacePathDenied;
-        return self.run(null, &.{ "cat", path, "-r", task.branch, "-R", self.repository });
+        return self.readAtRevision(path, task.branch);
     }
 
     pub fn contentAt(self: Manager, path: []const u8, revision_id: []const u8) ![]const u8 {
@@ -2913,7 +2934,7 @@ pub const Manager = struct {
         try self.checkOperation();
         if (self.immutable_reads) |cache| if (cache.get(.content, self.repository, revision_id, path)) |bytes| return self.alloc.dupe(u8, bytes);
         if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .content, self.repository, revision_id, path)) |bytes| return bytes;
-        const bytes = try self.run(null, &.{ "cat", path, "-r", revision_id, "-R", self.repository });
+        const bytes = try self.readAtRevision(path, revision_id);
         if (self.immutable_reads) |cache| try cache.put(.content, self.repository, revision_id, path, bytes);
         if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .content, self.repository, revision_id, path, bytes);
         return bytes;
@@ -3013,7 +3034,7 @@ pub const Manager = struct {
         defer lease.release();
         var current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
         if (current.state == .accepted or current.state == .publication_pending) return bytes;
-        const base = self.run(null, &.{ "cat", path, "-r", current.base_revision, "-R", self.repository }) catch null;
+        const base = self.readAtRevision(path, current.base_revision) catch null;
         const dependency: ReadDependency = .{ .path = path, .base_hash = if (base) |value| try hash(self.alloc, value) else null, .observed_hash = try hash(self.alloc, bytes) };
         var dependencies: std.ArrayList(ReadDependency) = .empty;
         for (current.dependencies) |existing| if (!std.mem.eql(u8, existing.path, path)) try dependencies.append(self.alloc, existing);
@@ -3079,7 +3100,7 @@ pub const Manager = struct {
             if (task.parent_contract_version != parent.definition.version) return error.ParentContractChanged;
         }
         for (task.dependencies) |dependency| {
-            const current = self.run(null, &.{ "cat", dependency.path, "-r", task.parent, "-R", self.repository }) catch null;
+            const current = self.readAtRevision(dependency.path, task.parent) catch null;
             const digest = if (current) |value| try hash(self.alloc, value) else null;
             if (digest) |value| {
                 if (std.mem.eql(u8, value, dependency.observed_hash)) continue;
@@ -3104,7 +3125,7 @@ pub const Manager = struct {
 
     pub fn trunkContent(self: Manager, path: []const u8) ![]const u8 {
         if (!allowedPath(path)) return error.WorkspacePathDenied;
-        return self.run(null, &.{ "cat", path, "-r", "trunk", "-R", self.repository });
+        return self.readAtRevision(path, "trunk");
     }
 
     pub fn taskHistoryPaths(self: Manager, task: Task, revision_id: []const u8) ![]const []const u8 {
@@ -3131,45 +3152,18 @@ pub const Manager = struct {
     }
 
     fn historyBatch(self: Manager, paths: []const []const u8, revision_id: []const u8) ![]const []const u8 {
-        var args: std.ArrayList([]const u8) = .empty;
-        try args.append(self.alloc, "cat");
-        try args.appendSlice(self.alloc, paths);
-        try args.appendSlice(self.alloc, &.{ "-r", revision_id, "-R", self.repository });
-        const bytes = try self.run(null, args.items);
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
+        if (paths.len == 0) return &.{};
+        var db = fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+        defer db.close();
         var records: std.ArrayList([]const u8) = .empty;
-        var record_start: usize = 0;
-        var depth: usize = 0;
-        var quoted = false;
-        var escaped = false;
-        for (bytes, 0..) |byte, i| {
-            if (quoted) {
-                if (escaped) {
-                    escaped = false;
-                } else if (byte == '\\') {
-                    escaped = true;
-                } else if (byte == '"') {
-                    quoted = false;
-                }
-                continue;
-            }
-            if (byte == '"') {
-                quoted = true;
-                continue;
-            }
-            if (byte == '{' or byte == '[') depth += 1;
-            if (byte == '}' or byte == ']') {
-                if (depth == 0) return error.InvalidWorkspaceJournal;
-                depth -= 1;
-                if (depth == 0) {
-                    const entry_bytes = bytes[record_start .. i + 1];
-                    if (records.items.len >= paths.len) return error.InvalidWorkspaceJournal;
-                    try self.checkHistoryHash(paths[records.items.len], entry_bytes);
-                    try records.append(self.alloc, entry_bytes);
-                    record_start = i + 1;
-                }
-            }
+        for (paths) |path| {
+            try self.checkOperation();
+            const entry_bytes = db.readFileAtRevision(self.alloc, revision_id, path) catch |err| return mapSqliteReaderError(err);
+            try self.checkHistoryHash(path, entry_bytes);
+            try records.append(self.alloc, entry_bytes);
         }
-        if (record_start != bytes.len or records.items.len != paths.len) return error.InvalidWorkspaceJournal;
         return records.toOwnedSlice(self.alloc);
     }
 
@@ -4034,30 +4028,24 @@ pub const Manager = struct {
 
     fn verifyBatch(self: Manager, revision_id: []const u8, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
         if (files.len == 0) return;
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
         var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
         defer scratch.deinit();
         var manager = self;
         manager.alloc = scratch.allocator();
-        var arguments: std.ArrayList([]const u8) = .empty;
-        try arguments.append(manager.alloc, "cat");
-        var total: usize = 0;
+        var db = fossil_sqlite_reader.Db.openReadOnly(manager.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+        defer db.close();
         for (files) |file| {
-            try arguments.append(manager.alloc, file.entry.path);
-            total += file.bytes;
-        }
-        try arguments.appendSlice(manager.alloc, &.{ "-r", revision_id, "-R", self.repository });
-        const bytes = try manager.run(null, arguments.items);
-        if (bytes.len != total) return error.WorkspaceVerificationFailed;
-        var offset: usize = 0;
-        for (files) |file| {
-            const content_bytes = bytes[offset .. offset + file.bytes];
+            try manager.checkOperation();
+            const content_bytes = db.readFileAtRevision(manager.alloc, revision_id, file.entry.path) catch |err| return mapSqliteReaderError(err);
+            if (content_bytes.len != file.bytes) return error.WorkspaceVerificationFailed;
             if (verify_objects) try fossil_manifest.verifyObject(file.entry.artifact.?, content_bytes);
             try manager.verifyFile(file.entry.path, content_bytes, declaration);
             if (accepted) |index| {
                 const publication = try parse(manager.alloc, Publication, content_bytes);
                 try index.append(self.alloc, .{ .id = try self.alloc.dupe(u8, publication.task.id), .version = publication.task.definition.version, .source = try self.alloc.dupe(u8, publication.source), .target = try self.alloc.dupe(u8, publication.target) });
             }
-            offset += file.bytes;
         }
     }
 
@@ -4303,7 +4291,7 @@ pub const Manager = struct {
     fn finishPublication(self: Manager, pending_publication: Publication) ![]const u8 {
         var publication = pending_publication;
         const receipt = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
-        const already = self.run(null, &.{ "cat", receipt, "-r", publication.target, "-R", self.repository }) catch null;
+        const already = self.readAtRevision(receipt, publication.target) catch null;
         var accepted_revision: []const u8 = undefined;
         if (already) |bytes| {
             if (!try publicationEqual(self.alloc, bytes, publication)) return error.WorkspaceVerificationFailed;
@@ -4352,7 +4340,7 @@ pub const Manager = struct {
             }
             try atomicWrite(self.alloc, try join(self.alloc, tree, receipt), try json(self.alloc, publication));
             accepted_revision = try self.commit(tree, try self.alloc.print("Accept verified task {s} operation {s}", .{ publication.task.id, publication.operation }));
-            const committed = try self.run(null, &.{ "cat", receipt, "-r", accepted_revision, "-R", self.repository });
+            const committed = try self.readAtRevision(receipt, accepted_revision);
             if (!std.mem.eql(u8, committed, try json(self.alloc, publication))) return error.WorkspaceVerificationFailed;
         }
         if (try self.companyRevision() != null) try @import("company_keys.zig").observe(self);
@@ -4367,7 +4355,7 @@ pub const Manager = struct {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         const publication = try parse(self.alloc, Publication, try read(self.alloc, try self.publicationPath(task.id)));
         const receipt = try self.alloc.print("acceptances/{s}.json", .{publication.operation});
-        const bytes = self.run(null, &.{ "cat", receipt, "-r", publication.target, "-R", self.repository }) catch |err| switch (err) {
+        const bytes = self.readAtRevision(receipt, publication.target) catch |err| switch (err) {
             error.FossilCommandFailed => return false,
             else => return err,
         };
@@ -4552,7 +4540,7 @@ pub const Manager = struct {
         while (lines.next()) |raw| {
             const branch = try fossil_manifest.branchName(raw);
             if (!std.mem.startsWith(u8, branch, "task/") or !safeId(branch[5..])) continue;
-            const bytes = self.run(null, &.{ "cat", try self.taskPath(branch[5..]), "-r", branch, "-R", self.repository }) catch continue;
+            const bytes = self.readAtRevision(try self.taskPath(branch[5..]), branch) catch continue;
             const canonical = try parse(self.alloc, Task, bytes);
             const previous = self.loadTask(canonical.id) catch null;
             if (previous == null or (previous.?.definition.version <= canonical.definition.version and previous.?.state != .publication_pending)) try self.saveTask(canonical);
@@ -4589,7 +4577,7 @@ pub const Manager = struct {
         const marker = try join(self.alloc, self.root, "restore.pending");
         if ((try self.tasks()).len != 0 and exists(try join(self.alloc, self.root, "sessions")) and !exists(marker)) return;
         try atomicWrite(self.alloc, marker, "Rebuild task and session indexes from retained Fossil records.");
-        const bytes = self.run(null, &.{ "cat", "registry.json", "-r", "trunk", "-R", self.repository }) catch {
+        const bytes = self.readAtRevision("registry.json", "trunk") catch {
             try self.rebuildBranches(false);
             try self.restoreSessionBindings();
             try mkdir(try join(self.alloc, self.root, "tasks"));
@@ -5188,7 +5176,150 @@ fn optionalEqual(a: ?[]const u8, b: ?[]const u8) bool {
     return b == null;
 }
 
+fn ensureWalMode(alloc: Allocator, repository: []const u8) void {
+    if (comptime builtin.target.cpu.arch.isWasm()) return;
+    if (fossil_sqlite_reader.queryReadOnly(alloc, repository, "SELECT * FROM pragma_journal_mode;")) |qr| {
+        defer qr.deinit(alloc);
+        if (qr.rows.len == 1 and qr.rows[0].len == 1) {
+            switch (qr.rows[0][0]) {
+                .text => |mode| if (std.ascii.eqlIgnoreCase(mode, "wal")) return,
+                else => {},
+            }
+        }
+    } else |_| {}
+    fossil_sqlite_reader.enableWalMode(alloc, repository) catch {};
+}
+
+fn mapSqliteReaderError(err: anyerror) anyerror {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.SqliteBusy => error.WorkspaceBusy,
+        error.RevisionNotFound,
+        error.InvalidRevision,
+        error.AmbiguousRevision,
+        error.FileNotFoundInRevision,
+        error.MissingArtifact,
+        error.MissingBaselineManifest,
+        error.MissingBlobContent,
+        error.FileNotFound,
+        error.AccessDenied,
+        error.SqliteOpenFailed,
+        error.SqlitePrepareFailed,
+        error.SqliteBindFailed,
+        error.SqliteStepFailed,
+        error.InvalidFossilDatabase,
+        => error.FossilCommandFailed,
+        else => err,
+    };
+}
+
 fn unexpectedEntry(directory: []const u8, name: []const u8) error{UnexpectedWorkspaceEntry} {
     debug_trace.logf("workspace", "Unexpected workspace entry in {s}: {s}", .{ directory, name });
     return error.UnexpectedWorkspaceEntry;
+}
+
+test "fossil_workspace: pure reads bypass command.lock and enable WAL on open" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try join(alloc, root, "repo.fossil");
+    const work_dir = try join(alloc, root, "work");
+    const manager_root = try join(alloc, root, "manager-root");
+    try tmp.dir.createDir(std.testing.io, "work", .default_dir);
+    try tmp.dir.createDir(std.testing.io, "manager-root", .default_dir);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    const prev_environ = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
+
+    const fossil_bin = "/home/coder/.local/bin/fossil";
+    const runFossil = struct {
+        fn call(a: Allocator, cwd: ?[]const u8, argv: []const []const u8) !void {
+            const res = try std.process.run(a, std.testing.io, .{
+                .argv = argv,
+                .cwd = if (cwd) |p| .{ .path = p } else .inherit,
+            });
+            if (res.term != .exited or res.term.exited != 0) return error.FossilCommandFailed;
+        }
+    }.call;
+
+    try runFossil(alloc, root, &.{ fossil_bin, "init", "--admin-user", "omos", repo_path });
+    try runFossil(alloc, work_dir, &.{ fossil_bin, "open", repo_path });
+    try runFossil(alloc, work_dir, &.{ fossil_bin, "user", "default", "omos" });
+
+    const work_sub = try tmp.dir.openDir(std.testing.io, "work", .{});
+    defer work_sub.close(std.testing.io);
+
+    const ws_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const manifest_bytes = try json(alloc, Manifest{ .format = 1, .id = ws_id });
+    try work_sub.writeFile(std.testing.io, .{ .sub_path = "workspace.json", .data = manifest_bytes });
+
+    const task_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const history_body = "{\"kind\":\"task_plan\",\"task\":\"" ++ task_id ++ "\",\"contract_version\":1,\"value\":{}}";
+    const history_hash = try hash(alloc, history_body);
+    const history_rel = try alloc.print("history/{s}/{s}.json", .{ task_id, history_hash });
+    try work_sub.createDirPath(std.testing.io, try alloc.print("history/{s}", .{task_id}));
+    try work_sub.writeFile(std.testing.io, .{ .sub_path = history_rel, .data = history_body });
+
+    try runFossil(alloc, work_dir, &.{ fossil_bin, "add", "workspace.json", history_rel });
+    try runFossil(alloc, work_dir, &.{ fossil_bin, "commit", "-m", "initial" });
+
+    // Manager.open should enable WAL mode and read workspace.json via sqlite reader.
+    var manager = try Manager.open(alloc, repo_path);
+    try std.testing.expectEqualStrings(ws_id, manager.manifest.id);
+    {
+        const qr = try fossil_sqlite_reader.queryReadOnly(alloc, repo_path, "SELECT * FROM pragma_journal_mode;");
+        defer qr.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), qr.rows.len);
+        try std.testing.expect(std.ascii.eqlIgnoreCase(qr.rows[0][0].text, "wal"));
+    }
+
+    const trunk_rev = try manager.revision("trunk");
+    const entries = try manager.fileManifest(trunk_rev);
+    var history_entry: ?fossil_manifest.File = null;
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.path, history_rel)) {
+            history_entry = entry;
+            break;
+        }
+    }
+
+    // Point manager.root at our temp dir and hold command.lock exclusively so any
+    // call routed through Manager.run would block/fail with WorkspaceBusy.
+    manager.root = manager_root;
+    const lock_path = try join(alloc, manager_root, "command.lock");
+    const lock_file = try std.Io.Dir.cwd().createFile(std.testing.io, lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+    defer {
+        lock_file.unlock(std.testing.io);
+        lock_file.close(std.testing.io);
+    }
+    try std.testing.expect(try lock_file.tryLock(std.testing.io, .exclusive));
+
+    // Pure reads succeed while command.lock is held.
+    const got_trunk_rev = try manager.revision("trunk");
+    try std.testing.expectEqualStrings(trunk_rev, got_trunk_rev);
+    try std.testing.expectError(error.FossilCommandFailed, manager.revision("nonexistent-branch"));
+
+    const got_manifest = try manager.trunkContent("workspace.json");
+    try std.testing.expectEqualStrings(manifest_bytes, got_manifest);
+
+    const got_at = try manager.contentAt("workspace.json", trunk_rev);
+    try std.testing.expectEqualStrings(manifest_bytes, got_at);
+    try std.testing.expectError(error.FossilCommandFailed, manager.contentAt("memory/missing.txt", trunk_rev));
+
+    const anc = try manager.ancestorRevision(trunk_rev, trunk_rev);
+    try std.testing.expectEqualStrings(trunk_rev, anc.?);
+
+    const batch = try manager.historyBatch(&.{history_rel}, trunk_rev);
+    try std.testing.expectEqual(@as(usize, 1), batch.len);
+    try std.testing.expectEqualStrings(history_body, batch[0]);
+
+    try manager.verifyBatch(trunk_rev, &.{.{ .entry = history_entry.?, .bytes = history_body.len }}, null, null, false);
 }
