@@ -10,9 +10,12 @@ pub fn run(original: workspace.Manager, port: u16, writable: bool, context: *any
     var live_hosts: @import("company_runtime.zig").LiveHosts = .{};
     var shared_reads: @import("immutable_read_cache.zig").Shared = .{ .cache = .{ .alloc = std.heap.c_allocator } };
     defer shared_reads.deinit();
+    var writer_queue: workspace.WriterQueue = .{};
+    defer writer_queue.deinit();
     var manager = original;
     manager.company_runtime_live = &live_hosts;
     manager.shared_immutable_reads = &shared_reads;
+    manager.writer_queue = &writer_queue;
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     @import("../shared/debug_trace.zig").configureFromEnv(manager.alloc, std.Io.Dir.path.dirname(manager.repository) orelse ".");
     defer @import("../shared/debug_trace.zig").shutdown();
@@ -242,7 +245,7 @@ fn reject(manager: workspace.Manager, request: *std.http.Server.Request, keep_al
     const status: std.http.Status = switch (err) {
         error.CompanySubscriptionsBusy => .too_many_requests,
         error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceMergeConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
         else => .bad_request,
     };
     return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive });

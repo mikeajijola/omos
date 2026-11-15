@@ -24,6 +24,7 @@ const c = struct {
 
     pub const SQLITE_OPEN_READONLY: c_int = 0x00000001;
     pub const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
+    pub const SQLITE_OPEN_CREATE: c_int = 0x00000004;
     pub const SQLITE_OPEN_NOMUTEX: c_int = 0x00008000;
 
     pub const SQLITE_INTEGER: c_int = 1;
@@ -59,6 +60,7 @@ const c = struct {
         destructor: ?*const fn (?*anyopaque) callconv(.c) void,
     ) c_int;
     pub extern "c" fn sqlite3_bind_int64(pStmt: *sqlite3_stmt, idx: c_int, val: i64) c_int;
+    pub extern "c" fn sqlite3_bind_null(pStmt: *sqlite3_stmt, idx: c_int) c_int;
     pub extern "c" fn sqlite3_step(pStmt: *sqlite3_stmt) c_int;
     pub extern "c" fn sqlite3_column_count(pStmt: *sqlite3_stmt) c_int;
     pub extern "c" fn sqlite3_column_name(pStmt: *sqlite3_stmt, N: c_int) ?[*:0]const u8;
@@ -142,6 +144,55 @@ pub const Db = struct {
     pub fn fullRevision(self: *Db, alloc: Allocator, rev_or_branch: []const u8) ![]u8 {
         const resolved = try self.resolveCheckin(alloc, rev_or_branch);
         return resolved.uuid;
+    }
+
+    pub fn tryFullRevision(self: *Db, alloc: Allocator, rev_or_branch: []const u8) !?[]u8 {
+        const resolved = self.resolveCheckin(alloc, rev_or_branch) catch |err| switch (err) {
+            error.RevisionNotFound => return null,
+            else => return err,
+        };
+        return resolved.uuid;
+    }
+
+    pub fn readResolvedManifest(self: *Db, alloc: Allocator, rev_or_branch: []const u8) ![]const fossil_manifest.File {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const checkin_ref = try self.resolveCheckin(arena, rev_or_branch);
+        const manifest_bytes = try self.reconstructRid(arena, checkin_ref.rid);
+        const parsed = try fossil_manifest.parse(arena, manifest_bytes);
+
+        const files = if (parsed.baseline) |baseline_uuid| blk: {
+            const baseline_rid = (try self.findRidByExactUuid(baseline_uuid)) orelse return error.MissingBaselineManifest;
+            const baseline_bytes = try self.reconstructRid(arena, baseline_rid);
+            const baseline_manifest = try fossil_manifest.parse(arena, baseline_bytes);
+            break :blk try fossil_manifest.resolve(arena, baseline_manifest, parsed);
+        } else parsed.files;
+
+        const out = try alloc.alloc(fossil_manifest.File, files.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |f| {
+                alloc.free(f.path);
+                if (f.artifact) |a| alloc.free(a);
+            }
+            alloc.free(out);
+        }
+        for (files, 0..) |f, i| {
+            out[i] = .{
+                .path = try alloc.dupe(u8, f.path),
+                .artifact = if (f.artifact) |a| try alloc.dupe(u8, a) else null,
+                .mode = f.mode,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    pub fn readArtifactByUuid(self: *Db, alloc: Allocator, uuid: []const u8) ![]u8 {
+        const rid = (try self.findRidByUuidOrPrefix40(uuid)) orelse return error.MissingArtifact;
+        return self.reconstructRid(alloc, rid);
     }
 
     /// Reconstruct and return the raw bytes of `file_path` at `rev_or_branch`.
@@ -385,7 +436,7 @@ pub const Db = struct {
         return .{ .rid = rid, .uuid = uuid_copy };
     }
 
-    fn findRidByExactUuid(self: *Db, uuid: []const u8) !?i64 {
+    pub fn findRidByExactUuid(self: *Db, uuid: []const u8) !?i64 {
         const sql: [:0]const u8 = "SELECT rid FROM blob WHERE uuid = ?1 LIMIT 1;";
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
@@ -402,6 +453,30 @@ pub const Db = struct {
         if (rc == c.SQLITE_DONE) return null;
         if (rc != c.SQLITE_ROW) return mapSqliteStepError(rc);
         return c.sqlite3_column_int64(prepared, 0);
+    }
+
+    fn findRidByUuidOrPrefix40(self: *Db, uuid: []const u8) !?i64 {
+        if (try self.findRidByExactUuid(uuid)) |rid| return rid;
+        if (uuid.len != 40) return null;
+        const sql: [:0]const u8 = "SELECT rid FROM blob WHERE length(uuid) = 64 AND substr(uuid, 1, 40) = ?1 LIMIT 2;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, uuid.ptr, @intCast(uuid.len), c.SQLITE_STATIC) != c.SQLITE_OK) {
+            return error.SqliteBindFailed;
+        }
+        const rc1 = c.sqlite3_step(prepared);
+        if (rc1 == c.SQLITE_DONE) return null;
+        if (rc1 != c.SQLITE_ROW) return mapSqliteStepError(rc1);
+        const rid = c.sqlite3_column_int64(prepared, 0);
+        const rc2 = c.sqlite3_step(prepared);
+        if (rc2 == c.SQLITE_ROW) return error.AmbiguousRevision;
+        if (rc2 != c.SQLITE_DONE) return mapSqliteStepError(rc2);
+        return rid;
     }
 
     /// Reconstruct the uncompressed, un-deltified artifact bytes for `rid`.
@@ -712,6 +787,288 @@ fn mapSqliteStepError(rc: c_int) anyerror {
         else => error.SqliteStepFailed,
     };
 }
+
+pub const CompanyViewsIndex = struct {
+    handle: *c.sqlite3,
+
+    pub const ViewRow = struct {
+        filename: []const u8,
+        id: []const u8,
+        actor: []const u8,
+        grant_id: []const u8,
+        task: []const u8,
+        base: []const u8,
+        scope: ?[]const u8 = null,
+        created_at_ms: ?i64 = null,
+    };
+
+    const HeaderEntry = struct {
+        filename: []const u8,
+        id: []const u8,
+        actor: []const u8,
+        grant: []const u8,
+        task: []const u8,
+        base: []const u8,
+        scope: ?[]const u8 = null,
+        created_at_ms: ?i64 = null,
+    };
+
+    const schema_version = "2";
+
+    pub fn open(alloc: Allocator, index_path: []const u8) !CompanyViewsIndex {
+        const path_z = try alloc.dupeSentinel(u8, index_path, 0);
+        defer alloc.free(path_z);
+
+        var db: ?*c.sqlite3 = null;
+        const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_NOMUTEX;
+        const rc = c.sqlite3_open_v2(path_z.ptr, &db, flags, null);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return mapSqliteOpenError(rc);
+        }
+        const handle = db orelse return error.SqliteOpenFailed;
+        errdefer _ = c.sqlite3_close(handle);
+
+        _ = c.sqlite3_busy_timeout(handle, busy_timeout_ms);
+
+        var self: CompanyViewsIndex = .{ .handle = handle };
+        try self.execSql("PRAGMA journal_mode=WAL;");
+        try self.execSql("PRAGMA synchronous=NORMAL;");
+        try self.ensureSchema(alloc);
+        return self;
+    }
+
+    pub fn close(self: *CompanyViewsIndex) void {
+        _ = c.sqlite3_close(self.handle);
+    }
+
+    fn execSql(self: *CompanyViewsIndex, sql: [:0]const u8) !void {
+        const rc = c.sqlite3_exec(self.handle, sql.ptr, null, null, null);
+        if (rc != c.SQLITE_OK) return mapSqliteStepError(rc);
+    }
+
+    fn ensureSchema(self: *CompanyViewsIndex, alloc: Allocator) !void {
+        try self.execSql(
+            "CREATE TABLE IF NOT EXISTS index_meta (" ++
+                "key TEXT PRIMARY KEY, " ++
+                "value TEXT NOT NULL" ++
+                ");",
+        );
+        const current_ver = try self.getMeta(alloc, "schema_version");
+        defer if (current_ver) |v| alloc.free(v);
+        if (current_ver == null or !std.mem.eql(u8, current_ver.?, schema_version)) {
+            try self.beginImmediate();
+            errdefer self.rollback();
+            try self.execSql("DROP TABLE IF EXISTS company_views;");
+            try self.execSql("DELETE FROM index_meta WHERE key = 'company_revision';");
+            try self.execSql(
+                "CREATE TABLE company_views (" ++
+                    "filename TEXT PRIMARY KEY, " ++
+                    "id TEXT NOT NULL, " ++
+                    "actor TEXT NOT NULL, " ++
+                    "grant_id TEXT NOT NULL, " ++
+                    "task TEXT NOT NULL, " ++
+                    "base TEXT NOT NULL, " ++
+                    "scope TEXT, " ++
+                    "created_at_ms INTEGER NOT NULL DEFAULT 0, " ++
+                    "has_created_at_ms INTEGER NOT NULL DEFAULT 1" ++
+                    ");",
+            );
+            try self.execSql(
+                "CREATE INDEX idx_company_views_actor_grant " ++
+                    "ON company_views (actor, grant_id, created_at_ms DESC, filename);",
+            );
+            try self.setMeta("schema_version", schema_version);
+            try self.commit();
+            return;
+        }
+        try self.execSql(
+            "CREATE TABLE IF NOT EXISTS company_views (" ++
+                "filename TEXT PRIMARY KEY, " ++
+                "id TEXT NOT NULL, " ++
+                "actor TEXT NOT NULL, " ++
+                "grant_id TEXT NOT NULL, " ++
+                "task TEXT NOT NULL, " ++
+                "base TEXT NOT NULL, " ++
+                "scope TEXT, " ++
+                "created_at_ms INTEGER NOT NULL DEFAULT 0, " ++
+                "has_created_at_ms INTEGER NOT NULL DEFAULT 1" ++
+                ");",
+        );
+        try self.execSql(
+            "CREATE INDEX IF NOT EXISTS idx_company_views_actor_grant " ++
+                "ON company_views (actor, grant_id, created_at_ms DESC, filename);",
+        );
+    }
+
+    pub fn beginImmediate(self: *CompanyViewsIndex) !void {
+        try self.execSql("BEGIN IMMEDIATE;");
+    }
+
+    pub fn commit(self: *CompanyViewsIndex) !void {
+        try self.execSql("COMMIT;");
+    }
+
+    pub fn rollback(self: *CompanyViewsIndex) void {
+        _ = c.sqlite3_exec(self.handle, "ROLLBACK;", null, null, null);
+    }
+
+    pub fn getMeta(self: *CompanyViewsIndex, alloc: Allocator, key: []const u8) !?[]u8 {
+        const sql: [:0]const u8 = "SELECT value FROM index_meta WHERE key = ?1 LIMIT 1;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, key.ptr, @intCast(key.len), c.SQLITE_STATIC) != c.SQLITE_OK) {
+            return error.SqliteBindFailed;
+        }
+        const rc = c.sqlite3_step(prepared);
+        if (rc == c.SQLITE_DONE) return null;
+        if (rc != c.SQLITE_ROW) return mapSqliteStepError(rc);
+        const ptr = c.sqlite3_column_text(prepared, 0);
+        const len: usize = @intCast(@max(c.sqlite3_column_bytes(prepared, 0), 0));
+        if (ptr == null) return null;
+        return try alloc.dupe(u8, ptr.?[0..len]);
+    }
+
+    pub fn setMeta(self: *CompanyViewsIndex, key: []const u8, value: []const u8) !void {
+        const sql: [:0]const u8 = "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?1, ?2);";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, key.ptr, @intCast(key.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 2, value.ptr, @intCast(value.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        const rc = c.sqlite3_step(prepared);
+        if (rc != c.SQLITE_DONE) return mapSqliteStepError(rc);
+    }
+
+    pub fn clearViews(self: *CompanyViewsIndex) !void {
+        try self.execSql("DELETE FROM company_views;");
+    }
+
+    pub fn deleteView(self: *CompanyViewsIndex, filename: []const u8) !void {
+        const sql: [:0]const u8 = "DELETE FROM company_views WHERE filename = ?1;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, filename.ptr, @intCast(filename.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        const rc = c.sqlite3_step(prepared);
+        if (rc != c.SQLITE_DONE) return mapSqliteStepError(rc);
+    }
+
+    pub fn upsertView(self: *CompanyViewsIndex, row: ViewRow) !void {
+        const sql: [:0]const u8 =
+            "INSERT OR REPLACE INTO company_views " ++
+            "(filename, id, actor, grant_id, task, base, scope, created_at_ms, has_created_at_ms) " ++
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, row.filename.ptr, @intCast(row.filename.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 2, row.id.ptr, @intCast(row.id.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 3, row.actor.ptr, @intCast(row.actor.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 4, row.grant_id.ptr, @intCast(row.grant_id.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 5, row.task.ptr, @intCast(row.task.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 6, row.base.ptr, @intCast(row.base.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (row.scope) |s| {
+            if (c.sqlite3_bind_text(prepared, 7, s.ptr, @intCast(s.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        } else {
+            if (c.sqlite3_bind_null(prepared, 7) != c.SQLITE_OK) return error.SqliteBindFailed;
+        }
+        if (c.sqlite3_bind_int64(prepared, 8, row.created_at_ms orelse 0) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int64(prepared, 9, if (row.created_at_ms != null) 1 else 0) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        const rc = c.sqlite3_step(prepared);
+        if (rc != c.SQLITE_DONE) return mapSqliteStepError(rc);
+    }
+
+    pub fn queryHeadersJson(
+        self: *CompanyViewsIndex,
+        alloc: Allocator,
+        actor: []const u8,
+        grant_id: []const u8,
+        limit: usize,
+        offset: usize,
+    ) ![]u8 {
+        const sql: [:0]const u8 =
+            "SELECT filename, id, actor, grant_id, task, base, scope, created_at_ms, has_created_at_ms " ++
+            "FROM company_views " ++
+            "WHERE actor = ?1 AND grant_id = ?2 " ++
+            "ORDER BY created_at_ms DESC, filename " ++
+            "LIMIT ?3 OFFSET ?4;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.handle, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.SqlitePrepareFailed;
+        }
+        const prepared = stmt orelse return error.SqlitePrepareFailed;
+        defer _ = c.sqlite3_finalize(prepared);
+
+        if (c.sqlite3_bind_text(prepared, 1, actor.ptr, @intCast(actor.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_text(prepared, 2, grant_id.ptr, @intCast(grant_id.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int64(prepared, 3, @intCast(limit)) != c.SQLITE_OK) return error.SqliteBindFailed;
+        if (c.sqlite3_bind_int64(prepared, 4, @intCast(offset)) != c.SQLITE_OK) return error.SqliteBindFailed;
+
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const Outer = struct { entry: []const u8 };
+        var rows: std.ArrayList(Outer) = .empty;
+
+        while (true) {
+            const rc = c.sqlite3_step(prepared);
+            if (rc == c.SQLITE_DONE) break;
+            if (rc != c.SQLITE_ROW) return mapSqliteStepError(rc);
+
+            const filename = try colText(arena, prepared, 0);
+            const id = try colText(arena, prepared, 1);
+            const row_actor = try colText(arena, prepared, 2);
+            const row_grant = try colText(arena, prepared, 3);
+            const task = try colText(arena, prepared, 4);
+            const base = try colText(arena, prepared, 5);
+            const scope: ?[]const u8 = if (c.sqlite3_column_type(prepared, 6) == c.SQLITE_NULL) null else try colText(arena, prepared, 6);
+            const raw_created = c.sqlite3_column_int64(prepared, 7);
+            const has_created = c.sqlite3_column_int64(prepared, 8) != 0;
+
+            const entry_json = try std.json.Stringify.valueAlloc(arena, HeaderEntry{
+                .filename = filename,
+                .id = id,
+                .actor = row_actor,
+                .grant = row_grant,
+                .task = task,
+                .base = base,
+                .scope = scope,
+                .created_at_ms = if (has_created) raw_created else null,
+            }, .{});
+            try rows.append(arena, .{ .entry = entry_json });
+        }
+
+        const out_json = try std.json.Stringify.valueAlloc(arena, rows.items, .{});
+        return try alloc.dupe(u8, out_json);
+    }
+
+    fn colText(alloc: Allocator, stmt: *c.sqlite3_stmt, col: c_int) ![]const u8 {
+        const ptr = c.sqlite3_column_text(stmt, col);
+        const len: usize = @intCast(@max(c.sqlite3_column_bytes(stmt, col), 0));
+        const slice = if (ptr != null and len > 0) ptr.?[0..len] else "";
+        return try alloc.dupe(u8, slice);
+    }
+};
 
 // --- Tests ---
 

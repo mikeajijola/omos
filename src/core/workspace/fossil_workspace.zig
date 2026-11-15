@@ -17,6 +17,8 @@ const background_contract = @import("background_contract.zig");
 const company_publication = @import("company_publication.zig");
 const fossil_manifest = @import("fossil_manifest.zig");
 const fossil_sqlite_reader = @import("fossil_sqlite_reader.zig");
+const bounded_operation = @import("../shared/bounded_operation.zig");
+const three_way_merge = @import("three_way_merge.zig");
 
 const Allocator = std.mem.Allocator;
 const max_bytes = 8 * 1024 * 1024;
@@ -407,26 +409,206 @@ fn exists(path: []const u8) bool {
     return true;
 }
 
+/// In-process FIFO queue for workspace writers. Wakes waiting threads in 0ms
+/// on release while keeping the OS advisory `writer.lock` held across queued
+/// turns and releasing it when the queue drains so external CLI processes stay safe.
+pub const WriterQueue = struct {
+    mutex: std.Io.Mutex = .init,
+    head: ?*Waiter = null,
+    tail: ?*Waiter = null,
+    active_holder: bool = false,
+    os_lock_file: ?std.Io.File = null,
+
+    const Waiter = struct {
+        prev: ?*Waiter = null,
+        next: ?*Waiter = null,
+        cond: std.Io.Condition = .init,
+        granted: bool = false,
+        in_queue: bool = false,
+    };
+
+    pub fn deinit(self: *WriterQueue) void {
+        if (comptime builtin.target.cpu.arch.isWasm()) return;
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        if (self.os_lock_file) |file| {
+            file.unlock(zio);
+            file.close(zio);
+            self.os_lock_file = null;
+        }
+        self.active_holder = false;
+        self.head = null;
+        self.tail = null;
+    }
+
+    pub fn acquire(self: *WriterQueue, alloc: Allocator, root: []const u8, control: ?bounded_operation.Control) !Lease {
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        const zio = io_mod.getIo();
+        try checkQueueControl(zio, control);
+
+        self.mutex.lockUncancelable(zio);
+        if (!self.active_holder and self.head == null) {
+            self.active_holder = true;
+            self.mutex.unlock(zio);
+        } else {
+            var waiter: Waiter = .{ .in_queue = true };
+            self.appendWaiterLocked(&waiter);
+
+            const default_deadline = std.Io.Clock.Timestamp.fromNow(zio, .{ .clock = .awake, .raw = .fromSeconds(30) });
+            const overall_deadline = if (control) |c| c.deadline else default_deadline;
+
+            while (!waiter.granted) {
+                if (control) |c| {
+                    if (c.cancel.load(.seq_cst)) {
+                        self.abortWaiterLocked(&waiter);
+                        self.mutex.unlock(zio);
+                        return error.Cancelled;
+                    }
+                }
+                const now = std.Io.Clock.Timestamp.now(zio, .awake);
+                if (!std.Io.Clock.Timestamp.compare(now, .lt, overall_deadline)) {
+                    self.abortWaiterLocked(&waiter);
+                    self.mutex.unlock(zio);
+                    return error.WorkspaceBusy;
+                }
+
+                const step_timeout: std.Io.Timeout = if (control != null) blk: {
+                    const step = std.Io.Clock.Timestamp{
+                        .clock = .awake,
+                        .raw = now.raw.addDuration(.fromMilliseconds(25)),
+                    };
+                    const target = if (std.Io.Clock.Timestamp.compare(step, .lt, overall_deadline)) step else overall_deadline;
+                    break :blk .{ .deadline = target };
+                } else .{ .deadline = overall_deadline };
+
+                waiter.cond.waitTimeout(zio, &self.mutex, step_timeout) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => {
+                        self.abortWaiterLocked(&waiter);
+                        self.mutex.unlock(zio);
+                        return error.Cancelled;
+                    },
+                };
+            }
+            self.mutex.unlock(zio);
+        }
+
+        if (self.os_lock_file == null) {
+            const os_lease = Lease.acquireControlledForQueue(alloc, root, "writer.lock", control) catch |err| {
+                self.release();
+                return switch (err) {
+                    error.Timeout => error.WorkspaceBusy,
+                    else => err,
+                };
+            };
+            self.os_lock_file = os_lease.file;
+        }
+        return .{ .queue = self };
+    }
+
+    pub fn release(self: *WriterQueue) void {
+        if (comptime builtin.target.cpu.arch.isWasm()) return;
+        const zio = io_mod.getIo();
+        self.mutex.lockUncancelable(zio);
+        defer self.mutex.unlock(zio);
+        self.releaseLocked();
+    }
+
+    fn checkQueueControl(zio: std.Io, control: ?bounded_operation.Control) !void {
+        if (control) |c| {
+            if (c.cancel.load(.seq_cst)) return error.Cancelled;
+            if (!std.Io.Clock.Timestamp.compare(std.Io.Clock.Timestamp.now(zio, .awake), .lt, c.deadline)) return error.WorkspaceBusy;
+        }
+    }
+
+    fn appendWaiterLocked(self: *WriterQueue, waiter: *Waiter) void {
+        waiter.prev = self.tail;
+        waiter.next = null;
+        if (self.tail) |tail| {
+            tail.next = waiter;
+        } else {
+            self.head = waiter;
+        }
+        self.tail = waiter;
+        waiter.in_queue = true;
+    }
+
+    fn removeWaiterLocked(self: *WriterQueue, waiter: *Waiter) void {
+        if (!waiter.in_queue) return;
+        if (waiter.prev) |prev| {
+            prev.next = waiter.next;
+        } else {
+            self.head = waiter.next;
+        }
+        if (waiter.next) |next| {
+            next.prev = waiter.prev;
+        } else {
+            self.tail = waiter.prev;
+        }
+        waiter.prev = null;
+        waiter.next = null;
+        waiter.in_queue = false;
+    }
+
+    fn abortWaiterLocked(self: *WriterQueue, waiter: *Waiter) void {
+        if (waiter.granted) {
+            self.releaseLocked();
+            return;
+        }
+        self.removeWaiterLocked(waiter);
+    }
+
+    fn releaseLocked(self: *WriterQueue) void {
+        const zio = io_mod.getIo();
+        if (self.head) |next_waiter| {
+            self.removeWaiterLocked(next_waiter);
+            next_waiter.granted = true;
+            next_waiter.cond.signal(zio);
+            return;
+        }
+        if (self.os_lock_file) |file| {
+            file.unlock(zio);
+            file.close(zio);
+            self.os_lock_file = null;
+        }
+        self.active_holder = false;
+    }
+};
+
 /// Advisory locks are released by the kernel after a crash. The lock file is
 /// never unlinked, so concurrent openers cannot lock different inodes.
 const Lease = struct {
-    file: std.Io.File,
+    file: ?std.Io.File = null,
+    queue: ?*WriterQueue = null,
     fn acquire(alloc: Allocator, root: []const u8) !Lease {
         return acquireNamed(alloc, root, "writer.lock");
     }
     fn acquireNamed(alloc: Allocator, root: []const u8, name: []const u8) !Lease {
         return acquireControlled(alloc, root, name, null);
     }
-    fn acquireControlled(alloc: Allocator, root: []const u8, name: []const u8, control: ?@import("../shared/bounded_operation.zig").Control) !Lease {
+    fn acquireControlled(alloc: Allocator, root: []const u8, name: []const u8, control: ?bounded_operation.Control) !Lease {
+        return acquireControlledInner(alloc, root, name, control, false);
+    }
+    fn acquireControlledForQueue(alloc: Allocator, root: []const u8, name: []const u8, control: ?bounded_operation.Control) !Lease {
+        return acquireControlledInner(alloc, root, name, control, true);
+    }
+    fn acquireControlledInner(alloc: Allocator, root: []const u8, name: []const u8, control: ?bounded_operation.Control, busy_on_deadline: bool) !Lease {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
-        if (control) |value| try value.check();
+        if (control) |value| value.check() catch |err| {
+            if (busy_on_deadline and err == error.Timeout) return error.WorkspaceBusy;
+            return err;
+        };
         try mkdir(root);
         const path = try join(alloc, root, name);
         const file = try std.Io.Dir.cwd().createFile(io_mod.getIo(), path, .{ .truncate = false, .permissions = .fromMode(0o600) });
         errdefer file.close(io_mod.getIo());
         var attempts: usize = 0;
         while (!try file.tryLock(io_mod.getIo(), .exclusive)) {
-            if (control) |value| try value.check();
+            if (control) |value| value.check() catch |err| {
+                if (busy_on_deadline and err == error.Timeout) return error.WorkspaceBusy;
+                return err;
+            };
             if (attempts >= 3000) return error.WorkspaceBusy;
             attempts += 1;
             if (control != null) try io_mod.getIo().sleep(.fromMilliseconds(10), .awake) else io_mod.sleep(10 * std.time.ns_per_ms);
@@ -434,18 +616,27 @@ const Lease = struct {
         return .{ .file = file };
     }
     fn release(self: Lease) void {
-        self.file.unlock(io_mod.getIo());
-        self.file.close(io_mod.getIo());
+        if (self.queue) |q| {
+            q.release();
+        } else if (self.file) |file| {
+            file.unlock(io_mod.getIo());
+            file.close(io_mod.getIo());
+        }
     }
 };
 
 /// Kernel-owned actor exclusion; released automatically after a process crash.
 pub const ExecutionLease = struct {
-    file: std.Io.File,
+    file: ?std.Io.File = null,
     shared: ?std.Io.File = null,
+    writer_queue: ?*WriterQueue = null,
     pub fn release(self: ExecutionLease) void {
-        self.file.unlock(io_mod.getIo());
-        self.file.close(io_mod.getIo());
+        if (self.writer_queue) |q| {
+            q.release();
+        } else if (self.file) |file| {
+            file.unlock(io_mod.getIo());
+            file.close(io_mod.getIo());
+        }
         if (self.shared) |file| {
             file.unlock(io_mod.getIo());
             file.close(io_mod.getIo());
@@ -486,7 +677,8 @@ pub const Manager = struct {
     shared_immutable_reads: ?*@import("immutable_read_cache.zig").Shared = null,
     task_read_revision: ?struct { branch: []const u8, revision: []const u8 } = null,
     company_runtime_live: ?*@import("company_runtime.zig").LiveHosts = null,
-    operation_control: ?@import("../shared/bounded_operation.zig").Control = null,
+    operation_control: ?bounded_operation.Control = null,
+    writer_queue: ?*WriterQueue = null,
 
     alloc: Allocator,
     repository: []const u8,
@@ -498,6 +690,9 @@ pub const Manager = struct {
     }
 
     fn writerLease(self: Manager) !Lease {
+        if (self.writer_queue) |queue| {
+            return queue.acquire(self.alloc, self.root, self.operation_control);
+        }
         return Lease.acquireControlled(self.alloc, self.root, "writer.lock", self.operation_control);
     }
 
@@ -571,6 +766,26 @@ pub const Manager = struct {
     pub fn companyRevision(self: Manager) !?[]const u8 {
         if (self.company_read_revision) |revision_id| return revision_id;
         if (self.company_revision_cache) |cache| if (cache.valid) return cache.revision;
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            try self.checkOperation();
+            if (fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository)) |opened| {
+                var db = opened;
+                defer db.close();
+                if (db.tryFullRevision(self.alloc, company_branch)) |maybe_rev| {
+                    if (maybe_rev) |rev| {
+                        if (!immutableRevision(rev)) return error.InvalidFossilRevision;
+                        return rev;
+                    }
+                    return null;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                }
+            } else |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {},
+            }
+        }
         const branches = try self.run(null, &.{ "branch", "list", "--all", "-R", self.repository });
         var lines = std.mem.splitScalar(u8, branches, '\n');
         while (lines.next()) |line| if (std.mem.eql(u8, try fossil_manifest.branchName(line), company_branch)) return try self.revision(company_branch);
@@ -714,6 +929,10 @@ pub const Manager = struct {
             cache.revision = try cache.alloc.dupe(u8, mutation.revision);
             cache.valid = true;
         }
+        self.syncCompanyViewsIndexIncremental(current, mutation.revision, files) catch |err| switch (err) {
+            error.OutOfMemory, error.Cancelled, error.Timeout => return err,
+            else => debug_trace.logf("workspace", "company_views_index sync skipped error={s}", .{@errorName(err)}),
+        };
         try @import("company_keys.zig").observe(self);
         for (files) |file| if (std.mem.startsWith(u8, file.path, "company/submissions/")) try fault("company-submission-prepared");
         for (files) |file| if (std.mem.startsWith(u8, file.path, "company/execution/")) try fault("company-execution-committed");
@@ -828,7 +1047,7 @@ pub const Manager = struct {
     /// Recovery holds the source writer boundary until issuer activation ends.
     pub fn snapshotLease(self: Manager) !ExecutionLease {
         const lease = try self.writerLease();
-        return .{ .file = lease.file };
+        return .{ .file = lease.file, .writer_queue = lease.queue };
     }
 
     pub fn repositoryFingerprint(self: Manager) ![]const u8 {
@@ -1797,9 +2016,8 @@ pub const Manager = struct {
                 // concurrent additions. Accept only the exact three-way result,
                 // including every file's bytes and mode, without rewriting it.
                 if (try self.exactMergeResult(tree, previous.base_revision, revision_id)) return;
-                var task = try self.loadTask(previous.id);
-                task.state = .conflict;
-                try self.saveTask(task);
+                const conflicts = self.findMergeConflicts(previous, revision_id, previous.parent) catch &[_]ConflictItem{};
+                try self.markMergeConflict(previous, revision_id, try self.revision(previous.parent), conflicts);
             }
             return err;
         };
@@ -2068,9 +2286,128 @@ pub const Manager = struct {
 
     /// Host-generated, read-only projection. Actor and grant identifiers are
     /// validated before interpolation; no caller can supply SQL or file paths.
+    fn companyViewsIndexPath(self: Manager) ![]const u8 {
+        return join(self.alloc, self.root, "company_views_index.sqlite3");
+    }
+
+    fn parseCompanyViewRow(alloc: Allocator, filename: []const u8, bytes: []const u8) !fossil_sqlite_reader.CompanyViewsIndex.ViewRow {
+        const RawView = struct {
+            id: []const u8,
+            actor: []const u8,
+            grant: []const u8,
+            task: []const u8,
+            base: []const u8,
+            scope: ?[]const u8 = null,
+            created_at_ms: ?i64 = null,
+        };
+        const raw = try std.json.parseFromSliceLeaky(RawView, alloc, bytes, .{ .ignore_unknown_fields = true });
+        return .{
+            .filename = filename,
+            .id = raw.id,
+            .actor = raw.actor,
+            .grant_id = raw.grant,
+            .task = raw.task,
+            .base = raw.base,
+            .scope = raw.scope,
+            .created_at_ms = raw.created_at_ms,
+        };
+    }
+
+    fn isCompanyViewPath(path: []const u8) bool {
+        return std.mem.startsWith(u8, path, "company/views/") and std.mem.endsWith(u8, path, ".json") and std.mem.findScalar(u8, path["company/views/".len..], '/') == null;
+    }
+
+    fn syncCompanyViewsIndexIncremental(self: Manager, expected_before: ?[]const u8, after_revision: []const u8, files: ?[]const CompanyFile) !void {
+        if (comptime builtin.target.cpu.arch.isWasm()) return;
+        try self.checkOperation();
+        try mkdir(self.root);
+        var index = fossil_sqlite_reader.CompanyViewsIndex.open(self.alloc, try self.companyViewsIndexPath()) catch |err| return mapSqliteReaderError(err);
+        defer index.close();
+
+        if (try index.getMeta(self.alloc, "company_revision")) |stored| {
+            if (std.mem.eql(u8, stored, after_revision)) return;
+        }
+
+        index.beginImmediate() catch |err| return mapSqliteReaderError(err);
+        errdefer index.rollback();
+
+        const stored_locked = try index.getMeta(self.alloc, "company_revision");
+        if (stored_locked) |stored| {
+            if (std.mem.eql(u8, stored, after_revision)) {
+                index.commit() catch |err| return mapSqliteReaderError(err);
+                return;
+            }
+        }
+
+        if (files) |changed_files| {
+            if (optionalEqual(stored_locked, expected_before)) {
+                for (changed_files) |file| {
+                    if (!isCompanyViewPath(file.path)) continue;
+                    const row = try parseCompanyViewRow(self.alloc, file.path, file.content);
+                    index.upsertView(row) catch |err| return mapSqliteReaderError(err);
+                }
+                index.setMeta("company_revision", after_revision) catch |err| return mapSqliteReaderError(err);
+                index.commit() catch |err| return mapSqliteReaderError(err);
+                return;
+            }
+        }
+
+        var db = fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+        defer db.close();
+        const after_files = db.readResolvedManifest(self.alloc, after_revision) catch |err| return mapSqliteReaderError(err);
+
+        const before_files: ?[]const fossil_manifest.File = if (stored_locked) |stored|
+            db.readResolvedManifest(self.alloc, stored) catch null
+        else
+            null;
+
+        if (before_files) |prev_files| {
+            const changes = try fossil_manifest.compare(self.alloc, prev_files, after_files);
+            for (changes) |change| {
+                if (!isCompanyViewPath(change.path)) continue;
+                if (change.after) |after_file| {
+                    const artifact_uuid = after_file.artifact orelse return error.InvalidFossilManifest;
+                    const bytes = db.readArtifactByUuid(self.alloc, artifact_uuid) catch |err| return mapSqliteReaderError(err);
+                    try fossil_manifest.verifyObject(artifact_uuid, bytes);
+                    const row = try parseCompanyViewRow(self.alloc, change.path, bytes);
+                    index.upsertView(row) catch |err| return mapSqliteReaderError(err);
+                } else {
+                    index.deleteView(change.path) catch |err| return mapSqliteReaderError(err);
+                }
+            }
+        } else {
+            index.clearViews() catch |err| return mapSqliteReaderError(err);
+            for (after_files) |entry| {
+                if (!isCompanyViewPath(entry.path)) continue;
+                const artifact_uuid = entry.artifact orelse return error.InvalidFossilManifest;
+                const bytes = db.readArtifactByUuid(self.alloc, artifact_uuid) catch |err| return mapSqliteReaderError(err);
+                try fossil_manifest.verifyObject(artifact_uuid, bytes);
+                const row = try parseCompanyViewRow(self.alloc, entry.path, bytes);
+                index.upsertView(row) catch |err| return mapSqliteReaderError(err);
+            }
+        }
+
+        index.setMeta("company_revision", after_revision) catch |err| return mapSqliteReaderError(err);
+        index.commit() catch |err| return mapSqliteReaderError(err);
+    }
+
     pub fn companyViewHeaders(self: Manager, grant: @import("company_authority.zig").Grant, revision_id: []const u8, offset: usize, limit: usize) ![]const u8 {
         const authority = @import("company_authority.zig");
         if (!self.company_operation_held or !authority.safeIdentity(grant.actor) or !authority.safeIdentity(grant.id) or !fossil_manifest.validHash(revision_id) or offset > 1000000 or limit == 0 or limit > 33) return error.InvalidCompanyViewIndex;
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            var live = self;
+            live.company_read_revision = null;
+            live.company_revision_cache = null;
+            if (try live.companyRevision()) |head| {
+                const is_head = std.mem.eql(u8, head, revision_id) or revisionMatches(revision_id, head);
+                if (is_head) {
+                    try self.syncCompanyViewsIndexIncremental(null, head, null);
+                    var index = fossil_sqlite_reader.CompanyViewsIndex.open(self.alloc, try self.companyViewsIndexPath()) catch |err| return mapSqliteReaderError(err);
+                    defer index.close();
+                    return index.queryHeadersJson(self.alloc, grant.actor, grant.id, limit, offset) catch |err| return mapSqliteReaderError(err);
+                }
+            }
+        }
         const query = try self.alloc.print(
             \\SELECT json_object('filename',filename,'id',json_extract(content(uuid),'$.id'),
             \\'actor',json_extract(content(uuid),'$.actor'),'grant',json_extract(content(uuid),'$.grant'),
@@ -3045,6 +3382,238 @@ pub const Manager = struct {
         return bytes;
     }
 
+    pub const ConflictItem = struct {
+        path: []const u8,
+        reason: []const u8,
+        base_hash: ?[]const u8 = null,
+        source_hash: ?[]const u8 = null,
+        target_hash: ?[]const u8 = null,
+    };
+
+    pub const ConflictRecord = struct {
+        version: u32 = 1,
+        task: []const u8,
+        base_revision: []const u8,
+        source_revision: []const u8,
+        target_revision: []const u8,
+        conflicts: []const ConflictItem,
+    };
+
+    const RebaseResolvedFile = struct {
+        path: []const u8,
+        content: []const u8,
+        mode: @FieldType(fossil_manifest.File, "mode"),
+    };
+
+    fn conflictRecordPath(self: Manager, id: []const u8) ![]const u8 {
+        if (!safeId(id)) return error.InvalidTaskId;
+        return join(self.alloc, try join(self.alloc, self.root, "conflicts"), try self.alloc.print("{s}.json", .{id}));
+    }
+
+    pub fn loadConflictRecord(self: Manager, id: []const u8) !?ConflictRecord {
+        const path = try self.conflictRecordPath(id);
+        const bytes = read(self.alloc, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try parse(self.alloc, ConflictRecord, bytes);
+    }
+
+    fn saveConflictRecord(self: Manager, record_value: ConflictRecord) !void {
+        const path = try self.conflictRecordPath(record_value.task);
+        try mkdir(std.Io.Dir.path.dirname(path).?);
+        try atomicWrite(self.alloc, path, try json(self.alloc, record_value));
+    }
+
+    fn clearConflictRecord(self: Manager, id: []const u8) void {
+        const path = self.conflictRecordPath(id) catch return;
+        remove(path) catch {};
+    }
+
+    fn markMergeConflict(self: Manager, task: Task, source_rev: []const u8, target_rev: []const u8, conflicts: []const ConflictItem) !void {
+        if (conflicts.len > 0) {
+            try self.saveConflictRecord(.{
+                .task = task.id,
+                .base_revision = task.base_revision,
+                .source_revision = source_rev,
+                .target_revision = target_rev,
+                .conflicts = conflicts,
+            });
+        }
+        var conflicted = try self.loadTask(task.id);
+        conflicted.state = .conflict;
+        try self.saveTask(conflicted);
+    }
+
+    fn requireMergeable(self: Manager, task: Task, source: []const u8, target: []const u8) !void {
+        const source_rev = try self.revision(source);
+        const target_rev = try self.revision(target);
+        const conflicts = try self.findMergeConflicts(task, source_rev, target_rev);
+        if (conflicts.len == 0) return;
+        try self.markMergeConflict(task, source_rev, target_rev, conflicts);
+        return error.WorkspaceMergeConflict;
+    }
+
+    fn autoMergeablePath(path: []const u8) bool {
+        if (std.mem.startsWith(u8, path, "history/") or std.mem.startsWith(u8, path, "company/reads/")) return false;
+        if (std.mem.startsWith(u8, path, "records/")) return true;
+        return allowedMutablePath(path) and !std.mem.startsWith(u8, path, "artifacts/");
+    }
+
+    fn readBytesForMerge(self: Manager, db: ?*fossil_sqlite_reader.Db, revision_id: []const u8, path: []const u8) ![]const u8 {
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            if (db) |reader_db| {
+                if (reader_db.readFileAtRevision(self.alloc, revision_id, path)) |bytes| {
+                    return bytes;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                }
+            }
+        }
+        return self.contentAt(path, revision_id);
+    }
+
+    fn validateMergedRecord(self: Manager, path: []const u8, bytes: []const u8, declaration: ?model.Declaration) !void {
+        if (declaration) |definition| {
+            if (@import("company_records.zig").identity(path)) |info| {
+                const row = parse(self.alloc, std.json.Value, bytes) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidCompanyRecordJson,
+                };
+                if (!std.mem.eql(u8, model.text(row, "entity"), info.entity) or !std.mem.eql(u8, model.text(row, "id"), info.id)) return error.InvalidEntityRecord;
+                const data = model.field(row, "data") orelse return error.InvalidEntityRecord;
+                try model.validateRecord(definition.semantic, info.entity, data, true);
+                return;
+            }
+        }
+        try self.verifyFile(path, bytes, declaration);
+    }
+
+    fn planRebaseMerges(
+        self: Manager,
+        task: Task,
+        source_rev: []const u8,
+        target_rev: []const u8,
+        conflicts: []const ConflictItem,
+    ) !union(enum) { resolved: []const RebaseResolvedFile, unresolved: []const ConflictItem } {
+        const conflict_record = try self.loadConflictRecord(task.id);
+        var post_conflict_paths = std.StringHashMap(void).init(self.alloc);
+        defer post_conflict_paths.deinit();
+        if (conflict_record) |rec| {
+            if (!try self.sameRevision(source_rev, rec.source_revision)) {
+                for (try self.compareFiles(rec.source_revision, source_rev)) |change| {
+                    if (autoMergeablePath(change.path)) try post_conflict_paths.put(change.path, {});
+                }
+            }
+        }
+
+        var base_map = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer base_map.deinit();
+        for (try self.fileManifest(try self.revision(task.base_revision))) |file| try base_map.put(file.path, file);
+
+        var source_map = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer source_map.deinit();
+        for (try self.fileManifest(source_rev)) |file| try source_map.put(file.path, file);
+
+        var target_map = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer target_map.deinit();
+        for (try self.fileManifest(target_rev)) |file| try target_map.put(file.path, file);
+
+        var conflict_target_map = std.StringHashMap(fossil_manifest.File).init(self.alloc);
+        defer conflict_target_map.deinit();
+        if (conflict_record) |rec| {
+            for (try self.fileManifest(try self.revision(rec.target_revision))) |file| try conflict_target_map.put(file.path, file);
+        }
+
+        var db: ?fossil_sqlite_reader.Db = if (comptime !builtin.target.cpu.arch.isWasm())
+            fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository) catch null
+        else
+            null;
+        defer if (db) |*d| d.close();
+
+        const declaration: ?model.Declaration = if (task.model_basis) |basis| try self.loadDeclaration(basis.revision) else null;
+
+        var resolved_list: std.ArrayList(RebaseResolvedFile) = .empty;
+        var unresolved_list: std.ArrayList(ConflictItem) = .empty;
+
+        for (conflicts) |item| {
+            if (!autoMergeablePath(item.path)) {
+                try unresolved_list.append(self.alloc, item);
+                continue;
+            }
+            const source_file = source_map.get(item.path);
+            const target_file = target_map.get(item.path);
+            if (source_file == null or target_file == null) {
+                try unresolved_list.append(self.alloc, item);
+                continue;
+            }
+            if (source_file.?.mode == .symlink or target_file.?.mode == .symlink or source_file.?.mode != target_file.?.mode) {
+                try unresolved_list.append(self.alloc, item);
+                continue;
+            }
+
+            const post_resolved = post_conflict_paths.contains(item.path);
+            const effective_base_rev = if (post_resolved) conflict_record.?.target_revision else task.base_revision;
+            const effective_base_present = if (post_resolved) conflict_target_map.contains(item.path) else base_map.contains(item.path);
+
+            const base_bytes: []const u8 = if (effective_base_present)
+                try self.readBytesForMerge(if (db) |*d| d else null, effective_base_rev, item.path)
+            else
+                "";
+            const source_bytes = try self.readBytesForMerge(if (db) |*d| d else null, source_rev, item.path);
+            const target_bytes = try self.readBytesForMerge(if (db) |*d| d else null, target_rev, item.path);
+
+            const merge_outcome = try three_way_merge.mergeUtf8(self.alloc, base_bytes, source_bytes, target_bytes);
+            switch (merge_outcome) {
+                .merged => |merged_bytes| {
+                    if (merged_bytes.len > max_bytes) {
+                        try unresolved_list.append(self.alloc, .{
+                            .path = item.path,
+                            .reason = "merged_too_large",
+                            .base_hash = item.base_hash,
+                            .source_hash = item.source_hash,
+                            .target_hash = item.target_hash,
+                        });
+                        continue;
+                    }
+                    self.validateMergedRecord(item.path, merged_bytes, declaration) catch |err| switch (err) {
+                        error.OutOfMemory, error.Cancelled, error.Timeout => return err,
+                        else => {
+                            try unresolved_list.append(self.alloc, .{
+                                .path = item.path,
+                                .reason = "validation_failed",
+                                .base_hash = item.base_hash,
+                                .source_hash = item.source_hash,
+                                .target_hash = item.target_hash,
+                            });
+                            continue;
+                        },
+                    };
+                    try resolved_list.append(self.alloc, .{
+                        .path = item.path,
+                        .content = merged_bytes,
+                        .mode = target_file.?.mode,
+                    });
+                },
+                .conflict => |reason| {
+                    try unresolved_list.append(self.alloc, .{
+                        .path = item.path,
+                        .reason = reason,
+                        .base_hash = item.base_hash,
+                        .source_hash = item.source_hash,
+                        .target_hash = item.target_hash,
+                    });
+                },
+            }
+        }
+
+        if (unresolved_list.items.len > 0) {
+            return .{ .unresolved = try unresolved_list.toOwnedSlice(self.alloc) };
+        }
+        return .{ .resolved = try resolved_list.toOwnedSlice(self.alloc) };
+    }
+
     pub fn refresh(self: Manager, previous: Task) !Task {
         const lease = try self.writerLease();
         defer lease.release();
@@ -3052,10 +3621,84 @@ pub const Manager = struct {
         if (task.state == .publication_pending or task.state == .accepted) return error.TaskIsReadOnly;
         const parent_revision = try self.revision(task.parent);
         try @import("company_reads.zig").validate(self, task, task.company_reads, parent_revision);
-        if (try self.sameRevision(parent_revision, task.base_revision)) return task;
-        try self.ensureMergeable(task, try self.revision(task.branch), parent_revision);
+        if (try self.sameRevision(parent_revision, task.base_revision)) {
+            if (task.state == .conflict) {
+                task.state = .active;
+                try self.saveTask(task);
+                self.clearConflictRecord(task.id);
+            }
+            return task;
+        }
+        const source_revision = try self.revision(task.branch);
+        const conflicts = try self.findMergeConflicts(task, source_revision, parent_revision);
+        if (conflicts.len == 0) {
+            const tree = try self.checkout(task.branch);
+            try self.merge(tree, parent_revision, task);
+            if (task.parent_task_id) |id| {
+                const parent = try self.loadTask(id);
+                if (task.parent_contract_version != parent.definition.version) {
+                    const amendments = try self.alloc.alloc([]const u8, task.amendments.len + 1);
+                    @memcpy(amendments[0..task.amendments.len], task.amendments);
+                    amendments[task.amendments.len] = try self.alloc.print("Parent work contract changed. Reassess the delegated work against this authenticated parent task context: {s}", .{try json(self.alloc, .{ .contract = parent.definition, .amendments = parent.amendments })});
+                    task.amendments = amendments;
+                    task.definition.version = std.math.add(u32, task.definition.version, 1) catch return error.StaleWorkContract;
+                    task.revision_pending = task.model_basis != null;
+                    task.review_job = null;
+                    task.parent_contract_version = parent.definition.version;
+                }
+            }
+            task.base_revision = parent_revision;
+            task.dependencies = &.{};
+            if (task.state == .conflict) task.state = .active;
+            try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
+            _ = try self.commit(tree, "Refresh task workspace dependencies");
+            try self.saveTask(task);
+            self.clearConflictRecord(task.id);
+            if (task.authority != null) try fault("company-submission-refreshed");
+            return task;
+        }
+
+        const plan = try self.planRebaseMerges(task, source_revision, parent_revision, conflicts);
+        const resolved_files = switch (plan) {
+            .unresolved => |unresolved| {
+                try self.markMergeConflict(task, source_revision, parent_revision, unresolved);
+                return error.WorkspaceMergeConflict;
+            },
+            .resolved => |files| files,
+        };
+
+        var resolved_map = std.StringHashMap(RebaseResolvedFile).init(self.alloc);
+        defer resolved_map.deinit();
+        for (resolved_files) |file| try resolved_map.put(file.path, file);
+
+        var db: ?fossil_sqlite_reader.Db = if (comptime !builtin.target.cpu.arch.isWasm())
+            fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository) catch null
+        else
+            null;
+        defer if (db) |*d| d.close();
+
         const tree = try self.checkout(task.branch);
-        try self.merge(tree, parent_revision, task);
+        const own_task_path = try self.taskPath(task.id);
+        for (try self.compareFiles(task.base_revision, parent_revision)) |change| {
+            if (std.mem.eql(u8, change.path, own_task_path)) continue;
+            if (resolved_map.get(change.path)) |merged_file| {
+                var parent = try contentParent(self.alloc, tree, merged_file.path);
+                defer parent.close(io_mod.getIo());
+                try atomicWriteAtMode(self.alloc, parent, std.Io.Dir.path.basename(merged_file.path), merged_file.content, max_bytes, merged_file.mode == .executable);
+                continue;
+            }
+            if (!allowedPath(change.path) and !std.mem.eql(u8, change.path, "registry.json")) return error.WorkspacePathDenied;
+            if (change.after) |after_file| {
+                if (after_file.mode == .symlink) return error.WorkspaceSymlinkDenied;
+                const bytes = try self.readBytesForMerge(if (db) |*d| d else null, parent_revision, change.path);
+                var parent = try contentParent(self.alloc, tree, change.path);
+                defer parent.close(io_mod.getIo());
+                try atomicWriteAtMode(self.alloc, parent, std.Io.Dir.path.basename(change.path), bytes, max_bytes, after_file.mode == .executable);
+            } else {
+                try remove(try join(self.alloc, tree, change.path));
+            }
+        }
+
         if (task.parent_task_id) |id| {
             const parent = try self.loadTask(id);
             if (task.parent_contract_version != parent.definition.version) {
@@ -3069,28 +3712,44 @@ pub const Manager = struct {
                 task.parent_contract_version = parent.definition.version;
             }
         }
+
         task.base_revision = parent_revision;
         task.dependencies = &.{};
-        try atomicWrite(self.alloc, try join(self.alloc, tree, try self.taskPath(task.id)), try json(self.alloc, task));
-        _ = try self.commit(tree, "Refresh task workspace dependencies");
+        if (task.state == .conflict) task.state = .active;
+        try atomicWrite(self.alloc, try join(self.alloc, tree, own_task_path), try json(self.alloc, task));
+        const rebased_rev = try self.commit(tree, "Auto-rebase task workspace onto updated parent");
+        try @import("company_reads.zig").validate(self, task, task.company_reads, parent_revision);
+        if ((try self.findMergeConflicts(task, rebased_rev, parent_revision)).len != 0) return error.WorkspaceVerificationFailed;
         try self.saveTask(task);
+        self.clearConflictRecord(task.id);
         if (task.authority != null) try fault("company-submission-refreshed");
         return task;
     }
 
-    fn ensureMergeable(self: Manager, task: Task, source: []const u8, target: []const u8) !void {
+    pub fn findMergeConflicts(self: Manager, task: Task, source: []const u8, target: []const u8) ![]const ConflictItem {
         var target_files = std.StringHashMap(fossil_manifest.File).init(self.alloc);
         defer target_files.deinit();
         for (try self.fileManifest(try self.revision(target))) |file| try target_files.put(file.path, file);
+        var conflicts: std.ArrayList(ConflictItem) = .empty;
         for (try self.compareFiles(task.base_revision, source)) |change| {
             if (!allowedPath(change.path) and !std.mem.eql(u8, change.path, "registry.json")) return error.WorkspacePathDenied;
             const target_file = target_files.get(change.path);
             if (sameFile(change.after, target_file) or sameFile(change.before, target_file)) continue;
-            var conflicted = try self.loadTask(task.id);
-            conflicted.state = .conflict;
-            try self.saveTask(conflicted);
-            return error.WorkspaceMergeConflict;
+            const reason: []const u8 = if (change.after == null or target_file == null)
+                "delete_modify_conflict"
+            else if (change.after.?.mode != target_file.?.mode)
+                "mode_conflict"
+            else
+                "content_conflict";
+            try conflicts.append(self.alloc, .{
+                .path = change.path,
+                .reason = reason,
+                .base_hash = if (change.before) |f| f.artifact else null,
+                .source_hash = if (change.after) |f| f.artifact else null,
+                .target_hash = if (target_file) |f| f.artifact else null,
+            });
         }
+        return conflicts.toOwnedSlice(self.alloc);
     }
 
     fn validateDependencies(self: Manager, task: Task) !void {
@@ -3111,16 +3770,27 @@ pub const Manager = struct {
     }
 
     /// An explicit host resume may retry retained work once its conflicting
-    /// files and read dependencies agree with the current parent again.
+    /// files and read dependencies agree with the current parent again, or once
+    /// post-conflict edits / three-way auto-merge can reconcile against parent.
     pub fn reconcileConflict(self: Manager, previous: Task) !void {
         const lease = try self.writerLease();
         defer lease.release();
         var task = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
         if (task.state != .conflict) return;
-        try self.ensureMergeable(task, try self.currentRevision(task), try self.revision(task.parent));
+        const source_rev = try self.currentRevision(task);
+        const parent_rev = try self.revision(task.parent);
+        const conflicts = try self.findMergeConflicts(task, source_rev, parent_rev);
+        if (conflicts.len > 0) {
+            const plan = try self.planRebaseMerges(task, source_rev, parent_rev, conflicts);
+            switch (plan) {
+                .unresolved => return error.WorkspaceMergeConflict,
+                .resolved => {},
+            }
+        }
         try self.validateDependencies(task);
         task.state = .active;
         try self.saveTask(task);
+        if (conflicts.len == 0) self.clearConflictRecord(task.id);
     }
 
     pub fn trunkContent(self: Manager, path: []const u8) ![]const u8 {
@@ -3927,7 +4597,33 @@ pub const Manager = struct {
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
         if (self.immutable_reads) |cache| if (cache.get(.artifact, self.repository, identity, "")) |bytes| return self.alloc.dupe(u8, bytes);
         if (self.shared_immutable_reads) |cache| if (try cache.get(io_mod.getIo(), self.alloc, .artifact, self.repository, identity, "")) |bytes| return bytes;
-        const bytes = try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        const bytes = blk: {
+            if (comptime !builtin.target.cpu.arch.isWasm()) {
+                if (fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository)) |opened| {
+                    var db = opened;
+                    defer db.close();
+                    if (try db.findRidByExactUuid(identity)) |rid| {
+                        if (db.reconstructRid(self.alloc, rid)) |reconstructed| {
+                            break :blk reconstructed;
+                        } else |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => {},
+                        }
+                    } else if (identity.len == 40) {
+                        if (db.readArtifactByUuid(self.alloc, identity)) |reconstructed| {
+                            break :blk reconstructed;
+                        } else |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => {},
+                        }
+                    }
+                } else |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                }
+            }
+            break :blk try self.run(null, &.{ "artifact", identity, "-R", self.repository });
+        };
         if (self.immutable_reads) |cache| try cache.put(.artifact, self.repository, identity, "", bytes);
         if (self.shared_immutable_reads) |cache| try cache.put(io_mod.getIo(), .artifact, self.repository, identity, "", bytes);
         return bytes;
@@ -4193,7 +4889,7 @@ pub const Manager = struct {
         if (!try self.sameRevision(review.revision, try self.revision(task.branch))) return error.WorkspaceRevisionChanged;
         if ((try self.entries(try self.journalDir(task))).len != 0) return error.WorkspacePendingEvidence;
         if (try self.uiChanged(latest.base_revision, review.revision) and !try self.hasUiReceipt(latest, review.revision)) return error.UiValidationRequired;
-        try self.ensureMergeable(latest, review.revision, try self.revision(task.parent));
+        try self.requireMergeable(latest, review.revision, try self.revision(task.parent));
         try self.validateDependencies(latest);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, review.revision, review.contract_version, task.parent }));
         const runtime_activation = try @import("capability_runtime.zig").activation(self, latest, review.revision, try self.revision(task.parent));
@@ -4309,7 +5005,7 @@ pub const Manager = struct {
             // The lease protects this manager's writers; Fossil's no-fork commit
             // also fences external processes that advance the target branch.
             _ = try self.run(tree, &.{ "update", "--nosync", publication.target });
-            try self.ensureMergeable(publication.task, publication.source, try self.revision(publication.target));
+            try self.requireMergeable(publication.task, publication.source, try self.revision(publication.target));
             try self.validateDependencies(publication.task);
             if (publication.task.authority != null and publication.version >= 2) {
                 const authority_revision = (try self.companyRevision()) orelse return error.CompanyNotInitialized;
@@ -5322,4 +6018,386 @@ test "fossil_workspace: pure reads bypass command.lock and enable WAL on open" {
     try std.testing.expectEqualStrings(history_body, batch[0]);
 
     try manager.verifyBatch(trunk_rev, &.{.{ .entry = history_entry.?, .bytes = history_body.len }}, null, null, false);
+}
+
+test "fossil_workspace: WriterQueue enforces FIFO ordering, cancellation, deadline, and OS writer.lock drain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+
+    var queue: WriterQueue = .{};
+    defer queue.deinit();
+
+    // Acquire initial lease on main thread; OS writer.lock must be held.
+    const first = try queue.acquire(alloc, root, null);
+    const lock_path = try join(alloc, root, "writer.lock");
+    {
+        const probe = try std.Io.Dir.cwd().createFile(std.testing.io, lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        defer probe.close(std.testing.io);
+        try std.testing.expect(!try probe.tryLock(std.testing.io, .exclusive));
+    }
+
+    const FifoState = struct {
+        mutex: std.Io.Mutex = .init,
+        order: [4]usize = undefined,
+        count: usize = 0,
+        errors: usize = 0,
+    };
+    var fifo_state: FifoState = .{};
+
+    const FifoWorker = struct {
+        queue: *WriterQueue,
+        alloc: Allocator,
+        root: []const u8,
+        id: usize,
+        state: *FifoState,
+
+        fn run(self: *@This()) void {
+            const lease = self.queue.acquire(self.alloc, self.root, null) catch {
+                self.state.mutex.lockUncancelable(io_mod.getIo());
+                self.state.errors += 1;
+                self.state.mutex.unlock(io_mod.getIo());
+                return;
+            };
+            defer lease.release();
+
+            self.state.mutex.lockUncancelable(io_mod.getIo());
+            self.state.order[self.state.count] = self.id;
+            self.state.count += 1;
+            self.state.mutex.unlock(io_mod.getIo());
+        }
+    };
+
+    var workers: [4]FifoWorker = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (0..4) |i| {
+        workers[i] = .{ .queue = &queue, .alloc = alloc, .root = root, .id = i, .state = &fifo_state };
+        threads[i] = try std.Thread.spawn(.{}, FifoWorker.run, .{&workers[i]});
+        // Wait until this waiter is queued at the tail before spawning the next so enqueue order is deterministic.
+        while (true) {
+            queue.mutex.lockUncancelable(io_mod.getIo());
+            var queued_count: usize = 0;
+            var cur = queue.head;
+            while (cur) |w| : (cur = w.next) queued_count += 1;
+            queue.mutex.unlock(io_mod.getIo());
+            if (queued_count >= i + 1) break;
+            io_mod.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    // Release head; all 4 waiters run in strict FIFO order and drain the OS lock.
+    first.release();
+    for (&threads) |*t| t.join();
+    try std.testing.expectEqual(@as(usize, 0), fifo_state.errors);
+    try std.testing.expectEqual(@as(usize, 4), fifo_state.count);
+    for (0..4) |i| try std.testing.expectEqual(i, fifo_state.order[i]);
+
+    // After queue drains, OS writer.lock must be unlocked.
+    {
+        const probe = try std.Io.Dir.cwd().createFile(std.testing.io, lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+        defer probe.close(std.testing.io);
+        try std.testing.expect(try probe.tryLock(std.testing.io, .exclusive));
+        probe.unlock(std.testing.io);
+    }
+
+    // Now test cancellation and deadline handling with a trailing non-cancelled waiter.
+    const held = try queue.acquire(alloc, root, null);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var cancel_result: anyerror!void = {};
+    var deadline_result: anyerror!void = {};
+    var trailing_ok = std.atomic.Value(bool).init(false);
+
+    const CancelCtx = struct {
+        queue: *WriterQueue,
+        alloc: Allocator,
+        root: []const u8,
+        cancel: *std.atomic.Value(bool),
+        result: *anyerror!void,
+        fn run(self: *@This()) void {
+            const control: bounded_operation.Control = .{
+                .cancel = self.cancel,
+                .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromSeconds(10) }),
+            };
+            if (self.queue.acquire(self.alloc, self.root, control)) |lease| {
+                lease.release();
+            } else |err| {
+                self.result.* = err;
+            }
+        }
+    };
+    const DeadlineCtx = struct {
+        queue: *WriterQueue,
+        alloc: Allocator,
+        root: []const u8,
+        result: *anyerror!void,
+        fn run(self: *@This()) void {
+            var never_cancel = std.atomic.Value(bool).init(false);
+            const control: bounded_operation.Control = .{
+                .cancel = &never_cancel,
+                .deadline = .fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(30) }),
+            };
+            if (self.queue.acquire(self.alloc, self.root, control)) |lease| {
+                lease.release();
+            } else |err| {
+                self.result.* = err;
+            }
+        }
+    };
+    const TrailingCtx = struct {
+        queue: *WriterQueue,
+        alloc: Allocator,
+        root: []const u8,
+        ok: *std.atomic.Value(bool),
+        fn run(self: *@This()) void {
+            if (self.queue.acquire(self.alloc, self.root, null)) |lease| {
+                lease.release();
+                self.ok.store(true, .release);
+            } else |_| {}
+        }
+    };
+
+    var c_ctx: CancelCtx = .{ .queue = &queue, .alloc = alloc, .root = root, .cancel = &cancel_flag, .result = &cancel_result };
+    var d_ctx: DeadlineCtx = .{ .queue = &queue, .alloc = alloc, .root = root, .result = &deadline_result };
+    var t_ctx: TrailingCtx = .{ .queue = &queue, .alloc = alloc, .root = root, .ok = &trailing_ok };
+
+    const c_thread = try std.Thread.spawn(.{}, CancelCtx.run, .{&c_ctx});
+    const d_thread = try std.Thread.spawn(.{}, DeadlineCtx.run, .{&d_ctx});
+    io_mod.sleep(10 * std.time.ns_per_ms);
+    const t_thread = try std.Thread.spawn(.{}, TrailingCtx.run, .{&t_ctx});
+
+    io_mod.sleep(15 * std.time.ns_per_ms);
+    cancel_flag.store(true, .seq_cst);
+    c_thread.join();
+    d_thread.join();
+
+    try std.testing.expectError(error.Cancelled, cancel_result);
+    try std.testing.expectError(error.WorkspaceBusy, deadline_result);
+
+    held.release();
+    t_thread.join();
+    try std.testing.expect(trailing_ok.load(.acquire));
+}
+
+test "fossil_workspace: companyViewHeaders sidecar index parity, pagination, cold catch-up, and immutableArtifact SQLite parity while command.lock held" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try join(alloc, root, "repo.fossil");
+
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    const prev_environ = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
+
+    var writer_queue: WriterQueue = .{};
+    defer writer_queue.deinit();
+
+    var manager = try Manager.init(alloc, repo_path);
+    manager.writer_queue = &writer_queue;
+    manager.company_operation_held = true;
+
+    const authority = @import("company_authority.zig");
+    const kp = std.crypto.sign.Ed25519.KeyPair.generate(std.testing.io);
+    const pub_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(kp.public_key.toBytes(), .lower));
+    const alice_grant: authority.Grant = .{
+        .id = "grant_alice",
+        .actor = "alice",
+        .public_key = pub_hex,
+        .paths = &.{"documents/"},
+        .actions = &.{ .create_view, .status, .read, .checkpoint, .submit },
+        .expires_ms = io_mod.milliTimestamp() + 3600_000,
+    };
+    const bob_grant: authority.Grant = .{
+        .id = "grant_bob",
+        .actor = "bob",
+        .public_key = pub_hex,
+        .paths = &.{"documents/"},
+        .actions = &.{ .create_view, .status },
+        .expires_ms = io_mod.milliTimestamp() + 3600_000,
+    };
+
+    const key = try @import("company_keys.zig").prepare(manager, 1, false);
+    const issuer_hex = try alloc.dupe(u8, &std.fmt.bytesToHex(key.public_key.toBytes(), .lower));
+    const auth_state: authority.State = .{
+        .workspace = manager.manifest.id,
+        .issuer = issuer_hex,
+        .grants = &.{ alice_grant, bob_grant },
+    };
+    const rev0 = try manager.companyWrite(null, &.{.{ .path = "authority/state.json", .content = try json(alloc, auth_state) }});
+
+    const trunk_rev = try manager.revision("trunk");
+    const v1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const v2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    const v3 = "3333333333333333333333333333333333333333333333333333333333333333";
+    const v4 = "4444444444444444444444444444444444444444444444444444444444444444";
+
+    const view1_json = try json(alloc, .{ .id = v1, .actor = "alice", .grant = "grant_alice", .task = v1, .base = trunk_rev, .created_at_ms = @as(i64, 1000) });
+    const view2_json = try json(alloc, .{ .id = v2, .actor = "alice", .grant = "grant_alice", .task = v2, .base = trunk_rev, .scope = try alloc.print("company/scopes/{s}.json", .{v2}), .created_at_ms = @as(i64, 2000) });
+    const view3_json = try json(alloc, .{ .id = v3, .actor = "alice", .grant = "grant_alice", .task = v3, .base = trunk_rev });
+    const view4_json = try json(alloc, .{ .id = v4, .actor = "bob", .grant = "grant_bob", .task = v4, .base = trunk_rev, .created_at_ms = @as(i64, 3000) });
+
+    const rev1 = try manager.companyWrite(rev0, &.{
+        .{ .path = try alloc.print("company/views/{s}.json", .{v1}), .content = view1_json },
+        .{ .path = try alloc.print("company/views/{s}.json", .{v2}), .content = view2_json },
+        .{ .path = try alloc.print("company/views/{s}.json", .{v3}), .content = view3_json },
+        .{ .path = try alloc.print("company/views/{s}.json", .{v4}), .content = view4_json },
+    });
+
+    // Compare sidecar query output directly against `fossil sql` output (exact JSON parity).
+    const cliQuery = struct {
+        fn call(m: Manager, grant: authority.Grant, revision_id: []const u8, offset: usize, limit: usize) ![]const u8 {
+            const q = try m.alloc.print(
+                \\SELECT json_object('filename',filename,'id',json_extract(content(uuid),'$.id'),
+                \\'actor',json_extract(content(uuid),'$.actor'),'grant',json_extract(content(uuid),'$.grant'),
+                \\'task',json_extract(content(uuid),'$.task'),'base',json_extract(content(uuid),'$.base'),
+                \\'scope',json_extract(content(uuid),'$.scope'),'created_at_ms',json_extract(content(uuid),'$.created_at_ms')) AS entry
+                \\FROM files_of_checkin('{s}') WHERE filename GLOB 'company/views/*.json'
+                \\AND json_extract(content(uuid),'$.actor')='{s}' AND json_extract(content(uuid),'$.grant')='{s}'
+                \\ORDER BY coalesce(json_extract(content(uuid),'$.created_at_ms'),0) DESC,filename LIMIT {d} OFFSET {d};
+            , .{ revision_id, grant.actor, grant.id, limit, offset });
+            return m.run(null, &.{ "sql", "--readonly", "-init", "/dev/null", "-batch", "-json", "-R", m.repository, q });
+        }
+    }.call;
+
+    const cli_p1 = try cliQuery(manager, alice_grant, rev1, 0, 2);
+    const cli_p2 = try cliQuery(manager, alice_grant, rev1, 2, 2);
+    const cli_bob = try cliQuery(manager, bob_grant, rev1, 0, 10);
+    const cli_artifact = try manager.run(null, &.{ "artifact", rev1, "-R", manager.repository });
+
+    // Hold command.lock exclusively so any fossil CLI fallback would block/fail.
+    const cmd_lock_path = try join(alloc, manager.root, "command.lock");
+    const cmd_lock = try std.Io.Dir.cwd().createFile(std.testing.io, cmd_lock_path, .{ .truncate = false, .permissions = .fromMode(0o600) });
+    defer {
+        cmd_lock.unlock(std.testing.io);
+        cmd_lock.close(std.testing.io);
+    }
+    try std.testing.expect(try cmd_lock.tryLock(std.testing.io, .exclusive));
+
+    // Warm sidecar query succeeds while command.lock is held, with exact JSON parity.
+    const idx_p1 = try manager.companyViewHeaders(alice_grant, rev1, 0, 2);
+    const idx_p2 = try manager.companyViewHeaders(alice_grant, rev1, 2, 2);
+    const idx_bob = try manager.companyViewHeaders(bob_grant, rev1, 0, 10);
+    const norm = struct {
+        fn call(a: Allocator, raw: []const u8) ![]const u8 {
+            return json(a, try parse(a, std.json.Value, raw));
+        }
+    }.call;
+    try std.testing.expectEqualStrings(try norm(alloc, cli_p1), try norm(alloc, idx_p1));
+    try std.testing.expectEqualStrings(try norm(alloc, cli_p2), try norm(alloc, idx_p2));
+    try std.testing.expectEqualStrings(try norm(alloc, cli_bob), try norm(alloc, idx_bob));
+
+    // Delete sidecar DB (cold catch-up) while command.lock is STILL held -> syncs via fossil_sqlite_reader!
+    try remove(try manager.companyViewsIndexPath());
+    try remove(try alloc.print("{s}-wal", .{try manager.companyViewsIndexPath()}));
+    try remove(try alloc.print("{s}-shm", .{try manager.companyViewsIndexPath()}));
+
+    const cold_p1 = try manager.companyViewHeaders(alice_grant, rev1, 0, 2);
+    try std.testing.expectEqualStrings(try norm(alloc, cli_p1), try norm(alloc, cold_p1));
+
+    // immutableArtifact and fileManifest also succeed while command.lock is held.
+    const sql_artifact = try manager.immutableArtifact(rev1);
+    try std.testing.expectEqualStrings(cli_artifact, sql_artifact);
+    const manifest_files = try manager.fileManifest(rev1);
+    try std.testing.expect(manifest_files.len >= 5);
+}
+
+test "fossil_workspace: auto-rebase merges disjoint files and non-overlapping line hunks and marks true conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try join(alloc, root, "repo.fossil");
+    const project_dir = try join(alloc, root, "project");
+    try mkdir(project_dir);
+
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    const prev_environ = io_mod.environMap();
+    io_mod.setEnvironMap(&environ);
+    defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
+
+    var writer_queue: WriterQueue = .{};
+    defer writer_queue.deinit();
+
+    var manager = try Manager.init(alloc, repo_path);
+    manager.writer_queue = &writer_queue;
+
+    const publishTask = struct {
+        fn run(m: Manager, t: Task, summary: []const u8) ![]const u8 {
+            const rev = try m.revision(t.branch);
+            const assessment = try json(m.alloc, contract.Assessment{
+                .contractId = t.id,
+                .version = t.definition.version,
+                .obligations = &.{.{ .id = "request_complete", .status = .met, .evidence = &.{"memory/notes.md"}, .note = summary }},
+            });
+            return m.publish(t, .{
+                .task_id = t.id,
+                .revision = rev,
+                .contract_version = t.definition.version,
+                .disposition = "fulfilled",
+                .candidate = summary,
+                .assessment = assessment,
+            });
+        }
+    }.run;
+
+    // Seed multi-line text and single-line JSON on trunk.
+    const seed = try manager.start("seed-session", project_dir, "Seed shared files", null);
+    try manager.writeContent(seed, "memory/notes.md", "line 1\nline 2\nline 3\nline 4\nline 5\n");
+    try manager.writeContent(seed, "memory/state.json", "{\"a\":1}");
+    _ = try publishTask(manager, seed, "Seeded files");
+
+    // Branch two concurrent tasks from the same trunk base.
+    const task_a = try manager.start("session-a", project_dir, "Task A edits top", null);
+    const task_b = try manager.start("session-b", project_dir, "Task B edits bottom", null);
+
+    try manager.writeContent(task_a, "memory/notes.md", "line 1 (A)\nline 2\nline 3\nline 4\nline 5\n");
+    try manager.writeContent(task_a, "memory/state.json", "{\"a\":1,\"from_a\":true}");
+    try manager.writeContent(task_a, "memory/only_a.md", "only A");
+    const trunk_after_a = try publishTask(manager, task_a, "Task A published");
+
+    try manager.writeContent(task_b, "memory/notes.md", "line 1\nline 2\nline 3\nline 4\nline 5 (B)\n");
+    try manager.writeContent(task_b, "memory/state.json", "{\"a\":1,\"from_b\":true}");
+    try manager.writeContent(task_b, "memory/only_b.md", "only B");
+
+    // Auto-rebase should merge disjoint files, non-overlapping line hunks, and disjoint JSON keys!
+    const rebased_b = try manager.refresh(task_b);
+    try std.testing.expectEqual(@FieldType(Task, "state").active, rebased_b.state);
+    try std.testing.expect(try manager.sameRevision(rebased_b.base_revision, trunk_after_a));
+    try std.testing.expectEqualStrings("line 1 (A)\nline 2\nline 3\nline 4\nline 5 (B)\n", try manager.content(rebased_b, "memory/notes.md"));
+    try std.testing.expectEqualStrings("only A", try manager.content(rebased_b, "memory/only_a.md"));
+    try std.testing.expectEqualStrings("only B", try manager.content(rebased_b, "memory/only_b.md"));
+    const merged_json = try parse(alloc, std.json.Value, try manager.content(rebased_b, "memory/state.json"));
+    try std.testing.expectEqual(@as(i64, 1), merged_json.object.get("a").?.integer);
+    try std.testing.expect(merged_json.object.get("from_a").?.bool);
+    try std.testing.expect(merged_json.object.get("from_b").?.bool);
+
+    // Now create a true same-line conflict.
+    const task_c = try manager.start("session-c", project_dir, "Task C conflicts", null);
+    const task_d = try manager.start("session-d", project_dir, "Task D conflicts", null);
+    try manager.writeContent(task_c, "memory/notes.md", "line 1 (C)\nline 2\nline 3\nline 4\nline 5\n");
+    _ = try publishTask(manager, task_c, "Task C published");
+
+    try manager.writeContent(task_d, "memory/notes.md", "line 1 (D)\nline 2\nline 3\nline 4\nline 5\n");
+    try std.testing.expectError(error.WorkspaceMergeConflict, manager.refresh(task_d));
+
+    const conflicted_d = try manager.loadTask(task_d.id);
+    try std.testing.expectEqual(@FieldType(Task, "state").conflict, conflicted_d.state);
+    const rec = (try manager.loadConflictRecord(task_d.id)).?;
+    try std.testing.expectEqual(@as(usize, 1), rec.conflicts.len);
+    try std.testing.expectEqualStrings("memory/notes.md", rec.conflicts[0].path);
 }

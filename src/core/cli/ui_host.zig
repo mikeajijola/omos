@@ -144,6 +144,7 @@ const Server = struct {
     journal_dir: []const u8,
     repository: []const u8,
     workspace_id: []const u8,
+    writer_queue: ?*workspace.WriterQueue = null,
 
     fn respond(self: *Server, id: []const u8, result: std.json.Value, err: ?[]const u8) !void {
         self.output_mutex.lockUncancelable(io.getIo());
@@ -197,7 +198,9 @@ const Server = struct {
                 if (self.job) |active| active.ui.stop();
                 return error.WorkspaceBindingChanged;
             }
-            bound_manager = bound;
+            var queued = bound;
+            queued.writer_queue = self.writer_queue;
+            bound_manager = queued;
         }
         if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1" } });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
@@ -242,7 +245,11 @@ const Server = struct {
         }
         // Reuse this request's verified binding instead of reopening Fossil
         // under the same dispatch lock for every workspace RPC.
-        const manager = bound_manager orelse (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+        const manager = bound_manager orelse blk: {
+            var opened = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            opened.writer_queue = self.writer_queue;
+            break :blk opened;
+        };
         if (std.mem.eql(u8, method, "schedule.series")) return value(arena, try manager.scheduleSeriesSnapshot(try records.decode(@import("../workspace/schedule_series.zig").Request, arena, try std.json.Stringify.valueAlloc(arena, params, .{}), .{})));
         if (std.mem.eql(u8, method, "background")) return @import("../workspace/background_api.zig").execute(manager, try std.json.parseFromValueLeaky(@import("../workspace/background_api.zig").Request, arena, params, .{}));
         if (std.mem.eql(u8, method, "channel.dispatch")) {
@@ -369,7 +376,8 @@ const Server = struct {
         }
         const acknowledgement = try value(arena, .{ .turn = id, .already_accepted = false });
         const execution_lease: ?workspace.ExecutionLease = if (scheduled == null) blk: {
-            const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            var manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
+            manager.writer_queue = self.writer_queue;
             break :blk (try manager.trySessionExecutionLease(request.session orelse id)) orelse return error.WorkspaceExecutionBusy;
         } else null;
         errdefer if (execution_lease) |lease| lease.release();
@@ -572,7 +580,7 @@ const BackgroundRun = struct {
         const runner: *Runner = @ptrCast(@alignCast(raw));
         const journal_dir = try std.Io.Dir.path.join(manager.alloc, &.{ try background_control.directory(manager), "events" });
         try std.Io.Dir.cwd().createDirPath(io.getIo(), journal_dir);
-        var server: Server = .{ .runner = runner.*, .journal_dir = journal_dir, .repository = manager.repository, .workspace_id = manager.manifest.id };
+        var server: Server = .{ .runner = runner.*, .journal_dir = journal_dir, .repository = manager.repository, .workspace_id = manager.manifest.id, .writer_queue = manager.writer_queue };
         const starting = (try background_dispatch.reserve(manager, entry, owner)) orelse return error.WorkspaceExecutionBusy;
         var context: BackgroundRun = .{ .manager = manager, .entry = starting, .authority = authority, .owner = owner, .cancel = cancel };
         const id = try manager.alloc.print("background-{s}-{d}", .{ entry.task, starting.generation });
@@ -610,8 +618,12 @@ pub fn runBackground(runner: Runner) !void {
     std.Io.Dir.deleteFileAbsolute(io.getIo(), try background_control.path(manager, "", "stop")) catch |err| if (err != error.FileNotFound) return err;
     workspace.configureHostBinding(.{ .repository = manager.repository, .workspace_id = manager.manifest.id });
     defer workspace.configureHostBinding(null);
+    var writer_queue: workspace.WriterQueue = .{};
+    defer writer_queue.deinit();
+    var queued_manager = manager;
+    queued_manager.writer_queue = &writer_queue;
     var executor = runner;
-    var worker: @import("../workspace/background_worker.zig").Worker = .{ .manager = manager, .executor = .{ .context = &executor, .run = BackgroundRun.execute } };
+    var worker: @import("../workspace/background_worker.zig").Worker = .{ .manager = queued_manager, .executor = .{ .context = &executor, .run = BackgroundRun.execute } };
     defer worker.deinit();
     try worker.loop();
 }
@@ -673,7 +685,10 @@ pub fn run(runner: Runner) !void {
     @import("../agent/runtime/completion_review.zig").configureInvocation("ui-host");
     var setup = std.heap.ArenaAllocator.init(alloc);
     defer setup.deinit();
-    const binding = try workspace.Manager.ensureBound(setup.allocator());
+    var writer_queue: workspace.WriterQueue = .{};
+    defer writer_queue.deinit();
+    var binding = try workspace.Manager.ensureBound(setup.allocator());
+    binding.writer_queue = &writer_queue;
     workspace.configureHostBinding(.{ .repository = binding.repository, .workspace_id = binding.manifest.id });
     defer workspace.configureHostBinding(null);
     var maintenance: @import("../workspace/projection_maintenance.zig").Worker = .{ .manager = binding };
@@ -686,7 +701,7 @@ pub fn run(runner: Runner) !void {
     const directory = try alloc.print("{s}/.fx/ui-host/{s}", .{ home, try workspace.hash(alloc, try io.realpathAlloc(alloc, ".")) });
     defer alloc.free(directory);
     try std.Io.Dir.cwd().createDirPath(io.getIo(), directory);
-    var server: Server = .{ .runner = runner, .journal_dir = directory, .repository = binding.repository, .workspace_id = binding.manifest.id };
+    var server: Server = .{ .runner = runner, .journal_dir = directory, .repository = binding.repository, .workspace_id = binding.manifest.id, .writer_queue = &writer_queue };
     var scheduler: schedule_worker.Scheduler = .{ .manager = binding, .executor = .{ .context = &server, .run = Server.scheduledTask, .available = Server.available } };
     const scheduler_thread = try std.Thread.spawn(.{}, schedule_worker.Scheduler.loop, .{&scheduler});
     defer {
