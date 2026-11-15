@@ -237,6 +237,7 @@ pub const TurnContext = struct {
     approval_worker_route: ?approval_registry_mod.WorkerRoute = null,
     child_id: ?[]const u8 = null,
     active_work_id: ?[]const u8 = null,
+    workspace_root_override: ?[]const u8 = null,
     phase_context: ?*anyopaque = null,
     phase_fn: ?*const fn (
         *anyopaque,

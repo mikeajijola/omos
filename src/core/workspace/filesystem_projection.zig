@@ -729,8 +729,10 @@ pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: [
     if (task.authority != null) return error.CompanyExecutionIsolationRequired;
     if (!std.mem.eql(u8, project, task.project_root)) return error.TaskProjectMismatch;
     const root = try directory(manager, task);
-    var selection: Selection = .{ .all = process_access };
-    if (skill) {
+    var selection: Selection = .{};
+    if (process_access) {
+        selection = (try processSelection(alloc, project, root, arguments.value.object)) orelse return;
+    } else if (skill) {
         // Discovery reads only SKILL.md. Loading or installing a package makes
         // its executable resources available to the unchanged skill runtime.
         selection.path = "skills";
@@ -774,6 +776,51 @@ fn relativeManagedPath(alloc: std.mem.Allocator, project: []const u8, root: []co
     if (!std.mem.startsWith(u8, resolved, root) or resolved.len <= root.len or resolved[root.len] != '/') return null;
     const path = resolved[root.len + 1 ..];
     for (roots) |prefix| if (std.mem.eql(u8, path, prefix[0 .. prefix.len - 1]) or std.mem.startsWith(u8, path, prefix)) return path;
+    return null;
+}
+
+fn isInsidePath(parent: []const u8, child: []const u8) bool {
+    if (std.mem.eql(u8, parent, "/")) return child.len > 1 and child[0] == '/';
+    return std.mem.startsWith(u8, child, parent) and child.len > parent.len and child[parent.len] == '/';
+}
+
+fn matchedManagedRootSelection(command: []const u8) ?Selection {
+    var matched: ?[]const u8 = null;
+    for (roots) |prefix| {
+        if (std.mem.find(u8, command, prefix) != null) {
+            if (matched != null) return .{ .all = true };
+            matched = prefix[0 .. prefix.len - 1];
+        }
+    }
+    return if (matched) |path| .{ .path = path } else null;
+}
+
+fn processSelection(alloc: std.mem.Allocator, project: []const u8, root: []const u8, outer: std.json.ObjectMap) !?Selection {
+    const args_object = if (outer.get("request")) |request| switch (request) {
+        .object => |obj| obj,
+        else => outer,
+    } else outer;
+    const cwd = blk: {
+        if (args_object.get("cwd")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
+        if (args_object.get("workdir")) |value| if (value == .string and value.string.len > 0) break :blk value.string;
+        break :blk project;
+    };
+    if (try relativeManagedPath(alloc, project, root, cwd)) |managed_path| {
+        if (managed_path.len == 0) return .{ .all = true };
+        return .{ .path = managed_path };
+    }
+    const command = if (args_object.get("command")) |value| switch (value) {
+        .string => |s| s,
+        else => return null,
+    } else return null;
+    if (std.mem.find(u8, command, root) != null or std.mem.find(u8, command, ".fx/workspaces") != null) {
+        return matchedManagedRootSelection(command) orelse .{ .all = true };
+    }
+    const resolved_project = try std.Io.Dir.path.resolve(alloc, &.{project});
+    const resolved_cwd = try std.Io.Dir.path.resolve(alloc, &.{ project, cwd });
+    if (std.mem.eql(u8, resolved_cwd, resolved_project) and isInsidePath(resolved_project, root)) {
+        return matchedManagedRootSelection(command);
+    }
     return null;
 }
 
@@ -936,4 +983,53 @@ test "filesystem projection collection rejects ignored execution caches and unkn
     var root = try temporary.dir.openDir(std.testing.io, ".", .{ .iterate = true });
     defer root.close(std.testing.io);
     try std.testing.expectError(error.WorkspacePathDenied, scan(alloc, root, "", &files, &total, true));
+}
+
+fn parseTestSelection(alloc: std.mem.Allocator, project: []const u8, root: []const u8, raw: []const u8) !?Selection {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    return processSelection(alloc, project, root, parsed.value.object);
+}
+
+test "shell and run_command projection scoping skips external git worktrees and scopes managed paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const project = "/Users/example/project";
+    const root = "/Users/example/project/.fx/workspaces/workspace/task";
+
+    // External git repository / worktree or project root without managed refs skips hydration.
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"git status\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"zig build test\",\"workdir\":\"/Users/example/worktree\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"command\":\"cat documents/readme.md\",\"cwd\":\"/Users/example/worktree\"}")) == null);
+    try std.testing.expect((try parseTestSelection(alloc, project, root, "{\"request\":{\"action\":\"interact\",\"session_id\":\"s1\"}}")) == null);
+
+    // Managed cwd scopes to that managed path, or .all = true only for root itself.
+    const at_root = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"cwd\":\".fx/workspaces/workspace/task\"}")).?;
+    try std.testing.expect(at_root.all);
+    try std.testing.expect(at_root.path == null);
+
+    const at_docs = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"cwd\":\".fx/workspaces/workspace/task/documents/sub\"}")).?;
+    try std.testing.expect(!at_docs.all);
+    try std.testing.expectEqualStrings("documents/sub", at_docs.path.?);
+
+    const at_skills_workdir = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls\",\"workdir\":\"/Users/example/project/.fx/workspaces/workspace/task/skills\"}")).?;
+    try std.testing.expect(!at_skills_workdir.all);
+    try std.testing.expectEqualStrings("skills", at_skills_workdir.path.?);
+
+    // External cwd whose command references root or .fx/workspaces hydrates.
+    const ref_root = (try parseTestSelection(alloc, project, root, "{\"command\":\"ls /Users/example/project/.fx/workspaces/workspace/task\",\"cwd\":\"/Users/example/worktree\"}")).?;
+    try std.testing.expect(ref_root.all);
+
+    const ref_workspaces = (try parseTestSelection(alloc, project, root, "{\"command\":\"cat .fx/workspaces/workspace/task/memory/notes.md\",\"cwd\":\".\"}")).?;
+    try std.testing.expect(!ref_workspaces.all);
+    try std.testing.expectEqualStrings("memory", ref_workspaces.path.?);
+
+    // Project cwd with managed subdir in command triggers scoped hydration, and multi-subdir triggers .all.
+    const proj_single = (try parseTestSelection(alloc, project, root, "{\"request\":{\"action\":\"run\",\"command\":\"cat documents/plan.md\",\"cwd\":\".\"}}")).?;
+    try std.testing.expect(!proj_single.all);
+    try std.testing.expectEqualStrings("documents", proj_single.path.?);
+
+    const proj_multi = (try parseTestSelection(alloc, project, root, "{\"command\":\"cp documents/a.md artifacts/b.md\"}")).?;
+    try std.testing.expect(proj_multi.all);
 }

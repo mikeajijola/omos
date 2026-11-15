@@ -213,6 +213,15 @@ pub fn run(
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
     var routed_config = config;
+    if (turn.workspace_root_override) |isolated_root| {
+        const parent_root = config.tool_context.workspace_root;
+        routed_config.tool_context.workspace_root = isolated_root;
+        if (routed_config.tool_context.access_scope) |*scope| {
+            if (std.mem.eql(u8, scope.primary_directory, parent_root)) {
+                scope.primary_directory = isolated_root;
+            }
+        }
+    }
     const provider = config.provider_set.select(admission.provider);
     routed_config.tool_context.agent_stream_provider = provider.agent_stream_or_unavailable();
     routed_config.tool_context.permission_reviewer_provider = provider.permission_reviewer;
@@ -367,7 +376,7 @@ pub fn run(
         realisation_selection.resolvePromptSkillBindings(
             arena,
             prompt.prompt,
-            config.tool_context.workspace_root,
+            routed_config.tool_context.workspace_root,
             config.skill_catalog.skills,
         ) catch return error.OutOfMemory;
     const child_fossil = resolveChildFossilRouting(
@@ -384,7 +393,7 @@ pub fn run(
             .view = config.lifecycle_view,
             .scope = .{
                 .kind = .subagent,
-                .workspace_root = config.tool_context.workspace_root,
+                .workspace_root = routed_config.tool_context.workspace_root,
                 .session_id = turn.child_id,
                 .subagent_id = trace_context.subagent_id,
             },
@@ -425,8 +434,8 @@ pub fn run(
             .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
             .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
-            .workspace_root = config.tool_context.workspace_root,
-            .access_scope = config.tool_context.access_scope,
+            .workspace_root = routed_config.tool_context.workspace_root,
+            .access_scope = routed_config.tool_context.access_scope,
             .origin = .subagent,
             .root_user_intent_context = prompt.root_user_intent_context,
             .root_user_messages = message.root_user_messages,

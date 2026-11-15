@@ -6,6 +6,7 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const live_metrics = @import("live_metrics.zig");
+const worktree_isolation = @import("worktree_isolation.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
@@ -556,6 +557,16 @@ fn runOne(slot: *Slot) OneOutcome {
     var child = OpenChild.open(owner, slot.child_id, snapshot.instructions) catch |err|
         return failedOutcome(work_id, "session_resume", err);
     defer child.close(owner.alloc);
+    const parent_workspace_root = switch (owner.backend) {
+        .v1 => |sessions| sessions.workspace_root,
+        .v2 => |children| children.workspace,
+    };
+    var lease = worktree_isolation.Lease.acquire(
+        owner.alloc,
+        parent_workspace_root,
+        slot.child_id,
+    ) catch |err| return failedOutcome(work_id, "worktree_isolation", err);
+    defer lease.deinit();
     var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
         return failedOutcome(work_id, "turn_initialization", err);
     defer turn.deinit();
@@ -563,6 +574,7 @@ fn runOne(slot: *Slot) OneOutcome {
     turn.approval_registry = owner.approvals;
     turn.child_id = slot.child_id;
     turn.active_work_id = snapshot.active.id;
+    turn.workspace_root_override = if (lease.isolated) lease.workspace_root else null;
     turn.phase_context = owner;
     turn.phase_fn = Owner.phaseTransition;
     turn.live_metrics = &slot.metrics;
