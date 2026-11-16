@@ -58,6 +58,57 @@ fn sameRequest(a: []const u8, b: []const u8) bool {
     return right.next() == null;
 }
 
+/// A retained contract considered for recycling rather than minting a duplicate
+/// durable contract.
+pub const RecyclableCandidate = struct {
+    id: []const u8,
+    objective: []const u8,
+    scope: []const u8,
+    completed: bool = false,
+    isolated: bool = false,
+};
+
+/// Pure decision: choose an existing active/pending contract in the same scope
+/// with the same intent, so a new goal resumes it instead of duplicating it.
+/// Returns null when a genuinely new contract is warranted.
+pub fn chooseRecyclableContract(
+    message: []const u8,
+    scope: []const u8,
+    exclude_id: []const u8,
+    candidates: []const RecyclableCandidate,
+) ?[]const u8 {
+    for (candidates) |candidate| {
+        if (candidate.completed or candidate.isolated) continue;
+        if (std.mem.eql(u8, candidate.id, exclude_id)) continue;
+        if (scope.len > 0 and !std.mem.eql(u8, candidate.scope, scope)) continue;
+        if (!sameRequest(message, candidate.objective)) continue;
+        return candidate.id;
+    }
+    return null;
+}
+
+/// Scan retained contracts for one that can be resumed instead of creating a
+/// second durable contract for identical work.
+pub fn findRecyclableContract(
+    manager: workspace.Manager,
+    exclude_id: []const u8,
+    message: []const u8,
+    scope: []const u8,
+) !?[]const u8 {
+    var candidates: std.ArrayList(RecyclableCandidate) = .empty;
+    defer candidates.deinit(manager.alloc);
+    for (try manager.tasks()) |task| {
+        try candidates.append(manager.alloc, .{
+            .id = task.id,
+            .objective = task.definition.objective,
+            .scope = task.project_root,
+            .completed = task.state == .accepted,
+            .isolated = task.authority != null or task.parent_task_id != null,
+        });
+    }
+    return chooseRecyclableContract(message, scope, exclude_id, candidates.items);
+}
+
 pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const u8, history: []const types.ChatMessage, cancel: *std.atomic.Value(bool)) !Admission {
     const active = try manager.active(session);
     const raw = try manager.communication(try focusKey(manager, session));
@@ -170,6 +221,14 @@ pub fn apply(manager: workspace.Manager, session: []const u8, message: []const u
             return .{ .lookup_task = task.id };
         },
         .new => {
+            // A request that asks for "separate work" must not mint a duplicate
+            // durable contract when an active/pending contract for the same
+            // scope and intent already exists. Recycle it instead of creating
+            // a second long-lived contract for identical work.
+            if (try findRecyclableContract(manager, task.id, message, task.project_root)) |recyclable| {
+                try saveFocus(manager, session, recyclable, false);
+                return .{ .task = recyclable, .continuing = true };
+            }
             try saveFocus(manager, session, null, false);
             return .{ .new_goal = try manager.alloc.print("Create a separate contract. Previous objective for reference: {s}\nCurrent user instruction: {s}", .{ task.definition.objective, message }) };
         },
@@ -199,4 +258,26 @@ test "contract request matching ignores whitespace but not changed requirements"
     try std.testing.expect(sameRequest("  Save a\npreference ", "save a preference"));
     try std.testing.expect(!sameRequest("save a different preference", "save a preference"));
     try std.testing.expect(!sameRequest("save a preference and continue", "save a preference"));
+}
+
+test "new goal resumes an active contract with the same scope and intent" {
+    const candidates = [_]RecyclableCandidate{
+        .{ .id = "task-old", .objective = "save a preference", .scope = "/repo" },
+    };
+    try std.testing.expectEqualStrings("task-old", chooseRecyclableContract("  Save a\npreference ", "/repo", "task-current", &candidates).?);
+    // The contract that raised the new goal is never recycled into itself.
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "task-old", &candidates) == null);
+}
+
+test "new goal stays new when the matching contract is completed isolated or out of scope" {
+    const base = RecyclableCandidate{ .id = "task-1", .objective = "save a preference", .scope = "/repo" };
+    var completed = base;
+    completed.completed = true;
+    var isolated = base;
+    isolated.isolated = true;
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{completed}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{isolated}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/other", "", &.{base}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a different preference", "/repo", "", &.{base}) == null);
+    try std.testing.expect(chooseRecyclableContract("build a new feature", "/repo", "", &.{base}) == null);
 }

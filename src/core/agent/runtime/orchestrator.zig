@@ -270,7 +270,7 @@ noinline fn finishBackgroundHandoff(
     const queued = try dispatch.seal(turn.manager, turn.task, session);
     try control.ensureHost(turn.manager);
     if (deps.background_dispatched) |publish| try publish(deps.ctx, queued);
-    const text = try arena.print("Queued task {s} for a background agent. You can keep chatting. The original contract remains pending until independent review and publication pass.", .{queued.task});
+    const text = try arena.print("I've started that in the background and I'll keep working on it. You can carry on chatting while it runs.\n\n_(Background tracking: contract {s}. It stays pending until independent review and publication pass.)_", .{queued.task});
     try deps.push_text(deps.ctx, .assistant_started);
     try deps.push_text(deps.ctx, .{ .assistant_source = text });
     try deps.push_text(deps.ctx, .{ .assistant_rendered = text });
@@ -7903,14 +7903,45 @@ fn processQueuedPromptLoop(
                     containsToolName(config.advertised_tool_names, "fossil_workspace"))
                 {
                     if (try turn.manager.backgroundRecord(turn.task.id) == null) {
-                        const calls = try arena.alloc(types.ToolCall, 1);
-                        calls[0] = .{ .id = try arena.print("host-dispatch-{s}", .{turn.task.id}), .name = "fossil_workspace", .arguments_json = "{\"action\":\"dispatch\"}" };
-                        try turn.manager.record(turn.task, "coordinator_handoff_proposed", .{ .origin = "host", .contract_version = turn.task.definition.version, .call_id = calls[0].id });
-                        try deps.push_system_notice(deps.ctx, "Queuing the validated work contract...");
-                        stream_result = .{ .completed = .{ .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls }, .ownership = .borrowed } };
-                        stream_result_set = true;
-                        successful_gateway_model = job.model;
-                        break;
+                        // Capability-first gate: consult the map before proposing a
+                        // durable contract. A plain chat message whose work is already
+                        // covered by a declared realisation stays conversational; only
+                        // explicit background intent or a capability-map miss hands off.
+                        const prompt_text = current_user_effective.content orelse job.prompt;
+                        const selection = @import("../../workspace/realisation_selection.zig");
+                        var recycled: ?selection.ExistingRealisation = null;
+                        const revision = turn.task.model_basis.?.revision;
+                        if (turn.manager.loadDeclaration(revision)) |decl| {
+                            recycled = selection.findExistingRealisationForTask(
+                                arena,
+                                null,
+                                decl,
+                                prompt_text,
+                                request_capability,
+                                revision,
+                                &.{},
+                                config.workspace_root,
+                            ) catch null;
+                        } else |_| {}
+                        if (!selection.shouldCreateDurableContract(prompt_text, recycled)) {
+                            if (recycled) |reuse| {
+                                try turn.manager.record(turn.task, "realisation_recycled", .{
+                                    .capability = reuse.capability,
+                                    .realisation = reuse.realisation,
+                                    .reason = "existing_capability_covers_conversational_work",
+                                });
+                            }
+                            // Fall through to the ordinary conversational model call.
+                        } else {
+                            const calls = try arena.alloc(types.ToolCall, 1);
+                            calls[0] = .{ .id = try arena.print("host-dispatch-{s}", .{turn.task.id}), .name = "fossil_workspace", .arguments_json = "{\"action\":\"dispatch\"}" };
+                            try turn.manager.record(turn.task, "coordinator_handoff_proposed", .{ .origin = "host", .contract_version = turn.task.definition.version, .call_id = calls[0].id });
+                            try deps.push_system_notice(deps.ctx, "Starting durable background work. You can keep chatting while it runs.");
+                            stream_result = .{ .completed = .{ .completion = .{ .tool_calls = calls, .finish_reason = .tool_calls }, .ownership = .borrowed } };
+                            stream_result_set = true;
+                            successful_gateway_model = job.model;
+                            break;
+                        }
                     }
                 };
             }

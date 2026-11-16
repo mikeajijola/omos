@@ -53,9 +53,28 @@ test "configureInvocation enables contract review for omos, omo, fxos, and ui-ho
     try std.testing.expect(!named_invocation);
 }
 
+/// Coordinator mode is opt-in. A plain first chat message stays on the direct,
+/// conversational path so user activity is never turned into a durable contract
+/// merely to make it trackable. Durable background execution requires an
+/// explicit signal: OMOS_COORDINATOR=1 (or "true"), or work that misses the
+/// capability map and genuinely needs to outlive this conversation.
+/// OMOS_COORDINATOR=0 keeps forcing direct mode.
 pub fn coordinatorEnabled() bool {
-    const value = io.getenv("OMOS_COORDINATOR") orelse return named_invocation;
+    const value = io.getenv("OMOS_COORDINATOR") orelse return false;
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
+test "named invocations stay conversational by default; coordinator mode is opt-in" {
+    if (io.getenv("OMOS_COORDINATOR") != null) return; // env-driven CI overrides the default
+    defer configureInvocation("fx");
+    // Named invocations no longer imply coordinator mode: a plain chat message
+    // is answered directly instead of being converted into a durable contract.
+    configureInvocation("omos");
+    try std.testing.expect(!coordinatorEnabled());
+    configureInvocation("ui-host");
+    try std.testing.expect(!coordinatorEnabled());
+    configureInvocation("fx");
+    try std.testing.expect(!coordinatorEnabled());
 }
 
 pub fn defaultReviewerModelForProvider(

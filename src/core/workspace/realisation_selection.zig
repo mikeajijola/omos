@@ -112,6 +112,79 @@ pub fn resolveCapability(result: ?classification.Result, prompt: []const u8) ?re
     return classifyDeliverable(prompt);
 }
 
+/// A capability and realisation already declared and verified in this
+/// workspace. Reusing one keeps ordinary work on the conversational path
+/// instead of minting a durable background contract.
+pub const ExistingRealisation = struct {
+    capability: []const u8,
+    realisation: []const u8,
+    ranking: Ranking,
+    skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
+};
+
+/// Explicit signals that the user wants work to outlive this conversation.
+/// A plain first chat message never contains one of these, so it stays direct
+/// and conversational by default.
+pub fn hasExplicitBackgroundIntent(prompt: []const u8) bool {
+    return containsAnyIgnoreCase(prompt, &.{
+        "in the background",
+        "in background",
+        "as a background",
+        "background task",
+        "background agent",
+        "background worker",
+        "schedule ",
+        "schedule it",
+        "keep working until",
+        "keep going until",
+        "run overnight",
+        "run unattended",
+    });
+}
+
+/// Consult the workspace capability map for an existing realisation that already
+/// covers the requested work, including its skill/tool bindings. Returns null on
+/// a capability-map miss, i.e. when the request genuinely needs a new durable
+/// contract because no verified realisation is available in this workspace.
+pub fn findExistingRealisationForTask(
+    alloc: Allocator,
+    manager: ?workspace.Manager,
+    declaration: model.Declaration,
+    prompt: []const u8,
+    capability: ?request_plan.Capability,
+    revision: []const u8,
+    skills: []const skill_contract.Skill,
+    workspace_root: []const u8,
+) !?ExistingRealisation {
+    const cap = capability orelse resolveCapability(null, prompt) orelse return null;
+    const capability_id = @tagName(cap);
+    for (model.items(model.spec(declaration.value), "capabilities")) |declared| {
+        if (!std.mem.eql(u8, model.text(declared, "id"), capability_id)) continue;
+        // A declared capability without a realisation cannot cover the work.
+        if (model.items(declared, "realisations").len == 0) return null;
+        // Only a verified/native realisation can be recycled for direct work.
+        // A missing runtime would need a durable contract to import it.
+        if (!model.nativeCapability(declaration, capability_id)) return null;
+        const scored = try scoreCapability(alloc, manager, declaration, declared, prompt, revision);
+        if (scored.realisation.len == 0) return null;
+        return .{
+            .capability = try alloc.dupe(u8, capability_id),
+            .realisation = try alloc.dupe(u8, scored.realisation),
+            .ranking = scored.ranking,
+            .skill_bindings = try resolvePromptSkillBindings(alloc, prompt, workspace_root, skills),
+        };
+    }
+    return null;
+}
+
+/// Gate durable-contract creation. The capability map is consulted first: a
+/// recycled realisation plus a plain chat message stays conversational, while
+/// explicit background intent or a capability-map miss justifies a contract.
+pub fn shouldCreateDurableContract(prompt: []const u8, existing: ?ExistingRealisation) bool {
+    if (hasExplicitBackgroundIntent(prompt)) return true;
+    return existing == null;
+}
+
 /// Resolve unambiguous skill bindings referenced by the prompt or assigned
 /// realisation, preferring workspace-local skill paths over ancestor or global
 /// copies when duplicate skill names exist.
@@ -618,4 +691,71 @@ test "browserHostGuidance and buildExecutionGuidance emit run-first browser guid
     );
     defer alloc.free(exec_guidance);
     try std.testing.expect(std.mem.indexOf(u8, exec_guidance, "mcp_browseros-neo_run") != null);
+}
+
+test "findExistingRealisationForTask recycles a declared native realisation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+
+    const existing = try findExistingRealisationForTask(
+        alloc,
+        null,
+        declaration,
+        "Apply via LinkedIn Easy Apply and save JSON receipts",
+        .general_task,
+        "trunk",
+        &.{},
+        "",
+    );
+    try std.testing.expect(existing != null);
+    try std.testing.expectEqualStrings("general_task", existing.?.capability);
+    try std.testing.expectEqualStrings("general_task_native", existing.?.realisation);
+}
+
+test "findExistingRealisationForTask returns null when no capability covers the work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+
+    // Empty prompt resolves no capability, so the map has nothing to recycle.
+    const existing = try findExistingRealisationForTask(
+        alloc,
+        null,
+        declaration,
+        "   ",
+        null,
+        "trunk",
+        &.{},
+        "",
+    );
+    try std.testing.expect(existing == null);
+}
+
+test "durable contract gate recycles realisations unless background is explicit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+    const existing = try findExistingRealisationForTask(
+        alloc,
+        null,
+        declaration,
+        "Refactor src/core/agent/runtime/orchestrator.zig",
+        .coding_task,
+        "trunk",
+        &.{},
+        "",
+    );
+    try std.testing.expect(existing != null);
+
+    // A plain chat message reuses the existing realisation: no new contract.
+    try std.testing.expect(!shouldCreateDurableContract("Refactor the orchestrator gate", existing));
+    // A capability-map miss for non-trivial work needs a durable contract.
+    try std.testing.expect(shouldCreateDurableContract("Investigate a novel capability", null));
+    // Explicit background intent overrides recycling.
+    try std.testing.expect(shouldCreateDurableContract("Keep working on this in the background until it is done", existing));
+    try std.testing.expect(shouldCreateDurableContract("Schedule this", existing));
 }
