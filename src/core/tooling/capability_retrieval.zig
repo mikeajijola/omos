@@ -38,6 +38,13 @@ pub const RelevancePolicy = enum {
     intent,
 };
 
+/// Optional intent-aware reranking. Set by MCP tool search when the browser
+/// skill is bound so the single batched `run` tool outranks granular one-off
+/// browser tools for browser queries.
+pub const RerankPolicy = struct {
+    browser_first: bool = false,
+};
+
 pub const Request = struct {
     query: *const lexical_relevance.PreparedQuery,
     kind: Kind = .all,
@@ -45,6 +52,7 @@ pub const Request = struct {
     limit: usize = default_limit,
     cursor: ?[]const u8 = null,
     relevance_policy: RelevancePolicy = .compatible,
+    rerank: RerankPolicy = .{},
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;
@@ -178,7 +186,7 @@ pub fn retrieve(
     }
 
     for (documents, 0..) |document, document_index| {
-        const exact_identity = lexical_relevance.containsCompleteIdentity(
+        var exact_identity = lexical_relevance.containsCompleteIdentity(
             request.query.raw,
             &document.identities,
         ) or lexical_relevance.containsCompleteIdentity(
@@ -220,6 +228,10 @@ pub fn retrieve(
                     secondary_length,
                     stats.secondary_average_length,
                 ));
+        }
+
+        if (request.rerank.browser_first) {
+            applyBrowserRerank(document.identities[0], &score, &exact_identity);
         }
 
         const inventory = request.query.raw.len == 0;
@@ -264,6 +276,27 @@ pub fn retrieve(
         .request_hash = request_hash,
         .domain = domain,
     };
+}
+
+const browser_run_rerank_weight: f64 = 1.0e6;
+
+/// When a browser skill is bound, push the batched `run` tool to the top and
+/// push granular one-off browser tools to the bottom. Marking `run` as an
+/// exact identity also keeps it in the candidate set for any browser query.
+fn applyBrowserRerank(original_name: []const u8, score: *f64, exact_identity: *bool) void {
+    if (std.mem.eql(u8, original_name, "run")) {
+        score.* += browser_run_rerank_weight;
+        exact_identity.* = true;
+    } else if (isGranularBrowserTool(original_name)) {
+        score.* -= browser_run_rerank_weight;
+    }
+}
+
+fn isGranularBrowserTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "snapshot") or
+        std.mem.eql(u8, name, "navigate") or
+        std.mem.eql(u8, name, "click") or
+        std.mem.eql(u8, name, "act");
 }
 
 fn corpusStats(documents: []const Document) CorpusStats {
@@ -451,6 +484,7 @@ fn requestHash(request: Request, domain: Domain) u64 {
     updateHashField(&hash, request.query.raw);
     hash.update(&.{@backingInt(domain)});
     hash.update(&.{@backingInt(request.relevance_policy)});
+    hash.update(&.{@intFromBool(request.rerank.browser_first)});
     if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
@@ -688,6 +722,45 @@ test "intent relevance rejects corpus-wide procedural description terms" {
 
     try std.testing.expectEqual(@as(usize, 0), page.total_matches);
     try std.testing.expectEqual(@as(usize, 0), page.matches.len);
+}
+
+test "browser-first rerank puts run top-1 and demotes granular browser tools" {
+    const alloc = std.testing.allocator;
+    const query = try lexical_relevance.prepare("snapshot");
+    const documents = [_]Document{
+        .{
+            .identities = .{ "snapshot", "" },
+            .stable_key = "mcp_browseros-neo_snapshot",
+            .primary = .{ "browseros-neo", "snapshot", "", "" },
+            .secondary = .{ "Take a snapshot of the current browser page", "", "" },
+        },
+        .{
+            .identities = .{ "run", "" },
+            .stable_key = "mcp_browseros-neo_run",
+            .primary = .{ "browseros-neo", "run", "", "" },
+            .secondary = .{ "Run a batched browser script", "", "" },
+        },
+    };
+
+    var plain = try retrieve(
+        alloc,
+        .{ .query = &query, .kind = .mcp, .relevance_policy = .intent },
+        .mcp,
+        &documents,
+    );
+    defer plain.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), plain.matches[0].document_index);
+
+    var reranked = try retrieve(
+        alloc,
+        .{ .query = &query, .kind = .mcp, .relevance_policy = .intent, .rerank = .{ .browser_first = true } },
+        .mcp,
+        &documents,
+    );
+    defer reranked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), reranked.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), reranked.matches[0].document_index);
+    try std.testing.expectEqual(@as(usize, 0), reranked.matches[reranked.matches.len - 1].document_index);
 }
 
 test "inventory cursor partitions twenty eight tools without gaps" {

@@ -136,6 +136,16 @@ pub fn searchable(scratch: Allocator, permission_rules: types.PermissionRuleSet,
         try tool_result_limits.modelProjectionPreservesText(scratch, tool.prefixed_name);
 }
 
+/// The browser skill binds its MCP server into the catalog. When that server
+/// is among the candidates, steer browser queries to the single batched `run`
+/// tool instead of the granular one-off tools.
+fn hasBrowserServer(candidates: []const Candidate) bool {
+    for (candidates) |candidate| {
+        if (std.mem.eql(u8, candidate.server_name, "browseros-neo")) return true;
+    }
+    return false;
+}
+
 /// Ranks `candidates` for `request` and renders the page the model sees,
 /// within the search and schema budgets. `matched`, when given, receives the
 /// index of every ranked candidate.
@@ -146,6 +156,8 @@ pub fn rank(
     limits: context_limits.Values,
     matched: ?*std.ArrayList(usize),
 ) !tool_mcp_runtime.SearchResult {
+    var effective_request = request;
+    effective_request.rerank.browser_first = hasBrowserServer(candidates);
     const documents = try alloc.alloc(capability_retrieval.Document, candidates.len);
     defer alloc.free(documents);
     for (candidates, documents) |candidate, *document| {
@@ -181,7 +193,7 @@ pub fn rank(
     }
     var page = try capability_retrieval.retrieve(
         alloc,
-        request,
+        effective_request,
         .mcp,
         documents,
     );

@@ -3608,7 +3608,7 @@ test "gateway_system_prompt: compact ordered sections" {
         previous_index = found_index;
     }
 
-    try std.testing.expect(gateway_system_prompt.len < 8 * 1024);
+    try std.testing.expect(gateway_system_prompt.len < 9 * 1024);
 }
 
 test "gateway_system_prompt: local workspace authority" {
@@ -3679,7 +3679,7 @@ test "gateway_system_prompt: safety and permission boundaries" {
 }
 
 test "gateway_system_prompt: focused tools and live verification" {
-    try expectDefaultPromptContains("Choose the smallest suitable available capability.");
+    try expectDefaultPromptContains("For browser tasks, prefer one batched `mcp_browseros-neo_run` script");
     try expectDefaultPromptContains("verify the relevant behavior with direct checks");
     try expectDefaultPromptContains("Broaden when the touched surface is shared");
     try expectDefaultPromptContains("preserve the exact commands, pass or fail status, exit code when available, meaningful output");

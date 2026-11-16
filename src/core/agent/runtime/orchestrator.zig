@@ -8585,6 +8585,38 @@ fn processQueuedPromptLoop(
                             return;
                         }
                         tool_name_correction_used = true;
+                        // Auto-recover a live MCP tool the model named but that
+                        // this step did not advertise (for example `upload`):
+                        // resolve its schema, register it as a dynamic tool and
+                        // re-advertise it on the retry, without waiting for the
+                        // model to issue a separate capability_search.
+                        var rejected_name: []const u8 = "";
+                        if (diagnostic) |failure| rejected_name = failure.name();
+                        var auto_loaded = false;
+                        const dynamic_before = advertised_dynamic_tools.len;
+                        if (rejected_name.len > 0) {
+                            const call = types.ToolCall{
+                                .id = "",
+                                .name = rejected_name,
+                                .arguments_json = "{}",
+                            };
+                            try advertiseUnselectedMcpCalls(
+                                deps,
+                                arena,
+                                &.{call},
+                                &selected_dynamic_tools,
+                                &advertised_dynamic_tools,
+                                &advertised_dynamic_tool_names,
+                            );
+                            auto_loaded = advertised_dynamic_tools.len > dynamic_before;
+                        }
+                        if (auto_loaded) {
+                            for (advertised_dynamic_tools[dynamic_before..]) |tool| try advertised.append(arena, tool.name);
+                            model_request.tools.selected_dynamic = advertised_dynamic_tools;
+                            try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("A tool you proposed (`{s}`) was rejected because its schema was not advertised. Its live schema is now loaded and advertised; call it with that exact name next, with arguments matching the schema. Do not repeat earlier successful actions.", .{rejected_name}) });
+                            try deps.push_system_notice(deps.ctx, "Loaded the rejected tool schema; retrying with it advertised...");
+                            continue :agent_steps_loop;
+                        }
                         try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}. Use capability_search to discover and load any other configured tool before calling it. Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{try std.json.Stringify.valueAlloc(arena, advertised.items, .{})}) });
                         try deps.push_system_notice(deps.ctx, "Refreshing tool selection after a rejected tool name...");
                         continue :agent_steps_loop;
