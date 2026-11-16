@@ -804,18 +804,36 @@ pub fn Runtime(comptime App: type) type {
             );
             ctx.reviewer_model = sel.model;
             if (sel.provider.eql(ctx.provider)) return;
-            if (ctx.credential_source == .host_managed) {
-                ctx.permission_reviewer_provider = app.providerSet().select(sel.provider).permission_reviewer;
+            ctx.fallback_permission_reviewer_provider = ctx.permission_reviewer_provider;
+            ctx.fallback_reviewer_credential = if (ctx.credential_source == .host_managed)
+                .host_managed
+            else
+                .{ .direct = .{
+                    .secret_bytes = ctx.api_key,
+                    .source = ctx.credential_source,
+                    .account_id = ctx.account_id,
+                    .tenant_context = ctx.gateway_team,
+                } };
+            const cross_provider = app.providerSet().select(sel.provider).permission_reviewer;
+            if (cross_provider == null) {
+                ctx.permission_reviewer_provider = null;
                 return;
             }
-            const credential = (try auth_runtime.prepareCredential(
+            if (ctx.credential_source == .host_managed) {
+                ctx.permission_reviewer_provider = cross_provider;
+                return;
+            }
+            const credential = (auth_runtime.prepareCredential(
                 arena,
                 ctx.oauth_transport,
                 ctx.secret_store,
                 sel.provider,
                 null,
-            )) orelse return error.ReviewerCredentialUnavailable;
-            ctx.permission_reviewer_provider = app.providerSet().select(sel.provider).permission_reviewer;
+            ) catch null) orelse {
+                ctx.permission_reviewer_provider = null;
+                return;
+            };
+            ctx.permission_reviewer_provider = cross_provider;
             ctx.api_key = credential.token;
             ctx.credential_source = credential.source;
             ctx.account_id = credential.accountId();
@@ -1138,24 +1156,34 @@ pub fn Runtime(comptime App: type) type {
             var cross_review_credential: ?credentials.Credential = null;
             defer if (cross_review_credential) |*cred| cred.deinit(std.heap.c_allocator);
             if (comptime @hasField(App, "review_model") and @hasDecl(App, "providerSet")) {
-                const review_sel = completion_review.resolveSelection(
+                const raw_review_sel = completion_review.resolveSelection(
                     app.review_model,
                     job.provider,
                     app.providerSet().definitions,
                     job.model,
+                );
+                if (!raw_review_sel.provider.eql(job.provider)) {
+                    cross_review_credential = auth_runtime.prepareCredential(
+                        std.heap.c_allocator,
+                        app.auth.oauthTransport(),
+                        if (comptime @hasDecl(@TypeOf(app.auth), "secretStore")) app.auth.secretStore() else host.unavailable_secret_store,
+                        raw_review_sel.provider,
+                        null,
+                    ) catch null;
+                }
+                const review_sel = completion_review.resolveRunnableSelection(
+                    app.review_model,
+                    job.provider,
+                    app.providerSet().definitions,
+                    job.model,
+                    app.providerSet().select(raw_review_sel.provider).agent_stream != null,
+                    app.auth.credentialSource() == .host_managed or cross_review_credential != null,
                 );
                 config.contract_review_model = review_sel.model;
                 config.contract_review_effort = completion_review.reviewerEffort(review_sel.provider, app.providerSet().definitions);
                 config.contract_review_provider = review_sel.provider;
                 config.contract_review_stream_provider = app.providerSet().select(review_sel.provider).agent_stream_or_unavailable();
                 if (!review_sel.provider.eql(job.provider)) {
-                    cross_review_credential = auth_runtime.prepareCredential(
-                        std.heap.c_allocator,
-                        app.auth.oauthTransport(),
-                        if (comptime @hasDecl(@TypeOf(app.auth), "secretStore")) app.auth.secretStore() else host.unavailable_secret_store,
-                        review_sel.provider,
-                        null,
-                    ) catch null;
                     if (cross_review_credential) |cred| {
                         config.contract_review_credential = .{ .direct = .{
                             .secret_bytes = cred.token,
@@ -1353,6 +1381,10 @@ pub fn Runtime(comptime App: type) type {
             return .{
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(job.model),
+                .host_instructions = if (!completion_review.coordinatorEnabled())
+                    @import("../workspace/realisation_selection.zig").browserHostGuidance(job.prompt, bindings)
+                else
+                    "",
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,
@@ -3608,6 +3640,38 @@ test "app agent runtime queued prompt config uses captured job settings over sta
     try std.testing.expectEqualStrings("test model overlay", config.model_prompt_overlay.?);
     try std.testing.expect(!app.fast_mode);
     try std.testing.expectEqual(types.ReasoningEffort.literal("low"), app.effort);
+    try std.testing.expectEqualStrings("", config.host_instructions);
+}
+
+test "app agent runtime queued prompt config injects run-first browser guidance for browser tasks" {
+    const alloc = std.testing.allocator;
+    var app = try FakeApp.init(alloc);
+    defer app.deinit();
+
+    var job = try makeQueuedPrompt(alloc);
+    defer worker_runtime.freeQueuedPrompt(alloc, job);
+    alloc.free(job.prompt);
+    job.prompt = try alloc.dupe(u8, "Apply to UK contracts on LinkedIn using Easy Apply");
+
+    var tool_projection = tool_projection_mod.EffectiveToolProjection{
+        .advertised_names = try alloc.alloc([]const u8, 0),
+        .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
+        .custom_guidance = try alloc.dupe(u8, ""),
+    };
+    defer tool_projection.deinit(alloc);
+
+    const config = Runtime(FakeApp).buildQueuedPromptConfig(
+        &app,
+        job,
+        .{ .skills = &.{} },
+        &.{},
+        1,
+        test_gateway_chat_url,
+        &tool_projection,
+        null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, config.host_instructions, "<omos_browser_guidance>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config.host_instructions, "mcp_browseros-neo_run") != null);
 }
 
 test "app agent runtime highlights shell command rows over the tool text base" {

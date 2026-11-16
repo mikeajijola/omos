@@ -128,15 +128,7 @@ pub fn resolvePromptSkillBindings(
     var seen_names = std.StringHashMap(void).init(alloc);
     defer seen_names.deinit();
 
-    const browser_requested = containsAnyIgnoreCase(prompt, &.{
-        "browseros-neo",
-        "browseros neo",
-        "browser neo",
-        "use the browser",
-        "in the browser",
-        "http://",
-        "https://",
-    });
+    const browser_requested = hasBrowserTaskSignal(prompt);
 
     for (skills) |candidate| {
         if (seen_names.contains(candidate.name)) continue;
@@ -431,28 +423,10 @@ pub fn buildExecutionGuidance(
         try out.writer.writeByte('\n');
     }
 
-    const is_browser_task = has_browser_skill or containsAnyIgnoreCase(request_text, &.{
-        "browseros",
-        "browseros-neo",
-        "browser neo",
-        "http://",
-        "https://",
-        "in the browser",
-    });
+    const is_browser_task = has_browser_skill or hasBrowserTaskSignal(request_text);
 
     if (is_browser_task) {
-        try out.writer.writeAll(
-            "- Pre-loaded MCP tools: `mcp_browseros-neo_name_session` and `mcp_browseros-neo_run` are already advertised and callable now. On your VERY FIRST step, call `mcp_browseros-neo_name_session` and `mcp_browseros-neo_run` together without any preliminary `capability_search`, `skill`, or `fossil_workspace` calls.\n" ++
-                "- Single-tab reuse: Open one tab with `const page = await browser.open(url)` and reuse that same `page` handle with `await page.goto(nextUrl)` for subsequent navigations. Do NOT open many tabs in a loop or with `Promise.all(ids.map(id => browser.open(...)))`.\n" ++
-                "- Valid page handle methods: Use `await page.goto(url)`, `await page.read()`, `await page.snapshot()`, `await page.click(ref)`, `await page.fill(ref, value)`, `await page.selectOption(ref, value)`, `await page.upload(ref, [paths])`, `await page.waitForText(text)`, `await page.pdf()`, and `await page.evaluateInPage(fn)`. NEVER access `page.url` or `page.url()` on a page handle (it is not a method or property on the handle and throws an error).\n" ++
-                "- Staged HTML forms: When submitting a multi-step form (where clicking a review button POSTs to `/prepare/...` and renders a confirmation page with a `Confirm and send` button that POSTs to `/submit/...` and redirects to `/receipt/...`), complete BOTH stages on the SAME `page` handle inside the SAME `mcp_browseros-neo_run` script (`await page.goto(itemUrl)` -> `await page.snapshot()` -> fill/select/upload fields -> `await page.click(reviewRef)` -> `await page.waitForText('Confirm and send')` -> `await page.snapshot()` -> `await page.click(confirmRef)` -> `await page.waitForText('Confirmed receipt')` -> `await page.read()`). NEVER pass `/prepare/...` or `/submit/...` URLs to `browser.open()` or `page.goto()`, because those routes are POST-only and return 404 on GET.\n" ++
-                "- Batch multi-item work within the 30-second run timeout: Each `mcp_browseros-neo_run` call has a hard 30000ms wall-time cap. Batch 10-15 read-only page navigations per `run` call, 3-8 two-stage form submissions per `run` call, or 4-5 PDF renders/uploads per `run` call on a single reused tab, returning a structured JSON array of extracted facts and confirmed receipt IDs/URLs so no call exceeds 30s.\n" ++
-                "- Combined PDF-render and form-upload batching: When a task requires rendering tailored HTML files to PDF and uploading them to a browser form, first read all items in batches of 15-20 per `run` call, generate all tailored HTML files in one local script, and print the compact JSON list of all target items (ID, rate, cover note) to stdout once so it stays in your conversation context. Then issue consecutive `mcp_browseros-neo_run` calls (5 items per `run` call, reusing `cvTab` for `file:///.../cv.html` -> `await cvTab.pdf()` and `formTab` for the item URL -> fill/select -> `await formTab.upload(cvRef, [pdf.path])` -> `Review before sending` -> `Confirm and send`, returning `[{ job_id, pdf_path: pdf.path, receipt_id, state }]`) WITHOUT running `cat batch_N.json` or `python3` between every `run` call. After all 85 browser submissions finish, run ONE `python3` script to hash the returned `pdf_path` files and write the complete ledger.\n" ++
-                "- Signed-in LinkedIn people search: When researching prospects or collaborators on LinkedIn, BrowserOS Neo is ALREADY signed into LinkedIn. After reading the business URLs, navigate directly on your single reused tab to `https://www.linkedin.com/search/results/people/?keywords=` + encodeURIComponent(query) + `&page=` + pageNum and call `await page.read('main')` (each search page lists 10 real people with name, headline, location, and `https://www.linkedin.com/in/...` profile URL). Loop over 2-3 search pages per `mcp_browseros-neo_run` call so 50+ distinct sourced prospects are collected in 2-3 `run` calls, then write `documents/prospects.json` directly. NEVER use Google, DuckDuckGo, or Bing to search `site:linkedin.com/in`.\n" ++
-                "- Direct file deliverables: Save requested ledgers, JSON/CSV tables, HTML files, and PDFs directly in the workspace filesystem (for example under `documents/`) using `write_file` or local scripts. Do NOT call `fossil_workspace` (`status`, `definition`, `read`, `record`, `query`, `workers`) or `workspace_content` (`contracts`) to record task deliverables.\n" ++
-                "- No cross-directory shell probing: Never use `shell` to run `find /`, `grep -r`, `ps`, `ss`, or `curl`, and never inspect files outside your project workspace. Keep all browser interactions inside `mcp_browseros-neo_run`.\n" ++
-                "- Strict factual grounding: Every name, job title, company, date, rate, skill, and project claim in outbound messages, prospect tables, and CVs must match the inspected source profile and target page verbatim. In CVs and messages, never claim the candidate 'runs' or 'leads' a business description (such as Example Systems) or list it as a 'Current' employment entry under Experience when no employment title or dates are supplied, and never expand 'Designed ...' into 'Designed and implemented ...'.\n",
-        );
+        try out.writer.writeAll(browser_execution_guidance);
     } else if (std.mem.eql(u8, capability, "general_task")) {
         try out.writer.writeAll(
             "- Save requested deliverables directly in the workspace filesystem (such as `documents/`) using standard file tools, and avoid unnecessary `fossil_workspace` schema or status reads.\n",
@@ -461,6 +435,56 @@ pub fn buildExecutionGuidance(
 
     try out.writer.writeAll("</omos_realisation_assignment>");
     return out.toOwnedSlice();
+}
+
+pub const browser_execution_guidance =
+    "- Pre-loaded MCP tools: `mcp_browseros-neo_name_session` and `mcp_browseros-neo_run` are already advertised and callable now. On your VERY FIRST step, call `mcp_browseros-neo_name_session` and `mcp_browseros-neo_run` together without any preliminary `capability_search`, `skill`, or `fossil_workspace` calls, and prefer `mcp_browseros-neo_run` over granular one-off calls (`tabs`, `navigate`, `snapshot`, `act`, `read`, `grep`).\n" ++
+    "- Single-tab reuse: Open one tab with `const page = await browser.open(url)` and reuse that same `page` handle with `await page.goto(nextUrl)` for subsequent navigations. Do NOT open many tabs in a loop or with `Promise.all(ids.map(id => browser.open(...)))`.\n" ++
+    "- Valid page handle methods: Use `await page.goto(url)`, `await page.read()`, `await page.snapshot()`, `await page.click(ref)`, `await page.fill(ref, value)`, `await page.selectOption(ref, value)`, `await page.upload(ref, [paths])`, `await page.waitForText(text)`, `await page.pdf()`, and `await page.evaluateInPage(fn)`. NEVER access `page.url` or `page.url()` on a page handle (it is not a method or property on the handle and throws an error).\n" ++
+    "- Staged HTML forms: When submitting a multi-step form (where clicking a review button POSTs to `/prepare/...` and renders a confirmation page with a `Confirm and send` button that POSTs to `/submit/...` and redirects to `/receipt/...`), complete BOTH stages on the SAME `page` handle inside the SAME `mcp_browseros-neo_run` script (`await page.goto(itemUrl)` -> `await page.snapshot()` -> fill/select/upload fields -> `await page.click(reviewRef)` -> `await page.waitForText('Confirm and send')` -> `await page.snapshot()` -> `await page.click(confirmRef)` -> `await page.waitForText('Confirmed receipt')` -> `await page.read()`). NEVER pass `/prepare/...` or `/submit/...` URLs to `browser.open()` or `page.goto()`, because those routes are POST-only and return 404 on GET.\n" ++
+    "- Batch multi-item work within the 30-second run timeout: Each `mcp_browseros-neo_run` call has a hard 30000ms wall-time cap. Batch 10-15 read-only page navigations per `run` call, 3-8 two-stage form submissions per `run` call, or 4-5 PDF renders/uploads per `run` call on a single reused tab, returning a structured JSON array of extracted facts and confirmed receipt IDs/URLs so no call exceeds 30s.\n" ++
+    "- Combined PDF-render and form-upload batching: When a task requires rendering tailored HTML files to PDF and uploading them to a browser form, first read all items in batches of 15-20 per `run` call, generate all tailored HTML files in one local script, and print the compact JSON list of all target items (ID, rate, cover note) to stdout once so it stays in your conversation context. Then issue consecutive `mcp_browseros-neo_run` calls (5 items per `run` call, reusing `cvTab` for `file:///.../cv.html` -> `await cvTab.pdf()` and `formTab` for the item URL -> fill/select -> `await formTab.upload(cvRef, [pdf.path])` -> `Review before sending` -> `Confirm and send`, returning `[{ job_id, pdf_path: pdf.path, receipt_id, state }]`) WITHOUT running `cat batch_N.json` or `python3` between every `run` call. After all 85 browser submissions finish, run ONE `python3` script to hash the returned `pdf_path` files and write the complete ledger.\n" ++
+    "- Signed-in LinkedIn people search: When researching prospects or collaborators on LinkedIn, BrowserOS Neo is ALREADY signed into LinkedIn. After reading the business URLs, navigate directly on your single reused tab to `https://www.linkedin.com/search/results/people/?keywords=` + encodeURIComponent(query) + `&page=` + pageNum and call `await page.read('main')` (each search page lists 10 real people with name, headline, location, and `https://www.linkedin.com/in/...` profile URL). Loop over 2-3 search pages per `mcp_browseros-neo_run` call so 50+ distinct sourced prospects are collected in 2-3 `run` calls, then write `documents/prospects.json` directly. NEVER use Google, DuckDuckGo, or Bing to search `site:linkedin.com/in`.\n" ++
+    "- Direct file deliverables: Save requested ledgers, JSON/CSV tables, HTML files, and PDFs directly in the workspace filesystem (for example under `documents/`) using `write_file` or local scripts. Do NOT call `fossil_workspace` (`status`, `definition`, `read`, `record`, `query`, `workers`) or `workspace_content` (`contracts`) to record task deliverables.\n" ++
+    "- No cross-directory shell probing: Never use `shell` to run `find /`, `grep -r`, `ps`, `ss`, or `curl`, and never inspect files outside your project workspace. Keep all browser interactions inside `mcp_browseros-neo_run`.\n" ++
+    "- Strict factual grounding: Every name, job title, company, date, rate, skill, and project claim in outbound messages, prospect tables, and CVs must match the inspected source profile and target page verbatim. In CVs and messages, never claim the candidate 'runs' or 'leads' a business description (such as Example Systems) or list it as a 'Current' employment entry under Experience when no employment title or dates are supplied, and never expand 'Designed ...' into 'Designed and implemented ...'.\n";
+
+pub fn hasBrowserTaskSignal(prompt: []const u8) bool {
+    return containsAnyIgnoreCase(prompt, &.{
+        "browseros",
+        "browseros-neo",
+        "browseros neo",
+        "browser neo",
+        "use the browser",
+        "in the browser",
+        "http://",
+        "https://",
+        "browser",
+        "linkedin",
+        "easy apply",
+        "job board",
+        "website",
+        "webpage",
+    });
+}
+
+fn hasBoundBrowserSkill(skill_bindings: []const skill_invocation.ExplicitBinding) bool {
+    for (skill_bindings) |binding| {
+        if (std.ascii.eqlIgnoreCase(binding.name, "browseros-neo")) return true;
+    }
+    return false;
+}
+
+/// Returns concise run-first browser guidance for interactive and `fx ask` turns
+/// when a browser task is detected or `browseros-neo` is bound.
+pub fn browserHostGuidance(
+    prompt: []const u8,
+    skill_bindings: []const skill_invocation.ExplicitBinding,
+) []const u8 {
+    if (!hasBoundBrowserSkill(skill_bindings) and !hasBrowserTaskSignal(prompt)) return "";
+    return "<omos_browser_guidance>\n" ++
+        browser_execution_guidance ++
+        "</omos_browser_guidance>";
 }
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
@@ -535,4 +559,63 @@ test "capability scoring uses declaration ranking weights and selects native rea
     );
     try std.testing.expectEqualStrings("general_task_native", scored.realisation);
     try std.testing.expect(scored.ranking.score >= 0.8);
+}
+
+test "prompt skill binding auto-binds browseros-neo for expanded browser triggers" {
+    const alloc = std.testing.allocator;
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "browseros-neo", .description = "browser", .path = "/tmp/skills/browseros-neo", .source = .workspace_shared },
+    };
+    for ([_][]const u8{
+        "Open my browser and check notifications",
+        "Search LinkedIn for contract engineers",
+        "Submit Easy Apply applications for UK contracts",
+        "Check the job board listings",
+        "Inspect the company website for contact details",
+        "Read this webpage and summarize",
+    }) |prompt| {
+        const bindings = try resolvePromptSkillBindings(alloc, prompt, "/tmp", &skills);
+        defer {
+            for (bindings) |binding| {
+                alloc.free(binding.name);
+                alloc.free(binding.path);
+            }
+            alloc.free(bindings);
+        }
+        try std.testing.expectEqual(@as(usize, 1), bindings.len);
+        try std.testing.expectEqualStrings("browseros-neo", bindings[0].name);
+    }
+
+    const coding_bindings = try resolvePromptSkillBindings(
+        alloc,
+        "Refactor src/core/workspace/definition.zig and run zig build test.",
+        "/tmp",
+        &skills,
+    );
+    defer alloc.free(coding_bindings);
+    try std.testing.expectEqual(@as(usize, 0), coding_bindings.len);
+}
+
+test "browserHostGuidance and buildExecutionGuidance emit run-first browser guidance" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings("", browserHostGuidance("Refactor src/main.zig", &.{}));
+
+    const from_prompt = browserHostGuidance("Apply via LinkedIn Easy Apply", &.{});
+    try std.testing.expect(std.mem.indexOf(u8, from_prompt, "<omos_browser_guidance>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, from_prompt, "mcp_browseros-neo_run") != null);
+
+    const bound = [_]skill_invocation.ExplicitBinding{.{ .name = "browseros-neo", .path = "/tmp/skills/browseros-neo" }};
+    const from_binding = browserHostGuidance("Continue the task", &bound);
+    try std.testing.expect(std.mem.indexOf(u8, from_binding, "mcp_browseros-neo_run") != null);
+
+    const exec_guidance = try buildExecutionGuidance(
+        alloc,
+        "general_task",
+        "general_task_native",
+        .{ .relevance = 0.9, .precedent = 0.8, .evidence = 1.0, .recency = 0.8, .score = 0.88 },
+        &.{},
+        "Check the job board webpage",
+    );
+    defer alloc.free(exec_guidance);
+    try std.testing.expect(std.mem.indexOf(u8, exec_guidance, "mcp_browseros-neo_run") != null);
 }

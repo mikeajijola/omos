@@ -75,7 +75,7 @@ pub fn defaultReviewerModelForProvider(
                     break :blk fallback;
                 }
             }
-            if (std.ascii.eqlIgnoreCase(provider.label(), "gemini")) break :blk "gemini-3.8-flash";
+            if (std.ascii.eqlIgnoreCase(provider.label(), "gemini")) break :blk "gemini-2.5-flash";
             break :blk fallback;
         },
     };
@@ -219,6 +219,27 @@ pub fn resolveSelection(
         }
     }
     return .{ .provider = provider, .model = fallback };
+}
+
+/// Resolves `override` and falls back to the active connected `provider` and
+/// `fallback` model when the selected reviewer provider is unconfigured or lacks
+/// credentials/capabilities on the host.
+pub fn resolveRunnableSelection(
+    override: []const u8,
+    provider: model_provider.ProviderId,
+    definitions: []const configured_provider.Definition,
+    fallback: []const u8,
+    has_provider_route: bool,
+    has_cross_provider_credential: bool,
+) model_provider.ProviderSelection {
+    const selected = resolveSelection(override, provider, definitions, fallback);
+    if (!selected.provider.eql(provider) and (!has_provider_route or !has_cross_provider_credential)) {
+        return .{ .provider = provider, .model = fallback };
+    }
+    if (selected.provider.eql(provider) and !has_provider_route and fallback.len > 0) {
+        return .{ .provider = provider, .model = fallback };
+    }
+    return selected;
 }
 
 pub fn selectModel(override: []const u8, provider: model_provider.ProviderId, definitions: []const configured_provider.Definition, fallback: []const u8) []const u8 {
@@ -877,4 +898,51 @@ test "review-only continuation validates unread identities without changing cove
     const duplicate_alias = try std.json.Stringify.valueAlloc(alloc, .{ .evidence = &.{ "unread", view.references[0] } }, .{});
     try std.testing.expectError(error.InvalidReviewContinuation, reviewContinuation(alloc, &view, duplicate_alias));
     try std.testing.expectError(error.InvalidReviewContinuation, reviewContinuation(alloc, &view, "{\"evidence\":[\"unread\"],\"actor_work\":true}"));
+}
+
+test "resolveRunnableSelection and gemini default fall back cleanly to active connected model" {
+    const definitions = [_]configured_provider.Definition{
+        .{ .id = "gemini", .protocol = .@"openai-chat-completions", .base_url = "https://generativelanguage.googleapis.com/v1beta/openai", .auth = .none },
+    };
+    const gemini = model_provider.parse("gemini").?.bind(.{ .definitions = &definitions }) catch unreachable;
+    try std.testing.expectEqualStrings(
+        "gemini-2.5-flash",
+        defaultReviewerModelForProvider(gemini, &.{}, "gemini-2.5-flash"),
+    );
+
+    // Unconfigured cross-provider route falls back to active connected provider & model.
+    const unconfigured_cross = resolveRunnableSelection(
+        "codex:gpt-review",
+        .gateway,
+        &definitions,
+        "google/gemini-2.5-flash",
+        false,
+        false,
+    );
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, unconfigured_cross.provider);
+    try std.testing.expectEqualStrings("google/gemini-2.5-flash", unconfigured_cross.model);
+
+    // Missing cross-provider credential falls back to active connected provider & model.
+    const missing_cred = resolveRunnableSelection(
+        "codex:gpt-review",
+        .gateway,
+        &definitions,
+        "google/gemini-2.5-flash",
+        true,
+        false,
+    );
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, missing_cred.provider);
+    try std.testing.expectEqualStrings("google/gemini-2.5-flash", missing_cred.model);
+
+    // Configured cross-provider route with credential stays selected.
+    const configured_cross = resolveRunnableSelection(
+        "codex:gpt-review",
+        .gateway,
+        &definitions,
+        "google/gemini-2.5-flash",
+        true,
+        true,
+    );
+    try std.testing.expectEqual(model_provider.ProviderId.codex, configured_cross.provider);
+    try std.testing.expectEqualStrings("gpt-review", configured_cross.model);
 }

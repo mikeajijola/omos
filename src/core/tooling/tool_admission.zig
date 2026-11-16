@@ -1005,7 +1005,7 @@ fn automaticReviewOutcome(
     is_dynamic_tool: bool,
     file_authorization: ?file_mutation_contract.FileExecutionAuthorization,
 ) !command_admission.PermissionOutcome {
-    if (!input.auto_classifier.enabled()) {
+    if (!input.auto_classifier.canReview()) {
         return reviewerUnavailableOutcome(call, .reviewer_unconfigured);
     }
     const review_turn = input.permission_review_turn orelse
@@ -6455,4 +6455,114 @@ test "automatic trusted-root overwrite preserves configured read disclosure revi
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(ToolPermissionDecision.once, outcome.decision);
+}
+
+test "automatic review falls back to active connected model when primary reviewer fails or is unconfigured" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+
+    const Fallback = struct {
+        calls: usize = 0,
+        last_model: []const u8 = "",
+
+        fn review(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            provider_input: permission_auto_classifier.ProviderInput,
+            _: permission_auto_classifier.ReviewRequest,
+        ) anyerror!permission_auto_classifier.ParseOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            self.last_model = provider_input.reviewer_model;
+            return .{ .valid = .{
+                .risk = .low,
+                .decision = .clear,
+                .rationale = try alloc.dupe(u8, "Approved by active connected model fallback."),
+            } };
+        }
+    };
+
+    var fallback = Fallback{};
+    const fallback_provider = permission_auto_classifier.Provider{
+        .context = @ptrCast(&fallback),
+        .review_fn = Fallback.review,
+    };
+
+    // Case 1: primary fails with transport_permanent (e.g. invalid reviewer model id)
+    var primary_failed = FakeAutoClassifier{ .invalid_reason = .transport_permanent };
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&primary_failed),
+            FakeAutoClassifier.classify,
+        ).withFallback(fallback_provider, .{
+            .credential = "active-key",
+            .reviewer_model = "google/gemini-2.5-flash",
+        }),
+    );
+    const call = ToolCall{
+        .id = "fallback-on-permanent",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch fallback.txt\"}",
+    };
+    const outcome_permanent = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome_permanent.decision);
+    try std.testing.expectEqual(@as(usize, 1), primary_failed.calls);
+    try std.testing.expectEqual(@as(usize, 1), fallback.calls);
+    try std.testing.expectEqualStrings("google/gemini-2.5-flash", fallback.last_model);
+
+    // Case 2: primary is unconfigured (disabled) while active fallback is available
+    input.auto_classifier = permission_auto_classifier.Classifier.disabled().withFallback(
+        fallback_provider,
+        .{
+            .credential = "active-key",
+            .reviewer_model = "gemini-2.5-flash",
+        },
+    );
+    const outcome_unconfigured = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "fallback-on-unconfigured",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch fallback2.txt\"}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, outcome_unconfigured.decision);
+    try std.testing.expectEqual(@as(usize, 2), fallback.calls);
+    try std.testing.expectEqualStrings("gemini-2.5-flash", fallback.last_model);
+
+    // Case 3: primary returns valid caution -> never bypassed by fallback
+    var primary_caution = FakeAutoClassifier{ .decision = .caution };
+    input.auto_classifier = permission_auto_classifier.Classifier.withOverride(
+        @ptrCast(&primary_caution),
+        FakeAutoClassifier.classify,
+    ).withFallback(fallback_provider, .{
+        .credential = "active-key",
+        .reviewer_model = "gemini-2.5-flash",
+    });
+    const outcome_caution = try requestPermissionOutcome(
+        input,
+        arena_state.allocator(),
+        .{
+            .id = "caution-not-bypassed",
+            .name = "shell",
+            .arguments_json = "{\"action\":\"run\",\"command\":\"touch caution.txt\"}",
+        },
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, outcome_caution.decision);
+    try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, outcome_caution.denial_reason.?);
+    try std.testing.expectEqual(@as(usize, 2), fallback.calls);
 }

@@ -1304,19 +1304,46 @@ const AskContext = struct {
             .account_id = self.account_id,
             .tenant_context = self.gateway_team,
         } };
-        const credential = completion_review.reviewerCredential(self.provider, selection.provider, actor, self.reviewer_credential) catch
+        const active_provider = self.cfg.provider_set.select(self.provider).permission_reviewer;
+        const active_input: permission_auto_classifier.ProviderInput = .{
+            .credential = actor.secret() orelse "",
+            .credential_source = actor.credentialSource(),
+            .account_id = actor.accountId(),
+            .tenant = actor.tenant(),
+            .endpoint = self.cfg.gateway_chat_url,
+            .reviewer_model = self.model,
+            .cancel_flag = self.cancelFlag(),
+        };
+        const credential = completion_review.reviewerCredential(self.provider, selection.provider, actor, self.reviewer_credential) catch {
+            if (active_provider) |fallback| {
+                return permission_auto_classifier.Classifier.disabled().withFallback(fallback, active_input);
+            }
             return permission_auto_classifier.Classifier.disabled();
-        const provider = self.cfg.provider_set.select(selection.provider).permission_reviewer orelse
+        };
+        const provider = self.cfg.provider_set.select(selection.provider).permission_reviewer orelse {
+            if (active_provider) |fallback| {
+                return permission_auto_classifier.Classifier.disabled().withFallback(fallback, active_input);
+            }
             return permission_auto_classifier.Classifier.disabled();
-        return permission_auto_classifier.Classifier.withProvider(provider, .{
+        };
+        const primary_reviewer_model = if (self.reviewer_model.len > 0) selection.model else "";
+        const primary = permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = credential.secret() orelse "",
             .credential_source = credential.credentialSource(),
             .account_id = credential.accountId(),
             .tenant = credential.tenant(),
             .endpoint = self.cfg.gateway_chat_url,
-            .reviewer_model = if (self.reviewer_model.len > 0) selection.model else "",
+            .reviewer_model = primary_reviewer_model,
             .cancel_flag = self.cancelFlag(),
         });
+        if (active_provider) |fallback| {
+            if (!selection.provider.eql(self.provider) or
+                (self.model.len > 0 and !std.mem.eql(u8, primary_reviewer_model, self.model)))
+            {
+                return primary.withFallback(fallback, active_input);
+            }
+        }
+        return primary;
     }
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
@@ -2186,24 +2213,35 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             recovery_checkpoint == null
     else
         false;
-    const review_selection = completion_review.resolveSelection(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model);
+    const raw_review_selection = completion_review.resolveSelection(ctx.reviewer_model, ctx.provider, cfg.provider_set.definitions, ctx.model);
     var cross_review_credential: ?credentials.Credential = null;
     defer if (cross_review_credential) |*cred| cred.deinit(alloc);
-    if (!review_selection.provider.eql(ctx.provider)) {
+    if (!raw_review_selection.provider.eql(ctx.provider)) {
         cross_review_credential = auth_runtime.prepareCredential(
             alloc,
             cfg.gateway_provider.oauth_transport,
             cfg.secret_store,
-            review_selection.provider,
+            raw_review_selection.provider,
             null,
         ) catch null;
     }
-    ctx.reviewer_credential = if (cross_review_credential) |cred| .{ .direct = .{
-        .secret_bytes = cred.token,
-        .source = cred.source,
-        .account_id = cred.accountId(),
-        .tenant_context = cred.gatewayTeam(),
-    } } else null;
+    const review_selection = completion_review.resolveRunnableSelection(
+        ctx.reviewer_model,
+        ctx.provider,
+        cfg.provider_set.definitions,
+        ctx.model,
+        cfg.provider_set.select(raw_review_selection.provider).agent_stream != null,
+        cfg.auth_mode == .host_managed or cross_review_credential != null,
+    );
+    ctx.reviewer_credential = if (!review_selection.provider.eql(ctx.provider))
+        if (cross_review_credential) |cred| .{ .direct = .{
+            .secret_bytes = cred.token,
+            .source = cred.source,
+            .account_id = cred.accountId(),
+            .tenant_context = cred.gatewayTeam(),
+        } } else null
+    else
+        null;
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
@@ -2227,6 +2265,10 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
+        .host_instructions = if (inherited_authority == null or inherited_authority.?.execution_guidance.len == 0)
+            @import("../workspace/realisation_selection.zig").browserHostGuidance(owned_prompt, effective_skill_bindings)
+        else
+            "",
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .skill_bindings = effective_skill_bindings,
         .initial_dynamic_tools = initial_dynamic_tools,
@@ -2252,12 +2294,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .contract_review_effort = completion_review.reviewerEffort(review_selection.provider, cfg.provider_set.definitions),
         .contract_review_provider = review_selection.provider,
         .contract_review_stream_provider = cfg.provider_set.select(review_selection.provider).agent_stream_or_unavailable(),
-        .contract_review_credential = if (cross_review_credential) |cred| .{ .direct = .{
-            .secret_bytes = cred.token,
-            .source = cred.source,
-            .account_id = cred.accountId(),
-            .tenant_context = cred.gatewayTeam(),
-        } } else null,
+        .contract_review_credential = if (!review_selection.provider.eql(ctx.provider))
+            if (cross_review_credential) |cred| .{ .direct = .{
+                .secret_bytes = cred.token,
+                .source = cred.source,
+                .account_id = cred.accountId(),
+                .tenant_context = cred.gatewayTeam(),
+            } } else null
+        else
+            null,
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
         .effort = ctx.effort,
@@ -5891,6 +5936,90 @@ test "cross-provider reviewer CLI permission route keeps actor credential isolat
     try std.testing.expectEqualStrings("actor-key", ctx.api_key);
     ctx.reviewer_credential = .{ .direct = .{ .secret_bytes = "actor-key", .source = .ai_gateway_api_key } };
     try std.testing.expect(!ctx.admissionAutoClassifier().enabled());
+}
+
+test "fx ask admissionAutoClassifier falls back to active connected model when reviewer fails or is unconfigured" {
+    const alloc = std.testing.allocator;
+    const Fake = struct {
+        var calls: usize = 0;
+        var seen_models: [4][]const u8 = undefined;
+
+        fn review(_: ?*anyopaque, review_alloc: Allocator, input: permission_auto_classifier.ProviderInput, _: permission_auto_classifier.ReviewRequest) anyerror!permission_auto_classifier.ParseOutcome {
+            if (calls < seen_models.len) {
+                seen_models[calls] = input.reviewer_model;
+            }
+            calls += 1;
+            if (std.mem.eql(u8, input.reviewer_model, "active/connected-model")) {
+                return .{ .valid = .{
+                    .risk = .low,
+                    .decision = .clear,
+                    .rationale = try review_alloc.dupe(u8, "Approved via active model fallback."),
+                } };
+            }
+            return .{ .invalid = .transport_permanent };
+        }
+    };
+    Fake.calls = 0;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var config = testConfig();
+    config.provider_set.gateway.permission_reviewer = .{ .review_fn = Fake.review };
+
+    var ctx = AskContext.init(alloc, config, testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.provider = .gateway;
+    ctx.model = "active/connected-model";
+    ctx.api_key = "actor-key";
+    ctx.credential_source = .ai_gateway_api_key;
+
+    const call = ToolCall{
+        .id = "fallback-ask-1",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"touch ask_fallback.txt\"}",
+    };
+    var review_turn = TestReviewTurn.init("Create ask_fallback.txt.", call);
+
+    // Case 1: unconfigured cross-provider reviewer falls back to active gateway + active model
+    ctx.reviewer_model = "gemini:gemini-3.8-flash";
+    const unconfigured_outcome = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena_state.allocator(),
+        call,
+        review_turn.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, unconfigured_outcome.decision);
+    try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+    try std.testing.expectEqualStrings("active/connected-model", Fake.seen_models[0]);
+
+    // Case 2: primary fails with transport_permanent -> falls back to active connected model
+    ctx.reviewer_model = "openai/unavailable-model";
+    const permanent_outcome = try requestToolPermissionOutcomeWithRequest(
+        &ctx,
+        arena_state.allocator(),
+        call,
+        review_turn.context(),
+        .auto,
+        &.{},
+        null,
+        null,
+        &.{},
+        null,
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.once, permanent_outcome.decision);
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expectEqualStrings("openai/unavailable-model", Fake.seen_models[1]);
+    try std.testing.expectEqualStrings("active/connected-model", Fake.seen_models[2]);
 }
 
 test "fx ask ChatGPT route disables Gateway-backed auxiliary providers" {

@@ -220,6 +220,8 @@ pub const Context = struct {
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    fallback_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    fallback_reviewer_credential: ?types.CredentialLease = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
@@ -318,10 +320,37 @@ pub const Context = struct {
     }
 
     fn admissionAutoClassifier(self: Context) permission_auto_classifier.Classifier {
-        if (self.auto_classifier.enabled()) return self.auto_classifier;
-        const provider = self.permission_reviewer_provider orelse
+        if (self.auto_classifier.canReview()) return self.auto_classifier;
+        const active_provider = self.fallback_permission_reviewer_provider orelse self.permission_reviewer_provider;
+        const active_input: ?permission_auto_classifier.ProviderInput = if (active_provider != null) .{
+            .credential = if (self.fallback_reviewer_credential) |lease|
+                (lease.secret() orelse "")
+            else
+                self.api_key,
+            .credential_source = if (self.fallback_reviewer_credential) |lease|
+                lease.credentialSource()
+            else
+                self.credential_source,
+            .account_id = if (self.fallback_reviewer_credential) |lease|
+                lease.accountId()
+            else
+                self.account_id,
+            .tenant = if (self.fallback_reviewer_credential) |lease|
+                lease.tenant()
+            else
+                self.gateway_team,
+            .endpoint = self.gateway_chat_url,
+            .reviewer_model = self.model,
+            .cancel_flag = self.cancel_flag,
+        } else null;
+
+        const provider = self.permission_reviewer_provider orelse {
+            if (active_provider) |fallback| {
+                return permission_auto_classifier.Classifier.disabled().withFallback(fallback, active_input.?);
+            }
             return permission_auto_classifier.Classifier.disabled();
-        return permission_auto_classifier.Classifier.withProvider(provider, .{
+        };
+        const primary = permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
             .credential_source = self.credential_source,
             .account_id = self.account_id,
@@ -330,6 +359,13 @@ pub const Context = struct {
             .reviewer_model = self.reviewer_model,
             .cancel_flag = self.cancel_flag,
         });
+        if (active_provider) |fallback| {
+            const same_provider = self.fallback_permission_reviewer_provider == null;
+            if (!same_provider or (self.model.len > 0 and !std.mem.eql(u8, self.reviewer_model, self.model))) {
+                return primary.withFallback(fallback, active_input.?);
+            }
+        }
+        return primary;
     }
 };
 

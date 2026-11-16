@@ -601,6 +601,8 @@ pub const Reviewer = struct {
 pub const Classifier = struct {
     provider: ?Provider = null,
     provider_input: ProviderInput = .{},
+    fallback_provider: ?Provider = null,
+    fallback_provider_input: ProviderInput = .{},
     override_ctx: ?*anyopaque = null,
     override_fn: ?OverrideFn = null,
 
@@ -622,8 +624,60 @@ pub const Classifier = struct {
         };
     }
 
+    pub fn withFallback(
+        self: Classifier,
+        provider: Provider,
+        provider_input: ProviderInput,
+    ) Classifier {
+        var next = self;
+        next.fallback_provider = provider;
+        next.fallback_provider_input = provider_input;
+        return next;
+    }
+
     pub fn enabled(self: Classifier) bool {
         return self.override_fn != null or self.provider != null;
+    }
+
+    pub fn canReview(self: Classifier) bool {
+        return self.enabled() or self.fallback_provider != null;
+    }
+
+    pub fn isReviewerUnavailableReason(reason: InvalidReason) bool {
+        return switch (reason) {
+            .reviewer_unconfigured,
+            .override_failed,
+            .transport_unconfigured,
+            .transport_call_failed,
+            .transport_transient,
+            .transport_permanent,
+            .transport_timed_out,
+            .provider_context_missing,
+            .provider_failed,
+            => true,
+            else => false,
+        };
+    }
+
+    fn reviewFallback(
+        self: Classifier,
+        alloc: std.mem.Allocator,
+        request: ReviewRequest,
+    ) error{ OutOfMemory, Cancelled }!ParseOutcome {
+        const fallback = self.fallback_provider orelse return .{ .invalid = .reviewer_unconfigured };
+        if (self.fallback_provider_input.cancel_flag) |flag| {
+            if (flag.load(.seq_cst)) return error.Cancelled;
+        }
+        return fallback.review_fn(
+            fallback.context,
+            alloc,
+            self.fallback_provider_input,
+            request,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Cancelled => return error.Cancelled,
+            else => return .{ .invalid = .provider_failed },
+        };
     }
 
     pub fn review(
@@ -631,27 +685,43 @@ pub const Classifier = struct {
         alloc: std.mem.Allocator,
         request: ReviewRequest,
     ) error{ OutOfMemory, Cancelled }!ParseOutcome {
-        if (self.override_fn) |review_fn| {
-            return Reviewer.withOverride(
+        const primary: ParseOutcome = if (self.override_fn) |review_fn|
+            Reviewer.withOverride(
                 self.override_ctx orelse return .{ .invalid = .override_context_missing },
                 review_fn,
             ).review(alloc, request) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Cancelled => return error.Cancelled,
-                else => return .{ .invalid = .override_failed },
-            };
+                else => .{ .invalid = .override_failed },
+            }
+        else if (self.provider) |provider|
+            provider.review_fn(
+                provider.context,
+                alloc,
+                self.provider_input,
+                request,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Cancelled => return error.Cancelled,
+                else => .{ .invalid = .provider_failed },
+            }
+        else if (self.fallback_provider != null)
+            return self.reviewFallback(alloc, request)
+        else
+            return .{ .invalid = .reviewer_unconfigured };
+
+        switch (primary) {
+            .invalid => |reason| if (self.fallback_provider != null and isReviewerUnavailableReason(reason)) {
+                debug_trace.logf(
+                    "permission",
+                    "event=auto_review_fallback reason={s} fallback_model={s}",
+                    .{ @tagName(reason), self.fallback_provider_input.reviewer_model },
+                );
+                return self.reviewFallback(alloc, request);
+            },
+            else => {},
         }
-        const provider = self.provider orelse return .{ .invalid = .reviewer_unconfigured };
-        return provider.review_fn(
-            provider.context,
-            alloc,
-            self.provider_input,
-            request,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
-            else => return .{ .invalid = .provider_failed },
-        };
+        return primary;
     }
 };
 

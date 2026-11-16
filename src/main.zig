@@ -2459,7 +2459,7 @@ const App = struct {
                 count = appendUniqueModelCompletion(out, count, normalized, rm);
             }
         }
-        for ([_][]const u8{ "openai/gpt-5.6-luna", "gpt-5.6-luna", "grok-4.5", "gemini-3.8-flash" }) |builtin_id| {
+        for ([_][]const u8{ "openai/gpt-5.6-luna", "gpt-5.6-luna", "grok-4.5", "gemini-2.5-flash" }) |builtin_id| {
             count = appendUniqueModelCompletion(out, count, normalized, builtin_id);
         }
         return count;
