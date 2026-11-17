@@ -8,6 +8,7 @@ const model = @import("definition.zig");
 const workspace = @import("fossil_workspace.zig");
 const request_plan = @import("request_plan.zig");
 const classification = @import("classification.zig");
+const decision_tool_select = @import("decision_tool_select.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const skill_invocation = @import("../skills/skill_invocation.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
@@ -526,6 +527,15 @@ pub const browser_execution_guidance =
     "- No cross-directory shell probing: Never use `shell` to run `find /`, `grep -r`, `ps`, `ss`, or `curl`, and never inspect files outside your project workspace. Keep all browser interactions inside `mcp_browseros-neo_run`.\n" ++
     "- Strict factual grounding: Every name, job title, company, date, rate, skill, and project claim in outbound messages, prospect tables, and CVs must match the inspected source profile and target page verbatim. In CVs and messages, never claim the candidate 'runs' or 'leads' a business description (such as Example Systems) or list it as a 'Current' employment entry under Experience when no employment title or dates are supplied, and never expand 'Designed ...' into 'Designed and implemented ...'.\n";
 
+/// Advisory alternative emitted only when the config-gated decision model
+/// confidently selects `granular` for the first browser call. Permissions and
+/// the BM25/rerank path are unchanged; this is guidance text only.
+pub const browser_execution_guidance_granular =
+    "- First step: the decision model selected granular browser tooling. You MAY call `capability_search` to discover browser tools, and you may prefer one-off tools (`tabs`, `navigate`, `snapshot`, `act`, `read`, `grep`) when a single step is clearer than a batched script. `mcp_browseros-neo_run` stays available for batching. This selection is advisory and grants no extra permission.\n";
+
+const wrapped_browser_guidance = "<omos_browser_guidance>\n" ++ browser_execution_guidance ++ "</omos_browser_guidance>";
+const wrapped_browser_guidance_granular = "<omos_browser_guidance>\n" ++ browser_execution_guidance_granular ++ "</omos_browser_guidance>";
+
 pub fn hasBrowserTaskSignal(prompt: []const u8) bool {
     return containsAnyIgnoreCase(prompt, &.{
         "browseros",
@@ -559,9 +569,19 @@ pub fn browserHostGuidance(
     skill_bindings: []const skill_invocation.ExplicitBinding,
 ) []const u8 {
     if (!hasBoundBrowserSkill(skill_bindings) and !hasBrowserTaskSignal(prompt)) return "";
-    return "<omos_browser_guidance>\n" ++
-        browser_execution_guidance ++
-        "</omos_browser_guidance>";
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const selection = decision_tool_select.decide(
+        arena.allocator(),
+        prompt,
+        &decision_tool_select.browser_capabilities,
+        hasBoundBrowserSkill(skill_bindings),
+    );
+    return decision_tool_select.firstCallGuidance(
+        selection,
+        wrapped_browser_guidance,
+        wrapped_browser_guidance_granular,
+    );
 }
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
