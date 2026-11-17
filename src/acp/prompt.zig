@@ -1,4 +1,5 @@
 const work_contract = @import("../core/agent/runtime/work_contract.zig");
+const tool_selection = @import("../core/workspace/tool_selection.zig");
 const std = @import("std");
 const observation = @import("../core/agent/runtime/observation.zig");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
@@ -1144,15 +1145,58 @@ pub fn handlePrompt(
             session.workspace_root,
             skill_catalog.items,
         );
+    // Decision-model tool narrowing: gated on OMOS_TOOL_SELECT, advisory only,
+    // and never able to select a tool that is not already callable this turn.
+    var effective_advertised_names = tool_projection.advertised_names;
+    var effective_advertised_functions = tool_projection.advertised_functions;
+    var effective_dynamic_tools = initial_dynamic_tools;
+    var effective_first_call_tool_choice = session.first_call_tool_choice;
+    if (comptime !host_target.is_wasm) {
+        if (@import("../core/workspace/realisation_selection.zig").hasBrowserTaskSignal(owned_prompt)) {
+            const tsa = dynamic_tool_arena.allocator();
+            var cand_names: std.ArrayList([]const u8) = .empty;
+            var cand_desc: std.ArrayList([]const u8) = .empty;
+            var allowed_names: std.ArrayList([]const u8) = .empty;
+            for (effective_advertised_functions) |f| {
+                cand_names.append(tsa, f.name) catch {};
+                cand_desc.append(tsa, f.description) catch {};
+            }
+            for (effective_advertised_names) |name| allowed_names.append(tsa, name) catch {};
+            for (effective_dynamic_tools) |d| {
+                cand_names.append(tsa, d.name) catch {};
+                cand_desc.append(tsa, d.description) catch {};
+                allowed_names.append(tsa, d.name) catch {};
+            }
+            for (tool_selection.browser_candidates) |c| {
+                cand_names.append(tsa, c.name) catch {};
+                cand_desc.append(tsa, c.description) catch {};
+            }
+            if (tool_selection.selectFirst(tsa, owned_prompt, cand_names.items, cand_desc.items, allowed_names.items)) |chosen| {
+                var fn_list: std.ArrayList(@TypeOf(effective_advertised_functions[0])) = .empty;
+                var name_list: std.ArrayList([]const u8) = .empty;
+                var dyn_list: std.ArrayList(@TypeOf(effective_dynamic_tools[0])) = .empty;
+                for (effective_advertised_functions) |f| if (std.mem.eql(u8, f.name, chosen)) fn_list.append(tsa, f) catch {};
+                for (effective_advertised_names) |name| if (std.mem.eql(u8, name, chosen)) name_list.append(tsa, name) catch {};
+                for (effective_dynamic_tools) |d| if (std.mem.eql(u8, d.name, chosen)) dyn_list.append(tsa, d) catch {};
+                if (name_list.items.len + fn_list.items.len + dyn_list.items.len > 0) {
+                    effective_advertised_names = name_list.toOwnedSlice(tsa) catch effective_advertised_names;
+                    effective_advertised_functions = fn_list.toOwnedSlice(tsa) catch effective_advertised_functions;
+                    effective_dynamic_tools = dyn_list.toOwnedSlice(tsa) catch effective_dynamic_tools;
+                    effective_first_call_tool_choice = .required;
+                }
+            }
+        }
+    }
     var agent_config = buildAgentConfig(state, session, .{
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .skill_bindings = effective_skill_bindings,
         .host_instructions = host_instructions,
-        .initial_dynamic_tools = initial_dynamic_tools,
-        .advertised_tool_names = tool_projection.advertised_names,
-        .advertised_functions = tool_projection.advertised_functions,
+        .initial_dynamic_tools = effective_dynamic_tools,
+        .advertised_tool_names = effective_advertised_names,
+        .advertised_functions = effective_advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
     }, current_prompt_is_root_authority);
+    agent_config.first_call_tool_choice = effective_first_call_tool_choice;
     agent_config.session_child_capability = sessionChildCapability(session);
     var cross_review_credential: ?credentials.Credential = null;
     defer if (cross_review_credential) |*cred| cred.deinit(alloc);

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 const completion_review = @import("core/agent/runtime/completion_review.zig");
+const tool_selection_tests = @import("core/workspace/tool_selection.zig");
 
 pub const version = "0.0.14";
 
@@ -5172,4 +5173,8 @@ test {
     _ = @import("gateway/host_openai_codex.zig");
     _ = @import("gateway/host_xai_grok.zig");
     _ = @import("gateway/host_chat_completions.zig");
+}
+
+test "tool_selection module is included in the standard test suite" {
+    _ = tool_selection_tests;
 }

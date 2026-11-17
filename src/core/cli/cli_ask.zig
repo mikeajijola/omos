@@ -80,6 +80,7 @@ else
 const builtin_tools = @import("../../builtins/tools.zig");
 const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_projection_mod = @import("../tooling/tool_projection.zig");
+const tool_selection = @import("../workspace/tool_selection.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_args = @import("../tooling/tool_args.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
@@ -2262,20 +2263,62 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             ctx.workspace_root,
             loaded_skills.skills,
         );
+    // Decision-model tool narrowing: gated on OMOS_TOOL_SELECT, advisory only,
+    // and never able to select a tool that is not already callable this turn.
+    var effective_advertised_names = tool_projection.advertised_names;
+    var effective_advertised_functions = tool_projection.advertised_functions;
+    var effective_dynamic_tools = initial_dynamic_tools;
+    var effective_first_call_tool_choice = ctx.first_call_tool_choice;
+    var effective_host_instructions = if (inherited_authority == null or inherited_authority.?.execution_guidance.len == 0)
+        @import("../workspace/realisation_selection.zig").browserHostGuidance(owned_prompt, effective_skill_bindings)
+    else
+        "";
+    if (@import("../workspace/realisation_selection.zig").hasBrowserTaskSignal(owned_prompt)) {
+        const tsa = dynamic_tool_arena.allocator();
+        var cand_names: std.ArrayList([]const u8) = .empty;
+        var cand_desc: std.ArrayList([]const u8) = .empty;
+        var allowed_names: std.ArrayList([]const u8) = .empty;
+        for (effective_advertised_functions) |f| {
+            cand_names.append(tsa, f.name) catch {};
+            cand_desc.append(tsa, f.description) catch {};
+        }
+        for (effective_advertised_names) |name| allowed_names.append(tsa, name) catch {};
+        for (effective_dynamic_tools) |d| {
+            cand_names.append(tsa, d.name) catch {};
+            cand_desc.append(tsa, d.description) catch {};
+            allowed_names.append(tsa, d.name) catch {};
+        }
+        for (tool_selection.browser_candidates) |c| {
+            cand_names.append(tsa, c.name) catch {};
+            cand_desc.append(tsa, c.description) catch {};
+        }
+        if (tool_selection.selectFirst(tsa, owned_prompt, cand_names.items, cand_desc.items, allowed_names.items)) |chosen| {
+            var fn_list: std.ArrayList(@TypeOf(effective_advertised_functions[0])) = .empty;
+            var name_list: std.ArrayList([]const u8) = .empty;
+            var dyn_list: std.ArrayList(@TypeOf(effective_dynamic_tools[0])) = .empty;
+            for (effective_advertised_functions) |f| if (std.mem.eql(u8, f.name, chosen)) fn_list.append(tsa, f) catch {};
+            for (effective_advertised_names) |name| if (std.mem.eql(u8, name, chosen)) name_list.append(tsa, name) catch {};
+            for (effective_dynamic_tools) |d| if (std.mem.eql(u8, d.name, chosen)) dyn_list.append(tsa, d) catch {};
+            if (name_list.items.len + fn_list.items.len + dyn_list.items.len > 0) {
+                effective_advertised_names = name_list.toOwnedSlice(tsa) catch effective_advertised_names;
+                effective_advertised_functions = fn_list.toOwnedSlice(tsa) catch effective_advertised_functions;
+                effective_dynamic_tools = dyn_list.toOwnedSlice(tsa) catch effective_dynamic_tools;
+                effective_first_call_tool_choice = .required;
+                effective_host_instructions = "";
+            }
+        }
+    }
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
-        .host_instructions = if (inherited_authority == null or inherited_authority.?.execution_guidance.len == 0)
-            @import("../workspace/realisation_selection.zig").browserHostGuidance(owned_prompt, effective_skill_bindings)
-        else
-            "",
+        .host_instructions = effective_host_instructions,
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
         .skill_bindings = effective_skill_bindings,
-        .initial_dynamic_tools = initial_dynamic_tools,
+        .initial_dynamic_tools = effective_dynamic_tools,
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
-        .advertised_tool_names = tool_projection.advertised_names,
-        .advertised_functions = tool_projection.advertised_functions,
+        .advertised_tool_names = effective_advertised_names,
+        .advertised_functions = effective_advertised_functions,
         .provider_capabilities = if (options.deps.ui_host != null and options.deps.ui_host.?.coordinator_mode) .{} else cfg.provider_set.select(ctx.provider).capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
@@ -2308,7 +2351,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .effort = ctx.effort,
         .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
         .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
-        .first_call_tool_choice = ctx.first_call_tool_choice,
+        .first_call_tool_choice = effective_first_call_tool_choice,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .origin = if (ctx.writable) |writable|
