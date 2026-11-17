@@ -20,12 +20,24 @@ pub const AlwaysLoadedTools = struct {
 };
 
 /// These always-loaded browser tools are pinned to load first so a tight
-/// `mcp_selected_schema_bytes` budget cannot silently drop them.
-pub const pinned_tool_names = [_][]const u8{ "upload", "pdf", "snapshot", "read_output" };
+/// `mcp_selected_schema_bytes` budget cannot silently drop them. `run` owns the
+/// "use run first" steering, so its complete description must be present from
+/// step 1 in every mode.
+pub const pinned_tool_names = [_][]const u8{ "run", "upload", "pdf", "snapshot", "read_output" };
 
-fn isPinnedTool(name: []const u8) bool {
+pub fn isPinnedTool(name: []const u8) bool {
     for (pinned_tool_names) |pinned| if (std.mem.eql(u8, name, pinned)) return true;
     return false;
+}
+
+/// Discovery previews for pinned browser tools keep their complete description
+/// so `run`'s steering instructions survive capability_search too. Every other
+/// tool keeps the configured `mcp_description_bytes` preview cap.
+pub fn discoveryDescriptionLimit(tool: McpTool, limits: context_limits.Values) context_limits.Resolved {
+    if (isPinnedTool(tool.original_name)) {
+        return .{ .value = .{ .bytes = context_limits.emergency_ceiling_bytes }, .source = limits.mcp_description_bytes.source };
+    }
+    return limits.mcp_description_bytes;
 }
 
 const PendingTool = struct {
@@ -230,4 +242,69 @@ test "AlwaysLoaded pins browser tools ahead of catalog order under a tight budge
     try std.testing.expectEqual(@as(usize, 1), result.tools.len);
     try std.testing.expectEqualStrings("mcp_fixture_snapshot", result.tools[0].name);
     try std.testing.expect(result.notice != null);
+}
+
+test "run keeps its full steering description in always-loaded selection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var limits: context_limits.Values = .{};
+    // A tight discovery preview cap must not shrink always-loaded schemas.
+    limits.mcp_description_bytes = .{ .value = .{ .bytes = 64 }, .source = .user_global };
+
+    const padding = try alloc.alloc(u8, 11 * 1024);
+    @memset(padding, 'x');
+    const steer = try alloc.print("Use run first{s}", .{padding});
+
+    const run_tool: McpTool = .{
+        .original_name = "run",
+        .prefixed_name = try alloc.dupe(u8, "mcp_browseros-neo_run"),
+        .description = steer,
+        .input_schema_json = try alloc.dupe(u8, "{}"),
+        .tags = &.{},
+    };
+    const granular: McpTool = .{
+        .original_name = "snapshot",
+        .prefixed_name = try alloc.dupe(u8, "mcp_browseros-neo_snapshot"),
+        .description = try alloc.dupe(u8, "snapshot"),
+        .input_schema_json = try alloc.dupe(u8, "{}"),
+        .tags = &.{},
+    };
+
+    var loaded = AlwaysLoaded.init(limits);
+    defer loaded.deinit(alloc);
+    // run is first in catalog order and pinned, so it loads whole and first.
+    try loaded.add(alloc, run_tool, null, undefined, limits);
+    try loaded.add(alloc, granular, null, undefined, limits);
+    var result = try loaded.finish(alloc);
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tools.len);
+    var run_index: ?usize = null;
+    for (result.tools, 0..) |selected, index| {
+        if (std.mem.eql(u8, selected.name, "mcp_browseros-neo_run")) run_index = index;
+    }
+    const index = run_index orelse return error.RunToolNotLoaded;
+    try std.testing.expect(std.mem.indexOf(u8, result.tools[index].schema_json, steer) != null);
+}
+
+test "discovery description cap exempts pinned tools only" {
+    var limits: context_limits.Values = .{};
+    limits.mcp_description_bytes = .{ .value = .{ .bytes = 64 }, .source = .user_global };
+    const run_tool: McpTool = .{
+        .original_name = "run",
+        .prefixed_name = @constCast("mcp_browseros-neo_run"),
+        .description = @constCast("steer"),
+        .input_schema_json = @constCast("{}"),
+        .tags = &.{},
+    };
+    const other: McpTool = .{
+        .original_name = "echo",
+        .prefixed_name = @constCast("mcp_fixture_echo"),
+        .description = @constCast("echo"),
+        .input_schema_json = @constCast("{}"),
+        .tags = &.{},
+    };
+    try std.testing.expect(discoveryDescriptionLimit(run_tool, limits).effectiveBytes() > 11 * 1024);
+    try std.testing.expectEqual(limits.mcp_description_bytes.effectiveBytes(), discoveryDescriptionLimit(other, limits).effectiveBytes());
 }

@@ -214,7 +214,7 @@ pub fn rank(
         matches.len,
         page.total_matches,
         full_cursor,
-        limits.mcp_description_bytes,
+        limits,
         limits.mcp_search_result_bytes,
         0,
         false,
@@ -241,7 +241,7 @@ pub fn rank(
             selected_count,
             page.total_matches,
             candidate_cursor,
-            limits.mcp_description_bytes,
+            limits,
             limits.mcp_search_result_bytes,
             observed_bytes,
             true,
@@ -307,7 +307,7 @@ fn renderSearchResult(
     selected_count: usize,
     total_matches: usize,
     next_cursor: ?[]const u8,
-    description_limit: context_limits.Resolved,
+    limits: context_limits.Values,
     result_limit: context_limits.Resolved,
     observed_bytes: usize,
     limit_triggered: bool,
@@ -317,7 +317,7 @@ fn renderSearchResult(
     try out.writer.writeAll("{\"tools\":[");
     for (matches[0..selected_count], 0..) |match, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try writeToolMetadataJson(alloc, &out.writer, match, description_limit);
+        try writeToolMetadataJson(alloc, &out.writer, match, limits);
     }
     try out.writer.print(
         "],\"count\":{d},\"total_matches\":{d},\"more_available\":{s},\"next_cursor\":",
@@ -350,12 +350,13 @@ fn renderSearchNotice(
         const tool = match.tool;
         const encoded_description = try encodeScalarAlloc(alloc, tool.description);
         defer alloc.free(encoded_description);
-        if (encoded_description.len <= limits.mcp_description_bytes.effectiveBytes()) continue;
+        const description_limit = selected_schema.discoveryDescriptionLimit(tool.*, limits);
+        if (encoded_description.len <= description_limit.effectiveBytes()) continue;
         try out.writer.writeAll("[context] MCP description for \"");
         try model_context_encoding.writeScalar(&out.writer, tool.prefixed_name);
         try out.writer.print(
             "\" truncated: observed={d} bytes effective={d} bytes source={s}; override with --context-limit mcp_description_bytes=BYTES|off\n",
-            .{ encoded_description.len, limits.mcp_description_bytes.effectiveBytes(), limits.mcp_description_bytes.source.label() },
+            .{ encoded_description.len, description_limit.effectiveBytes(), description_limit.source.label() },
         );
     }
     if (result_limit_triggered) {
@@ -376,9 +377,10 @@ fn writeToolMetadataJson(
     alloc: Allocator,
     writer: *std.Io.Writer,
     match: Candidate,
-    description_limit: context_limits.Resolved,
+    limits: context_limits.Values,
 ) !void {
     const tool = match.tool;
+    const description_limit = selected_schema.discoveryDescriptionLimit(tool.*, limits);
     const bounded = try boundedEncodedScalar(
         alloc,
         tool.description,
@@ -563,4 +565,36 @@ test "MCP search names why the server it names is down" {
 
     servers[0].state.store(.ready, .release);
     try std.testing.expectEqual(@as(?[]u8, null), try renderServerFailure(alloc, &handles, &access, "devtools"));
+}
+
+test "capability_search preview keeps run's full steering description under a tight cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var limits: context_limits.Values = .{};
+    limits.mcp_description_bytes = .{ .value = .{ .bytes = 64 }, .source = .user_global };
+
+    const padding = try alloc.alloc(u8, 11 * 1024);
+    @memset(padding, 'x');
+    const steer = try alloc.print("Use run first{s}", .{padding});
+
+    const tool = McpTool{
+        .original_name = "run",
+        .prefixed_name = try alloc.dupe(u8, "mcp_browseros-neo_run"),
+        .description = steer,
+        .input_schema_json = try alloc.dupe(u8, "{}"),
+        .tags = &.{},
+    };
+    const candidate = Candidate{
+        .server_name = "browseros-neo",
+        .instructions = null,
+        .tool = &tool,
+        .binding = undefined,
+    };
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolMetadataJson(alloc, &out.writer, candidate, limits);
+    const rendered = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, rendered, steer) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "mcp_description_bytes") == null);
 }
