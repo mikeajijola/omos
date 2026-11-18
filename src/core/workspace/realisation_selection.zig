@@ -106,6 +106,15 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
 /// deterministic deliverable analysis when the route is `work` but the
 /// secondary capability probability distribution is flat.
 pub fn resolveCapability(result: ?classification.Result, prompt: []const u8) ?request_plan.Capability {
+    // Config-gated proof of concept: when OMOS_OLLAYA_CONTRACT_SELECT=1, ask the
+    // winnow decision model to pick a capability/realisation instead of using the
+    // deterministic keyword rules. Any miss falls back to the existing path.
+    const experiment = @import("ollaya_contract_select.zig");
+    if (experiment.enabled()) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (experiment.select(arena.allocator(), prompt, null, null) catch null) |selected| return selected;
+    }
     if (result) |classified| {
         if (request_plan.select(classified)) |selected| return selected;
     }

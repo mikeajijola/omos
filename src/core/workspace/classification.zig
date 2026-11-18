@@ -76,19 +76,25 @@ pub fn validate(request: Request) !void {
 /// All result storage belongs to the caller's request arena. Endpoint and model
 /// are owner configuration, never model-supplied tool arguments.
 pub fn execute(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool)) !Result {
-    return executeConfigured(alloc, request, cancel, false);
+    return executeConfigured(alloc, request, cancel, false, null);
+}
+
+/// Execute with an explicit model, overriding owner configuration. Used by
+/// config-gated experiments that must pin a specific decision model.
+pub fn executeWithModel(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool), model_override: []const u8) !Result {
+    return executeConfigured(alloc, request, cancel, false, model_override);
 }
 
 /// Stopping uses a separately selected host model; agent arguments cannot select it.
 pub fn executeLookup(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool)) !Result {
-    return executeConfigured(alloc, request, cancel, true);
+    return executeConfigured(alloc, request, cancel, true, null);
 }
 
-fn executeConfigured(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool), lookup: bool) !Result {
+fn executeConfigured(alloc: std.mem.Allocator, request: Request, cancel: ?*std.atomic.Value(bool), lookup: bool, model_override: ?[]const u8) !Result {
     try validate(request);
     const config = try configuration(alloc);
     const endpoint = config.endpoint;
-    const model = if (lookup) config.lookup_model orelse return error.LookupClassifierNotConfigured else config.model;
+    const model = model_override orelse (if (lookup) config.lookup_model orelse return error.LookupClassifierNotConfigured else config.model);
     const token = config.token;
     const body = try encode(alloc, request, model);
     defer alloc.free(body);
