@@ -3,15 +3,16 @@
 const std = @import("std");
 const classification = @import("classification.zig");
 
-pub const Capability = enum { general_task, coding_task };
+pub const Capability = enum { general_task, coding_task, job_application };
 
 pub const question: classification.Question = .{
     .id = "capability",
     .required = false,
-    .instructions = "Classify the requested deliverable, not the tools that might implement it. coding_task means changing software implementation or behavior, delivering reusable executable software, or changing runtime configuration. general_task means operational work, using applications or websites, retrieving information, analysing records, or producing documents and structured data. Temporary scripts and saving JSON or CSV for operational work do not make it coding. Choose unresolved for an ambiguous deliverable. This selection does not grant permissions or prove completion.",
+    .instructions = "Classify the requested deliverable, not the tools that might implement it. coding_task means changing software implementation or behavior, delivering reusable executable software, or changing runtime configuration. job_application means preparing or submitting job applications, tailoring a CV, searching LinkedIn or job boards, and recording application receipts. general_task means other operational work, using applications or websites, retrieving information, analysing records, or producing documents and structured data. Temporary scripts and saving JSON or CSV for operational work do not make it coding. Choose unresolved for an ambiguous deliverable. This selection does not grant permissions or prove completion.",
     .choices = &.{
         .{ .label = "general_task", .description = "Operational, browser, information, document or data work without a software deliverable." },
         .{ .label = "coding_task", .description = "Implement or change software behavior, executable software or runtime configuration." },
+        .{ .label = "job_application", .description = "Prepare or submit job applications, tailor a CV, search LinkedIn or job boards, and record receipts." },
         .{ .label = "unresolved", .description = "The requested deliverable or its context is ambiguous." },
     },
 };
@@ -62,6 +63,13 @@ test "request contract template requires a complete confident offered capability
     try std.testing.expectEqual(Capability.coding_task, select(result).?);
     result.decisions = &.{};
     try std.testing.expect(select(result) == null);
+}
+
+test "request contract template selects job_application capability" {
+    const scores = [_]classification.Probability{ .{ .label = "job_application", .probability = 0.96 }, .{ .label = "general_task", .probability = 0.02 }, .{ .label = "coding_task", .probability = 0.01 }, .{ .label = "unresolved", .probability = 0.01 } };
+    const decision: classification.Decision = .{ .question = "capability", .choice = "job_application", .confidence = 0.96, .probabilities = &scores };
+    const result: classification.Result = .{ .model = "fixture", .elapsed_ms = 1, .decisions = (&decision)[0..1] };
+    try std.testing.expectEqual(Capability.job_application, select(result).?);
 }
 
 test "request contract template cannot replace retained scoped or amended work" {
