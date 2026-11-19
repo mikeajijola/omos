@@ -301,9 +301,11 @@ fn taskCommandWithManager(alloc: std.mem.Allocator, manager: workspace.Manager, 
         const request = if (argument.len == 0) api.Request{} else try @import("../shared/record_json.zig").decode(api.Request, alloc, argument, .{});
         return std.json.Stringify.valueAlloc(alloc, try api.execute(manager, request), .{ .whitespace = .indent_2 });
     }
-    const task = if (std.mem.eql(u8, action, "new"))
-        try manager.start(session, project, argument, null)
-    else if (std.mem.eql(u8, action, "resume")) blk: {
+    const task = if (std.mem.eql(u8, action, "new")) blk: {
+        const selection = @import("realisation_selection.zig");
+        const assignment = selection.assignGoalForManager(alloc, manager, argument, null, null, project, &.{}) catch null;
+        break :blk try manager.startWithAssignment(session, project, argument, null, assignment);
+    } else if (std.mem.eql(u8, action, "resume")) blk: {
         const selection = try parseTaskSelection(argument);
         break :blk try manager.resumeTaskInProject(session, selection.id, project, selection.rebind_project);
     } else return error.InvalidTaskCommand;

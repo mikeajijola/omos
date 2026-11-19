@@ -23,6 +23,29 @@ fn journalTimestamp(value: std.json.Value) i64 {
     return if (value == .integer) @max(0, value.integer) else 0;
 }
 
+fn startAssignedTask(
+    alloc: std.mem.Allocator,
+    manager: workspace.Manager,
+    session: []const u8,
+    project: []const u8,
+    goal: []const u8,
+    parent: ?workspace.Task,
+    capability_override: ?[]const u8,
+    skills: []const @import("../skills/skill_contract.zig").Skill,
+) !workspace.Task {
+    const selection = @import("realisation_selection.zig");
+    const assignment = selection.assignGoalForManager(
+        alloc,
+        manager,
+        goal,
+        capability_override,
+        parent,
+        project,
+        skills,
+    ) catch null;
+    return manager.startWithAssignment(session, project, goal, parent, assignment);
+}
+
 pub const Turn = struct {
     manager: workspace.Manager,
     task: workspace.Task,
@@ -51,10 +74,33 @@ pub const Turn = struct {
         return beginResolved(alloc, session, parent_session, project, prompt, false);
     }
 
+    fn startWithoutAssignment(
+        manager: workspace.Manager,
+        session: []const u8,
+        project: []const u8,
+        goal: []const u8,
+        parent: ?workspace.Task,
+    ) !workspace.Task {
+        return manager.start(session, project, goal, parent);
+    }
+
     pub fn beginResolved(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8, continuing: bool) !?Turn {
+        return beginResolvedWithContext(alloc, session, parent_session, project, prompt, continuing, null, &.{});
+    }
+
+    pub fn beginResolvedWithContext(
+        alloc: std.mem.Allocator,
+        session: []const u8,
+        parent_session: ?[]const u8,
+        project: []const u8,
+        prompt: []const u8,
+        continuing: bool,
+        capability_override: ?[]const u8,
+        skills: []const @import("../skills/skill_contract.zig").Skill,
+    ) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
-        var task = if (try manager.active(session)) |active| active else try manager.start(session, project, prompt, parent);
+        var task = if (try manager.active(session)) |active| active else try startAssignedTask(alloc, manager, session, project, prompt, parent, capability_override, skills);
         var turn: Turn = .{ .manager = manager, .task = task, .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy };
         errdefer turn.release();
         task = try manager.refreshTaskContext(task);

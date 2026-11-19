@@ -31,8 +31,19 @@ pub const Authority = struct {
     session_generation: u64,
     capability: ?[]const u8 = null,
     realisation: ?[]const u8 = null,
+    realisation_id: ?[]const u8 = null,
+    /// Canonical tool names declared by the specialist realisation. Pre-binding
+    /// these tools at dispatch never grants or bypasses tool permissions.
+    required_tools: []const []const u8 = &.{},
+    /// Portable skill names declared by the specialist realisation (resolved to
+    /// local skill paths on the executing host).
+    declared_skills: []const []const u8 = &.{},
     skill_bindings: []const @import("../skills/skill_invocation.zig").ExplicitBinding = &.{},
     execution_guidance: []const u8 = "",
+
+    pub fn effectiveRealisationId(self: Authority) ?[]const u8 {
+        return self.realisation_id orelse self.realisation;
+    }
 };
 
 pub const Command = struct {
@@ -248,4 +259,59 @@ pub fn verifyLiveAuthority(manager: workspace.Manager, authority: Authority) !vo
     defer state.deinit(manager.alloc);
     const encoded = try @import("../session/session_codec.zig").encodePermissionState(manager.alloc, state);
     if (!std.mem.eql(u8, authority.session_permission_sha256, try workspace.hash(manager.alloc, encoded))) return error.BackgroundSourcePermissionsChanged;
+}
+
+test "background_control Authority round-trips required_tools and declared_skills while staying backward compatible" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const specialist: Authority = .{
+        .workspace = "ws-1",
+        .task = "task-1",
+        .operation = "op-1",
+        .request_sha256 = "sha-1",
+        .permission_mode = .auto,
+        .provider = .gateway,
+        .model = "anthropic/claude-sonnet-4",
+        .effort = .auto,
+        .root_user_context = "Apply to contract roles",
+        .root_user_messages = &.{"Apply to contract roles"},
+        .root_user_evidence_complete = true,
+        .source_session = "sess-1",
+        .project_root = "/Users/example/project",
+        .policy_sha256 = "policy-sha",
+        .session_permission_sha256 = "perm-sha",
+        .permission_rules = .{},
+        .session_rules = &.{},
+        .session_generation = 1,
+        .capability = "job_application",
+        .realisation = "job_application_browser",
+        .realisation_id = "job_application_browser",
+        .required_tools = &.{ "shell", "read_file", "write_file", "mcp_browseros-neo_run" },
+        .declared_skills = &.{"browseros-neo"},
+        .skill_bindings = &.{.{ .name = "browseros-neo", .path = "/Users/example/project/skills/browseros-neo" }},
+        .execution_guidance = "<omos_realisation_assignment/>",
+    };
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, specialist, .{});
+    const decoded = try record_json.decode(Authority, alloc, encoded, .{});
+    try std.testing.expectEqualStrings("job_application_browser", decoded.effectiveRealisationId().?);
+    try std.testing.expectEqual(@as(usize, 4), decoded.required_tools.len);
+    try std.testing.expectEqualStrings("shell", decoded.required_tools[0]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", decoded.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), decoded.declared_skills.len);
+    try std.testing.expectEqualStrings("browseros-neo", decoded.declared_skills[0]);
+    try std.testing.expectEqual(types.PermissionMode.auto, decoded.permission_mode);
+
+    // Legacy serialized Authority omitting Phase 3 fields decodes cleanly with empty defaults.
+    var parsed_obj = try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{});
+    _ = parsed_obj.object.swapRemove("realisation_id");
+    _ = parsed_obj.object.swapRemove("required_tools");
+    _ = parsed_obj.object.swapRemove("declared_skills");
+    const legacy_bytes = try std.json.Stringify.valueAlloc(alloc, parsed_obj, .{});
+    const legacy = try record_json.decode(Authority, alloc, legacy_bytes, .{});
+    try std.testing.expectEqualStrings("job_application_browser", legacy.effectiveRealisationId().?);
+    try std.testing.expectEqual(@as(usize, 0), legacy.required_tools.len);
+    try std.testing.expectEqual(@as(usize, 0), legacy.declared_skills.len);
 }

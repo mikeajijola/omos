@@ -40,9 +40,11 @@ pub const RelevancePolicy = enum {
 
 /// Optional intent-aware reranking. Set by MCP tool search when the browser
 /// skill is bound so the single batched `run` tool outranks granular one-off
-/// browser tools for browser queries.
+/// browser tools for browser queries. Declared `required_tools` are always
+/// retained and never starved by browser-first reranking or top-1 narrowing.
 pub const RerankPolicy = struct {
     browser_first: bool = false,
+    required_tools: []const []const u8 = &.{},
 };
 
 pub const Request = struct {
@@ -141,6 +143,7 @@ pub const RetrieveError = Allocator.Error || error{
 
 const Ranked = struct {
     document_index: usize,
+    required: bool = false,
     exact_identity: bool,
     score: f64,
     primary_hits: u8,
@@ -178,6 +181,7 @@ pub fn retrieve(
     const ranked = try alloc.alloc(Ranked, documents.len);
     defer alloc.free(ranked);
     var ranked_count: usize = 0;
+    var required_ranked_count: usize = 0;
     const stats = corpusStats(documents);
     var document_frequencies: [lexical_relevance.max_query_tokens]usize = undefined;
     for (0..request.query.token_count) |index| {
@@ -186,6 +190,7 @@ pub fn retrieve(
     }
 
     for (documents, 0..) |document, document_index| {
+        const is_required = documentMatchesRequired(document, request.rerank.required_tools);
         var exact_identity = lexical_relevance.containsCompleteIdentity(
             request.query.raw,
             &document.identities,
@@ -231,7 +236,7 @@ pub fn retrieve(
         }
 
         if (request.rerank.browser_first) {
-            applyBrowserRerank(document.identities[0], &score, &exact_identity);
+            applyBrowserRerank(document.identities[0], is_required, &score, &exact_identity);
         }
 
         const inventory = request.query.raw.len == 0;
@@ -241,14 +246,16 @@ pub fn retrieve(
             primary_hits,
             secondary_hits,
         );
-        if (!inventory and !clear_match) continue;
+        if (!inventory and !clear_match and !is_required) continue;
         ranked[ranked_count] = .{
             .document_index = document_index,
+            .required = is_required,
             .exact_identity = exact_identity,
             .score = score,
             .primary_hits = primary_hits,
         };
         ranked_count += 1;
+        if (is_required) required_ranked_count += 1;
     }
 
     if (request.query.raw.len == 0) {
@@ -257,10 +264,14 @@ pub fn retrieve(
         sort_utils.sort(Ranked, ranked[0..ranked_count], documents, lessRelevance);
     }
     if (start_offset > ranked_count) return error.InvalidCursor;
-    const end = @min(
+    const limit_end = @min(
         std.math.add(usize, start_offset, request.limit) catch ranked_count,
         ranked_count,
     );
+    const end = if (start_offset == 0)
+        @min(@max(limit_end, required_ranked_count), ranked_count)
+    else
+        limit_end;
     const page_matches = try alloc.alloc(Match, end - start_offset);
     errdefer alloc.free(page_matches);
     for (ranked[start_offset..end], 0..) |match, index| {
@@ -281,15 +292,81 @@ pub fn retrieve(
 const browser_run_rerank_weight: f64 = 1.0e6;
 
 /// When a browser skill is bound, push the batched `run` tool to the top and
-/// push granular one-off browser tools to the bottom. Marking `run` as an
-/// exact identity also keeps it in the candidate set for any browser query.
-fn applyBrowserRerank(original_name: []const u8, score: *f64, exact_identity: *bool) void {
+/// push granular one-off browser tools to the bottom (unless explicitly
+/// declared in `required_tools`). Marking `run` as an exact identity also
+/// keeps it in the candidate set for any browser query.
+fn applyBrowserRerank(original_name: []const u8, is_required: bool, score: *f64, exact_identity: *bool) void {
     if (std.mem.eql(u8, original_name, "run")) {
         score.* += browser_run_rerank_weight;
         exact_identity.* = true;
-    } else if (isGranularBrowserTool(original_name)) {
+    } else if (!is_required and isGranularBrowserTool(original_name)) {
         score.* -= browser_run_rerank_weight;
     }
+}
+
+pub fn canonicalToolAlias(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "native shell")) return "shell";
+    return trimmed;
+}
+
+fn documentMatchesRequired(document: Document, required_tools: []const []const u8) bool {
+    for (required_tools) |raw| {
+        const canonical = canonicalToolAlias(raw);
+        if (canonical.len == 0) continue;
+        if (std.mem.eql(u8, document.stable_key, canonical) or
+            std.mem.eql(u8, document.stable_key, raw))
+        {
+            return true;
+        }
+        for (document.identities) |identity| {
+            if (identity.len == 0) continue;
+            if (std.mem.eql(u8, identity, canonical) or std.mem.eql(u8, identity, raw)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Retain every permission-allowed tool in `narrowed_tools` and ensure every
+/// declared tool in `required_tools` that is present in `allowed_tools` stays
+/// in the active set. Never admits any tool absent from `allowed_tools`, so
+/// permission/policy denials remain authoritative.
+/// Caller owns the returned slice; string slices borrow from `allowed_tools`.
+pub fn retainRequiredTools(
+    alloc: Allocator,
+    allowed_tools: []const []const u8,
+    narrowed_tools: []const []const u8,
+    required_tools: []const []const u8,
+) Allocator.Error![]const []const u8 {
+    var active: std.ArrayList([]const u8) = .empty;
+    errdefer active.deinit(alloc);
+
+    for (narrowed_tools) |candidate| {
+        const allowed_name = findExactName(allowed_tools, candidate) orelse continue;
+        if (findExactName(active.items, allowed_name) != null) continue;
+        try active.append(alloc, allowed_name);
+    }
+
+    for (required_tools) |raw_required| {
+        const canonical = canonicalToolAlias(raw_required);
+        if (canonical.len == 0) continue;
+        const allowed_name = findExactName(allowed_tools, canonical) orelse
+            findExactName(allowed_tools, raw_required) orelse
+            continue;
+        if (findExactName(active.items, allowed_name) != null) continue;
+        try active.append(alloc, allowed_name);
+    }
+
+    return active.toOwnedSlice(alloc);
+}
+
+fn findExactName(names: []const []const u8, needle: []const u8) ?[]const u8 {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, needle)) return name;
+    }
+    return null;
 }
 
 fn isGranularBrowserTool(name: []const u8) bool {
@@ -431,6 +508,7 @@ fn lessInventory(
     lhs: Ranked,
     rhs: Ranked,
 ) bool {
+    if (lhs.required != rhs.required) return lhs.required;
     return lessStableKey(documents, lhs.document_index, rhs.document_index);
 }
 
@@ -439,6 +517,7 @@ fn lessRelevance(
     lhs: Ranked,
     rhs: Ranked,
 ) bool {
+    if (lhs.required != rhs.required) return lhs.required;
     if (lhs.exact_identity != rhs.exact_identity) return lhs.exact_identity;
     if (lhs.score != rhs.score) return lhs.score > rhs.score;
     if (lhs.primary_hits != rhs.primary_hits) return lhs.primary_hits > rhs.primary_hits;
@@ -485,6 +564,9 @@ fn requestHash(request: Request, domain: Domain) u64 {
     hash.update(&.{@backingInt(domain)});
     hash.update(&.{@backingInt(request.relevance_policy)});
     hash.update(&.{@intFromBool(request.rerank.browser_first)});
+    const required_count: u64 = @intCast(request.rerank.required_tools.len);
+    hash.update(std.mem.asBytes(&required_count));
+    for (request.rerank.required_tools) |tool_name| updateHashField(&hash, canonicalToolAlias(tool_name));
     if (request.server) |server| updateHashField(&hash, server);
     return hash.final();
 }
@@ -929,4 +1011,130 @@ test "retrieval releases every allocation failure" {
         }
     };
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
+}
+
+test "browser-first rerank and top-1 narrowing never starve declared required_tools" {
+    const alloc = std.testing.allocator;
+    const query = try lexical_relevance.prepare("snapshot");
+    const documents = [_]Document{
+        .{
+            .identities = .{ "snapshot", "mcp_browseros-neo_snapshot" },
+            .stable_key = "mcp_browseros-neo_snapshot",
+            .primary = .{ "browseros-neo", "snapshot", "mcp_browseros-neo_snapshot", "" },
+            .secondary = .{ "Take a snapshot of the current browser page", "", "" },
+        },
+        .{
+            .identities = .{ "run", "mcp_browseros-neo_run" },
+            .stable_key = "mcp_browseros-neo_run",
+            .primary = .{ "browseros-neo", "run", "mcp_browseros-neo_run", "" },
+            .secondary = .{ "Run a batched browser script", "", "" },
+        },
+        .{
+            .identities = .{ "shell", "" },
+            .stable_key = "shell",
+            .primary = .{ "native", "shell", "", "" },
+            .secondary = .{ "Run local shell commands", "", "" },
+        },
+        .{
+            .identities = .{ "read_file", "" },
+            .stable_key = "read_file",
+            .primary = .{ "native", "read_file", "", "" },
+            .secondary = .{ "Read a local file", "", "" },
+        },
+        .{
+            .identities = .{ "write_file", "" },
+            .stable_key = "write_file",
+            .primary = .{ "native", "write_file", "", "" },
+            .secondary = .{ "Write a local file", "", "" },
+        },
+    };
+
+    const required = [_][]const u8{
+        "native shell",
+        "read_file",
+        "write_file",
+        "mcp_browseros-neo_run",
+    };
+
+    var page = try retrieve(
+        alloc,
+        .{
+            .query = &query,
+            .kind = .mcp,
+            .limit = 1,
+            .relevance_policy = .intent,
+            .rerank = .{
+                .browser_first = true,
+                .required_tools = &required,
+            },
+        },
+        .mcp,
+        &documents,
+    );
+    defer page.deinit(alloc);
+
+    // `run` remains rank #1, and all 4 declared required tools are retained despite limit=1.
+    try std.testing.expectEqual(@as(usize, 4), page.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), page.matches[0].document_index);
+    var saw_run = false;
+    var saw_shell = false;
+    var saw_read = false;
+    var saw_write = false;
+    var saw_snapshot = false;
+    for (page.matches) |match| {
+        switch (match.document_index) {
+            0 => saw_snapshot = true,
+            1 => saw_run = true,
+            2 => saw_shell = true,
+            3 => saw_read = true,
+            4 => saw_write = true,
+            else => unreachable,
+        }
+    }
+    try std.testing.expect(saw_run);
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(saw_read);
+    try std.testing.expect(saw_write);
+    try std.testing.expect(!saw_snapshot);
+
+    // Legacy empty required_tools keeps exact top-1 behavior.
+    var legacy = try retrieve(
+        alloc,
+        .{
+            .query = &query,
+            .kind = .mcp,
+            .limit = 1,
+            .relevance_policy = .intent,
+            .rerank = .{ .browser_first = true },
+        },
+        .mcp,
+        &documents,
+    );
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), legacy.matches.len);
+    try std.testing.expectEqual(@as(usize, 1), legacy.matches[0].document_index);
+}
+
+test "retainRequiredTools preserves allowed specialist tools and never bypasses permission exclusions" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{ "shell", "read_file", "write_file", "mcp_browseros-neo_run" };
+    const top1_narrowed = [_][]const u8{"mcp_browseros-neo_run"};
+    const required = [_][]const u8{ "native shell", "read_file", "write_file", "mcp_browseros-neo_run" };
+
+    const active = try retainRequiredTools(alloc, &allowed, &top1_narrowed, &required);
+    defer alloc.free(active);
+    try std.testing.expectEqual(@as(usize, 4), active.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", active[0]);
+    try std.testing.expectEqualStrings("shell", active[1]);
+    try std.testing.expectEqualStrings("read_file", active[2]);
+    try std.testing.expectEqualStrings("write_file", active[3]);
+
+    // If policy denied `shell` (absent from allowed), retainRequiredTools must NOT re-admit it.
+    const restricted_allowed = [_][]const u8{ "read_file", "write_file", "mcp_browseros-neo_run" };
+    const restricted_active = try retainRequiredTools(alloc, &restricted_allowed, &top1_narrowed, &required);
+    defer alloc.free(restricted_active);
+    try std.testing.expectEqual(@as(usize, 3), restricted_active.len);
+    for (restricted_active) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "shell"));
+    }
 }

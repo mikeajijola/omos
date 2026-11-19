@@ -24,6 +24,19 @@ pub const Ranking = struct {
     score: f64,
 };
 
+/// Typed execution binding and formatted guidance emitted by realisation
+/// selection. Carries canonical runtime tool names and portable skill names
+/// alongside the rendered `<omos_realisation_assignment>` text. Pre-binding
+/// these fields never grants or bypasses tool permissions.
+pub const ExecutionGuidance = struct {
+    capability: []const u8 = "",
+    realisation_id: []const u8 = "",
+    required_tools: []const []const u8 = &.{},
+    skill_bindings: []const []const u8 = &.{},
+    resolved_skills: []const skill_invocation.ExplicitBinding = &.{},
+    text: []const u8 = "",
+};
+
 pub const Assignment = struct {
     capability: []const u8,
     realisation: []const u8,
@@ -32,23 +45,13 @@ pub const Assignment = struct {
     declared_skills: []const []const u8 = &.{},
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     guidance: []const u8 = "",
+    execution_guidance: ExecutionGuidance = .{},
 
     /// Collect deduplicated portable skill names from explicit bindings and
     /// declared realisation skills for persisting on a work contract.
     /// Caller owns the returned slice and strings.
     pub fn persistedSkillBindings(self: Assignment, alloc: Allocator) ![]const []const u8 {
-        var names: std.ArrayList([]const u8) = .empty;
-        errdefer {
-            for (names.items) |name| alloc.free(name);
-            names.deinit(alloc);
-        }
-        for (self.skill_bindings) |binding| {
-            try appendUniqueNonEmpty(alloc, &names, binding.name);
-        }
-        for (self.declared_skills) |skill_name| {
-            try appendUniqueNonEmpty(alloc, &names, skill_name);
-        }
-        return names.toOwnedSlice(alloc);
+        return collectPortableSkillNames(alloc, self.skill_bindings, self.declared_skills);
     }
 };
 
@@ -291,6 +294,113 @@ fn resolveSkillBindingsForRealisation(
     return bindings.toOwnedSlice(alloc);
 }
 
+/// Normalize declared tool identifiers from workspace declarations (such as
+/// `"native shell"`) to their canonical runtime tool names (such as `"shell"`).
+pub fn canonicalToolName(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "native shell")) return "shell";
+    return trimmed;
+}
+
+/// Normalize and deduplicate a list of raw declared tool names into canonical
+/// runtime tool names. Caller owns the returned slice and strings.
+pub fn canonicalRequiredTools(
+    alloc: Allocator,
+    raw_tools: []const []const u8,
+) ![]const []const u8 {
+    var tools: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (tools.items) |tool| alloc.free(tool);
+        tools.deinit(alloc);
+    }
+    for (raw_tools) |raw| {
+        const canonical = canonicalToolName(raw);
+        if (canonical.len == 0) continue;
+        try appendUniqueNonEmpty(alloc, &tools, canonical);
+    }
+    return tools.toOwnedSlice(alloc);
+}
+
+fn collectPortableSkillNames(
+    alloc: Allocator,
+    skill_bindings: []const skill_invocation.ExplicitBinding,
+    declared_skills: []const []const u8,
+) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    for (skill_bindings) |binding| {
+        try appendUniqueNonEmpty(alloc, &names, binding.name);
+    }
+    for (declared_skills) |skill_name| {
+        try appendUniqueNonEmpty(alloc, &names, skill_name);
+    }
+    return names.toOwnedSlice(alloc);
+}
+
+/// Resolve persisted portable skill names (e.g. `"browseros-neo"`) back to
+/// local skill paths via the current host's discovered skill catalog. Prefers
+/// workspace-local copies over global copies when duplicate names exist, and
+/// preserves any existing explicit bindings with non-empty paths.
+/// Caller owns the returned slice and strings.
+pub fn resolveSkillBindingsByNames(
+    alloc: Allocator,
+    skill_names: []const []const u8,
+    existing_bindings: []const skill_invocation.ExplicitBinding,
+    workspace_root: []const u8,
+    skills: []const skill_contract.Skill,
+) ![]const skill_invocation.ExplicitBinding {
+    var bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
+    errdefer {
+        for (bindings.items) |binding| {
+            alloc.free(binding.name);
+            alloc.free(binding.path);
+        }
+        bindings.deinit(alloc);
+    }
+
+    for (existing_bindings) |binding| {
+        const name = std.mem.trim(u8, binding.name, " \t\r\n");
+        if (name.len == 0) continue;
+        if (containsBindingIgnoreCase(bindings.items, name)) continue;
+        if (binding.path.len > 0) {
+            try bindings.append(alloc, .{
+                .name = try alloc.dupe(u8, name),
+                .path = try alloc.dupe(u8, binding.path),
+            });
+            continue;
+        }
+        if (selectPreferredSkillByNameOrNull(skills, name, workspace_root)) |best| {
+            try bindings.append(alloc, .{
+                .name = try alloc.dupe(u8, best.name),
+                .path = try alloc.dupe(u8, best.path),
+            });
+        }
+    }
+
+    for (skill_names) |raw_name| {
+        const name = std.mem.trim(u8, raw_name, " \t\r\n");
+        if (name.len == 0) continue;
+        if (containsBindingIgnoreCase(bindings.items, name)) continue;
+        const best = selectPreferredSkillByNameOrNull(skills, name, workspace_root) orelse continue;
+        try bindings.append(alloc, .{
+            .name = try alloc.dupe(u8, best.name),
+            .path = try alloc.dupe(u8, best.path),
+        });
+    }
+
+    return bindings.toOwnedSlice(alloc);
+}
+
+fn containsBindingIgnoreCase(bindings: []const skill_invocation.ExplicitBinding, name: []const u8) bool {
+    for (bindings) |binding| {
+        if (std.ascii.eqlIgnoreCase(binding.name, name)) return true;
+    }
+    return false;
+}
+
 fn appendUniqueNonEmpty(alloc: Allocator, list: *std.ArrayList([]const u8), raw: []const u8) !void {
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return;
     for (list.items) |existing| {
@@ -375,6 +485,14 @@ fn selectPreferredSkillByName(
     name: []const u8,
     workspace_root: []const u8,
 ) skill_contract.Skill {
+    return selectPreferredSkillByNameOrNull(skills, name, workspace_root).?;
+}
+
+fn selectPreferredSkillByNameOrNull(
+    skills: []const skill_contract.Skill,
+    name: []const u8,
+    workspace_root: []const u8,
+) ?skill_contract.Skill {
     var best: ?skill_contract.Skill = null;
     for (skills) |candidate| {
         if (!std.ascii.eqlIgnoreCase(candidate.name, name)) continue;
@@ -395,7 +513,7 @@ fn selectPreferredSkillByName(
             best = candidate;
         }
     }
-    return best.?;
+    return best;
 }
 
 fn mentionsSkillName(prompt: []const u8, skill_name: []const u8) bool {
@@ -561,6 +679,40 @@ fn gatherPrecedentStats(
     return stats;
 }
 
+/// Build typed execution guidance carrying the selected `realisation_id`,
+/// canonical runtime `required_tools`, portable `skill_bindings`, resolved
+/// local skill paths, and formatted `<omos_realisation_assignment>` text.
+/// Pre-binding these fields never grants or bypasses tool permissions.
+pub fn buildTypedExecutionGuidance(
+    alloc: Allocator,
+    capability: []const u8,
+    realisation_id: []const u8,
+    ranking: Ranking,
+    raw_required_tools: []const []const u8,
+    declared_skills: []const []const u8,
+    skill_bindings: []const skill_invocation.ExplicitBinding,
+    request_text: []const u8,
+) !ExecutionGuidance {
+    const text = try buildExecutionGuidance(
+        alloc,
+        capability,
+        realisation_id,
+        ranking,
+        skill_bindings,
+        request_text,
+    );
+    const canonical_tools = try canonicalRequiredTools(alloc, raw_required_tools);
+    const portable_skills = try collectPortableSkillNames(alloc, skill_bindings, declared_skills);
+    return .{
+        .capability = try alloc.dupe(u8, capability),
+        .realisation_id = try alloc.dupe(u8, realisation_id),
+        .required_tools = canonical_tools,
+        .skill_bindings = portable_skills,
+        .resolved_skills = skill_bindings,
+        .text = text,
+    };
+}
+
 /// Assign the affected capability, preferred realisation path, declared tool
 /// requirements, unambiguous skill bindings, and execution guidance for a goal
 /// against a pinned workspace declaration.
@@ -604,11 +756,13 @@ pub fn assignForGoal(
     const required_tools = try requiredToolsForRealisation(alloc, declaration, selected_realisation);
     const declared_skills = try declaredSkillsForRealisation(alloc, declaration, selected_realisation);
     const skill_bindings = try resolveSkillBindingsForRealisation(alloc, goal, declared_skills, workspace_root, skills);
-    const guidance = try buildExecutionGuidance(
+    const typed_guidance = try buildTypedExecutionGuidance(
         alloc,
         capability_id,
         selected_realisation,
         selected_ranking,
+        required_tools,
+        declared_skills,
         skill_bindings,
         goal,
     );
@@ -620,13 +774,42 @@ pub fn assignForGoal(
         .required_tools = required_tools,
         .declared_skills = declared_skills,
         .skill_bindings = skill_bindings,
-        .guidance = guidance,
+        .guidance = typed_guidance.text,
+        .execution_guidance = typed_guidance,
     };
+}
+
+/// Resolve a goal assignment against the workspace manager's active declaration
+/// at `parent`'s branch or `trunk`. Returns `null` when the workspace has no
+/// loadable declaration (preserving legacy workspace compatibility).
+pub fn assignGoalForManager(
+    alloc: Allocator,
+    manager: workspace.Manager,
+    goal: []const u8,
+    capability_override: ?[]const u8,
+    parent: ?workspace.Task,
+    workspace_root: []const u8,
+    skills: []const skill_contract.Skill,
+) !?Assignment {
+    const base_branch = if (parent) |p| p.branch else "trunk";
+    const revision = manager.revision(base_branch) catch return null;
+    const declaration = manager.loadDeclaration(revision) catch return null;
+    return try assignForGoal(
+        alloc,
+        manager,
+        declaration,
+        goal,
+        capability_override,
+        revision,
+        workspace_root,
+        skills,
+    );
 }
 
 /// Assign the affected capability, preferred realisation path, unambiguous
 /// skill bindings, and execution guidance for a task being dispatched by the
-/// parent coordinator.
+/// parent coordinator. Preserves and resolves any persisted specialist fields
+/// (`realisation_id`, `required_tools`, `skill_bindings`) from the task contract.
 pub fn assignForTask(
     alloc: Allocator,
     manager: workspace.Manager,
@@ -638,7 +821,7 @@ pub fn assignForTask(
     const revision = if (task.model_basis) |basis| basis.revision else try manager.revision("trunk");
     const declaration = try manager.loadDeclaration(revision);
     const capability_override = if (task.model_basis) |basis| basis.capability else null;
-    return assignForGoal(
+    var assignment = try assignForGoal(
         alloc,
         manager,
         declaration,
@@ -648,6 +831,72 @@ pub fn assignForTask(
         workspace_root,
         skills,
     );
+
+    const persisted_realisation = if (task.definition.realisation_id) |id|
+        std.mem.trim(u8, id, " \t\r\n")
+    else
+        "";
+    const effective_realisation = if (persisted_realisation.len > 0)
+        persisted_realisation
+    else
+        assignment.realisation;
+
+    var merged_tools: std.ArrayList([]const u8) = .empty;
+    for (task.definition.required_tools) |tool| {
+        try appendUniqueNonEmpty(alloc, &merged_tools, tool);
+    }
+    if (persisted_realisation.len > 0 and !std.mem.eql(u8, persisted_realisation, assignment.realisation)) {
+        for (try requiredToolsForRealisation(alloc, declaration, persisted_realisation)) |tool| {
+            try appendUniqueNonEmpty(alloc, &merged_tools, tool);
+        }
+    }
+    for (assignment.required_tools) |tool| {
+        try appendUniqueNonEmpty(alloc, &merged_tools, tool);
+    }
+
+    var merged_declared_skills: std.ArrayList([]const u8) = .empty;
+    for (task.definition.skill_bindings) |skill_name| {
+        try appendUniqueNonEmpty(alloc, &merged_declared_skills, skill_name);
+    }
+    if (persisted_realisation.len > 0 and !std.mem.eql(u8, persisted_realisation, assignment.realisation)) {
+        for (try declaredSkillsForRealisation(alloc, declaration, persisted_realisation)) |skill_name| {
+            try appendUniqueNonEmpty(alloc, &merged_declared_skills, skill_name);
+        }
+    }
+    for (assignment.declared_skills) |skill_name| {
+        try appendUniqueNonEmpty(alloc, &merged_declared_skills, skill_name);
+    }
+
+    if (persisted_realisation.len > 0 or
+        task.definition.required_tools.len > 0 or
+        task.definition.skill_bindings.len > 0)
+    {
+        const resolved_bindings = try resolveSkillBindingsByNames(
+            alloc,
+            merged_declared_skills.items,
+            assignment.skill_bindings,
+            workspace_root,
+            skills,
+        );
+        const typed_guidance = try buildTypedExecutionGuidance(
+            alloc,
+            assignment.capability,
+            effective_realisation,
+            assignment.ranking,
+            merged_tools.items,
+            merged_declared_skills.items,
+            resolved_bindings,
+            request_text,
+        );
+        assignment.realisation = try alloc.dupe(u8, effective_realisation);
+        assignment.required_tools = try merged_tools.toOwnedSlice(alloc);
+        assignment.declared_skills = try merged_declared_skills.toOwnedSlice(alloc);
+        assignment.skill_bindings = resolved_bindings;
+        assignment.guidance = typed_guidance.text;
+        assignment.execution_guidance = typed_guidance;
+    }
+
+    return assignment;
 }
 
 pub fn buildExecutionGuidance(
@@ -1042,4 +1291,88 @@ test "assignForGoal populates realisation required_tools and portable skill bind
     const no_catalog_skills = try no_catalog.persistedSkillBindings(alloc);
     try std.testing.expectEqual(@as(usize, 1), no_catalog_skills.len);
     try std.testing.expectEqualStrings("browseros-neo", no_catalog_skills[0]);
+}
+
+test "job_application assignment produces typed ExecutionGuidance with canonical required_tools and skill_bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "browseros-neo", .description = "global", .path = "/Users/example/.agents/skills/browseros-neo", .source = .workspace_agents },
+        .{ .name = "browseros-neo", .description = "project", .path = "/Users/example/project/skills/browseros-neo", .source = .workspace_shared },
+    };
+
+    const assignment = try assignForGoal(
+        alloc,
+        null,
+        declaration,
+        "Apply to outside IR35 contract roles via LinkedIn Easy Apply",
+        null,
+        "trunk",
+        "/Users/example/project",
+        &skills,
+    );
+    const typed = assignment.execution_guidance;
+    try std.testing.expectEqualStrings("job_application", typed.capability);
+    try std.testing.expectEqualStrings("job_application_browser", typed.realisation_id);
+    try std.testing.expectEqual(@as(usize, 4), typed.required_tools.len);
+    try std.testing.expectEqualStrings("shell", typed.required_tools[0]);
+    try std.testing.expectEqualStrings("read_file", typed.required_tools[1]);
+    try std.testing.expectEqualStrings("write_file", typed.required_tools[2]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", typed.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), typed.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", typed.skill_bindings[0]);
+    try std.testing.expectEqual(@as(usize, 1), typed.resolved_skills.len);
+    try std.testing.expectEqualStrings("/Users/example/project/skills/browseros-neo", typed.resolved_skills[0].path);
+    try std.testing.expectEqualStrings(assignment.guidance, typed.text);
+    try std.testing.expect(std.mem.find(u8, typed.text, "realisation=\"job_application_browser\"") != null);
+
+    // Non-specialist general_task keeps empty required_tools and skill_bindings.
+    const general = try assignForGoal(
+        alloc,
+        null,
+        declaration,
+        "Summarize the quarterly report",
+        null,
+        "trunk",
+        "/Users/example/project",
+        &skills,
+    );
+    try std.testing.expectEqualStrings("general_task_native", general.execution_guidance.realisation_id);
+    try std.testing.expectEqual(@as(usize, 0), general.execution_guidance.required_tools.len);
+    try std.testing.expectEqual(@as(usize, 0), general.execution_guidance.skill_bindings.len);
+}
+
+test "resolveSkillBindingsByNames resolves persisted portable skill names to workspace-local paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "browseros-neo", .description = "global", .path = "/Users/example/.agents/skills/browseros-neo", .source = .workspace_agents },
+        .{ .name = "browseros-neo", .description = "local", .path = "/Users/example/project/skills/browseros-neo", .source = .workspace_shared },
+    };
+
+    const resolved = try resolveSkillBindingsByNames(
+        alloc,
+        &.{ "browseros-neo", "missing-skill" },
+        &.{},
+        "/Users/example/project",
+        &skills,
+    );
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("browseros-neo", resolved[0].name);
+    try std.testing.expectEqualStrings("/Users/example/project/skills/browseros-neo", resolved[0].path);
+
+    // Deduplicates when already bound and keeps existing explicit paths.
+    const deduped = try resolveSkillBindingsByNames(
+        alloc,
+        &.{"browseros-neo"},
+        resolved,
+        "/Users/example/project",
+        &skills,
+    );
+    try std.testing.expectEqual(@as(usize, 1), deduped.len);
 }
