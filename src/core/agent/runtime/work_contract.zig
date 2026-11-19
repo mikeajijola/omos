@@ -6,12 +6,53 @@ pub const bridge_name = "__libfx_contract_assess";
 pub const max_bytes = 64 * 1024;
 
 pub const Obligation = struct { id: []const u8, description: []const u8 };
+pub const Criterion = Obligation;
 pub const Definition = struct {
     id: []const u8,
     version: u32,
     objective: []const u8,
     obligations: []const Obligation,
+    realisation_id: ?[]const u8 = null,
+    criteria: []const Obligation = &.{},
+    required_tools: []const []const u8 = &.{},
+    skill_bindings: []const []const u8 = &.{},
+
+    // Omit empty optional specialist fields so legacy contracts keep identical
+    // serialized JSON and SHA-256 digests.
+    pub fn jsonStringify(self: Definition, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("id");
+        try writer.write(self.id);
+        try writer.objectField("version");
+        try writer.write(self.version);
+        try writer.objectField("objective");
+        try writer.write(self.objective);
+        try writer.objectField("obligations");
+        try writer.write(self.obligations);
+        if (self.realisation_id) |realisation_id| {
+            try writer.objectField("realisation_id");
+            try writer.write(realisation_id);
+        }
+        if (self.criteria.len > 0) {
+            try writer.objectField("criteria");
+            try writer.write(self.criteria);
+        }
+        if (self.required_tools.len > 0) {
+            try writer.objectField("required_tools");
+            try writer.write(self.required_tools);
+        }
+        if (self.skill_bindings.len > 0) {
+            try writer.objectField("skill_bindings");
+            try writer.write(self.skill_bindings);
+        }
+        try writer.endObject();
+    }
 };
+
+/// Serialize a contract definition to JSON. Caller owns the returned slice.
+pub fn stringify(alloc: std.mem.Allocator, definition: Definition) ![]u8 {
+    return std.json.Stringify.valueAlloc(alloc, definition, .{});
+}
 pub const State = enum { pending, met, blocked };
 pub const Report = struct {
     id: []const u8,
@@ -41,6 +82,30 @@ pub fn parse(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parsed(Definit
         if (!bounded(obligation.id, 128) or !bounded(obligation.description, 4096)) return error.InvalidWorkContract;
         for (value.obligations[0..index]) |previous| {
             if (std.mem.eql(u8, previous.id, obligation.id)) return error.InvalidWorkContract;
+        }
+    }
+    if (value.realisation_id) |realisation_id| {
+        if (!bounded(realisation_id, 128)) return error.InvalidWorkContract;
+    }
+    if (value.criteria.len > 100) return error.InvalidWorkContract;
+    for (value.criteria, 0..) |criterion, index| {
+        if (!bounded(criterion.id, 128) or !bounded(criterion.description, 4096)) return error.InvalidWorkContract;
+        for (value.criteria[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.id, criterion.id)) return error.InvalidWorkContract;
+        }
+    }
+    if (value.required_tools.len > 100) return error.InvalidWorkContract;
+    for (value.required_tools, 0..) |tool, index| {
+        if (!bounded(tool, 128)) return error.InvalidWorkContract;
+        for (value.required_tools[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, tool)) return error.InvalidWorkContract;
+        }
+    }
+    if (value.skill_bindings.len > 100) return error.InvalidWorkContract;
+    for (value.skill_bindings, 0..) |binding, index| {
+        if (!bounded(binding, 128)) return error.InvalidWorkContract;
+        for (value.skill_bindings[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, binding)) return error.InvalidWorkContract;
         }
     }
     return parsed;
@@ -255,4 +320,88 @@ test "work contract revision counts changes separately from retained echoes" {
     defer alloc.free(bounded_revision);
     try std.testing.expectEqual(@as(usize, 100), bounded_revision.len);
     try std.testing.expectError(error.InvalidContractRevision, revisedObligations(alloc, definition, replacements[0..33], &superseded));
+}
+
+test "work contract legacy JSON defaults specialist fields and preserves serialization and assess" {
+    const alloc = std.testing.allocator;
+    const parsed = try parse(alloc, test_definition);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.realisation_id == null);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.criteria.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.required_tools.len);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.skill_bindings.len);
+
+    const encoded = try stringify(alloc, parsed.value);
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings(test_definition, encoded);
+
+    const decision = try assess(
+        alloc,
+        parsed.value,
+        "{\"contractId\":\"task\",\"version\":1,\"obligations\":[{\"id\":\"report\",\"status\":\"met\",\"note\":\"Verified\",\"evidence\":[\"receipt:1\"]}]}",
+    );
+    defer alloc.free(decision.feedback);
+    try std.testing.expectEqual(Disposition.fulfilled, decision.disposition);
+}
+
+test "work contract parses validates and round-trips specialist fields" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"id":"job-1","version":1,"objective":"Submit job applications","obligations":[{"id":"request_complete","description":"Submit applications and record receipts"}],"realisation_id":"job_application_browser","criteria":[{"id":"receipt_saved","description":"Each submission has a saved receipt"}],"required_tools":["native shell","read_file","write_file","mcp_browseros-neo_run"],"skill_bindings":["browseros-neo"]}
+    ;
+    const mutable = try alloc.dupe(u8, raw);
+    defer alloc.free(mutable);
+    const parsed = try parse(alloc, mutable);
+    defer parsed.deinit();
+    @memset(mutable, ' ');
+
+    try std.testing.expectEqualStrings("job_application_browser", parsed.value.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.criteria.len);
+    try std.testing.expectEqualStrings("receipt_saved", parsed.value.criteria[0].id);
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.required_tools.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", parsed.value.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", parsed.value.skill_bindings[0]);
+
+    const encoded = try stringify(alloc, parsed.value);
+    defer alloc.free(encoded);
+    try std.testing.expectEqualStrings(raw, encoded);
+
+    // assess() remains governed by obligations without requiring criteria reports.
+    const decision = try assess(
+        alloc,
+        parsed.value,
+        "{\"contractId\":\"job-1\",\"version\":1,\"obligations\":[{\"id\":\"request_complete\",\"status\":\"met\",\"note\":\"Submitted\",\"evidence\":[\"documents/receipts.json\"]}]}",
+    );
+    defer alloc.free(decision.feedback);
+    try std.testing.expectEqual(Disposition.fulfilled, decision.disposition);
+
+    // Explicit null / empty arrays are accepted and serialize without empty keys.
+    const empty_optionals = try parse(
+        alloc,
+        "{\"id\":\"task\",\"version\":1,\"objective\":\"Save a report\",\"obligations\":[{\"id\":\"report\",\"description\":\"Report exists\"}],\"realisation_id\":null,\"criteria\":[],\"required_tools\":[],\"skill_bindings\":[]}",
+    );
+    defer empty_optionals.deinit();
+    const compact = try stringify(alloc, empty_optionals.value);
+    defer alloc.free(compact);
+    try std.testing.expectEqualStrings(test_definition, compact);
+}
+
+test "work contract rejects invalid empty or duplicate specialist fields" {
+    const alloc = std.testing.allocator;
+    const base = "\"id\":\"task\",\"version\":1,\"objective\":\"Do work\",\"obligations\":[{\"id\":\"a\",\"description\":\"A\"}]";
+    for ([_][]const u8{
+        "{" ++ base ++ ",\"realisation_id\":\"\"}",
+        "{" ++ base ++ ",\"realisation_id\":\"   \"}",
+        "{" ++ base ++ ",\"required_tools\":[\"\"]}",
+        "{" ++ base ++ ",\"required_tools\":[\"  \"]}",
+        "{" ++ base ++ ",\"required_tools\":[\"read_file\",\"read_file\"]}",
+        "{" ++ base ++ ",\"skill_bindings\":[\"\"]}",
+        "{" ++ base ++ ",\"skill_bindings\":[\"browseros-neo\",\"browseros-neo\"]}",
+        "{" ++ base ++ ",\"criteria\":[{\"id\":\"\",\"description\":\"D\"}]}",
+        "{" ++ base ++ ",\"criteria\":[{\"id\":\"c1\",\"description\":\"   \"}]}",
+        "{" ++ base ++ ",\"criteria\":[{\"id\":\"c1\",\"description\":\"A\"},{\"id\":\"c1\",\"description\":\"B\"}]}",
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidWorkContract, parse(alloc, invalid));
+    }
 }

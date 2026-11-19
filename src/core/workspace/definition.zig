@@ -7,7 +7,7 @@ const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 
 pub const profile_id = "omos.workspace/v1";
-pub const standard_version = "1.0.0-alpha.8";
+pub const standard_version = "1.0.0-alpha.9";
 pub const declaration_path = "omniform/company.json";
 pub const execution_path = "execution/omos.json";
 pub const seed = compactJson(@embedFile("standard/omos.json"));
@@ -381,6 +381,55 @@ test "workspace declaration upgrade merges new capability realisation and resour
     try std.testing.expect(named(items(field(spec(next.value), "resources").?, "machines"), "native_application_files") != null);
     try std.testing.expect(nativeCapability(next, "job_application"));
     try std.testing.expectEqualStrings(next.hash, (try upgrade(alloc, next)).hash);
+}
+
+test "workspace declaration upgrade additively extends omos_task with optional specialist fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var value = (try std.json.parseFromSlice(Value, alloc, seed, .{})).value;
+
+    // Model a pre-Phase-2 declaration whose omos_task omits the new optional fields.
+    for (value.object.getPtr("spec").?.object.getPtr("semantic").?.object.getPtr("entityTypes").?.array.items) |*entity| {
+        if (!std.mem.eql(u8, text(entity.*, "id"), "omos_task")) continue;
+        const fields = entity.object.getPtr("fields").?;
+        for ([_][]const u8{ "realisation_id", "criteria", "required_tools", "skill_bindings" }) |key| {
+            _ = fields.object.swapRemove(key);
+        }
+    }
+
+    const previous = try parse(alloc, try canonical(alloc, value));
+    const current = try parse(alloc, seed);
+    try std.testing.expect(try compatible(alloc, previous, current));
+
+    const upgraded = try upgrade(alloc, previous);
+    try std.testing.expect(try compatible(alloc, previous, upgraded));
+    try std.testing.expectEqualStrings(upgraded.hash, (try upgrade(alloc, upgraded)).hash);
+
+    // Both legacy records (without specialist fields) and enriched records validate cleanly.
+    const legacy_record = (try std.json.parseFromSlice(
+        Value,
+        alloc,
+        "{\"objective\":\"Save a report\",\"state\":\"active\",\"contract\":{\"id\":\"t1\",\"version\":1,\"objective\":\"Save a report\",\"obligations\":[{\"id\":\"request_complete\",\"description\":\"Done\"}]}}",
+        .{},
+    )).value;
+    try validateRecord(upgraded.semantic, "omos_task", legacy_record, true);
+
+    const specialist_record = (try std.json.parseFromSlice(
+        Value,
+        alloc,
+        "{\"objective\":\"Submit applications\",\"state\":\"active\",\"contract\":{\"id\":\"t2\",\"version\":1,\"objective\":\"Submit applications\",\"obligations\":[{\"id\":\"request_complete\",\"description\":\"Done\"}],\"realisation_id\":\"job_application_browser\",\"required_tools\":[\"native shell\",\"read_file\",\"write_file\",\"mcp_browseros-neo_run\"],\"skill_bindings\":[\"browseros-neo\"]},\"realisation_id\":\"job_application_browser\",\"criteria\":[{\"id\":\"receipts\",\"description\":\"Receipts saved\"}],\"required_tools\":[\"native shell\",\"read_file\",\"write_file\",\"mcp_browseros-neo_run\"],\"skill_bindings\":[\"browseros-neo\"]}",
+        .{},
+    )).value;
+    try validateRecord(upgraded.semantic, "omos_task", specialist_record, true);
+
+    const invalid_type_record = (try std.json.parseFromSlice(
+        Value,
+        alloc,
+        "{\"objective\":\"Bad\",\"state\":\"active\",\"contract\":{},\"realisation_id\":42}",
+        .{},
+    )).value;
+    try std.testing.expectError(error.InvalidEntityFieldType, validateRecord(upgraded.semantic, "omos_task", invalid_type_record, true));
 }
 
 /// Schemas belong to the pinned declaration; older tasks retain their legacy adapter.

@@ -28,8 +28,28 @@ pub const Assignment = struct {
     capability: []const u8,
     realisation: []const u8,
     ranking: Ranking,
+    required_tools: []const []const u8 = &.{},
+    declared_skills: []const []const u8 = &.{},
     skill_bindings: []const skill_invocation.ExplicitBinding = &.{},
     guidance: []const u8 = "",
+
+    /// Collect deduplicated portable skill names from explicit bindings and
+    /// declared realisation skills for persisting on a work contract.
+    /// Caller owns the returned slice and strings.
+    pub fn persistedSkillBindings(self: Assignment, alloc: Allocator) ![]const []const u8 {
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+        for (self.skill_bindings) |binding| {
+            try appendUniqueNonEmpty(alloc, &names, binding.name);
+        }
+        for (self.declared_skills) |skill_name| {
+            try appendUniqueNonEmpty(alloc, &names, skill_name);
+        }
+        return names.toOwnedSlice(alloc);
+    }
 };
 
 const PrecedentStats = struct {
@@ -226,9 +246,25 @@ pub fn resolvePromptSkillBindings(
     workspace_root: []const u8,
     skills: []const skill_contract.Skill,
 ) ![]const skill_invocation.ExplicitBinding {
+    return resolveSkillBindingsForRealisation(alloc, prompt, &.{}, workspace_root, skills);
+}
+
+fn resolveSkillBindingsForRealisation(
+    alloc: Allocator,
+    prompt: []const u8,
+    declared_skills: []const []const u8,
+    workspace_root: []const u8,
+    skills: []const skill_contract.Skill,
+) ![]const skill_invocation.ExplicitBinding {
     if (skills.len == 0) return &.{};
     var bindings: std.ArrayList(skill_invocation.ExplicitBinding) = .empty;
-    errdefer bindings.deinit(alloc);
+    errdefer {
+        for (bindings.items) |binding| {
+            alloc.free(binding.name);
+            alloc.free(binding.path);
+        }
+        bindings.deinit(alloc);
+    }
 
     var seen_names = std.StringHashMap(void).init(alloc);
     defer seen_names.deinit();
@@ -237,7 +273,11 @@ pub fn resolvePromptSkillBindings(
 
     for (skills) |candidate| {
         if (seen_names.contains(candidate.name)) continue;
-        const mentioned = mentionsSkillName(prompt, candidate.name) or
+        const declared = for (declared_skills) |skill_name| {
+            if (std.ascii.eqlIgnoreCase(candidate.name, skill_name)) break true;
+        } else false;
+        const mentioned = declared or
+            mentionsSkillName(prompt, candidate.name) or
             (browser_requested and std.ascii.eqlIgnoreCase(candidate.name, "browseros-neo"));
         if (!mentioned) continue;
 
@@ -249,6 +289,85 @@ pub fn resolvePromptSkillBindings(
         });
     }
     return bindings.toOwnedSlice(alloc);
+}
+
+fn appendUniqueNonEmpty(alloc: Allocator, list: *std.ArrayList([]const u8), raw: []const u8) !void {
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return;
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, raw)) return;
+    }
+    try list.append(alloc, try alloc.dupe(u8, raw));
+}
+
+fn findDeclaredResource(declaration: model.Declaration, resource_id: []const u8) ?Value {
+    const resources = model.field(model.spec(declaration.value), "resources") orelse return null;
+    if (resources != .object) return null;
+    var families = resources.object.iterator();
+    while (families.next()) |family| {
+        if (family.value_ptr.* != .array) continue;
+        for (family.value_ptr.array.items) |resource| {
+            if (std.mem.eql(u8, model.text(resource, "id"), resource_id)) return resource;
+        }
+    }
+    return null;
+}
+
+/// Derive unique tool identifiers declared by a realisation's participant
+/// resources (`spec.tools`). Recording required tools on a work contract never
+/// grants tool permissions; authorization remains in host policy and permissions.
+/// Caller owns the returned slice and strings.
+pub fn requiredToolsForRealisation(
+    alloc: Allocator,
+    declaration: model.Declaration,
+    realisation_id: []const u8,
+) ![]const []const u8 {
+    var tools: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (tools.items) |tool| alloc.free(tool);
+        tools.deinit(alloc);
+    }
+    for (model.items(model.spec(declaration.value), "realisations")) |realisation| {
+        if (!std.mem.eql(u8, model.text(realisation, "id"), realisation_id)) continue;
+        for (model.items(realisation, "participants")) |participant| {
+            const resource = findDeclaredResource(declaration, model.text(participant, "resource")) orelse continue;
+            const resource_spec = model.field(resource, "spec") orelse continue;
+            for (model.items(resource_spec, "tools")) |tool| {
+                if (tool != .string) continue;
+                try appendUniqueNonEmpty(alloc, &tools, tool.string);
+            }
+        }
+        break;
+    }
+    return tools.toOwnedSlice(alloc);
+}
+
+/// Derive unique skill identifiers declared by a realisation's participant
+/// resources (`spec.skill` / `spec.skills`). Caller owns the returned slice and strings.
+pub fn declaredSkillsForRealisation(
+    alloc: Allocator,
+    declaration: model.Declaration,
+    realisation_id: []const u8,
+) ![]const []const u8 {
+    var declared: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (declared.items) |name| alloc.free(name);
+        declared.deinit(alloc);
+    }
+    for (model.items(model.spec(declaration.value), "realisations")) |realisation| {
+        if (!std.mem.eql(u8, model.text(realisation, "id"), realisation_id)) continue;
+        for (model.items(realisation, "participants")) |participant| {
+            const resource = findDeclaredResource(declaration, model.text(participant, "resource")) orelse continue;
+            const resource_spec = model.field(resource, "spec") orelse continue;
+            const single = model.text(resource_spec, "skill");
+            if (single.len > 0) try appendUniqueNonEmpty(alloc, &declared, single);
+            for (model.items(resource_spec, "skills")) |entry| {
+                if (entry != .string) continue;
+                try appendUniqueNonEmpty(alloc, &declared, entry.string);
+            }
+        }
+        break;
+    }
+    return declared.toOwnedSlice(alloc);
 }
 
 fn selectPreferredSkillByName(
@@ -333,6 +452,8 @@ pub fn scoreCapability(
         choices[0].string
     else if (std.mem.eql(u8, id, "coding_task"))
         "coding_task_native"
+    else if (std.mem.eql(u8, id, "job_application"))
+        "job_application_browser"
     else
         "general_task_native";
 
@@ -440,6 +561,69 @@ fn gatherPrecedentStats(
     return stats;
 }
 
+/// Assign the affected capability, preferred realisation path, declared tool
+/// requirements, unambiguous skill bindings, and execution guidance for a goal
+/// against a pinned workspace declaration.
+pub fn assignForGoal(
+    alloc: Allocator,
+    manager: ?workspace.Manager,
+    declaration: model.Declaration,
+    goal: []const u8,
+    capability_override: ?[]const u8,
+    revision: []const u8,
+    workspace_root: []const u8,
+    skills: []const skill_contract.Skill,
+) !Assignment {
+    const capability_id = capability_override orelse if (classifyDeliverable(goal)) |cap|
+        @tagName(cap)
+    else
+        "general_task";
+
+    var selected_realisation: []const u8 = if (std.mem.eql(u8, capability_id, "coding_task"))
+        "coding_task_native"
+    else if (std.mem.eql(u8, capability_id, "job_application"))
+        "job_application_browser"
+    else
+        "general_task_native";
+    var selected_ranking: Ranking = .{
+        .relevance = 0.9,
+        .precedent = 0.75,
+        .evidence = 1.0,
+        .recency = 0.8,
+        .score = 0.88,
+    };
+
+    for (model.items(model.spec(declaration.value), "capabilities")) |capability| {
+        if (!std.mem.eql(u8, model.text(capability, "id"), capability_id)) continue;
+        const scored = try scoreCapability(alloc, manager, declaration, capability, goal, revision);
+        selected_realisation = scored.realisation;
+        selected_ranking = scored.ranking;
+        break;
+    }
+
+    const required_tools = try requiredToolsForRealisation(alloc, declaration, selected_realisation);
+    const declared_skills = try declaredSkillsForRealisation(alloc, declaration, selected_realisation);
+    const skill_bindings = try resolveSkillBindingsForRealisation(alloc, goal, declared_skills, workspace_root, skills);
+    const guidance = try buildExecutionGuidance(
+        alloc,
+        capability_id,
+        selected_realisation,
+        selected_ranking,
+        skill_bindings,
+        goal,
+    );
+
+    return .{
+        .capability = try alloc.dupe(u8, capability_id),
+        .realisation = try alloc.dupe(u8, selected_realisation),
+        .ranking = selected_ranking,
+        .required_tools = required_tools,
+        .declared_skills = declared_skills,
+        .skill_bindings = skill_bindings,
+        .guidance = guidance,
+    };
+}
+
 /// Assign the affected capability, preferred realisation path, unambiguous
 /// skill bindings, and execution guidance for a task being dispatched by the
 /// parent coordinator.
@@ -453,51 +637,17 @@ pub fn assignForTask(
     const request_text = try manager.originalRequest(task);
     const revision = if (task.model_basis) |basis| basis.revision else try manager.revision("trunk");
     const declaration = try manager.loadDeclaration(revision);
-
-    const capability_id = if (task.model_basis) |basis|
-        basis.capability orelse if (classifyDeliverable(request_text)) |cap| @tagName(cap) else "general_task"
-    else if (classifyDeliverable(request_text)) |cap|
-        @tagName(cap)
-    else
-        "general_task";
-
-    var selected_realisation: []const u8 = if (std.mem.eql(u8, capability_id, "coding_task"))
-        "coding_task_native"
-    else
-        "general_task_native";
-    var selected_ranking: Ranking = .{
-        .relevance = 0.9,
-        .precedent = 0.75,
-        .evidence = 1.0,
-        .recency = 0.8,
-        .score = 0.88,
-    };
-
-    for (model.items(model.spec(declaration.value), "capabilities")) |capability| {
-        if (!std.mem.eql(u8, model.text(capability, "id"), capability_id)) continue;
-        const scored = try scoreCapability(alloc, manager, declaration, capability, request_text, revision);
-        selected_realisation = scored.realisation;
-        selected_ranking = scored.ranking;
-        break;
-    }
-
-    const skill_bindings = try resolvePromptSkillBindings(alloc, request_text, workspace_root, skills);
-    const guidance = try buildExecutionGuidance(
+    const capability_override = if (task.model_basis) |basis| basis.capability else null;
+    return assignForGoal(
         alloc,
-        capability_id,
-        selected_realisation,
-        selected_ranking,
-        skill_bindings,
+        manager,
+        declaration,
         request_text,
+        capability_override,
+        revision,
+        workspace_root,
+        skills,
     );
-
-    return .{
-        .capability = try alloc.dupe(u8, capability_id),
-        .realisation = try alloc.dupe(u8, selected_realisation),
-        .ranking = selected_ranking,
-        .skill_bindings = skill_bindings,
-        .guidance = guidance,
-    };
 }
 
 pub fn buildExecutionGuidance(
@@ -820,4 +970,76 @@ test "durable contract gate recycles realisations unless background is explicit"
     // Explicit background intent overrides recycling.
     try std.testing.expect(shouldCreateDurableContract("Keep working on this in the background until it is done", existing));
     try std.testing.expect(shouldCreateDurableContract("Schedule this", existing));
+}
+
+test "realisation resource resolution derives required tools and declared skills from omos.json" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+
+    const job_tools = try requiredToolsForRealisation(alloc, declaration, "job_application_browser");
+    try std.testing.expectEqual(@as(usize, 4), job_tools.len);
+    try std.testing.expectEqualStrings("native shell", job_tools[0]);
+    try std.testing.expectEqualStrings("read_file", job_tools[1]);
+    try std.testing.expectEqualStrings("write_file", job_tools[2]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", job_tools[3]);
+
+    const job_skills = try declaredSkillsForRealisation(alloc, declaration, "job_application_browser");
+    try std.testing.expectEqual(@as(usize, 1), job_skills.len);
+    try std.testing.expectEqualStrings("browseros-neo", job_skills[0]);
+
+    const general_tools = try requiredToolsForRealisation(alloc, declaration, "general_task_native");
+    try std.testing.expectEqual(@as(usize, 0), general_tools.len);
+
+    const unknown_tools = try requiredToolsForRealisation(alloc, declaration, "nonexistent_realisation");
+    try std.testing.expectEqual(@as(usize, 0), unknown_tools.len);
+}
+
+test "assignForGoal populates realisation required_tools and portable skill bindings for job_application" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const declaration = try model.parse(alloc, model.seed);
+
+    const skills = [_]skill_contract.Skill{
+        .{ .name = "browseros-neo", .description = "browser", .path = "/Users/example/project/skills/browseros-neo", .source = .workspace_shared },
+        .{ .name = "cv-tailor", .description = "cv", .path = "/Users/example/project/skills/cv-tailor", .source = .workspace_shared },
+    };
+
+    const assignment = try assignForGoal(
+        alloc,
+        null,
+        declaration,
+        "Tailor a CV using cv-tailor and submit outside IR35 job applications",
+        null,
+        "trunk",
+        "/Users/example/project",
+        &skills,
+    );
+    try std.testing.expectEqualStrings("job_application", assignment.capability);
+    try std.testing.expectEqualStrings("job_application_browser", assignment.realisation);
+    try std.testing.expectEqual(@as(usize, 4), assignment.required_tools.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", assignment.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 2), assignment.skill_bindings.len);
+
+    const persisted = try assignment.persistedSkillBindings(alloc);
+    try std.testing.expectEqual(@as(usize, 2), persisted.len);
+    try std.testing.expectEqualStrings("browseros-neo", persisted[0]);
+    try std.testing.expectEqualStrings("cv-tailor", persisted[1]);
+
+    // Even with no local skill catalog, declared realisation skills are still persisted.
+    const no_catalog = try assignForGoal(
+        alloc,
+        null,
+        declaration,
+        "Apply for outside IR35 contract roles",
+        null,
+        "trunk",
+        "",
+        &.{},
+    );
+    const no_catalog_skills = try no_catalog.persistedSkillBindings(alloc);
+    try std.testing.expectEqual(@as(usize, 1), no_catalog_skills.len);
+    try std.testing.expectEqualStrings("browseros-neo", no_catalog_skills[0]);
 }

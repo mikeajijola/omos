@@ -7119,7 +7119,11 @@
             "objective": "string",
             "state": "string",
             "contract": "json",
-            "basis": "json"
+            "basis": "json",
+            "realisation_id": "string",
+            "criteria": "json",
+            "required_tools": "json",
+            "skill_bindings": "json"
           },
           "required": [
             "objective",
