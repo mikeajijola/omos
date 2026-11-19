@@ -4868,7 +4868,7 @@ pub const Manager = struct {
         }
     }
 
-    fn verifyBatch(self: Manager, revision_id: []const u8, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
+    fn verifyBatch(self: Manager, rev_index: *const fossil_sqlite_reader.Db.RevisionIndex, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
         if (files.len == 0) return;
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try self.checkOperation();
@@ -4876,11 +4876,9 @@ pub const Manager = struct {
         defer scratch.deinit();
         var manager = self;
         manager.alloc = scratch.allocator();
-        var db = fossil_sqlite_reader.Db.openReadOnly(manager.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
-        defer db.close();
         for (files) |file| {
             try manager.checkOperation();
-            const content_bytes = db.readFileAtRevision(manager.alloc, revision_id, file.entry.path) catch |err| return mapSqliteReaderError(err);
+            const content_bytes = rev_index.readFile(manager.alloc, file.entry.path) catch |err| return mapSqliteReaderError(err);
             if (content_bytes.len != file.bytes) return error.WorkspaceVerificationFailed;
             if (verify_objects) try fossil_manifest.verifyObject(file.entry.artifact.?, content_bytes);
             try manager.verifyFile(file.entry.path, content_bytes, declaration);
@@ -4921,6 +4919,9 @@ pub const Manager = struct {
             for (sizes) |file| try lengths.put(file.path, file.bytes);
             const company = std.mem.eql(u8, branch, company_branch);
             const declaration: ?model.Declaration = if (company) try manager.loadDeclaration(trunk) else null;
+            var db = fossil_sqlite_reader.Db.openReadOnly(manager.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+            defer db.close();
+            var rev_index: ?fossil_sqlite_reader.Db.RevisionIndex = null;
             var batch: [32]VerificationFile = undefined;
             var count: usize = 0;
             var batch_bytes: usize = 0;
@@ -4944,7 +4945,8 @@ pub const Manager = struct {
                 }
                 if (size > max_bytes) return error.WorkspaceRecordTooLarge;
                 if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
-                    try manager.verifyBatch(revision_id, batch[0..count], declaration, null, false);
+                    if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
+                    try manager.verifyBatch(&rev_index.?, batch[0..count], declaration, null, false);
                     count = 0;
                     batch_bytes = 0;
                 }
@@ -4954,7 +4956,10 @@ pub const Manager = struct {
                 if (verified.count() >= 16384) verified.clearRetainingCapacity();
                 try verified.put(key, size);
             }
-            try manager.verifyBatch(revision_id, batch[0..count], declaration, null, false);
+            if (count > 0) {
+                if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
+                try manager.verifyBatch(&rev_index.?, batch[0..count], declaration, null, false);
+            }
         }
     }
 
@@ -4968,6 +4973,9 @@ pub const Manager = struct {
         const sizes = try fossil_manifest.sizes(manager.alloc, try manager.run(null, &.{ "ls", "-v", "-r", revision_id, "-R", self.repository }));
         var lengths = std.StringHashMap(usize).init(manager.alloc);
         for (sizes) |file| try lengths.put(file.path, file.bytes);
+        var db = fossil_sqlite_reader.Db.openReadOnly(manager.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+        defer db.close();
+        var rev_index: ?fossil_sqlite_reader.Db.RevisionIndex = null;
         var accepted: std.ArrayList(AcceptedTask) = .empty;
         var batch: [32]VerificationFile = undefined;
         var count: usize = 0;
@@ -4978,7 +4986,8 @@ pub const Manager = struct {
             const size = lengths.get(file.path) orelse return error.WorkspaceVerificationFailed;
             if (size > max_bytes) return error.WorkspaceRecordTooLarge;
             if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
-                try self.verifyBatch(revision_id, batch[0..count], null, &accepted, true);
+                if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
+                try self.verifyBatch(&rev_index.?, batch[0..count], null, &accepted, true);
                 count = 0;
                 batch_bytes = 0;
             }
@@ -4986,7 +4995,10 @@ pub const Manager = struct {
             count += 1;
             batch_bytes += size;
         }
-        try self.verifyBatch(revision_id, batch[0..count], null, &accepted, true);
+        if (count > 0) {
+            if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
+            try self.verifyBatch(&rev_index.?, batch[0..count], null, &accepted, true);
+        }
         return accepted.toOwnedSlice(self.alloc);
     }
 

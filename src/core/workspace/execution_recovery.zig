@@ -286,27 +286,27 @@ pub fn recoverRecipe(
     }
 
     var capability_id: ?[]const u8 = null;
-    if (latest.model_basis) |basis| {
-        if (basis.capability) |cap| {
-            const trimmed = std.mem.trim(u8, cap, " \t\r\n");
-            if (trimmed.len > 0) capability_id = try alloc.dupe(u8, trimmed);
+    if (realisation_id) |real_id| {
+        if (declaration) |decl| {
+            for (model.items(model.spec(decl.value), "realisations")) |entry| {
+                if (std.mem.eql(u8, model.text(entry, "id"), real_id)) {
+                    const cap = model.text(entry, "capability");
+                    if (cap.len > 0) capability_id = try alloc.dupe(u8, cap);
+                    break;
+                }
+            }
+        }
+        if (capability_id == null) {
+            if (inferCapabilityFromRealisation(real_id)) |inferred| {
+                capability_id = try alloc.dupe(u8, inferred);
+            }
         }
     }
     if (capability_id == null) {
-        if (realisation_id) |real_id| {
-            if (declaration) |decl| {
-                for (model.items(model.spec(decl.value), "realisations")) |entry| {
-                    if (std.mem.eql(u8, model.text(entry, "id"), real_id)) {
-                        const cap = model.text(entry, "capability");
-                        if (cap.len > 0) capability_id = try alloc.dupe(u8, cap);
-                        break;
-                    }
-                }
-            }
-            if (capability_id == null) {
-                if (inferCapabilityFromRealisation(real_id)) |inferred| {
-                    capability_id = try alloc.dupe(u8, inferred);
-                }
+        if (latest.model_basis) |basis| {
+            if (basis.capability) |cap| {
+                const trimmed = std.mem.trim(u8, cap, " \t\r\n");
+                if (trimmed.len > 0) capability_id = try alloc.dupe(u8, trimmed);
             }
         }
     }

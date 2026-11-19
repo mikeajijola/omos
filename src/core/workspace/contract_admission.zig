@@ -99,11 +99,14 @@ fn trimmedNonEmpty(value: ?[]const u8) ?[]const u8 {
 }
 
 fn effectiveCapability(capability_id: ?[]const u8, realisation_id: ?[]const u8) ?[]const u8 {
+    if (trimmedNonEmpty(realisation_id)) |real| {
+        if (std.mem.startsWith(u8, real, "job_application")) return "job_application";
+        if (std.mem.startsWith(u8, real, "coding_task")) return "coding_task";
+    }
     if (trimmedNonEmpty(capability_id)) |cap| return cap;
-    const real = trimmedNonEmpty(realisation_id) orelse return null;
-    if (std.mem.startsWith(u8, real, "job_application")) return "job_application";
-    if (std.mem.startsWith(u8, real, "coding_task")) return "coding_task";
-    if (std.mem.startsWith(u8, real, "general_task")) return "general_task";
+    if (trimmedNonEmpty(realisation_id)) |real| {
+        if (std.mem.startsWith(u8, real, "general_task")) return "general_task";
+    }
     return null;
 }
 
@@ -505,5 +508,20 @@ test "chooseRecyclableContract recycles matching specialist realisation rejects 
             &.{legacy_candidate},
             .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
         ) == null,
+    );
+
+    // 4. Specialist candidate whose planner basis recorded general_task still recycles via specialist realisation_id.
+    var fallback_basis_candidate = specialist_candidate;
+    fallback_basis_candidate.id = "task-specialist-fallback-basis";
+    fallback_basis_candidate.capability_id = "general_task";
+    try std.testing.expectEqualStrings(
+        "task-specialist-fallback-basis",
+        chooseRecyclableContract(
+            "Submit a second batch of UK contract applications via LinkedIn Easy Apply",
+            "/Users/example/project",
+            "task-other",
+            &.{fallback_basis_candidate},
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ).?,
     );
 }
