@@ -23,7 +23,12 @@ fn journalTimestamp(value: std.json.Value) i64 {
     return if (value == .integer) @max(0, value.integer) else 0;
 }
 
-fn startAssignedTask(
+pub const AssignedStart = struct {
+    task: workspace.Task,
+    recycled: bool = false,
+};
+
+pub fn startOrRecycleAssignedTask(
     alloc: std.mem.Allocator,
     manager: workspace.Manager,
     session: []const u8,
@@ -32,8 +37,10 @@ fn startAssignedTask(
     parent: ?workspace.Task,
     capability_override: ?[]const u8,
     skills: []const @import("../skills/skill_contract.zig").Skill,
-) !workspace.Task {
+    exclude_id: []const u8,
+) !AssignedStart {
     const selection = @import("realisation_selection.zig");
+    const admission = @import("contract_admission.zig");
     const assignment = selection.assignGoalForManager(
         alloc,
         manager,
@@ -43,12 +50,35 @@ fn startAssignedTask(
         project,
         skills,
     ) catch null;
-    return manager.startWithAssignment(session, project, goal, parent, assignment);
+    if (parent == null) {
+        const recyclable = admission.findRecyclableContractWithAssignment(
+            manager,
+            exclude_id,
+            goal,
+            project,
+            assignment,
+        ) catch null;
+        if (recyclable) |recyclable_id| {
+            if (manager.resumeTask(session, recyclable_id, project)) |resumed| {
+                return .{ .task = resumed, .recycled = true };
+            } else |err| switch (err) {
+                error.OutOfMemory, error.Cancelled => return err,
+                else => {},
+            }
+        }
+    }
+    return .{
+        .task = try manager.startWithAssignment(session, project, goal, parent, assignment),
+        .recycled = false,
+    };
 }
 
 pub const Turn = struct {
     manager: workspace.Manager,
     task: workspace.Task,
+    recycled: bool = false,
+    recovered_recipe: @import("execution_recovery.zig").SpecialistRecipe = .{},
+    execution_guidance: @import("realisation_selection.zig").ExecutionGuidance = .{},
     reviewed_revision: ?[]const u8 = null,
     assessment: []const u8 = "",
     review_snapshot: []const u8 = "",
@@ -74,16 +104,6 @@ pub const Turn = struct {
         return beginResolved(alloc, session, parent_session, project, prompt, false);
     }
 
-    fn startWithoutAssignment(
-        manager: workspace.Manager,
-        session: []const u8,
-        project: []const u8,
-        goal: []const u8,
-        parent: ?workspace.Task,
-    ) !workspace.Task {
-        return manager.start(session, project, goal, parent);
-    }
-
     pub fn beginResolved(alloc: std.mem.Allocator, session: []const u8, parent_session: ?[]const u8, project: []const u8, prompt: []const u8, continuing: bool) !?Turn {
         return beginResolvedWithContext(alloc, session, parent_session, project, prompt, continuing, null, &.{});
     }
@@ -100,8 +120,18 @@ pub const Turn = struct {
     ) !?Turn {
         const manager = try workspace.Manager.ensureBound(alloc);
         const parent = if (parent_session) |id| try manager.active(id) else null;
-        var task = if (try manager.active(session)) |active| active else try startAssignedTask(alloc, manager, session, project, prompt, parent, capability_override, skills);
-        var turn: Turn = .{ .manager = manager, .task = task, .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy };
+        var recycled = false;
+        var task = if (try manager.active(session)) |active| active else blk: {
+            const started = try startOrRecycleAssignedTask(alloc, manager, session, project, prompt, parent, capability_override, skills, "");
+            recycled = started.recycled;
+            break :blk started.task;
+        };
+        var turn: Turn = .{
+            .manager = manager,
+            .task = task,
+            .recycled = recycled,
+            .execution_lease = (try manager.tryTaskExecutionLease(task.id)) orelse return error.WorkspaceExecutionBusy,
+        };
         errdefer turn.release();
         task = try manager.refreshTaskContext(task);
         turn.task = task;
@@ -117,7 +147,9 @@ pub const Turn = struct {
                 if (try manager.publicationCommitted(task)) {
                     _ = try manager.retryPublication(task);
                     try manager.acknowledge(task);
-                    task = try manager.start(session, project, prompt, parent);
+                    const started = try startOrRecycleAssignedTask(alloc, manager, session, project, prompt, parent, capability_override, skills, task.id);
+                    task = started.task;
+                    turn.recycled = started.recycled;
                     try turn.selectTask(task);
                 } else {
                     task = try manager.reopenUnpublished(task);
@@ -126,18 +158,29 @@ pub const Turn = struct {
                 turn.recovered_candidate = try manager.pendingCandidate(task);
                 _ = (try manager.retryPublication(task)) orelse return error.WorkspaceRecoveryRequired;
                 turn.task = try manager.loadTask(task.id);
+                try turn.refreshRecipe(alloc, &.{}, project, skills);
                 return turn;
             }
         }
         if (task.state == .conflict) return error.WorkspaceMergeConflict;
         if (task.state == .accepted) {
-            task = try manager.start(session, project, prompt, parent);
+            const started = try startOrRecycleAssignedTask(alloc, manager, session, project, prompt, parent, capability_override, skills, task.id);
+            task = started.task;
+            turn.recycled = started.recycled;
             try turn.selectTask(task);
         }
         turn.task = try manager.setState(task.id, .active);
         if (continuing or std.ascii.eqlIgnoreCase(std.mem.trim(u8, prompt, " \t\r\n"), "continue")) turn.review_only_candidate = try manager.retainedReviewCandidate(turn.task);
-        if (!continuing and parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
+        if (!continuing and !turn.recycled and parent_session == null and !std.mem.eql(u8, prompt, task.definition.objective)) {
             turn.task = try manager.amend(task, prompt);
+        }
+        try turn.refreshRecipe(alloc, &.{}, project, skills);
+        if (turn.recycled) {
+            try manager.record(turn.task, "contract_recycled", .{
+                .realisation_id = turn.recovered_recipe.realisation_id,
+                .required_tools = turn.recovered_recipe.required_tools,
+                .skill_bindings = turn.recovered_recipe.skill_bindings,
+            });
         }
         try manager.record(turn.task, "user_request", .{ .text = prompt, .origin = if (parent_session == null) "user" else "delegation" });
         _ = try manager.checkpoint(turn.task);
@@ -149,6 +192,26 @@ pub const Turn = struct {
             turn.maintenance = @import("projection_maintenance.zig").Handle.start(manager) catch null;
         };
         return turn;
+    }
+
+    pub fn refreshRecipe(
+        self: *Turn,
+        alloc: std.mem.Allocator,
+        existing_bindings: []const @import("../skills/skill_invocation.zig").ExplicitBinding,
+        workspace_root: []const u8,
+        skills: []const @import("../skills/skill_contract.zig").Skill,
+    ) !void {
+        const recovery = @import("execution_recovery.zig");
+        self.recovered_recipe = try recovery.recoverRecipe(alloc, self.manager, self.task);
+        self.execution_guidance = try recovery.hydrateExecutionGuidance(
+            alloc,
+            self.manager,
+            self.task,
+            self.recovered_recipe,
+            existing_bindings,
+            workspace_root,
+            skills,
+        );
     }
 
     fn selectTask(self: *Turn, task: workspace.Task) !void {
@@ -609,4 +672,142 @@ test "managed chronological evidence preloads newest complete result within unch
     _ = try view.initialInspections(alloc, 1800);
     try view.requireInspected("newest");
     try std.testing.expectError(error.UninspectedContractEvidence, view.requireInspected("oldest"));
+}
+
+test "managed_task recycles matching specialist contract and hydrates recipe alongside recovery_context on reuse and resume" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const io_mod = @import("../shared/io.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try std.Io.Dir.path.join(alloc, &.{ root, "repo.fossil" });
+    const project_dir = try std.Io.Dir.path.join(alloc, &.{ root, "project" });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), project_dir, .fromMode(0o700));
+
+    const EnvFallback = struct {
+        var empty: std.process.Environ.Map = .init(std.heap.page_allocator);
+    };
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(&EnvFallback.empty);
+
+    _ = try workspace.Manager.init(alloc, repo_path);
+
+    const skill_contract = @import("../skills/skill_contract.zig");
+    const skills = [_]skill_contract.Skill{
+        .{
+            .name = "browseros-neo",
+            .description = "Dedicated agent browser",
+            .path = "/Users/example/project/skills/browseros-neo",
+            .source = .workspace_shared,
+        },
+    };
+
+    // 1. Start first job_application turn, record tool evidence, and pause it.
+    var first_turn = (try Turn.beginResolvedWithContext(
+        alloc,
+        "session-job-1",
+        null,
+        project_dir,
+        "Apply to outside IR35 UK contract roles via LinkedIn Easy Apply",
+        false,
+        null,
+        &skills,
+    )).?;
+    const original_task_id = try alloc.dupe(u8, first_turn.task.id);
+    try std.testing.expect(!first_turn.recycled);
+    try std.testing.expectEqualStrings("job_application_browser", first_turn.recovered_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), first_turn.recovered_recipe.required_tools.len);
+    try std.testing.expectEqualStrings("shell", first_turn.recovered_recipe.required_tools[0]);
+    try std.testing.expectEqualStrings("read_file", first_turn.recovered_recipe.required_tools[1]);
+    try std.testing.expectEqualStrings("write_file", first_turn.recovered_recipe.required_tools[2]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", first_turn.recovered_recipe.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), first_turn.recovered_recipe.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", first_turn.recovered_recipe.skill_bindings[0]);
+    try std.testing.expectEqual(@as(usize, 1), first_turn.execution_guidance.resolved_skills.len);
+    try std.testing.expect(std.mem.find(u8, first_turn.execution_guidance.text, "realisation=\"job_application_browser\"") != null);
+
+    try first_turn.manager.record(first_turn.task, "tool_evidence", &[_]review.Evidence{
+        .{
+            .id = "ev-1",
+            .action_id = "act-1",
+            .kind = .tool,
+            .tool = "mcp_browseros-neo_run",
+            .status = .success,
+            .arguments = "{\"script\":\"return 1\"}",
+            .content = "Submitted first batch receipt-001",
+        },
+    });
+    try first_turn.retain();
+    first_turn.release();
+
+    // 2. Resume existing session with "continue": both recovery_context AND specialist recipe hydrate!
+    var resumed_turn = (try Turn.beginResolvedWithContext(
+        alloc,
+        "session-job-1",
+        null,
+        project_dir,
+        "continue",
+        true,
+        null,
+        &skills,
+    )).?;
+    try std.testing.expectEqualStrings(original_task_id, resumed_turn.task.id);
+    try std.testing.expect(std.mem.find(u8, resumed_turn.recovery_context, "Retained execution summary") != null);
+    try std.testing.expect(std.mem.find(u8, resumed_turn.recovery_context, "receipt-001") != null);
+    try std.testing.expectEqualStrings("job_application_browser", resumed_turn.recovered_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), resumed_turn.recovered_recipe.required_tools.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", resumed_turn.recovered_recipe.required_tools[3]);
+    try std.testing.expectEqualStrings("browseros-neo", resumed_turn.recovered_recipe.skill_bindings[0]);
+    try std.testing.expectEqual(@as(usize, 1), resumed_turn.execution_guidance.resolved_skills.len);
+    try std.testing.expect(std.mem.find(u8, resumed_turn.execution_guidance.text, "mcp_browseros-neo_run") != null);
+    try resumed_turn.retain();
+    resumed_turn.release();
+
+    // 3. Second matching job_application request in a new session recycles the specialist contract!
+    var recycled_turn = (try Turn.beginResolvedWithContext(
+        alloc,
+        "session-job-2",
+        null,
+        project_dir,
+        "Submit job applications for outside IR35 roles on LinkedIn and save receipts",
+        false,
+        null,
+        &skills,
+    )).?;
+    try std.testing.expect(recycled_turn.recycled);
+    try std.testing.expectEqualStrings(original_task_id, recycled_turn.task.id);
+    try std.testing.expect(std.mem.find(u8, recycled_turn.recovery_context, "Retained execution summary") != null);
+    try std.testing.expectEqualStrings("job_application_browser", recycled_turn.recovered_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), recycled_turn.recovered_recipe.required_tools.len);
+    try std.testing.expectEqualStrings("shell", recycled_turn.recovered_recipe.required_tools[0]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", recycled_turn.recovered_recipe.required_tools[3]);
+    try std.testing.expectEqualStrings("browseros-neo", recycled_turn.recovered_recipe.skill_bindings[0]);
+    try std.testing.expectEqual(@as(usize, 1), recycled_turn.execution_guidance.resolved_skills.len);
+    try recycled_turn.retain();
+    recycled_turn.release();
+
+    // 4. Mismatched coding_task request in the same project is NEVER cross-recycled.
+    var coding_turn = (try Turn.beginResolvedWithContext(
+        alloc,
+        "session-coding-1",
+        null,
+        project_dir,
+        "Refactor src/main.zig and run zig build test",
+        false,
+        null,
+        &skills,
+    )).?;
+    defer {
+        coding_turn.retain() catch {};
+        coding_turn.release();
+    }
+    try std.testing.expect(!coding_turn.recycled);
+    try std.testing.expect(!std.mem.eql(u8, original_task_id, coding_turn.task.id));
+    try std.testing.expectEqualStrings("coding_task_native", coding_turn.recovered_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 0), coding_turn.recovered_recipe.required_tools.len);
 }

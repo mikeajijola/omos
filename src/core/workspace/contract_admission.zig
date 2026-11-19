@@ -59,54 +59,171 @@ fn sameRequest(a: []const u8, b: []const u8) bool {
 }
 
 /// A retained contract considered for recycling rather than minting a duplicate
-/// durable contract.
+/// durable contract. Carries optional specialist metadata when present on the
+/// persisted contract; matching a candidate never grants tool permissions.
 pub const RecyclableCandidate = struct {
     id: []const u8,
     objective: []const u8,
     scope: []const u8,
     completed: bool = false,
     isolated: bool = false,
+    capability_id: ?[]const u8 = null,
+    realisation_id: ?[]const u8 = null,
+    required_tools: []const []const u8 = &.{},
+    skill_bindings: []const []const u8 = &.{},
+
+    pub fn fromTask(task: workspace.Task) RecyclableCandidate {
+        return .{
+            .id = task.id,
+            .objective = task.definition.objective,
+            .scope = task.project_root,
+            .completed = task.state == .accepted or task.state == .publication_pending or task.state == .conflict,
+            .isolated = task.authority != null or task.parent_task_id != null,
+            .capability_id = if (task.model_basis) |basis| basis.capability else null,
+            .realisation_id = task.definition.realisation_id,
+            .required_tools = task.definition.required_tools,
+            .skill_bindings = task.definition.skill_bindings,
+        };
+    }
 };
 
+pub const RecycleRequest = struct {
+    capability_id: ?[]const u8 = null,
+    realisation_id: ?[]const u8 = null,
+};
+
+fn trimmedNonEmpty(value: ?[]const u8) ?[]const u8 {
+    const raw = value orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+fn effectiveCapability(capability_id: ?[]const u8, realisation_id: ?[]const u8) ?[]const u8 {
+    if (trimmedNonEmpty(capability_id)) |cap| return cap;
+    const real = trimmedNonEmpty(realisation_id) orelse return null;
+    if (std.mem.startsWith(u8, real, "job_application")) return "job_application";
+    if (std.mem.startsWith(u8, real, "coding_task")) return "coding_task";
+    if (std.mem.startsWith(u8, real, "general_task")) return "general_task";
+    return null;
+}
+
+/// Generic host realisations (`general_task_native`, `coding_task_native`) cover
+/// arbitrary unrelated requests unless they carry explicit specialist bindings,
+/// so they still require `sameRequest`. Dedicated specialist realisations (such
+/// as `job_application_browser`) represent a concrete workflow recipe and can
+/// be recycled for compatible specialist requests in the same scope.
+pub fn isSpecialistRealisation(realisation_id: ?[]const u8, candidate: ?RecyclableCandidate) bool {
+    if (candidate) |cand| {
+        if (cand.required_tools.len > 0 or cand.skill_bindings.len > 0) return true;
+    }
+    const id = trimmedNonEmpty(realisation_id) orelse return false;
+    return !std.mem.eql(u8, id, "general_task_native") and
+        !std.mem.eql(u8, id, "coding_task_native");
+}
+
 /// Pure decision: choose an existing active/pending contract in the same scope
-/// with the same intent, so a new goal resumes it instead of duplicating it.
-/// Returns null when a genuinely new contract is warranted.
+/// with compatible specialist realisation or identical request intent, so a new
+/// goal resumes it instead of duplicating it. Mismatched specialist realisations
+/// are never cross-recycled, and legacy contracts with `realisation_id == null`
+/// fall back to `sameRequest`. Returns null when a genuinely new contract is warranted.
 pub fn chooseRecyclableContract(
     message: []const u8,
     scope: []const u8,
     exclude_id: []const u8,
     candidates: []const RecyclableCandidate,
+    request: RecycleRequest,
 ) ?[]const u8 {
+    if (isConversationalGreeting(message)) return null;
+    if (std.mem.trim(u8, message, " \t\r\n").len == 0) return null;
+
+    const req_realisation = trimmedNonEmpty(request.realisation_id);
+    const req_capability = effectiveCapability(request.capability_id, req_realisation);
+
+    var best_id: ?[]const u8 = null;
+    var best_rank: u8 = 0;
+
     for (candidates) |candidate| {
         if (candidate.completed or candidate.isolated) continue;
         if (std.mem.eql(u8, candidate.id, exclude_id)) continue;
         if (scope.len > 0 and !std.mem.eql(u8, candidate.scope, scope)) continue;
-        if (!sameRequest(message, candidate.objective)) continue;
-        return candidate.id;
+
+        const cand_realisation = trimmedNonEmpty(candidate.realisation_id);
+        const cand_capability = effectiveCapability(candidate.capability_id, cand_realisation);
+
+        // Never cross-recycle mismatched specialist realisations or capabilities.
+        if (req_realisation != null and cand_realisation != null and
+            !std.mem.eql(u8, req_realisation.?, cand_realisation.?))
+        {
+            continue;
+        }
+        if (req_capability != null and cand_capability != null and
+            !std.mem.eql(u8, req_capability.?, cand_capability.?))
+        {
+            continue;
+        }
+
+        const exact_request = sameRequest(message, candidate.objective);
+        const realisation_matches = req_realisation != null and cand_realisation != null and
+            std.mem.eql(u8, req_realisation.?, cand_realisation.?);
+        const capability_matches = req_capability != null and cand_capability != null and
+            std.mem.eql(u8, req_capability.?, cand_capability.?);
+
+        const rank: u8 = if (realisation_matches and exact_request)
+            4
+        else if (realisation_matches and isSpecialistRealisation(cand_realisation, candidate))
+            3
+        else if (req_realisation == null and capability_matches and isSpecialistRealisation(cand_realisation, candidate))
+            2
+        else if (exact_request and (req_realisation == null or cand_realisation == null or realisation_matches))
+            1
+        else
+            0;
+
+        if (rank > best_rank) {
+            best_rank = rank;
+            best_id = candidate.id;
+            if (rank == 4) break;
+        }
     }
-    return null;
+    return best_id;
+}
+
+/// Scan retained contracts using an already-resolved assignment so callers do
+/// not recompute capability selection.
+pub fn findRecyclableContractWithAssignment(
+    manager: workspace.Manager,
+    exclude_id: []const u8,
+    message: []const u8,
+    scope: []const u8,
+    assignment: ?@import("realisation_selection.zig").Assignment,
+) !?[]const u8 {
+    const candidates = try manager.recyclableCandidates();
+    const request: RecycleRequest = if (assignment) |assigned| .{
+        .capability_id = assigned.capability,
+        .realisation_id = assigned.realisation,
+    } else .{};
+    return chooseRecyclableContract(message, scope, exclude_id, candidates, request);
 }
 
 /// Scan retained contracts for one that can be resumed instead of creating a
-/// second durable contract for identical work.
+/// second durable contract for identical or matching specialist work.
 pub fn findRecyclableContract(
     manager: workspace.Manager,
     exclude_id: []const u8,
     message: []const u8,
     scope: []const u8,
 ) !?[]const u8 {
-    var candidates: std.ArrayList(RecyclableCandidate) = .empty;
-    defer candidates.deinit(manager.alloc);
-    for (try manager.tasks()) |task| {
-        try candidates.append(manager.alloc, .{
-            .id = task.id,
-            .objective = task.definition.objective,
-            .scope = task.project_root,
-            .completed = task.state == .accepted,
-            .isolated = task.authority != null or task.parent_task_id != null,
-        });
-    }
-    return chooseRecyclableContract(message, scope, exclude_id, candidates.items);
+    const selection = @import("realisation_selection.zig");
+    const assignment = selection.assignGoalForManager(
+        manager.alloc,
+        manager,
+        message,
+        null,
+        null,
+        scope,
+        &.{},
+    ) catch null;
+    return findRecyclableContractWithAssignment(manager, exclude_id, message, scope, assignment);
 }
 
 pub fn resolve(manager: workspace.Manager, session: []const u8, message: []const u8, history: []const types.ChatMessage, cancel: *std.atomic.Value(bool)) !Admission {
@@ -264,9 +381,9 @@ test "new goal resumes an active contract with the same scope and intent" {
     const candidates = [_]RecyclableCandidate{
         .{ .id = "task-old", .objective = "save a preference", .scope = "/repo" },
     };
-    try std.testing.expectEqualStrings("task-old", chooseRecyclableContract("  Save a\npreference ", "/repo", "task-current", &candidates).?);
+    try std.testing.expectEqualStrings("task-old", chooseRecyclableContract("  Save a\npreference ", "/repo", "task-current", &candidates, .{}).?);
     // The contract that raised the new goal is never recycled into itself.
-    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "task-old", &candidates) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "task-old", &candidates, .{}) == null);
 }
 
 test "new goal stays new when the matching contract is completed isolated or out of scope" {
@@ -275,9 +392,118 @@ test "new goal stays new when the matching contract is completed isolated or out
     completed.completed = true;
     var isolated = base;
     isolated.isolated = true;
-    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{completed}) == null);
-    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{isolated}) == null);
-    try std.testing.expect(chooseRecyclableContract("save a preference", "/other", "", &.{base}) == null);
-    try std.testing.expect(chooseRecyclableContract("save a different preference", "/repo", "", &.{base}) == null);
-    try std.testing.expect(chooseRecyclableContract("build a new feature", "/repo", "", &.{base}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{completed}, .{}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/repo", "", &.{isolated}, .{}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a preference", "/other", "", &.{base}, .{}) == null);
+    try std.testing.expect(chooseRecyclableContract("save a different preference", "/repo", "", &.{base}, .{}) == null);
+    try std.testing.expect(chooseRecyclableContract("build a new feature", "/repo", "", &.{base}, .{}) == null);
+}
+
+test "chooseRecyclableContract recycles matching specialist realisation rejects mismatches and falls back for legacy null realisation" {
+    const legacy_candidate = RecyclableCandidate{
+        .id = "task-legacy",
+        .objective = "Apply to outside IR35 roles on LinkedIn",
+        .scope = "/Users/example/project",
+        .realisation_id = null,
+    };
+    const specialist_candidate = RecyclableCandidate{
+        .id = "task-job-specialist",
+        .objective = "Apply to outside IR35 roles on LinkedIn",
+        .scope = "/Users/example/project",
+        .capability_id = "job_application",
+        .realisation_id = "job_application_browser",
+        .required_tools = &.{ "shell", "read_file", "write_file", "mcp_browseros-neo_run" },
+        .skill_bindings = &.{"browseros-neo"},
+    };
+    const coding_candidate = RecyclableCandidate{
+        .id = "task-coding",
+        .objective = "Apply to outside IR35 roles on LinkedIn",
+        .scope = "/Users/example/project",
+        .capability_id = "coding_task",
+        .realisation_id = "coding_task_native",
+    };
+
+    // 1. Matching realisation_id recycles the specialist candidate (and prefers it over legacy).
+    const mixed = [_]RecyclableCandidate{ legacy_candidate, coding_candidate, specialist_candidate };
+    try std.testing.expectEqualStrings(
+        "task-job-specialist",
+        chooseRecyclableContract(
+            "Apply to outside IR35 roles on LinkedIn",
+            "/Users/example/project",
+            "task-other",
+            &mixed,
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ).?,
+    );
+
+    // Compatible second job_application request in the same scope recycles the active specialist contract.
+    try std.testing.expectEqualStrings(
+        "task-job-specialist",
+        chooseRecyclableContract(
+            "Submit job applications for UK contract roles via LinkedIn Easy Apply",
+            "/Users/example/project",
+            "task-other",
+            &.{specialist_candidate},
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ).?,
+    );
+
+    // 2. Mismatched realisation_id is never cross-recycled, even if the objective text matches.
+    try std.testing.expect(
+        chooseRecyclableContract(
+            "Apply to outside IR35 roles on LinkedIn",
+            "/Users/example/project",
+            "task-other",
+            &.{specialist_candidate},
+            .{ .capability_id = "coding_task", .realisation_id = "coding_task_native" },
+        ) == null,
+    );
+    try std.testing.expect(
+        chooseRecyclableContract(
+            "Apply to outside IR35 roles on LinkedIn",
+            "/Users/example/project",
+            "task-other",
+            &.{coding_candidate},
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ) == null,
+    );
+
+    // Unrelated generic coding/general tasks with different objectives never cross-recycle.
+    const generic_coding = RecyclableCandidate{
+        .id = "task-coding-a",
+        .objective = "Refactor src/a.zig",
+        .scope = "/Users/example/project",
+        .capability_id = "coding_task",
+        .realisation_id = "coding_task_native",
+    };
+    try std.testing.expect(
+        chooseRecyclableContract(
+            "Refactor src/b.zig",
+            "/Users/example/project",
+            "task-other",
+            &.{generic_coding},
+            .{ .capability_id = "coding_task", .realisation_id = "coding_task_native" },
+        ) == null,
+    );
+
+    // 3. Legacy candidate with null realisation_id falls back cleanly to sameRequest.
+    try std.testing.expectEqualStrings(
+        "task-legacy",
+        chooseRecyclableContract(
+            "  apply to outside IR35 roles\non LinkedIn ",
+            "/Users/example/project",
+            "task-other",
+            &.{legacy_candidate},
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ).?,
+    );
+    try std.testing.expect(
+        chooseRecyclableContract(
+            "Submit a different application campaign",
+            "/Users/example/project",
+            "task-other",
+            &.{legacy_candidate},
+            .{ .capability_id = "job_application", .realisation_id = "job_application_browser" },
+        ) == null,
+    );
 }

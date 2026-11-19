@@ -2985,6 +2985,41 @@ pub const Manager = struct {
         return self.resumeTaskInProject(session, id, project, false);
     }
 
+    /// Collect retained tasks as specialist-aware recycling candidates.
+    /// Matching a persisted specialist recipe never grants tool permissions.
+    pub fn recyclableCandidates(self: Manager) ![]const @import("contract_admission.zig").RecyclableCandidate {
+        const admission = @import("contract_admission.zig");
+        const all_tasks = try self.tasks();
+        var candidates: std.ArrayList(admission.RecyclableCandidate) = .empty;
+        for (all_tasks) |task| {
+            var candidate = admission.RecyclableCandidate.fromTask(task);
+            if (candidate.capability_id == null) {
+                if (task.definition.realisation_id) |realisation_id| {
+                    if (task.model_basis) |basis| {
+                        if (self.loadDeclaration(basis.revision)) |declaration| {
+                            for (model.items(model.spec(declaration.value), "realisations")) |entry| {
+                                if (std.mem.eql(u8, model.text(entry, "id"), realisation_id)) {
+                                    const cap = model.text(entry, "capability");
+                                    if (cap.len > 0) candidate.capability_id = cap;
+                                    break;
+                                }
+                            }
+                        } else |_| {}
+                    }
+                }
+            }
+            if (!candidate.completed) {
+                if (try self.backgroundRecord(task.id)) |worker| {
+                    if (worker.state == .queued or worker.state == .starting or worker.state == .running) {
+                        candidate.completed = true;
+                    }
+                }
+            }
+            try candidates.append(self.alloc, candidate);
+        }
+        return candidates.toOwnedSlice(self.alloc);
+    }
+
     /// The caller holds execution ownership before restoring actor context.
     pub fn refreshTaskContext(self: Manager, previous: Task) !Task {
         const lease = try self.writerLease();
@@ -6525,15 +6560,13 @@ test "fossil_workspace: startWithAssignment persists specialist realisation requ
     const project_dir = try join(alloc, root, "project");
     try mkdir(project_dir);
 
-    const prev_environ = io_mod.environMap();
+    const EnvFallback = struct {
+        var empty: std.process.Environ.Map = .init(std.heap.page_allocator);
+    };
     var environ = std.process.Environ.Map.init(alloc);
     try environ.put("HOME", root);
-    if (prev_environ) |prev| {
-        if (prev.get("PATH")) |path_env| try environ.put("PATH", path_env);
-        if (prev.get("OMOS_FOSSIL_BIN")) |bin_env| try environ.put("OMOS_FOSSIL_BIN", bin_env);
-    }
     io_mod.setEnvironMap(&environ);
-    defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
+    defer io_mod.setEnvironMap(&EnvFallback.empty);
 
     var writer_queue: WriterQueue = .{};
     defer writer_queue.deinit();
@@ -6616,4 +6649,25 @@ test "fossil_workspace: startWithAssignment persists specialist realisation requ
     try std.testing.expectEqual(@as(usize, 4), minimal_task.definition.required_tools.len);
     try std.testing.expectEqual(@as(usize, 1), minimal_task.definition.skill_bindings.len);
     try std.testing.expectEqualStrings("browseros-neo", minimal_task.definition.skill_bindings[0]);
+
+    // 4. recyclableCandidates exposes specialist metadata alongside legacy null-realisation tasks.
+    const candidates = try manager.recyclableCandidates();
+    var found_plain = false;
+    var found_minimal = false;
+    for (candidates) |cand| {
+        if (std.mem.eql(u8, cand.id, plain.id)) {
+            found_plain = true;
+            try std.testing.expect(cand.realisation_id == null);
+            try std.testing.expectEqual(@as(usize, 0), cand.required_tools.len);
+            try std.testing.expectEqual(@as(usize, 0), cand.skill_bindings.len);
+        } else if (std.mem.eql(u8, cand.id, minimal_task.id)) {
+            found_minimal = true;
+            try std.testing.expectEqualStrings("job_application", cand.capability_id.?);
+            try std.testing.expectEqualStrings("job_application_browser", cand.realisation_id.?);
+            try std.testing.expectEqual(@as(usize, 4), cand.required_tools.len);
+            try std.testing.expectEqualStrings("browseros-neo", cand.skill_bindings[0]);
+        }
+    }
+    try std.testing.expect(found_plain);
+    try std.testing.expect(found_minimal);
 }

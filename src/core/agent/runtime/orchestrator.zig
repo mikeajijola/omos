@@ -5676,6 +5676,11 @@ fn collectTurnRequiredTools(
         }
     }
     if (managed) |turn| {
+        for (turn.recovered_recipe.required_tools) |raw_name| {
+            const canonical = capability_retrieval.canonicalToolAlias(raw_name);
+            if (canonical.len == 0 or containsToolName(tools.items, canonical)) continue;
+            try tools.append(arena, canonical);
+        }
         for (turn.task.definition.required_tools) |raw_name| {
             const canonical = capability_retrieval.canonicalToolAlias(raw_name);
             if (canonical.len == 0 or containsToolName(tools.items, canonical)) continue;
@@ -7534,17 +7539,19 @@ fn processQueuedPromptLoop(
                 ) catch null;
                 _ = try manager.startWithAssignment(config.fossil_session_id.?, config.workspace_root, goal, null, assignment);
             } else if (contract_selection.independent) {
-                const selection = @import("../../workspace/realisation_selection.zig");
-                const assignment = selection.assignGoalForManager(
+                const previous_active = if (try manager.active(config.fossil_session_id.?)) |prev| prev.id else "";
+                const started = try managed_task.startOrRecycleAssignedTask(
                     arena,
                     manager,
-                    job.prompt,
-                    if (request_capability) |cap| @tagName(cap) else null,
-                    null,
+                    config.fossil_session_id.?,
                     config.workspace_root,
+                    job.prompt,
+                    null,
+                    if (request_capability) |cap| @tagName(cap) else null,
                     config.skill_catalog.skills,
-                ) catch null;
-                _ = try manager.startWithAssignment(config.fossil_session_id.?, config.workspace_root, job.prompt, null, assignment);
+                    previous_active,
+                );
+                if (started.recycled) contract_selection.continuing = true;
             }
         }
     }
@@ -7673,6 +7680,11 @@ fn processQueuedPromptLoop(
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
     }
+    if (managed) |*turn| {
+        if (comptime !builtin.target.cpu.arch.isWasm()) {
+            try turn.refreshRecipe(arena, config.skill_bindings, config.workspace_root, config.skill_catalog.skills);
+        }
+    }
     const effective_required_tools = try collectTurnRequiredTools(
         arena,
         config,
@@ -7696,6 +7708,9 @@ fn processQueuedPromptLoop(
         }
     }
     if (managed) |*turn| {
+        for (turn.recovered_recipe.skill_bindings) |name| {
+            if (!containsToolName(specialist_skill_names.items, name)) try specialist_skill_names.append(arena, name);
+        }
         for (turn.task.definition.skill_bindings) |name| {
             if (!containsToolName(specialist_skill_names.items, name)) try specialist_skill_names.append(arena, name);
         }
@@ -7712,6 +7727,11 @@ fn processQueuedPromptLoop(
         );
         if (hasAdditionalSkillBindings(resolved_bindings, config.skill_bindings)) {
             config.skill_bindings = resolved_bindings;
+            if (managed) |*turn| {
+                if (comptime !builtin.target.cpu.arch.isWasm()) {
+                    try turn.refreshRecipe(arena, config.skill_bindings, config.workspace_root, config.skill_catalog.skills);
+                }
+            }
             turn_explicit_skills = skill_invocation.buildExplicitPromptSection(
                 arena,
                 config.skill_catalog,
@@ -7737,7 +7757,13 @@ fn processQueuedPromptLoop(
         try prebindStepZeroDynamicTools(deps, arena, effective_required_tools, &selected_dynamic_tools);
     }
     const current_user_effective: ChatMessage = if (config.background_worker) blk: {
-        const guidance = if (config.ui_host) |host| if (host.background_authority) |auth| auth.execution_guidance else "" else "";
+        const auth_guidance = if (config.ui_host) |host| if (host.background_authority) |auth| auth.execution_guidance else "" else "";
+        const guidance = if (auth_guidance.len > 0)
+            auth_guidance
+        else if (managed) |*turn|
+            turn.execution_guidance.text
+        else
+            "";
         const skill_text = if (effective_explicit_skills) |sec| sec.text else "";
         if (skill_text.len > 0) {
             break :blk .{
@@ -7966,6 +7992,9 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| {
             try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
+            if (!config.background_worker and turn.execution_guidance.text.len > 0) {
+                try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.execution_guidance.text });
+            }
             // The bounded pre-invocation snapshot remains available after the first tool call.
             if (turn.recovery_context.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.recovery_context });
         } else if (config.fossil_ephemeral) {
@@ -13985,4 +14014,136 @@ test "prebindStepZeroDynamicTools pre-binds allowed MCP specialist tools and ski
     // Deduplicated on repeated invocation.
     try prebindStepZeroDynamicTools(&deps, arena, &required, &selected);
     try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+}
+
+test "recycled and resumed managed turns hydrate specialist required_tools and skill_bindings at step zero while enforcing permissions" {
+    if (comptime builtin.target.cpu.arch.isWasm()) return;
+    const support = @import("tests/support.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+    const repo_path = try std.Io.Dir.path.join(arena, &.{ root, "repo.fossil" });
+    const project_dir = try std.Io.Dir.path.join(arena, &.{ root, "project" });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), project_dir, .fromMode(0o700));
+
+    const EnvFallback = struct {
+        var empty: std.process.Environ.Map = .init(std.heap.page_allocator);
+    };
+    var environ = std.process.Environ.Map.init(arena);
+    try environ.put("HOME", root);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(&EnvFallback.empty);
+
+    _ = try @import("../../workspace/fossil_workspace.zig").Manager.init(arena, repo_path);
+
+    const catalog = [_]skill_contract.Skill{
+        .{
+            .name = "browseros-neo",
+            .description = "Dedicated agent browser",
+            .path = "/Users/example/project/skills/browseros-neo",
+            .source = .workspace_shared,
+        },
+    };
+
+    // Create initial specialist contract and pause it.
+    var seed_turn = (try managed_task.Turn.beginResolvedWithContext(
+        arena,
+        "sess-seed",
+        null,
+        project_dir,
+        "Apply to outside IR35 roles on LinkedIn Easy Apply",
+        false,
+        null,
+        &catalog,
+    )).?;
+    const seed_id = try arena.dupe(u8, seed_turn.task.id);
+    try seed_turn.retain();
+    seed_turn.release();
+
+    // Start a second matching job_application turn: recycles seed_id and hydrates specialist recipe.
+    var recycled = (try managed_task.Turn.beginResolvedWithContext(
+        arena,
+        "sess-reuse",
+        null,
+        project_dir,
+        "Submit job applications for UK outside IR35 roles on LinkedIn",
+        false,
+        null,
+        &catalog,
+    )).?;
+    defer {
+        recycled.retain() catch {};
+        recycled.release();
+    }
+    try std.testing.expect(recycled.recycled);
+    try std.testing.expectEqualStrings(seed_id, recycled.task.id);
+    try std.testing.expectEqualStrings("job_application_browser", recycled.recovered_recipe.realisation_id.?);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    const cfg: Config = .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .workspace_root = project_dir,
+        .skill_catalog = .{ .skills = &catalog, .diagnostics = &.{} },
+        .advertised_tool_names = &.{ "shell", "read_file", "write_file" },
+        .cancel_flag = &cancel,
+    };
+    const required = try collectTurnRequiredTools(arena, cfg, &recycled);
+    try std.testing.expectEqual(@as(usize, 4), required.len);
+    try std.testing.expectEqualStrings("shell", required[0]);
+    try std.testing.expectEqualStrings("read_file", required[1]);
+    try std.testing.expectEqualStrings("write_file", required[2]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", required[3]);
+
+    // Permission-denied MCP tool resolves to null and is NOT pre-bound even on a recycled contract.
+    const DenyResolver = struct {
+        deny_run: bool = false,
+        fn resolve(raw_ctx: *anyopaque, call_arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+            const state: *const @This() = @ptrCast(@alignCast(raw_ctx));
+            if (std.mem.eql(u8, name, "mcp_browseros-neo_run") and !state.deny_run) {
+                return .{
+                    .name = name,
+                    .schema_json = try call_arena.dupe(u8, "{\"name\":\"mcp_browseros-neo_run\",\"description\":\"Run\",\"inputSchema\":{\"type\":\"object\"}}"),
+                    .mcp_binding = .{ .runtime_generation = 1, .connection_generation = 1, .catalog_generation = 1, .auth_generation = 1 },
+                };
+            }
+            return null;
+        }
+    };
+
+    var resolver_state: DenyResolver = .{ .deny_run = false };
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.ctx = @ptrCast(&resolver_state);
+    deps.resolve_unselected_mcp_tool = DenyResolver.resolve;
+
+    var allowed_selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindStepZeroDynamicTools(&deps, arena, required, &allowed_selected);
+    try std.testing.expectEqual(@as(usize, 1), allowed_selected.items.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", allowed_selected.items[0].name);
+
+    resolver_state.deny_run = true;
+    var denied_selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindStepZeroDynamicTools(&deps, arena, required, &denied_selected);
+    try std.testing.expectEqual(@as(usize, 0), denied_selected.items.len);
+
+    // Static tool denied by permission projection is NOT re-admitted by retainRequiredTools.
+    const restricted_allowed = [_][]const u8{ "read_file", "write_file" };
+    const retained_names = try @import("../../tooling/capability_retrieval.zig").retainRequiredTools(
+        arena,
+        &restricted_allowed,
+        &restricted_allowed,
+        required,
+    );
+    try std.testing.expectEqual(@as(usize, 2), retained_names.len);
+    for (retained_names) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "shell"));
+    }
 }
