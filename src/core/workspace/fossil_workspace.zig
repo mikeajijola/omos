@@ -4868,7 +4868,19 @@ pub const Manager = struct {
         }
     }
 
-    fn verifyBatch(self: Manager, rev_index: *const fossil_sqlite_reader.Db.RevisionIndex, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
+    fn verifyBatch(self: Manager, revision_id: []const u8, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
+        if (files.len == 0) return;
+        if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
+        try self.checkOperation();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer scratch.deinit();
+        var db = fossil_sqlite_reader.Db.openReadOnly(scratch.allocator(), self.repository) catch |err| return mapSqliteReaderError(err);
+        defer db.close();
+        const rev_index = db.indexRevision(scratch.allocator(), revision_id) catch |err| return mapSqliteReaderError(err);
+        return self.verifyBatchIndexed(&rev_index, files, declaration, accepted, verify_objects);
+    }
+
+    fn verifyBatchIndexed(self: Manager, rev_index: *const fossil_sqlite_reader.Db.RevisionIndex, files: []const VerificationFile, declaration: ?model.Declaration, accepted: ?*std.ArrayList(AcceptedTask), verify_objects: bool) !void {
         if (files.len == 0) return;
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try self.checkOperation();
@@ -4946,7 +4958,7 @@ pub const Manager = struct {
                 if (size > max_bytes) return error.WorkspaceRecordTooLarge;
                 if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
                     if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
-                    try manager.verifyBatch(&rev_index.?, batch[0..count], declaration, null, false);
+                    try manager.verifyBatchIndexed(&rev_index.?, batch[0..count], declaration, null, false);
                     count = 0;
                     batch_bytes = 0;
                 }
@@ -4958,7 +4970,7 @@ pub const Manager = struct {
             }
             if (count > 0) {
                 if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
-                try manager.verifyBatch(&rev_index.?, batch[0..count], declaration, null, false);
+                try manager.verifyBatchIndexed(&rev_index.?, batch[0..count], declaration, null, false);
             }
         }
     }
@@ -4987,7 +4999,7 @@ pub const Manager = struct {
             if (size > max_bytes) return error.WorkspaceRecordTooLarge;
             if (count == batch.len or (count > 0 and batch_bytes + size > max_bytes / 2)) {
                 if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
-                try self.verifyBatch(&rev_index.?, batch[0..count], null, &accepted, true);
+                try self.verifyBatchIndexed(&rev_index.?, batch[0..count], null, &accepted, true);
                 count = 0;
                 batch_bytes = 0;
             }
@@ -4997,7 +5009,7 @@ pub const Manager = struct {
         }
         if (count > 0) {
             if (rev_index == null) rev_index = db.indexRevision(manager.alloc, revision_id) catch |err| return mapSqliteReaderError(err);
-            try self.verifyBatch(&rev_index.?, batch[0..count], null, &accepted, true);
+            try self.verifyBatchIndexed(&rev_index.?, batch[0..count], null, &accepted, true);
         }
         return accepted.toOwnedSlice(self.alloc);
     }
