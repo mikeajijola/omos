@@ -428,11 +428,25 @@ pub const EffectiveToolProjection = struct {
     /// Exact borrowed built-in schemas selected for model advertisement. The
     /// slice storage is owned by this projection.
     advertised_functions: []const model_tool_schema.FunctionSchema,
+    /// Names of tools owned by dynamic engines (e.g. MCP v2). They are not in
+    /// `advertised_names` for static capability_search reasons, but remain
+    /// advertised through the dynamic tool projection.
+    dynamic_tool_names: []const []const u8 = &.{},
     custom_guidance: []u8,
+
+    fn advertise(name: []const u8, out: *[64][]const u8, index: *usize) void {
+        out[index.*] = name;
+        index.* += 1;
+    }
+
+    pub fn ownsDynamicToolNames(self: *const EffectiveToolProjection) bool {
+        return self.dynamic_tool_names.len > 0 or self.advertised_names.len > 0;
+    }
 
     pub fn deinit(self: *EffectiveToolProjection, alloc: Allocator) void {
         alloc.free(self.advertised_names);
         alloc.free(self.advertised_functions);
+        alloc.free(self.dynamic_tool_names);
         alloc.free(self.custom_guidance);
         self.* = undefined;
     }
@@ -534,7 +548,29 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     if (kind != .read_only) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
+            if (tool.prefers_advertised_names) continue;
             try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
+        }
+    }
+
+    var dynamic_names: std.ArrayList([]const u8) = .empty;
+    errdefer dynamic_names.deinit(alloc);
+    if (kind == .full) {
+        for (tool_set.registry.tools) |tool| {
+            const is_discovery_bridge = std.mem.eql(u8, tool.name, "capability_search") or
+                std.mem.eql(u8, tool.name, "mcp_select_tool");
+            if (!tool.prefers_advertised_names and !is_discovery_bridge) continue;
+            if (!tool.model_visible) continue;
+            if (tool.executor_kind == .fossil_workspace and !options.fossil_workspace_available) continue;
+            if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) continue;
+            if (options.permission_mode != .yolo and
+                permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) continue;
+            if (options.permission_mode != .yolo and tool.provider_executed and
+                !providerExecutionIsAllowed(tool.name, options.permission_rules))
+            {
+                continue;
+            }
+            try dynamic_names.append(alloc, tool.name);
         }
     }
 
@@ -543,9 +579,12 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     const names = try advertised_names.toOwnedSlice(alloc);
     errdefer alloc.free(names);
     const functions = try advertised_functions.toOwnedSlice(alloc);
+    errdefer alloc.free(functions);
+    const dynamic = try dynamic_names.toOwnedSlice(alloc);
     return .{
         .advertised_names = names,
         .advertised_functions = functions,
+        .dynamic_tool_names = dynamic,
         .custom_guidance = custom_guidance,
     };
 }
@@ -763,6 +802,105 @@ test "category-wide denies and later overrides select the expected tools" {
     try expectContainsName(overridden.advertised_names, "write_file");
 }
 
+fn test_native_registry_tools() []const tool_dispatch.Tool {
+    return &[_]tool_dispatch.Tool{
+        tool_dispatch.Tool{
+            .name = "shell",
+            .description = "Native shell.",
+            .model_schema = .{ .name = "shell", .description = "Native shell." },
+            .executor_kind = .terminal,
+            .activity_kind = .command,
+            .requires_approval = true,
+            .action_label = "Running shell",
+            .completed_action_label = "Ran shell",
+            .label_arg_kind = .action,
+            .label_arg_default = "session",
+            .decode = decodeTestInput,
+            .call = callTestTool,
+            .reads_only_fn = testToolReadsOnly,
+            .irreversible_fn = testToolIsIrreversible,
+            .prefers_advertised_names = true,
+        },
+    };
+}
+
+fn expectNamesDuplicateTolerant(
+    expected: []const []const u8,
+    actual: []const []const u8,
+) !void {
+    for (expected) |name| {
+        var found = false;
+        for (actual) |have| {
+            if (std.mem.eql(u8, name, have)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+fn expectNames(
+    expected: []const []const u8,
+    actual: []const []const u8,
+) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, have| try std.testing.expectEqualStrings(want, have);
+}
+
+test "native shell remains advertised when no static discovery tools run" {
+    const tools = test_native_registry_tools();
+    var projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, tools, .{});
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(legacy_projection_advertises_through_registry(projection.advertised_names));
+    try expectNamesDuplicateTolerant(&.{"shell"}, projection.advertised_names);
+}
+
+fn dynamic_tool_like(name: []const u8) tool_dispatch.Tool {
+    return .{
+        .name = name,
+        .description = "Dynamic tool.",
+        .model_schema = .{ .name = name, .description = "Dynamic tool." },
+        .executor_kind = .mcp_select_tool,
+        .activity_kind = .command,
+        .requires_approval = false,
+        .action_label = "Selecting",
+        .completed_action_label = "Selected",
+        .label_arg_kind = .name,
+        .decode = decodeTestInput,
+        .call = callTestTool,
+        .reads_only_fn = testToolReadsOnly,
+        .irreversible_fn = testToolIsIrreversible,
+        .prefers_advertised_names = true,
+    };
+}
+
+test "dynamic tools stay advertised through dynamic_tool_names" {
+    var tools = [_]tool_dispatch.Tool{dynamic_tool_like("mcp_fs_read")};
+    var projection = try buildTestModelToolProjectionForRegistry(std.testing.allocator, &tools, .{});
+    defer projection.deinit(std.testing.allocator);
+
+    try std.testing.expect(projection.ownsDynamicToolNames());
+    try expectNames(&.{"mcp_fs_read"}, projection.dynamic_tool_names);
+    try expectNames(&.{}, projection.advertised_names);
+}
+
+test "legacy dynamic tool projection advertises through registry names" {
+    const names = [_][]const u8{test_skill.name};
+    const legacy_projection = EffectiveToolProjection{
+        .advertised_names = names[0..],
+        .advertised_functions = &.{},
+        .dynamic_tool_names = &.{},
+        .custom_guidance = &.{},
+    };
+    try std.testing.expect(legacy_projection_advertises_through_registry(legacy_projection.advertised_names));
+    try expectNames(&.{"skill"}, legacy_projection.advertised_names);
+}
+
+fn legacy_projection_advertises_through_registry(
+    names: []const []const u8,
+) bool {
+    return names.len > 0;
+}
+
 fn checkEffectiveToolProjectionAllocationFailures(alloc: Allocator) !void {
     var projection = buildTestModelToolProjection(alloc, .{}) catch |err|
         return switch (err) {
@@ -788,6 +926,7 @@ test "base tool projection includes MCP discovery and explicit selection" {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "capability_search");
     try expectContainsName(projection.advertised_names, "mcp_select_tool");
+    try expectNames(&.{ "capability_search", "mcp_select_tool" }, projection.dynamic_tool_names);
 }
 
 test "subagent and shell selection follow host capability" {

@@ -1220,6 +1220,7 @@ const AskContext = struct {
             .permission_rules = self.permission_rules,
             .coordinator_mode = if (self.deps.ui_host) |ui| ui.coordinator_mode else false,
             .background_authority = if (self.deps.ui_host) |ui| ui.background_authority else null,
+            .required_tools = if (self.deps.ui_host) |ui| if (ui.background_authority) |authority| authority.required_tools else &.{} else &.{},
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.activeSessionId(),
@@ -2246,8 +2247,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
     const effective_skill_bindings = if (inherited_authority) |authority|
-        if (authority.skill_bindings.len > 0)
-            authority.skill_bindings
+        if (authority.skill_bindings.len > 0 or authority.declared_skills.len > 0)
+            try @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
+                dynamic_tool_arena.allocator(),
+                authority.declared_skills,
+                authority.skill_bindings,
+                ctx.workspace_root,
+                loaded_skills.skills,
+            )
         else
             try @import("../workspace/realisation_selection.zig").resolvePromptSkillBindings(
                 dynamic_tool_arena.allocator(),
@@ -2569,6 +2576,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
@@ -2837,12 +2845,22 @@ fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_str
     for (loaded.tools) |selected| {
         try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(arena, &tools, selected);
     }
+    if (ctx.deps.ui_host) |ui| if (ui.background_authority) |authority| {
+        if (authority.required_tools.len > 0) {
+            try tool_runtime.prebindRequiredDynamicTools(ctx.toolContext(), arena, authority.required_tools, &tools);
+        }
+    };
     return tools.items;
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
+fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -7753,6 +7771,38 @@ test "fx ask prepared file mutation callback preserves terminal permission promp
     try std.testing.expectEqualStrings(target_path, authorization.input.path());
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "Approve? [y/N]") != null);
     try std.testing.expectEqualStrings("", stdout_capture.bytes.items);
+}
+
+test "fx ask prebinds resolved skills and re-exports required tools into the agent turn context" {
+    const alloc = std.testing.allocator;
+    const catalog_storage = [_]skill_contract.Skill{
+        .{
+            .name = "browseros-neo",
+            .description = "browser",
+            .path = "/Users/example/project/skills/browseros-neo",
+            .source = .workspace_shared,
+        },
+    };
+    const locations = skill_contract.Locations{ .skills = &catalog_storage };
+    const persisted_names = [_][]const u8{"browseros-neo"};
+
+    const resolved = try tool_runtime.resolvePersistedSkillBindings(
+        alloc,
+        &persisted_names,
+        &.{},
+        "/Users/example/project",
+        &locations,
+    );
+    defer {
+        for (resolved) |binding| {
+            alloc.free(binding.name);
+            alloc.free(binding.path);
+        }
+        alloc.free(resolved);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("browseros-neo", resolved[0].name);
+    try std.testing.expectEqualStrings("/Users/example/project/skills/browseros-neo", resolved[0].path);
 }
 
 test "fx ask auto mode uses automatic allow for external prepared file mutation" {

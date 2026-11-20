@@ -5625,6 +5625,83 @@ const PreparedSkills = struct {
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
 };
 
+fn prebindStepZeroDynamicTools(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    required_tools: []const []const u8,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+) !void {
+    if (required_tools.len == 0) return;
+    const resolve = deps.resolve_unselected_mcp_tool orelse return;
+    const capability_retrieval = @import("../../tooling/capability_retrieval.zig");
+    for (required_tools) |raw_name| {
+        const canonical = capability_retrieval.canonicalToolAlias(raw_name);
+        if (canonical.len == 0) continue;
+        if (deps.tool_registry.lookup(canonical) != null or
+            deps.tool_registry.lookup(raw_name) != null)
+        {
+            continue;
+        }
+        var already_selected = false;
+        for (selected.items) |existing| {
+            if (std.mem.eql(u8, existing.name, canonical)) {
+                already_selected = true;
+                break;
+            }
+        }
+        if (already_selected) continue;
+        const resolved = (resolve(deps.ctx, arena, canonical) catch |err| switch (err) {
+            error.OutOfMemory, error.Cancelled => return err,
+            else => null,
+        }) orelse continue;
+        if (!std.mem.eql(u8, resolved.name, canonical) or resolved.mcp_binding == null) continue;
+        try runtime_gateway_step.recordSelectedDynamicTool(arena, selected, resolved);
+    }
+}
+
+fn collectTurnRequiredTools(
+    arena: Allocator,
+    config: Config,
+    managed: ?*const managed_task.Turn,
+) ![]const []const u8 {
+    const capability_retrieval = @import("../../tooling/capability_retrieval.zig");
+    var tools: std.ArrayList([]const u8) = .empty;
+    if (config.ui_host) |host| {
+        if (host.background_authority) |auth| {
+            for (auth.required_tools) |raw_name| {
+                const canonical = capability_retrieval.canonicalToolAlias(raw_name);
+                if (canonical.len == 0 or containsToolName(tools.items, canonical)) continue;
+                try tools.append(arena, canonical);
+            }
+        }
+    }
+    if (managed) |turn| {
+        for (turn.task.definition.required_tools) |raw_name| {
+            const canonical = capability_retrieval.canonicalToolAlias(raw_name);
+            if (canonical.len == 0 or containsToolName(tools.items, canonical)) continue;
+            try tools.append(arena, canonical);
+        }
+    }
+    return tools.toOwnedSlice(arena);
+}
+
+fn hasAdditionalSkillBindings(
+    candidate: []const skill_invocation.ExplicitBinding,
+    baseline: []const skill_invocation.ExplicitBinding,
+) bool {
+    for (candidate) |item| {
+        var found = false;
+        for (baseline) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.name, item.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return true;
+    }
+    return false;
+}
+
 fn prepareSkillCatalog(
     alloc: Allocator,
     deps: *const AgentRuntimeDeps,
@@ -7445,14 +7522,43 @@ fn processQueuedPromptLoop(
             if (!config.fossil_execution_lease_held) execution_lease = (try manager.trySessionExecutionLease(config.fossil_session_id.?)) orelse return error.WorkspaceExecutionBusy;
             if (contract_selection.task) |id| _ = try manager.resumeTask(config.fossil_session_id.?, id, config.workspace_root);
             if (contract_selection.new_goal) |goal| {
-                _ = try manager.start(config.fossil_session_id.?, config.workspace_root, goal, null);
+                const selection = @import("../../workspace/realisation_selection.zig");
+                const assignment = selection.assignGoalForManager(
+                    arena,
+                    manager,
+                    goal,
+                    if (request_capability) |cap| @tagName(cap) else null,
+                    null,
+                    config.workspace_root,
+                    config.skill_catalog.skills,
+                ) catch null;
+                _ = try manager.startWithAssignment(config.fossil_session_id.?, config.workspace_root, goal, null, assignment);
             } else if (contract_selection.independent) {
-                _ = try manager.start(config.fossil_session_id.?, config.workspace_root, job.prompt, null);
+                const selection = @import("../../workspace/realisation_selection.zig");
+                const assignment = selection.assignGoalForManager(
+                    arena,
+                    manager,
+                    job.prompt,
+                    if (request_capability) |cap| @tagName(cap) else null,
+                    null,
+                    config.workspace_root,
+                    config.skill_catalog.skills,
+                ) catch null;
+                _ = try manager.startWithAssignment(config.fossil_session_id.?, config.workspace_root, job.prompt, null, assignment);
             }
         }
     }
     var managed: ?managed_task.Turn = if (comptime builtin.target.cpu.arch.isWasm()) null else if (!retrieval_turn and config.fossil_session_id != null and !config.fossil_ephemeral)
-        try managed_task.Turn.beginResolved(arena, config.fossil_session_id.?, config.fossil_parent_session_id, config.workspace_root, job.prompt, contract_selection.continuing or contract_selection.new_goal != null)
+        try managed_task.Turn.beginResolvedWithContext(
+            arena,
+            config.fossil_session_id.?,
+            config.fossil_parent_session_id,
+            config.workspace_root,
+            job.prompt,
+            contract_selection.continuing or contract_selection.new_goal != null,
+            if (request_capability) |cap| @tagName(cap) else null,
+            config.skill_catalog.skills,
+        )
     else
         null;
     defer if (managed) |*turn| {
@@ -7567,14 +7673,72 @@ fn processQueuedPromptLoop(
             try turn.manager.record(turn.task, "invocation_started", .{ .turn = turn_id, .policy = turn.task.model_basis.?.execution.defaults });
         }
     }
+    const effective_required_tools = try collectTurnRequiredTools(
+        arena,
+        config,
+        if (managed) |*turn| turn else null,
+    );
+    if (effective_required_tools.len > 0 and !config.coordinator_mode and !retrieval_turn) {
+        config.advertised_tool_names = try @import("../../tooling/capability_retrieval.zig").retainRequiredTools(
+            arena,
+            config.advertised_tool_names,
+            config.advertised_tool_names,
+            effective_required_tools,
+        );
+    }
+
+    var specialist_skill_names: std.ArrayList([]const u8) = .empty;
+    if (config.ui_host) |host| {
+        if (host.background_authority) |auth| {
+            for (auth.declared_skills) |name| {
+                if (!containsToolName(specialist_skill_names.items, name)) try specialist_skill_names.append(arena, name);
+            }
+        }
+    }
+    if (managed) |*turn| {
+        for (turn.task.definition.skill_bindings) |name| {
+            if (!containsToolName(specialist_skill_names.items, name)) try specialist_skill_names.append(arena, name);
+        }
+    }
+    var turn_explicit_skills: ?skill_invocation.ExplicitPromptSection = null;
+    defer if (turn_explicit_skills) |*section| section.deinit(arena);
+    if (!retrieval_turn and specialist_skill_names.items.len > 0 and config.skill_catalog.skills.len > 0) {
+        const resolved_bindings = try @import("../../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
+            arena,
+            specialist_skill_names.items,
+            config.skill_bindings,
+            config.workspace_root,
+            config.skill_catalog.skills,
+        );
+        if (hasAdditionalSkillBindings(resolved_bindings, config.skill_bindings)) {
+            config.skill_bindings = resolved_bindings;
+            turn_explicit_skills = skill_invocation.buildExplicitPromptSection(
+                arena,
+                config.skill_catalog,
+                job.prompt,
+                resolved_bindings,
+                config.context_limits,
+                config.cancel_flag,
+            ) catch |err| switch (err) {
+                error.OutOfMemory, error.Cancelled => return err,
+                else => null,
+            };
+        }
+    }
+    const effective_explicit_skills: ?*const skill_invocation.ExplicitPromptSection =
+        if (turn_explicit_skills) |*sec| sec else skills.explicit;
+
     var selected_dynamic_tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     try selected_dynamic_tools.ensureTotalCapacity(arena, config.initial_dynamic_tools.len);
     for (config.initial_dynamic_tools) |tool| {
         selected_dynamic_tools.appendAssumeCapacity(tool);
     }
+    if (effective_required_tools.len > 0 and !config.coordinator_mode and !retrieval_turn) {
+        try prebindStepZeroDynamicTools(deps, arena, effective_required_tools, &selected_dynamic_tools);
+    }
     const current_user_effective: ChatMessage = if (config.background_worker) blk: {
         const guidance = if (config.ui_host) |host| if (host.background_authority) |auth| auth.execution_guidance else "" else "";
-        const skill_text = if (skills.explicit) |sec| sec.text else "";
+        const skill_text = if (effective_explicit_skills) |sec| sec.text else "";
         if (skill_text.len > 0) {
             break :blk .{
                 .role = .user,
@@ -7582,6 +7746,16 @@ fn processQueuedPromptLoop(
                     current_user_message.content orelse "",
                     skill_text,
                     if (guidance.len > 0) "\n\n" else "",
+                    guidance,
+                }),
+                .images = current_user_message.images,
+                .context_origin = current_user_message.context_origin,
+            };
+        } else if (guidance.len > 0) {
+            break :blk .{
+                .role = .user,
+                .content = try arena.print("{s}\n\n{s}", .{
+                    current_user_message.content orelse "",
                     guidance,
                 }),
                 .images = current_user_message.images,
@@ -7786,7 +7960,7 @@ fn processQueuedPromptLoop(
         };
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         if (!config.background_worker) {
-            if (skills.explicit) |section| {
+            if (effective_explicit_skills) |section| {
                 if (section.text.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = section.text });
             }
         }
@@ -13758,4 +13932,57 @@ test "writeNetworkRecordBody omits absent finish reason and generation" {
         "provider: gateway · model: m · 0ms\nfinish: unknown",
         body.written(),
     );
+}
+
+test "prebindStepZeroDynamicTools pre-binds allowed MCP specialist tools and skips native and denied tools" {
+    const support = @import("tests/support.zig");
+    const Resolver = struct {
+        fn resolve(_: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+            if (std.mem.eql(u8, name, "mcp_browseros-neo_run")) {
+                return .{
+                    .name = name,
+                    .schema_json = try arena.dupe(u8, "{\"name\":\"mcp_browseros-neo_run\",\"description\":\"Batched browser run\",\"inputSchema\":{\"type\":\"object\"}}"),
+                    .mcp_binding = .{
+                        .runtime_generation = 1,
+                        .connection_generation = 1,
+                        .catalog_generation = 1,
+                        .auth_generation = 1,
+                    },
+                };
+            }
+            // Denied or unavailable MCP tools resolve to null.
+            return null;
+        }
+    };
+
+    var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
+    defer fake.deinit();
+    var deps = fake.deps();
+    deps.resolve_unselected_mcp_tool = Resolver.resolve;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Backward compatibility: empty required_tools is a no-op.
+    var empty_selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindStepZeroDynamicTools(&deps, arena, &.{}, &empty_selected);
+    try std.testing.expectEqual(@as(usize, 0), empty_selected.items.len);
+
+    const required = [_][]const u8{
+        "native shell",
+        "read_file",
+        "write_file",
+        "mcp_browseros-neo_run",
+        "mcp_denied_tool",
+    };
+    var selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindStepZeroDynamicTools(&deps, arena, &required, &selected);
+
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", selected.items[0].name);
+
+    // Deduplicated on repeated invocation.
+    try prebindStepZeroDynamicTools(&deps, arena, &required, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
 }

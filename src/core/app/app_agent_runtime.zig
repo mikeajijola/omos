@@ -499,6 +499,31 @@ pub fn Runtime(comptime App: type) type {
             return null;
         }
 
+        fn resolveUnselectedMcpToolForAgent(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?tool_mcp_runtime.SelectedTool {
+            const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (comptime @hasDecl(App, "mcpToolSchemaJson")) {
+                const projection = (app.mcpToolSchemaJson(
+                    arena,
+                    name,
+                    app.permission_engine.rules,
+                    .unrestricted,
+                    &app.worker.worker_cancel_requested,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory, error.Cancelled => return err,
+                    else => return null,
+                }) orelse return null;
+                return switch (projection) {
+                    .selected => |payload| .{
+                        .name = name,
+                        .schema_json = payload.model_output,
+                        .mcp_binding = payload.mcp_binding,
+                    },
+                    .rejected => null,
+                };
+            }
+            return null;
+        }
+
         fn callMcpFeature(
             raw_ctx: *anyopaque,
             arena: Allocator,
@@ -1124,6 +1149,7 @@ pub fn Runtime(comptime App: type) type {
 
             var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
+            deps.resolve_unselected_mcp_tool = resolveUnselectedMcpToolForAgent;
             deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             var config = buildQueuedPromptConfig(

@@ -46,10 +46,14 @@ fn dynamicTool(name: []const u8) tool_dispatch.Tool {
         },
         .executor_kind = .mcp_select_tool,
         .activity_kind = .command,
+        .permission_target_kind = .none,
+        .action_label = "Selecting dynamic tool",
+        .completed_action_label = "Selected dynamic tool",
         .decode = decode,
         .call = call,
         .reads_only_fn = readsOnly,
         .irreversible_fn = isIrreversible,
+        .prefers_advertised_names = true,
     };
 }
 

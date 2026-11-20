@@ -113,7 +113,8 @@ pub fn call(
         ctx.max_tool_result_bytes,
         result_store.large_result_threshold_bytes,
     );
-    const request = input.request();
+    var request = input.request();
+    request.rerank.required_tools = ctx.required_tools;
     const searches_skills = request.includes(.skill);
     const searches_mcp = request.includes(.mcp);
     const domain_cap = if (searches_skills and searches_mcp and output_cap > 512)

@@ -251,8 +251,22 @@ pub const RunCommandBackend = struct {
 };
 
 /// Context shared by core tool dispatch, validation, and execution.
+pub const ResolvedDynamicTool = struct {
+    name: []const u8,
+    description: []const u8,
+    model_schema: struct {
+        name: []const u8,
+        description: []const u8,
+    },
+    mcp_ctx: ?*anyopaque = null,
+    mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
+};
+
 pub const DispatchContext = struct {
     coordinator_mode: bool = false,
+    required_tools: []const []const u8 = &.{},
+    advertising_dynamic_tool_names: []const []const u8 = &.{},
+    resolved_dynamic_tool: ?ResolvedDynamicTool = null,
     allocator: Allocator,
     fossil_session_id: ?[]const u8 = null,
     fossil_workspace_available: bool = false,
@@ -506,6 +520,10 @@ pub const Tool = struct {
     prepare_skill_call_fn: ?*const fn (DispatchContext, []const u8) DispatchError!skill_contract.CallPreparation = null,
     reads_only_fn: ReadsOnlyFn,
     irreversible_fn: IrreversibleFn,
+    /// When true, list this tool as dynamically advertised instead of in the
+    /// static capability_search preamble. Used by engines that select tools on
+    /// their own internal advertised list (e.g. MCP v2).
+    prefers_advertised_names: bool = false,
 };
 
 pub const Registry = mod_registry.ToolRegistry(Tool);

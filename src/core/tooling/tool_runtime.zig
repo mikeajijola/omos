@@ -105,6 +105,8 @@ const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 
 test {
     _ = tool_mcp_registry;
+    _ = capability_retrieval;
+    _ = @import("../workspace/background_control.zig");
     _ = tool_admission;
     _ = command_result_mapping;
     _ = @import("../session/command_replay_store.zig");
@@ -116,6 +118,7 @@ test {
 pub const Context = struct {
     coordinator_mode: bool = false,
     background_authority: ?*const @import("../workspace/background_control.zig").Authority = null,
+    required_tools: []const []const u8 = &.{},
     fossil_workspace_available: bool = false,
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
@@ -1142,6 +1145,139 @@ pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8
     };
 }
 
+/// Resolve persisted portable skill names (e.g. `"browseros-neo"`) back to
+/// local skill paths via `skill_locations`. Returns an owned slice allocated
+/// from `alloc`.
+pub fn resolvePersistedSkillBindings(
+    alloc: Allocator,
+    skill_names: []const []const u8,
+    existing_bindings: []const @import("../skills/skill_invocation.zig").ExplicitBinding,
+    workspace_root: []const u8,
+    skill_locations: ?*const skill_contract.Locations,
+) ![]const @import("../skills/skill_invocation.zig").ExplicitBinding {
+    const skills = if (skill_locations) |locations| locations.skills else &.{};
+    return @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
+        alloc,
+        skill_names,
+        existing_bindings,
+        workspace_root,
+        skills,
+    );
+}
+
+/// Pre-bind declared MCP `required_tools` into `selected` at step 0 using the
+/// runtime MCP schema catalog, skipping static native tools, duplicates, and
+/// any tool denied by `permission_rules` or `mcp_access`. Pre-binding NEVER
+/// grants or bypasses tool permissions.
+/// Returns owned slices in `alloc`; advertised names stay authoritative through
+/// `ctx.tool_registry.lookup(name)` and `resolveUnselectedMcpTool`.
+pub const PreboundRequiredTools = struct {
+    /// Canonical native tool names declared by the specialist, ordered.
+    registry_names: []const []const u8,
+    /// Advertised dynamic MCP tool names that remain active for dispatch.
+    advertised_dynamic_names: []const []const u8,
+};
+
+pub fn prebindRequiredTools(
+    ctx: Context,
+    alloc: Allocator,
+    required_tools: []const []const u8,
+    registry_tools: []const tool_dispatch.Tool,
+    advertised_dynamic_names: []const []const u8,
+) !PreboundRequiredTools {
+    const permissions = @import("../permissions/permissions.zig");
+    const selection = @import("../workspace/realisation_selection.zig");
+
+    var registry_allowed: std.ArrayList([]const u8) = .empty;
+    defer registry_allowed.deinit(alloc);
+    for (registry_tools) |tool| {
+        if (ctx.permission_mode != .yolo and
+            permissions.rulesDenyAllTargetsForTool(ctx.permission_rules, tool.name)) continue;
+        if (!containsName(registry_allowed.items, tool.name)) {
+            try registry_allowed.append(alloc, tool.name);
+        }
+    }
+
+    var native_required: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (native_required.items) |name| alloc.free(name);
+        native_required.deinit(alloc);
+    }
+    var dynamic_candidates: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (dynamic_candidates.items) |name| alloc.free(name);
+        dynamic_candidates.deinit(alloc);
+    }
+
+    for (advertised_dynamic_names) |name| {
+        if (ctx.permission_mode != .yolo and
+            permissions.rulesDenyAllTargetsForTool(ctx.permission_rules, name)) continue;
+        if (!containsName(dynamic_candidates.items, name)) {
+            try dynamic_candidates.append(alloc, try alloc.dupe(u8, name));
+        }
+    }
+
+    for (required_tools) |raw_name| {
+        const canonical = selection.canonicalToolName(raw_name);
+        if (canonical.len == 0) continue;
+        if (ctx.permission_mode != .yolo and
+            permissions.rulesDenyAllTargetsForTool(ctx.permission_rules, canonical)) continue;
+        if (containsName(registry_allowed.items, canonical)) {
+            if (!containsName(native_required.items, canonical)) {
+                try native_required.append(alloc, try alloc.dupe(u8, canonical));
+            }
+        } else {
+            if (!containsName(dynamic_candidates.items, canonical)) {
+                try dynamic_candidates.append(alloc, try alloc.dupe(u8, canonical));
+            }
+        }
+    }
+
+    return .{
+        .registry_names = try native_required.toOwnedSlice(alloc),
+        .advertised_dynamic_names = try dynamic_candidates.toOwnedSlice(alloc),
+    };
+}
+
+/// Convenience pre-binding helper for dynamic MCP tools. Uses `prebindRequiredTools`
+/// together with `resolveUnselectedMcpTool` so static native registry tools stay
+/// in the static channel, duplicates are skipped, and denied tools remain outside
+/// the allowed set.
+pub fn prebindRequiredDynamicTools(
+    ctx: Context,
+    arena: Allocator,
+    required_tools: []const []const u8,
+    selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
+) !void {
+    if (required_tools.len == 0) return;
+    const prebound = try prebindRequiredTools(
+        ctx,
+        arena,
+        required_tools,
+        ctx.tool_registry.tools,
+        ctx.advertised_dynamic_tool_names,
+    );
+    for (prebound.advertised_dynamic_names) |name| {
+        if (ctx.tool_registry.lookup(name) != null) continue;
+        var already_selected = false;
+        for (selected.items) |existing| {
+            if (std.mem.eql(u8, existing.name, name)) {
+                already_selected = true;
+                break;
+            }
+        }
+        if (already_selected) continue;
+        if (try resolveUnselectedMcpTool(ctx, arena, name)) |resolved| {
+            if (!std.mem.eql(u8, resolved.name, name)) continue;
+            try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(
+                arena,
+                selected,
+                resolved,
+            );
+        }
+    }
+}
+
 fn refreshChangedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolExecutionResult {
     var unavailable_output: []const u8 = "MCP tool definition changed before execution and is no longer available. Search for current tools.";
     var notice: ?[]const u8 = null;
@@ -1241,6 +1377,12 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .allocator = arena,
         .fossil_workspace_available = ctx.fossil_workspace_available,
         .coordinator_mode = ctx.coordinator_mode,
+        .required_tools = if (ctx.required_tools.len > 0)
+            ctx.required_tools
+        else if (ctx.background_authority) |authority|
+            authority.required_tools
+        else
+            &.{},
         .fossil_session_id = if (ctx.fossil_workspace_available) ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id else null,
         .observer = ctx.observer,
         .permission_mode = ctx.permission_mode,
@@ -2279,11 +2421,14 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
         task.project_root,
         catalog_skills,
     );
+    const typed_guidance = assignment.execution_guidance;
     try manager.record(task, "realisation_assigned", .{
         .operation = entry.operation,
         .capability = assignment.capability,
         .realisation = assignment.realisation,
         .ranking = assignment.ranking,
+        .required_tools = typed_guidance.required_tools,
+        .skill_bindings = typed_guidance.skill_bindings,
         .bound_skills = assignment.skill_bindings.len,
     });
     try control.activate(manager, entry, .{
@@ -2308,6 +2453,9 @@ fn dispatchBackgroundContract(raw: ?*anyopaque, arena: Allocator, call_id: []con
         .session_generation = state.next_generation,
         .capability = assignment.capability,
         .realisation = assignment.realisation,
+        .realisation_id = if (typed_guidance.realisation_id.len > 0) typed_guidance.realisation_id else assignment.realisation,
+        .required_tools = typed_guidance.required_tools,
+        .declared_skills = typed_guidance.skill_bindings,
         .skill_bindings = assignment.skill_bindings,
         .execution_guidance = assignment.guidance,
     });
@@ -8102,6 +8250,105 @@ test "vision runtime honors configured provider bounds without a hidden twenty K
     defer alloc.free(@constCast(unbounded.model_output));
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, unbounded.status);
     try std.testing.expectEqual(@as(usize, 3), fixture.call_count);
+}
+
+fn expectNamesContain(expected: []const []const u8, actual: []const []const u8) !void {
+    for (expected) |want| {
+        var found = false;
+        for (actual) |have| {
+            if (std.mem.eql(u8, want, have)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "prebindRequiredDynamicTools pre-binds MCP required_tools without static native re-advertise and respects denies" {
+    var mcp_ctx_dummy: u8 = 0;
+    var rt = TestRuntime{
+        .mcp_ctx = @ptrCast(&mcp_ctx_dummy),
+        .mcp_tool_schema = McpFixture.schema,
+        .advertised_dynamic_tool_names = &.{ "capability_search", "mcp_select_tool" },
+    };
+    defer rt.deinit(std.testing.allocator);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const required = [_][]const u8{
+        "native shell",
+        "read_file",
+        "mcp_fs_read",
+    };
+
+    var selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindRequiredDynamicTools(rt.context(), arena, &required, &selected);
+
+    // Only dynamic MCP tool `mcp_fs_read` is added to `selected`; native `shell` and `read_file` stay static.
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    try std.testing.expectEqualStrings("mcp_fs_read", selected.items[0].name);
+
+    // Calling again deduplicates without adding a second copy.
+    try prebindRequiredDynamicTools(rt.context(), arena, &required, &selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+
+    // Empty required_tools is a no-op.
+    var empty_selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindRequiredDynamicTools(rt.context(), arena, &.{}, &empty_selected);
+    try std.testing.expectEqual(@as(usize, 0), empty_selected.items.len);
+
+    // Permission deny rule prevents pre-binding `mcp_fs_read`.
+    var deny_rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("mcp_fs_read"), .pattern = @constCast("*"), .action = .deny },
+    };
+    rt.permission_rules = .{ .rules = &deny_rules };
+    var denied_selected: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try prebindRequiredDynamicTools(rt.context(), arena, &required, &denied_selected);
+    try std.testing.expectEqual(@as(usize, 0), denied_selected.items.len);
+}
+
+test "orchestrator step-zero tool set advertises required specialist tools through both channels" {
+    const required = [_][]const u8{
+        "native shell",
+        "read_file",
+        "write_file",
+        "mcp_browseros-neo_run",
+    };
+    var rt = TestRuntime{
+        .advertised_dynamic_tool_names = &.{
+            "capability_search",
+            "mcp_select_tool",
+        },
+    };
+    defer rt.deinit(std.testing.allocator);
+    var ctx = rt.context();
+    ctx.required_tools = &required;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prebound = try prebindRequiredTools(
+        ctx,
+        arena,
+        &required,
+        ctx.tool_registry.tools,
+        ctx.advertised_dynamic_tool_names,
+    );
+    try expectNamesContain(&.{ "shell", "read_file", "write_file" }, prebound.registry_names);
+    try expectNamesContain(&.{ "capability_search", "mcp_select_tool", "mcp_browseros-neo_run" }, prebound.advertised_dynamic_names);
+
+    var combined_allowed: std.ArrayList([]const u8) = .empty;
+    for (ctx.tool_registry.tools) |tool| try combined_allowed.append(arena, tool.name);
+    for (prebound.advertised_dynamic_names) |name| try combined_allowed.append(arena, name);
+
+    const allowed_names = try capability_retrieval.retainRequiredTools(
+        arena,
+        combined_allowed.items,
+        ctx.advertised_dynamic_tool_names,
+        &required,
+    );
+    try expectNamesContain(&.{ "shell", "read_file", "write_file", "mcp_browseros-neo_run" }, allowed_names);
 }
 
 test "vision cancellation stops later batches and does not surface the outage tip" {
