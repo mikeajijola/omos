@@ -1062,7 +1062,7 @@ test "company_service: conflict on submit allows checkpoint resolution and re-su
 
     var environ = std.process.Environ.Map.init(alloc);
     try environ.put("HOME", root);
-    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    if (io.getenv("PATH")) |p| try environ.put("PATH", p);
     const prev_environ = io.environMap();
     io.setEnvironMap(&environ);
     defer if (prev_environ) |prev| io.setEnvironMap(prev);

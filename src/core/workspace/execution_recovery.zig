@@ -263,7 +263,15 @@ pub fn recoverRecipe(
     manager: ?workspace.Manager,
     task: workspace.Task,
 ) !SpecialistRecipe {
-    const latest = if (manager) |m| (m.loadTask(task.id) catch task) else task;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const s_alloc = scratch.allocator();
+    const reader: ?workspace.Manager = if (manager) |m| blk: {
+        var r = m;
+        r.alloc = s_alloc;
+        break :blk r;
+    } else null;
+    const latest = if (reader) |r| (r.loadTask(task.id) catch task) else task;
     const raw_realisation = if (latest.definition.realisation_id) |id|
         std.mem.trim(u8, id, " \t\r\n")
     else
@@ -274,13 +282,13 @@ pub fn recoverRecipe(
         null;
 
     var declaration: ?model.Declaration = null;
-    if (manager) |m| {
+    if (reader) |r| {
         if (latest.model_basis) |basis| {
-            declaration = m.loadDeclaration(basis.revision) catch null;
+            declaration = r.loadDeclaration(basis.revision) catch null;
         }
         if (declaration == null) {
-            if (m.revision("trunk") catch null) |trunk_rev| {
-                declaration = m.loadDeclaration(trunk_rev) catch null;
+            if (r.revision("trunk") catch null) |trunk_rev| {
+                declaration = r.loadDeclaration(trunk_rev) catch null;
             }
         }
     }

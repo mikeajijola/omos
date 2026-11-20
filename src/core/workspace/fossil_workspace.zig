@@ -2536,17 +2536,20 @@ pub const Manager = struct {
 
     fn decodeTask(self: Manager, id: []const u8, bytes: []const u8) !Task {
         const task = try parse(self.alloc, Task, bytes);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const s_alloc = scratch.allocator();
         if (!std.mem.eql(u8, task.workspace_id, self.manifest.id) or !std.mem.eql(u8, task.id, id)) return error.WorkspaceBindingMismatch;
         if (!safeId(task.session) or !std.mem.eql(u8, task.definition.id, task.id) or task.definition.version == 0) return error.InvalidWorkspaceFormat;
-        if (!std.mem.eql(u8, task.branch, try self.alloc.print("task/{s}", .{task.id}))) return error.InvalidWorkspaceFormat;
+        if (!std.mem.eql(u8, task.branch, try s_alloc.print("task/{s}", .{task.id}))) return error.InvalidWorkspaceFormat;
         if (!std.mem.eql(u8, task.parent, "trunk") and !(std.mem.startsWith(u8, task.parent, "task/") and safeId(task.parent[5..]))) return error.InvalidWorkspaceFormat;
         if (!std.Io.Dir.path.isAbsolute(task.project_root)) return error.InvalidWorkspaceFormat;
         if (task.source_validation_version) |minimum| if (minimum == 0 or minimum > task.definition.version) return error.InvalidWorkspaceFormat;
-        const checked_contract = try contract.parse(self.alloc, try json(self.alloc, task.definition));
+        const checked_contract = try contract.parse(s_alloc, try json(s_alloc, task.definition));
         checked_contract.deinit();
         if (task.model_basis) |basis| {
             if (!std.mem.eql(u8, basis.profile, model.profile_id) or !safeId(basis.definition_hash)) return error.UnsupportedWorkspaceProfile;
-            _ = try model.parseExecution(self.alloc, try json(self.alloc, basis.execution));
+            _ = try model.parseExecution(s_alloc, try json(s_alloc, basis.execution));
         }
         if (task.request_artifact) |path| {
             if (path.len != 74 or !std.mem.startsWith(u8, path, "artifacts/") or !safeId(path[10..])) return error.InvalidArtifactIdentity;
@@ -2556,14 +2559,18 @@ pub const Manager = struct {
 
     pub fn validateTaskBasis(self: Manager, task: Task) !void {
         const basis = task.model_basis orelse return;
-        const declaration = try self.loadDeclaration(basis.revision);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var reader = self;
+        reader.alloc = scratch.allocator();
+        const declaration = try reader.loadDeclaration(basis.revision);
         if (!std.mem.eql(u8, declaration.hash, basis.definition_hash)) return error.StaleWorkspaceDefinition;
-        const execution_bytes = try self.contentAt(model.execution_path, basis.revision);
-        const execution = try model.parseExecution(self.alloc, execution_bytes);
-        if (!std.mem.eql(u8, try json(self.alloc, execution), try json(self.alloc, basis.execution))) return error.StaleExecutionPolicy;
+        const execution_bytes = try reader.contentAt(model.execution_path, basis.revision);
+        const execution = try model.parseExecution(reader.alloc, execution_bytes);
+        if (!std.mem.eql(u8, try json(reader.alloc, execution), try json(reader.alloc, basis.execution))) return error.StaleExecutionPolicy;
         if (basis.execution_hash) |expected| {
-            const value = (try std.json.parseFromSlice(std.json.Value, self.alloc, execution_bytes, .{})).value;
-            if (!std.mem.eql(u8, expected, try model.digest(self.alloc, value))) return error.StaleExecutionPolicy;
+            const value = (try std.json.parseFromSlice(std.json.Value, reader.alloc, execution_bytes, .{})).value;
+            if (!std.mem.eql(u8, expected, try model.digest(reader.alloc, value))) return error.StaleExecutionPolicy;
         }
         if (basis.capability) |capability| if (!model.nativeCapability(declaration, capability)) return error.UnboundCapability;
     }
@@ -2679,11 +2686,15 @@ pub const Manager = struct {
     /// Retain only the requested host record. A sparse checkout avoids hashing
     /// unrelated documents and execution history for each conversation update.
     fn retainRuntimeFile(self: Manager, path: []const u8, bytes: []const u8, message: []const u8) !void {
-        const lease = try self.writerLease();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const lease = try writer.writerLease();
         defer lease.release();
         const files = [_]CompanyFile{.{ .path = path, .content = bytes }};
-        const result = try self.commitSparseFiles(try self.runtimeRevisionIfPresent(), &files, runtime_branch, "runtime-record-scratch", message);
-        if (result.tree) |tree| try self.cleanCompanyTree(tree, &files);
+        const result = try writer.commitSparseFiles(try writer.runtimeRevisionIfPresent(), &files, runtime_branch, "runtime-record-scratch", message);
+        if (result.tree) |tree| try writer.cleanCompanyTree(tree, &files);
     }
 
     pub const CommunicationWrite = struct { key: []const u8, expected: ?[]const u8 = null, content: []const u8 };
@@ -2711,49 +2722,69 @@ pub const Manager = struct {
     /// subscriptions and outbox entries commit together under a short writer lease.
     pub fn saveCommunications(self: Manager, writes: []const CommunicationWrite) !void {
         if (writes.len == 0 or writes.len > 8) return error.InvalidCommunicationBatch;
-        const lease = try self.writerLease();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const lease = try writer.writerLease();
         defer lease.release();
-        const revision_id = try self.runtimeRevisionIfPresent();
+        const revision_id = try writer.runtimeRevisionIfPresent();
         var files: std.ArrayList(CompanyFile) = .empty;
         for (writes, 0..) |item, i| {
             if (item.content.len > 65536) return error.CommunicationTooLarge;
             for (writes[0..i]) |previous| if (std.mem.eql(u8, previous.key, item.key)) return error.DuplicateCommunicationKey;
-            const previous = if (revision_id) |rev| try self.communicationAt(item.key, rev) else null;
+            const previous = if (revision_id) |rev| try writer.communicationAt(item.key, rev) else null;
             if (previous) |bytes| {
                 const expected = item.expected orelse return error.CommunicationConflict;
-                if (!std.mem.eql(u8, expected, try hash(self.alloc, bytes))) return error.CommunicationConflict;
+                if (!std.mem.eql(u8, expected, try hash(writer.alloc, bytes))) return error.CommunicationConflict;
             } else if (item.expected != null) return error.CommunicationConflict;
-            try files.append(self.alloc, .{ .path = try self.communicationPath(item.key), .content = item.content });
+            try files.append(writer.alloc, .{ .path = try writer.communicationPath(item.key), .content = item.content });
         }
-        const result = try self.commitSparseFiles(revision_id, files.items, runtime_branch, "communications-scratch", "Retain contract communications");
-        if (result.tree) |tree| try self.cleanCompanyTree(tree, files.items);
+        const result = try writer.commitSparseFiles(revision_id, files.items, runtime_branch, "communications-scratch", "Retain contract communications");
+        if (result.tree) |tree| try writer.cleanCompanyTree(tree, files.items);
     }
 
     /// Host-owned diagnostic records are portable workspace history, not
     /// permissions, task obligations or actor-editable evidence.
     pub fn retainRoutingDecision(self: Manager, session: []const u8, message: []const u8, decision: anytype) !void {
-        const routing_record = try json(self.alloc, .{ .version = "omos.routing-record/v1", .session = session, .message_sha256 = try hash(self.alloc, message), .at_ms = io_mod.milliTimestamp(), .decision = decision, .authority = "advisory" });
-        const path = try self.alloc.print("runtime/routing/{s}/{s}.json", .{ try hash(self.alloc, session), try hash(self.alloc, routing_record) });
-        try self.retainRuntimeFile(path, routing_record, "Record conversation routing decision");
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const routing_record = try json(writer.alloc, .{ .version = "omos.routing-record/v1", .session = session, .message_sha256 = try hash(writer.alloc, message), .at_ms = io_mod.milliTimestamp(), .decision = decision, .authority = "advisory" });
+        const path = try writer.alloc.print("runtime/routing/{s}/{s}.json", .{ try hash(writer.alloc, session), try hash(writer.alloc, routing_record) });
+        try writer.retainRuntimeFile(path, routing_record, "Record conversation routing decision");
     }
 
     pub fn retainAttentionEvent(self: Manager, turn: []const u8, cursor: usize, event: std.json.Value) !void {
-        const bytes = try portableValue(self.alloc, try std.json.parseFromSliceLeaky(std.json.Value, self.alloc, try json(self.alloc, .{ .version = "omos.attention-event/v1", .turn = turn, .cursor = cursor, .at_ms = io_mod.milliTimestamp(), .event = event, .authority = "historical_host_event_not_live_approval" }), .{}));
-        const path = try self.alloc.print("runtime/attention/{s}/{d}.json", .{ try hash(self.alloc, turn), cursor });
-        try self.retainRuntimeFile(path, bytes, "Retain human attention event");
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const bytes = try portableValue(writer.alloc, try std.json.parseFromSliceLeaky(std.json.Value, writer.alloc, try json(writer.alloc, .{ .version = "omos.attention-event/v1", .turn = turn, .cursor = cursor, .at_ms = io_mod.milliTimestamp(), .event = event, .authority = "historical_host_event_not_live_approval" }), .{}));
+        const path = try writer.alloc.print("runtime/attention/{s}/{d}.json", .{ try hash(writer.alloc, turn), cursor });
+        try writer.retainRuntimeFile(path, bytes, "Retain human attention event");
     }
 
     pub fn retainLookupDecisions(self: Manager, session: []const u8, message: []const u8, decisions: anytype) !void {
-        const bytes = try json(self.alloc, .{ .version = "omos.lookup-record/v1", .session = session, .message_sha256 = try hash(self.alloc, message), .at_ms = io_mod.milliTimestamp(), .decisions = decisions, .authority = "advisory_not_evidence_or_permission" });
-        const path = try self.alloc.print("runtime/lookups/{s}/{s}.json", .{ try hash(self.alloc, session), try hash(self.alloc, bytes) });
-        try self.retainRuntimeFile(path, bytes, "Retain lookup stopping decisions");
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const bytes = try json(writer.alloc, .{ .version = "omos.lookup-record/v1", .session = session, .message_sha256 = try hash(writer.alloc, message), .at_ms = io_mod.milliTimestamp(), .decisions = decisions, .authority = "advisory_not_evidence_or_permission" });
+        const path = try writer.alloc.print("runtime/lookups/{s}/{s}.json", .{ try hash(writer.alloc, session), try hash(writer.alloc, bytes) });
+        try writer.retainRuntimeFile(path, bytes, "Retain lookup stopping decisions");
     }
 
     pub fn retainConversation(self: Manager, session: []const u8, projection: std.json.Value) !void {
-        const bytes = try portableValue(self.alloc, projection);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const bytes = try portableValue(writer.alloc, projection);
         if (bytes.len > 8 * 1024 * 1024) return error.ConversationProjectionTooLarge;
-        const path = try self.alloc.print("runtime/conversations/{s}.json", .{try hash(self.alloc, session)});
-        try self.retainRuntimeFile(path, bytes, "Retain readable conversation history");
+        const path = try writer.alloc.print("runtime/conversations/{s}.json", .{try hash(writer.alloc, session)});
+        try writer.retainRuntimeFile(path, bytes, "Retain readable conversation history");
     }
 
     /// Queue and release selection in one canonical commit. A private recovery
@@ -2880,6 +2911,15 @@ pub const Manager = struct {
     }
 
     fn startBound(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding, assignment: ?@import("realisation_selection.zig").Assignment) !Task {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const created_id = try worker.startBoundInner(session, project, goal, parent, authority, assignment);
+        return self.loadTask(created_id);
+    }
+
+    fn startBoundInner(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding, assignment: ?@import("realisation_selection.zig").Assignment) ![]const u8 {
         if (goal.len > max_bytes or !std.unicode.utf8ValidateSlice(goal)) return error.WorkspaceGoalTooLarge;
         const lease = try self.writerLease();
         defer lease.release();
@@ -2978,7 +3018,7 @@ pub const Manager = struct {
         _ = try self.commit(tree, "Record task contract");
         try self.saveTask(task);
         try self.selectSession(session, task);
-        return task;
+        return id;
     }
 
     pub fn resumeTask(self: Manager, session: []const u8, id: []const u8, project: []const u8) !Task {
@@ -3230,13 +3270,16 @@ pub const Manager = struct {
     }
 
     pub fn bindingHash(self: Manager, task: Task) ![]const u8 {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const s_alloc = scratch.allocator();
         if (task.model_basis == null or task.model_basis.?.execution_hash == null) {
             // Existing local checkpoints predate model-basis hashing. Their
             // original binding remains valid; validateTaskBasis separately
             // checks the retained declaration and policy before execution.
-            return hash(self.alloc, try json(self.alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact }));
+            return hash(self.alloc, try json(s_alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact }));
         }
-        return hash(self.alloc, try json(self.alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact, task.model_basis }));
+        return hash(self.alloc, try json(s_alloc, .{ self.manifest.id, task.id, task.branch, task.parent, task.base_revision, task.project_root, task.definition, task.amendments, task.parent_task_id, task.parent_contract_version, task.request_artifact, task.model_basis }));
     }
 
     fn journalDir(self: Manager, task: Task) ![]const u8 {
@@ -3246,24 +3289,46 @@ pub const Manager = struct {
     /// Immutable content-addressed journal entries survive a failed checkpoint.
     /// The caller supplies only public task data, never opaque session state.
     pub fn record(self: Manager, task: Task, kind: []const u8, value: anytype) !void {
-        const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
-        _ = try self.recordJson(task, kind, raw);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const raw = try std.json.Stringify.valueAlloc(writer.alloc, value, .{});
+        _ = try writer.recordJson(task, kind, raw);
     }
 
     /// A hash-bound companion may be retained only when the ordinary portable
     /// redaction policy leaves it exact. Never bypass redaction for evidence.
     pub fn recordExact(self: Manager, task: Task, kind: []const u8, value: anytype) !void {
-        const raw = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
-        try requirePortableExact(self.alloc, raw);
-        _ = try self.recordJson(task, kind, raw);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const raw = try std.json.Stringify.valueAlloc(writer.alloc, value, .{});
+        try requirePortableExact(writer.alloc, raw);
+        _ = try writer.recordJson(task, kind, raw);
     }
 
     pub fn recordReceipt(self: Manager, task: Task, kind: []const u8, value: anytype) ![]const u8 {
-        return self.recordJson(task, kind, try std.json.Stringify.valueAlloc(self.alloc, value, .{}));
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const id = try writer.recordJson(task, kind, try std.json.Stringify.valueAlloc(writer.alloc, value, .{}));
+        return self.alloc.dupe(u8, id);
     }
 
     // The durable journal path is independent of the caller's payload type.
     noinline fn recordJson(self: Manager, task: Task, kind: []const u8, raw: []const u8) ![]const u8 {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var writer = self;
+        writer.alloc = scratch.allocator();
+        const id = try writer.recordJsonInner(task, kind, raw);
+        return self.alloc.dupe(u8, id);
+    }
+
+    noinline fn recordJsonInner(self: Manager, task: Task, kind: []const u8, raw: []const u8) ![]const u8 {
         const lease = try self.writerLease();
         defer lease.release();
         try self.checkExpectedRevision(task.branch);
@@ -3353,48 +3418,68 @@ pub const Manager = struct {
     }
 
     fn drain(self: Manager, task: Task) !void {
-        const directory = try self.journalDir(task);
-        const names = try self.entries(directory);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const directory = try worker.journalDir(task);
+        const names = try worker.entries(directory);
         if (names.len == 0) return;
-        const tree = try self.checkout(task.branch);
+        const tree = try worker.checkout(task.branch);
         var has_tool_evidence = false;
         for (names) |name| {
             if (!safeId(name)) return error.InvalidWorkspaceJournal;
-            const bytes = try read(self.alloc, try join(self.alloc, directory, name));
+            const bytes = try read(worker.alloc, try join(worker.alloc, directory, name));
             if (std.mem.startsWith(u8, bytes, "{\"kind\":\"tool_evidence\",")) has_tool_evidence = true;
-            if (!std.mem.eql(u8, name, try hash(self.alloc, bytes))) return error.InvalidWorkspaceJournal;
-            const relative = try self.alloc.print("history/{s}/{s}.json", .{ task.id, name });
-            try atomicWrite(self.alloc, try join(self.alloc, tree, relative), bytes);
+            if (!std.mem.eql(u8, name, try hash(worker.alloc, bytes))) return error.InvalidWorkspaceJournal;
+            const relative = try worker.alloc.print("history/{s}/{s}.json", .{ task.id, name });
+            try atomicWrite(worker.alloc, try join(worker.alloc, tree, relative), bytes);
         }
-        const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
-        const extras = try self.run(tree, &.{"extras"});
-        if (std.mem.trim(u8, changes, " \r\n").len > 0 or std.mem.trim(u8, extras, " \r\n").len > 0) _ = try self.commit(tree, "Checkpoint task evidence");
+        const changes = try worker.run(tree, &.{ "changes", "--hash", "--differ" });
+        const extras = try worker.run(tree, &.{"extras"});
+        if (std.mem.trim(u8, changes, " \r\n").len > 0 or std.mem.trim(u8, extras, " \r\n").len > 0) _ = try worker.commit(tree, "Checkpoint task evidence");
         try fault("checkpoint-committed");
         if (has_tool_evidence) try fault("evidence-checkpoint-committed");
         // Verify the committed bytes before acknowledging the durable journal.
-        const revision_id = try self.revision(task.branch);
+        const revision_id = try worker.revision(task.branch);
+        var db: ?fossil_sqlite_reader.Db = if (comptime !builtin.target.cpu.arch.isWasm())
+            fossil_sqlite_reader.Db.openReadOnly(worker.alloc, worker.repository) catch null
+        else
+            null;
+        defer if (db) |*d| d.close();
+        const rev_index: ?fossil_sqlite_reader.Db.RevisionIndex = if (db) |*d|
+            d.indexRevision(worker.alloc, revision_id) catch null
+        else
+            null;
         for (names) |name| {
-            const relative = try self.alloc.print("history/{s}/{s}.json", .{ task.id, name });
-            const bytes = try self.readAtRevision(relative, revision_id);
-            if (!std.mem.eql(u8, name, try hash(self.alloc, bytes))) return error.WorkspaceVerificationFailed;
-            try remove(try join(self.alloc, directory, name));
+            const relative = try worker.alloc.print("history/{s}/{s}.json", .{ task.id, name });
+            const bytes = if (rev_index) |*idx|
+                idx.readFile(worker.alloc, relative) catch try worker.readAtRevision(relative, revision_id)
+            else
+                try worker.readAtRevision(relative, revision_id);
+            if (!std.mem.eql(u8, name, try hash(worker.alloc, bytes))) return error.WorkspaceVerificationFailed;
+            try remove(try join(worker.alloc, directory, name));
         }
     }
 
     pub fn checkpoint(self: Manager, task: Task) ![]const u8 {
-        const lease = try self.writerLease();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const lease = try worker.writerLease();
         defer lease.release();
-        try self.drain(task);
-        const latest = try self.refreshTaskContextLocked(try self.loadTask(task.id));
-        try self.checkReviewFence(latest);
-        if (self.review_fence == null) if (latest.review_job) |id| {
-            const job = try self.loadReviewJob(latest, id);
+        try worker.drain(task);
+        const latest = try worker.refreshTaskContextLocked(try worker.loadTask(task.id));
+        try worker.checkReviewFence(latest);
+        if (worker.review_fence == null) if (latest.review_job) |id| {
+            const job = try worker.loadReviewJob(latest, id);
             if (job.state == .queued or job.state == .running) return error.TaskReviewInProgress;
         };
         if (latest.state != .accepted and latest.state != .publication_pending) {
-            try self.retainTaskState(latest);
+            try worker.retainTaskState(latest);
         }
-        return self.revision(task.branch);
+        return self.alloc.dupe(u8, try worker.revision(task.branch));
     }
 
     fn retainTaskState(self: Manager, task: Task) !void {
@@ -3513,18 +3598,28 @@ pub const Manager = struct {
         try @import("worker_projection.zig").hydrateRead(self, task, path);
         const bytes = try self.content(task, path);
         if (!allowedMutablePath(path) and !std.mem.startsWith(u8, path, "records/")) return bytes;
-        const lease = try self.writerLease();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const lease = try worker.writerLease();
         defer lease.release();
-        var current = try self.refreshTaskContextLocked(try self.loadTask(task.id));
+        var current = try worker.refreshTaskContextLocked(try worker.loadTask(task.id));
         if (current.state == .accepted or current.state == .publication_pending) return bytes;
-        const base = self.readAtRevision(path, current.base_revision) catch null;
-        const dependency: ReadDependency = .{ .path = path, .base_hash = if (base) |value| try hash(self.alloc, value) else null, .observed_hash = try hash(self.alloc, bytes) };
+        const observed_hash = try hash(worker.alloc, bytes);
+        for (current.dependencies) |existing| {
+            if (std.mem.eql(u8, existing.path, path) and std.mem.eql(u8, existing.observed_hash, observed_hash)) {
+                return bytes;
+            }
+        }
+        const base = worker.readAtRevision(path, current.base_revision) catch null;
+        const dependency: ReadDependency = .{ .path = path, .base_hash = if (base) |value| try hash(worker.alloc, value) else null, .observed_hash = observed_hash };
         var dependencies: std.ArrayList(ReadDependency) = .empty;
-        for (current.dependencies) |existing| if (!std.mem.eql(u8, existing.path, path)) try dependencies.append(self.alloc, existing);
-        try dependencies.append(self.alloc, dependency);
+        for (current.dependencies) |existing| if (!std.mem.eql(u8, existing.path, path)) try dependencies.append(worker.alloc, existing);
+        try dependencies.append(worker.alloc, dependency);
         if (dependencies.items.len > 10000) return error.WorkspaceDependenciesTooLarge;
-        current.dependencies = try dependencies.toOwnedSlice(self.alloc);
-        try self.saveTask(current);
+        current.dependencies = try dependencies.toOwnedSlice(worker.alloc);
+        try worker.saveTask(current);
         return bytes;
     }
 
@@ -3971,13 +4066,18 @@ pub const Manager = struct {
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try self.checkOperation();
         if (paths.len == 0) return &.{};
-        var db = fossil_sqlite_reader.Db.openReadOnly(self.alloc, self.repository) catch |err| return mapSqliteReaderError(err);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const s_alloc = scratch.allocator();
+        var db = fossil_sqlite_reader.Db.openReadOnly(s_alloc, self.repository) catch |err| return mapSqliteReaderError(err);
         defer db.close();
+        const rev_index = db.indexRevision(s_alloc, revision_id) catch |err| return mapSqliteReaderError(err);
         var records: std.ArrayList([]const u8) = .empty;
         for (paths) |path| {
             try self.checkOperation();
-            const entry_bytes = db.readFileAtRevision(self.alloc, revision_id, path) catch |err| return mapSqliteReaderError(err);
-            try self.checkHistoryHash(path, entry_bytes);
+            const entry_bytes = rev_index.readFile(self.alloc, path) catch |err| return mapSqliteReaderError(err);
+            const name = std.Io.Dir.path.basename(path);
+            if (name.len != 69 or !std.mem.endsWith(u8, name, ".json") or !std.mem.eql(u8, name[0..64], try hash(s_alloc, entry_bytes))) return error.InvalidWorkspaceJournal;
             try records.append(self.alloc, entry_bytes);
         }
         return records.toOwnedSlice(self.alloc);
@@ -4450,6 +4550,15 @@ pub const Manager = struct {
     /// Bounded context is rebuilt at each request, including after compaction.
     /// It is task data and cannot confer tool permission or contract authority.
     pub fn context(self: Manager, task: Task) ![]const u8 {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var reader = self;
+        reader.alloc = scratch.allocator();
+        const rendered = try reader.contextInner(task);
+        return self.alloc.dupe(u8, rendered);
+    }
+
+    fn contextInner(self: Manager, task: Task) ![]const u8 {
         const started_ms = io_mod.milliTimestamp();
         defer debug_trace.logf("workspace", "event=task_context elapsed_ms={d}", .{io_mod.milliTimestamp() - started_ms});
         const latest = try self.loadTask(task.id);
@@ -4663,11 +4772,15 @@ pub const Manager = struct {
         // needs file identities, never a walk through their complete history.
         // Resolve mutable selectors on every call; only immutable artifact
         // bytes may enter the existing read caches.
-        const revision_id = try self.revision(branch);
-        const files = try self.fileManifest(revision_id);
-        var paths: std.ArrayList([]const u8) = .empty;
-        for (files) |file| try paths.append(self.alloc, file.path);
-        return paths.toOwnedSlice(self.alloc);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var reader = self;
+        reader.alloc = scratch.allocator();
+        const revision_id = try reader.revision(branch);
+        const files = try reader.fileManifest(revision_id);
+        const paths = try self.alloc.alloc([]const u8, files.len);
+        for (files, paths) |file, *dst| dst.* = try self.alloc.dupe(u8, file.path);
+        return paths;
     }
 
     pub fn snapshot(self: Manager, detail: []const u8) !Snapshot {
@@ -4777,15 +4890,28 @@ pub const Manager = struct {
 
     fn fileEntries(self: Manager, identity: []const u8, verify_objects: bool) ![]const fossil_manifest.File {
         if (!fossil_manifest.validHash(identity)) return error.InvalidFossilRevision;
-        const raw = try self.immutableArtifact(identity);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var reader = self;
+        reader.alloc = scratch.allocator();
+        const raw = try reader.immutableArtifact(identity);
         if (verify_objects) try fossil_manifest.verifyCheckinReference(identity, raw);
-        const current = try fossil_manifest.parse(self.alloc, raw);
+        const current = try fossil_manifest.parse(reader.alloc, raw);
         const baseline = if (current.baseline) |id| base: {
-            const bytes = try self.immutableArtifact(id);
+            const bytes = try reader.immutableArtifact(id);
             if (verify_objects) try fossil_manifest.verifyObject(id, bytes);
-            break :base try fossil_manifest.parse(self.alloc, bytes);
+            break :base try fossil_manifest.parse(reader.alloc, bytes);
         } else null;
-        return fossil_manifest.resolve(self.alloc, baseline, current);
+        const resolved = try fossil_manifest.resolve(reader.alloc, baseline, current);
+        const out = try self.alloc.alloc(fossil_manifest.File, resolved.len);
+        for (resolved, out) |src, *dst| {
+            dst.* = .{
+                .path = try self.alloc.dupe(u8, src.path),
+                .artifact = if (src.artifact) |art| try self.alloc.dupe(u8, art) else null,
+                .mode = src.mode,
+            };
+        }
+        return out;
     }
 
     const VerificationFile = struct { entry: fossil_manifest.File, bytes: usize };
@@ -4872,7 +4998,7 @@ pub const Manager = struct {
         if (files.len == 0) return;
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try self.checkOperation();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         var db = fossil_sqlite_reader.Db.openReadOnly(scratch.allocator(), self.repository) catch |err| return mapSqliteReaderError(err);
         defer db.close();
@@ -4884,7 +5010,7 @@ pub const Manager = struct {
         if (files.len == 0) return;
         if (comptime builtin.target.cpu.arch.isWasm()) return error.UnsupportedPlatform;
         try self.checkOperation();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         var manager = self;
         manager.alloc = scratch.allocator();
@@ -4919,7 +5045,7 @@ pub const Manager = struct {
             const branch = try fossil_manifest.branchName(raw);
             if (branch.len == 0) continue;
             if (!std.mem.eql(u8, branch, "trunk") and !std.mem.eql(u8, branch, company_branch) and !std.mem.eql(u8, branch, runtime_branch) and !std.mem.eql(u8, branch, schedule_branch) and !(std.mem.startsWith(u8, branch, "task/") and safeId(branch[5..])) and !(std.mem.startsWith(u8, branch, "definition/") and safeId(branch[11..]))) return error.UnexpectedWorkspaceBranch;
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var manager = self;
             manager.alloc = arena.allocator();
@@ -4976,7 +5102,7 @@ pub const Manager = struct {
     }
 
     fn acceptedTasks(self: Manager, parent: []const u8) ![]const AcceptedTask {
-        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         var manager = self;
         manager.alloc = scratch.allocator();
@@ -5022,6 +5148,15 @@ pub const Manager = struct {
     /// before acknowledgement discovers the committed receipt and never reruns
     /// tools or asks the actor to repeat already completed external effects.
     pub fn publish(self: Manager, task: Task, review: Review) ![]const u8 {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const accepted_rev = try worker.publishInner(task, review);
+        return self.alloc.dupe(u8, accepted_rev);
+    }
+
+    fn publishInner(self: Manager, task: Task, review: Review) ![]const u8 {
         const authority_lease: ?ExecutionLease = if (self.company_operation_held) null else try self.companyOperationLease();
         defer if (authority_lease) |held| held.release();
         const lease = try self.writerLease();
@@ -5248,10 +5383,14 @@ pub const Manager = struct {
     }
 
     pub fn acknowledge(self: Manager, task: Task) !void {
-        const lease = try self.writerLease();
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const lease = try worker.writerLease();
         defer lease.release();
-        if ((try self.loadTask(task.id)).state != .accepted) return error.WorkspacePublicationRequired;
-        try remove(try self.publicationPath(task.id));
+        if ((try worker.loadTask(task.id)).state != .accepted) return error.WorkspacePublicationRequired;
+        try remove(try worker.publicationPath(task.id));
     }
 
     pub fn retryPublication(self: Manager, task: Task) !?[]const u8 {
@@ -5622,6 +5761,15 @@ pub const Manager = struct {
     }
 
     fn applyPlan(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: ?[]const []const u8) !Task {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self;
+        worker.alloc = scratch.allocator();
+        const updated_id = try worker.applyPlanInner(previous, capability, summary, obligations, checks, superseded);
+        return self.loadTask(updated_id);
+    }
+
+    fn applyPlanInner(self: Manager, previous: Task, capability: []const u8, summary: []const u8, obligations: []const contract.Obligation, checks: []const []const u8, superseded: ?[]const []const u8) ![]const u8 {
         const lease = try self.writerLease();
         defer lease.release();
         var current = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
@@ -5634,7 +5782,7 @@ pub const Manager = struct {
         const previous_capability = current.model_basis.?.capability;
         if (superseded != null) {
             if (!current.revision_pending or current.amendments.len <= current.planned_amendments or previous_capability == null) return error.UnauthorizedContractRevision;
-        } else if (previous_capability != null) return current;
+        } else if (previous_capability != null) return current.id;
         const declaration_value = try self.loadDeclaration(current.model_basis.?.revision);
         var found = false;
         for (model.items(model.spec(declaration_value.value), "capabilities")) |item| found = found or std.mem.eql(u8, model.text(item, "id"), capability);
@@ -5698,7 +5846,7 @@ pub const Manager = struct {
         _ = try self.commit(tree, if (superseded == null) "Pin task plan and preserve original acceptance criteria" else "Revise requirements from authenticated user amendments");
         try self.saveTask(current);
         if (self.review_fence != null) try fault("company-plan-committed");
-        return current;
+        return current.id;
     }
 
     pub fn writeRecord(self: Manager, task: Task, entity: []const u8, bytes: []const u8) ![]const u8 {
@@ -6105,7 +6253,7 @@ test "fossil_workspace: pure reads bypass command.lock and enable WAL on open" {
     io_mod.setEnvironMap(&environ);
     defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
 
-    const fossil_bin = "/home/coder/.local/bin/fossil";
+    const fossil_bin = "fossil";
     const runFossil = struct {
         fn call(a: Allocator, cwd: ?[]const u8, argv: []const []const u8) !void {
             const res = try std.process.run(a, std.testing.io, .{
@@ -6364,7 +6512,7 @@ test "fossil_workspace: companyViewHeaders sidecar index parity, pagination, col
 
     var environ = std.process.Environ.Map.init(alloc);
     try environ.put("HOME", root);
-    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    if (io_mod.getenv("PATH")) |p| try environ.put("PATH", p);
     const prev_environ = io_mod.environMap();
     io_mod.setEnvironMap(&environ);
     defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
@@ -6495,7 +6643,7 @@ test "fossil_workspace: auto-rebase merges disjoint files and non-overlapping li
 
     var environ = std.process.Environ.Map.init(alloc);
     try environ.put("HOME", root);
-    try environ.put("OMOS_FOSSIL_BIN", "/home/coder/.local/bin/fossil");
+    if (io_mod.getenv("PATH")) |p| try environ.put("PATH", p);
     const prev_environ = io_mod.environMap();
     io_mod.setEnvironMap(&environ);
     defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);

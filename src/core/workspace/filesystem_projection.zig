@@ -359,7 +359,7 @@ fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Sele
             if (std.mem.eql(u8, entry, path)) break true;
         } else false;
         const need_bytes = altered or (current_file == null and prior == null);
-        var page_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var page_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer page_arena.deinit();
         var page_manager = manager;
         page_manager.alloc = page_arena.allocator();
@@ -391,7 +391,7 @@ fn materialise(manager: workspace.Manager, task: workspace.Task, selection: Sele
         if (!equal(observed, lookup(old, file.path)) or equal(observed, expected)) continue;
         var parent = try parentDirectory(manager.alloc, root, file.path);
         defer parent.close(io_mod.getIo());
-        var page_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var page_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer page_arena.deinit();
         var page_manager = manager;
         page_manager.alloc = page_arena.allocator();
@@ -485,7 +485,7 @@ fn cleanView(manager: workspace.Manager, task: workspace.Task, root: []const u8)
     const manifest = try manager.fileManifest(revision);
     var offset: usize = 0;
     while (offset < files.items.len) {
-        var page = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var page = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer page.deinit();
         var reader = manager;
         reader.alloc = page.allocator();
@@ -706,13 +706,17 @@ pub fn skillsDirectory(alloc: std.mem.Allocator, session: ?[]const u8) !?[]const
 /// hydrates its complete personal view instead of exposing missing placeholders.
 /// Company worker hydration also records pinned input provenance in its private
 /// Fossil branch. Tool permission policy remains unchanged.
-pub fn prepareForTool(alloc: std.mem.Allocator, session: ?[]const u8, project: []const u8, name: []const u8, raw: []const u8, cancel_flag: ?*std.atomic.Value(bool)) !void {
+pub fn prepareForTool(caller_alloc: std.mem.Allocator, session: ?[]const u8, project: []const u8, name: []const u8, raw: []const u8, cancel_flag: ?*std.atomic.Value(bool)) !void {
+    _ = caller_alloc;
     if (comptime builtin.target.cpu.arch.isWasm()) return;
     const id = session orelse return;
     const process_access = std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "run_command");
     const skill = std.mem.eql(u8, name, "skill") or std.mem.eql(u8, name, "install_skill");
     const file = std.mem.eql(u8, name, "read_file") or std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file") or std.mem.eql(u8, name, "glob_files") or std.mem.eql(u8, name, "grep_files");
     if (!process_access and !skill and !file) return;
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const alloc = scratch.allocator();
     const arguments = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return,

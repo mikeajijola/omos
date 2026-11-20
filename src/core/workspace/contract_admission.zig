@@ -200,12 +200,17 @@ pub fn findRecyclableContractWithAssignment(
     scope: []const u8,
     assignment: ?@import("realisation_selection.zig").Assignment,
 ) !?[]const u8 {
-    const candidates = try manager.recyclableCandidates();
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var reader = manager;
+    reader.alloc = scratch.allocator();
+    const candidates = try reader.recyclableCandidates();
     const request: RecycleRequest = if (assignment) |assigned| .{
         .capability_id = assigned.capability,
         .realisation_id = assigned.realisation,
     } else .{};
-    return chooseRecyclableContract(message, scope, exclude_id, candidates, request);
+    const chosen = chooseRecyclableContract(message, scope, exclude_id, candidates, request) orelse return null;
+    return try manager.alloc.dupe(u8, chosen);
 }
 
 /// Scan retained contracts for one that can be resumed instead of creating a

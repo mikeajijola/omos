@@ -2874,7 +2874,9 @@ fn hydrateAskContractRecipe(
     if (ctx.writable == null and ctx.v2 == null) return .{};
     if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return .{};
     const session_id = ctx.activeSessionId() orelse return .{};
-    const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena)) orelse return .{};
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(scratch.allocator())) orelse return .{};
     const active_or_recyclable: ?@import("../workspace/fossil_workspace.zig").Task = if (try manager.active(session_id)) |active|
         if (active.state == .accepted or active.state == .conflict) null else active
     else blk: {

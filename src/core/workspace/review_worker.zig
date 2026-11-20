@@ -159,7 +159,7 @@ pub const Scheduler = struct {
         io.getIo().random(&owner_bytes);
         const owner_text: [32]u8 = std.fmt.bytesToHex(&owner_bytes, .lower);
         while (!self.stopping.load(.acquire)) {
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var manager = self.manager;
             manager.alloc = arena.allocator();

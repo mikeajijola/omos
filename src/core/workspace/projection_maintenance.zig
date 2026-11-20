@@ -14,7 +14,7 @@ pub const Worker = struct {
         const pin = (@import("../shared/resource_pin.zig").tryExclusive(path) catch return) orelse return;
         defer pin.close();
         while (!self.stopping.load(.acquire)) {
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var manager = self.manager;
             manager.alloc = arena.allocator();

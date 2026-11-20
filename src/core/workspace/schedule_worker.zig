@@ -28,7 +28,7 @@ pub const Scheduler = struct {
     }
 
     pub fn tick(self: *Scheduler, owner: []const u8) !void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var manager = self.manager;
         manager.alloc = arena.allocator();
@@ -104,7 +104,7 @@ const Heartbeat = struct {
                 return;
             }
             if (io.milliTimestamp() >= renew_at) {
-                var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 var manager = self.manager;
                 manager.alloc = arena.allocator();

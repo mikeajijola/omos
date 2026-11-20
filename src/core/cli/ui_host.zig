@@ -82,7 +82,7 @@ const Job = struct {
                 saved = false;
             };
             if (saved) {
-                var arena = std.heap.ArenaAllocator.init(alloc);
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 if (workspace.Manager.bound(arena.allocator())) |bound| {
                     if (bound) |manager| manager.retainAttentionEvent(self.id, self.cursor, parsed.value) catch {};
@@ -108,7 +108,7 @@ const Job = struct {
             break :blk @as(u8, 1);
         };
         if (self.channel_session) |session| {
-            var arena = std.heap.ArenaAllocator.init(alloc);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             if (workspace.Manager.bound(arena.allocator())) |bound| {
                 if (bound) |manager| channels.bindCommand(manager, self.id, session) catch |err| {
@@ -510,7 +510,7 @@ const BackgroundRun = struct {
         }
 
         fn poll(self: *Monitor) !void {
-            var arena = std.heap.ArenaAllocator.init(alloc);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             var manager = self.run_context.manager;
             manager.alloc = arena.allocator();
@@ -719,7 +719,7 @@ pub fn run(runner: Runner) !void {
     defer alloc.free(buffer);
     var reader = std.Io.File.stdin().reader(io.getIo(), buffer);
     while (try reader.interface.takeDelimiter('\n')) |line| {
-        var arena = std.heap.ArenaAllocator.init(alloc);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         server.dispatch(arena.allocator(), line) catch |err| try server.respond("invalid", .null, @errorName(err));
     }

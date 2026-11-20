@@ -52,7 +52,7 @@ pub fn irreversible(_: dispatch.ToolInput) bool {
 
 pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.DispatchError!dispatch.ToolResult {
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return .{ .failure = try ctx.allocator.dupe(u8, "Fossil is available only in the native CLI host.") };
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const result = execute(arena.allocator(), ctx, input.as(Parsed).value) catch |err| {
         return .{ .failure = try ctx.allocator.print("Fossil workspace: {s}. The task remains unaccepted.", .{@errorName(err)}) };
