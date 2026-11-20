@@ -7450,14 +7450,14 @@ fn processQueuedPromptLoop(
             if (decision.route == .unresolved) {
                 try deps.push_system_notice(deps.ctx, "Resolving this request against the conversation...");
                 const active = try manager.active(config.fossil_session_id.?);
-                const context = try std.json.Stringify.valueAlloc(arena, .{
-                    .latest_message = @import("review_evidence.zig").View.prefix(job.prompt, 8192),
-                    .message_bytes = job.prompt.len,
-                    .conversation = try task_governance.referenceConversation(arena, route_history),
-                    .active_task = if (active) |task| task.id else @as(?[]const u8, null),
-                    .active_task_state = if (active) |task| @tagName(task.state) else @as(?[]const u8, null),
-                    .classifier = decision,
-                }, .{});
+                const context = try routing.resolutionContext(
+                    arena,
+                    job.prompt,
+                    route_history,
+                    if (active) |task| task.id else null,
+                    if (active) |task| @tagName(task.state) else null,
+                    decision,
+                );
                 var delivery: agent_stream_provider.DeliveryCertainty = .init();
                 var attempt: agent_stream_provider.AttemptEvidence = .{};
                 var event_context: u8 = 0;
@@ -7490,7 +7490,7 @@ fn processQueuedPromptLoop(
                     _ = summary_accumulator_ptr.reconcileTokenRequest(resolved.usage, false);
                 }
             }
-            retrieval_turn = decision.route != .work;
+            retrieval_turn = routing.finalizeDecision(&decision, job.prompt);
             classified_work = decision.route == .work and (decision.classification != null or decision.resolution != null or decision.capability != null);
             if (classified_work) request_capability = decision.capability orelse @import("../../workspace/realisation_selection.zig").resolveCapability(decision.classification, job.prompt);
             if (retrieval_turn) {
@@ -8751,7 +8751,7 @@ fn processQueuedPromptLoop(
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
-                if (err == error.InvalidToolName and config.contract_review_enabled and !cancel_requested) {
+                if (err == error.InvalidToolName and !cancel_requested) {
                     var advertised: std.ArrayList([]const u8) = .empty;
                     try advertised.appendSlice(arena, model_request.tools.advertised_names);
                     for (model_request.tools.selected_dynamic) |tool| try advertised.append(arena, tool.name);
@@ -8797,7 +8797,7 @@ fn processQueuedPromptLoop(
                         if (diagnostic) |failure| rejected_name = failure.name();
                         var auto_loaded = false;
                         const dynamic_before = advertised_dynamic_tools.len;
-                        if (rejected_name.len > 0) {
+                        if (rejected_name.len > 0 and !retrieval_turn) {
                             const call = types.ToolCall{
                                 .id = "",
                                 .name = rejected_name,
@@ -8820,7 +8820,10 @@ fn processQueuedPromptLoop(
                             try deps.push_system_notice(deps.ctx, "Loaded the rejected tool schema; retrying with it advertised...");
                             continue :agent_steps_loop;
                         }
-                        try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}. Use capability_search to discover and load any other configured tool before calling it. Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{try std.json.Stringify.valueAlloc(arena, advertised.items, .{})}) });
+                        try within_turn_suffix.append(arena, .{ .role = .user, .content = try arena.print("Your last tool proposal was rejected before execution because its name was missing, malformed, or absent from this request's tool definitions. No calls in that rejected response were executed. Use only the exact currently advertised names: {s}.{s} Do not repeat earlier successful actions. Return a fresh corrected proposal.", .{
+                            try std.json.Stringify.valueAlloc(arena, advertised.items, .{}),
+                            if (retrieval_turn) "" else " Use capability_search to discover and load any other configured tool before calling it.",
+                        }) });
                         try deps.push_system_notice(deps.ctx, "Refreshing tool selection after a rejected tool name...");
                         continue :agent_steps_loop;
                     }
@@ -14145,5 +14148,78 @@ test "recycled and resumed managed turns hydrate specialist required_tools and s
     try std.testing.expectEqual(@as(usize, 2), retained_names.len);
     for (retained_names) |name| {
         try std.testing.expect(!std.mem.eql(u8, name, "shell"));
+    }
+}
+
+test "InvalidToolName performs one-step corrective recovery even when contract_review_enabled is false" {
+    const support = @import("tests/support.zig");
+    const builtin_tools = @import("../../../builtins/tools.zig");
+    const alloc = std.testing.allocator;
+
+    // 1. Single InvalidToolName recovers on retry and records the completed turn.
+    {
+        const completions = [_]support.FakeCompletion{
+            .{ .stream_error = error.InvalidToolName },
+            .{ .content = "Recovered using the advertised workspace_content tool set." },
+        };
+        var gateway = support.FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var fake = support.FakeAgentRuntimeDeps.init(alloc);
+        fake.tool_registry = builtin_tools.registry;
+        fake.enable_recovery_checkpoint = true;
+        defer fake.deinit();
+        var fixture: support.PromptFixture = .{};
+        var config = fixture.config();
+        config.contract_review_enabled = false;
+        config.advertised_tool_names = &.{ "workspace_content", "read_tool_result" };
+        config.advertised_functions = &.{
+            builtin_tools.workspace_content.model_schema,
+            builtin_tools.read_tool_result.model_schema,
+        };
+        var job = fixture.job();
+        job.prompt = @constCast("Inspect the grant capability notes.");
+
+        try support.runFakePrompt(&gateway, &fake, config, job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try support.expectBodyContains(&gateway, 1, "Use only the exact currently advertised names");
+        try support.expectBodyContains(&gateway, 1, "workspace_content");
+        try std.testing.expectEqual(@as(usize, 1), fake.finish_event_count);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.completed, fake.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), fake.history_turns.items.len);
+        try std.testing.expectEqualStrings("Inspect the grant capability notes.", fake.history_turns.items[0].assistant.user.text);
+        try std.testing.expectEqualStrings(
+            "Recovered using the advertised workspace_content tool set.",
+            fake.history_turns.items[0].assistant.assistant,
+        );
+    }
+
+    // 2. Repeated InvalidToolName stops cleanly with failed outcome and retains user prompt in history.
+    {
+        const completions = [_]support.FakeCompletion{
+            .{ .stream_error = error.InvalidToolName },
+            .{ .stream_error = error.InvalidToolName },
+        };
+        var gateway = support.FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var fake = support.FakeAgentRuntimeDeps.init(alloc);
+        fake.tool_registry = builtin_tools.registry;
+        fake.enable_recovery_checkpoint = true;
+        defer fake.deinit();
+        var fixture: support.PromptFixture = .{};
+        var config = fixture.config();
+        config.contract_review_enabled = false;
+        config.advertised_tool_names = &.{"workspace_content"};
+        config.advertised_functions = &.{builtin_tools.workspace_content.model_schema};
+        var job = fixture.job();
+        job.prompt = @constCast("Second failure check.");
+
+        try support.runFakePrompt(&gateway, &fake, config, job);
+
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(@as(usize, 1), fake.finish_event_count);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, fake.finalized_outcome.?);
+        try std.testing.expectEqual(@as(usize, 1), fake.history_turns.items.len);
+        try std.testing.expectEqualStrings("Second failure check.", fake.history_turns.items[0].assistant.user.text);
     }
 }

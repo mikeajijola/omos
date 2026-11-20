@@ -79,6 +79,113 @@ const resolution_schema: schemas.FunctionSchema = .{
     }, .required = &.{ "route", "reason" }, .additional_properties = false },
 };
 pub const Resolution = struct { route: Route, reason: []const u8, model: []const u8, usage: types.Usage = .{} };
+pub const max_resolution_context_bytes: usize = 48 * 1024;
+const max_resolution_conversation_bytes: usize = 32 * 1024;
+const max_resolution_turns: usize = 16;
+const max_resolution_turn_bytes: usize = 4096;
+
+pub const ConversationTurn = struct {
+    role: enum { user, assistant },
+    text: []const u8,
+    bytes: usize,
+    truncated: bool,
+};
+
+pub const BoundedConversation = struct {
+    messages: []const ConversationTurn,
+    earlier_turns_omitted: usize,
+};
+
+/// Build a bounded JSON context packet (at most 48 KiB, comfortably below
+/// `resolve`'s 96 KiB ceiling) by tail-slicing recent user and assistant turns
+/// and recording `earlier_turns_omitted`. Caller owns the returned slice.
+pub fn resolutionContext(
+    alloc: std.mem.Allocator,
+    prompt: []const u8,
+    history: []const types.ChatMessage,
+    active_task: ?[]const u8,
+    active_task_state: ?[]const u8,
+    classifier: Decision,
+) ![]u8 {
+    const view = @import("../agent/runtime/review_evidence.zig").View;
+    var selected: std.ArrayList(ConversationTurn) = .empty;
+    var remaining: usize = max_resolution_conversation_bytes;
+    var omitted: usize = 0;
+    var index = history.len;
+    while (index > 0) {
+        index -= 1;
+        const message = history[index];
+        if (message.permission_feedback or message.context_origin == .handoff or message.tool_calls.len != 0) continue;
+        if (message.role != .assistant and !(message.role == .user and message.context_origin == .user_turn)) continue;
+        const content = message.content orelse continue;
+        if (content.len == 0) continue;
+        if (selected.items.len == max_resolution_turns or remaining < 256) {
+            omitted += 1;
+            continue;
+        }
+        var text = view.prefix(content, @min(max_resolution_turn_bytes, remaining));
+        var encoded = try std.json.Stringify.valueAlloc(alloc, text, .{});
+        while (encoded.len + 128 > remaining and text.len > 0) {
+            text = view.prefix(text, text.len / 2);
+            encoded = try std.json.Stringify.valueAlloc(alloc, text, .{});
+        }
+        if (text.len == 0) {
+            omitted += 1;
+            continue;
+        }
+        remaining -= encoded.len + 128;
+        try selected.append(alloc, .{
+            .role = if (message.role == .user) .user else .assistant,
+            .text = text,
+            .bytes = content.len,
+            .truncated = text.len != content.len,
+        });
+    }
+    std.mem.reverse(ConversationTurn, selected.items);
+
+    var drop_front: usize = 0;
+    var latest_limit: usize = 8192;
+    while (true) {
+        const packet = try std.json.Stringify.valueAlloc(alloc, .{
+            .latest_message = view.prefix(prompt, latest_limit),
+            .message_bytes = prompt.len,
+            .conversation = BoundedConversation{
+                .messages = selected.items[drop_front..],
+                .earlier_turns_omitted = omitted + drop_front,
+            },
+            .active_task = active_task,
+            .active_task_state = active_task_state,
+            .classifier = classifier,
+        }, .{});
+        if (packet.len <= max_resolution_context_bytes) return packet;
+        if (drop_front < selected.items.len) {
+            drop_front += 1;
+            continue;
+        }
+        if (latest_limit > 512) {
+            latest_limit /= 2;
+            continue;
+        }
+        return packet;
+    }
+}
+
+/// Apply the post-resolution routing invariant: only explicit `.conversation`
+/// and `.retrieval` decisions enter the bounded 3-tool read-only mode. Any
+/// remaining `.unresolved` route falls back to `.work` using deliverable
+/// classification when available so actionable requests retain full tools.
+pub fn finalizeDecision(decision: *Decision, prompt: []const u8) bool {
+    if (decision.route == .unresolved) {
+        if (@import("realisation_selection.zig").classifyDeliverable(prompt)) |cap| {
+            decision.capability = cap;
+        }
+        decision.route = .work;
+        if (decision.resolution == null) {
+            decision.reason = "unresolved_fallback_work";
+        }
+    }
+    return decision.route == .conversation or decision.route == .retrieval;
+}
 
 /// One bounded contextual resolution call. It can select a route, never
 /// execute actor tools, revise a contract, or approve an action.
@@ -91,7 +198,8 @@ pub fn resolve(alloc: std.mem.Allocator, provider: streams.Provider, base: strea
     request.tools = .{ .additional_functions = &.{resolution_schema} };
     request.tool_choice = .required;
     request.provider_options.parallel_tool_calls = false;
-    request.max_output_tokens = 512;
+    // Reasoning providers count internal reasoning against this budget too.
+    request.max_output_tokens = 2048;
     var result = try gateway.streamModelCompletion(provider, alloc, request);
     defer result.deinit(alloc);
     if (result != .completed) return error.RoutingResolutionUnavailable;
@@ -166,7 +274,7 @@ pub fn resolveContract(alloc: std.mem.Allocator, provider: streams.Provider, bas
     request.tool_choice = .required;
     request.provider_options.parallel_tool_calls = false;
     // Reasoning providers count internal reasoning against this budget too.
-    request.max_output_tokens = 1024;
+    request.max_output_tokens = 2048;
     var result = try gateway.streamModelCompletion(provider, alloc, request);
     defer result.deinit(alloc);
     if (result != .completed) return error.RoutingResolutionUnavailable;
@@ -176,4 +284,119 @@ pub fn resolveContract(alloc: std.mem.Allocator, provider: streams.Provider, bas
     if (!std.mem.eql(u8, call.name, intent_schema.name) or call.argument_integrity != .valid) return error.InvalidRoutingResolution;
     const decision = try @import("../shared/record_json.zig").decode(struct { choice: @import("contract_channels.zig").Intent }, alloc, call.arguments_json, .{});
     return .{ .choice = decision.choice, .usage = completion.usage };
+}
+
+test "resolutionContext bounds over-100KB conversation history and resolve sets reasoning token budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var history: std.ArrayList(types.ChatMessage) = .empty;
+    for (0..45) |turn_idx| {
+        const user_text = try alloc.print("Turn {d} user discussion: {s}", .{
+            turn_idx,
+            @import("../shared/text_utils.zig").repeat("prior context words ", 90),
+        });
+        const assistant_text = try alloc.print("Turn {d} assistant summary: {s}", .{
+            turn_idx,
+            @import("../shared/text_utils.zig").repeat("detailed job campaign status ", 90),
+        });
+        try history.append(alloc, .{ .role = .user, .content = user_text, .context_origin = .user_turn });
+        try history.append(alloc, .{ .role = .assistant, .content = assistant_text });
+    }
+    var raw_total: usize = 0;
+    for (history.items) |msg| raw_total += msg.content.?.len;
+    try std.testing.expect(raw_total > 120 * 1024);
+
+    const context = try resolutionContext(
+        alloc,
+        "I want you to develop a capability similar to job applications for grant applications",
+        history.items,
+        null,
+        null,
+        .{ .route = .unresolved, .reason = "uncertain_choice" },
+    );
+    try std.testing.expect(context.len <= max_resolution_context_bytes);
+    try std.testing.expect(context.len < 96 * 1024);
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, context, .{});
+    const conv = parsed.object.get("conversation").?.object;
+    const omitted = conv.get("earlier_turns_omitted").?.integer;
+    const messages = conv.get("messages").?.array.items;
+    try std.testing.expect(omitted > 0);
+    try std.testing.expect(messages.len > 0 and messages.len <= max_resolution_turns);
+    try std.testing.expect(std.mem.find(u8, messages[messages.len - 1].object.get("text").?.string, "Turn 44 assistant summary") != null);
+
+    const Mock = struct {
+        seen_max_output_tokens: ?u32 = null,
+        seen_context_len: usize = 0,
+        calls: [1]types.ToolCall = .{.{
+            .id = "route-1",
+            .name = "omos_request_route",
+            .arguments_json = "{\"route\":\"work\",\"reason\":\"Develop a new grant application capability.\"}",
+        }},
+
+        fn stream(raw: ?*anyopaque, _: std.mem.Allocator, req: streams.ModelRequest) anyerror!streams.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try req.admission.admit();
+            self.seen_max_output_tokens = req.max_output_tokens;
+            self.seen_context_len = req.messages[0].content.?.len;
+            return .{ .completed = .{
+                .completion = .{
+                    .finish_reason = .tool_calls,
+                    .tool_calls = &self.calls,
+                },
+            } };
+        }
+    };
+    var mock: Mock = .{};
+    var provider = streams.unavailable_provider;
+    provider.context = &mock;
+    provider.stream_fn = Mock.stream;
+    var delivery: streams.DeliveryCertainty = .init();
+    var attempt: streams.AttemptEvidence = .{};
+    var event_ctx: u8 = 0;
+    var cancel = std.atomic.Value(bool).init(false);
+    const noop_emit = struct {
+        fn emit(_: *anyopaque, _: streams.Event) void {}
+    }.emit;
+
+    const resolved = try resolve(alloc, provider, .{
+        .credential = .host_managed,
+        .model = "gemini-4-hydrogen",
+        .retry_count = 0,
+        .messages = &.{},
+        .tool_choice = .required,
+        .provider_options = .{},
+        .trace_ctx = .{},
+        .content_capture_limit = 8192,
+        .delivery = &delivery,
+        .attempt_evidence = &attempt,
+        .events = .{ .context = &event_ctx, .emit_fn = noop_emit },
+        .cancel_flag = &cancel,
+    }, context);
+    try std.testing.expectEqual(Route.work, resolved.route);
+    try std.testing.expectEqual(@as(?u32, 2048), mock.seen_max_output_tokens);
+    try std.testing.expectEqual(context.len, mock.seen_context_len);
+}
+
+test "finalizeDecision keeps conversation and retrieval read-only and promotes unresolved to work" {
+    var conv: Decision = .{ .route = .conversation, .reason = "choice_threshold_v1" };
+    try std.testing.expect(finalizeDecision(&conv, "Tell me about our setup"));
+    try std.testing.expectEqual(Route.conversation, conv.route);
+
+    var ret: Decision = .{ .route = .retrieval, .reason = "choice_threshold_v1" };
+    try std.testing.expect(finalizeDecision(&ret, "What was the last application?"));
+    try std.testing.expectEqual(Route.retrieval, ret.route);
+
+    var unresolved_capability: Decision = .{ .route = .unresolved, .reason = "uncertain_choice" };
+    try std.testing.expect(!finalizeDecision(&unresolved_capability, "I want you to develop a capability similar to job applications for grant applications"));
+    try std.testing.expectEqual(Route.work, unresolved_capability.route);
+    try std.testing.expectEqual(request_plan.Capability.coding_task, unresolved_capability.capability.?);
+    try std.testing.expectEqualStrings("unresolved_fallback_work", unresolved_capability.reason);
+
+    var unresolved_followup: Decision = .{ .route = .unresolved, .reason = "uncertain_choice" };
+    try std.testing.expect(!finalizeDecision(&unresolved_followup, "Yeah but i'm talking about grant applications"));
+    try std.testing.expectEqual(Route.work, unresolved_followup.route);
+    try std.testing.expectEqual(request_plan.Capability.general_task, unresolved_followup.capability.?);
 }
