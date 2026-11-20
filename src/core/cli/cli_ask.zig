@@ -678,6 +678,7 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    recovered_required_tools: []const []const u8 = &.{},
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -839,7 +840,27 @@ const AskContext = struct {
         }
         self.tool_call_records.deinit(self.alloc);
         if (self.resolved_provider) |provider| self.alloc.free(provider);
+        for (self.recovered_required_tools) |tool_name| self.alloc.free(tool_name);
+        if (self.recovered_required_tools.len > 0) self.alloc.free(self.recovered_required_tools);
         self.loaded_skills.deinit(self.alloc);
+    }
+
+    fn setRecoveredRequiredTools(self: *AskContext, tools: []const []const u8) !void {
+        for (self.recovered_required_tools) |tool_name| self.alloc.free(tool_name);
+        if (self.recovered_required_tools.len > 0) self.alloc.free(self.recovered_required_tools);
+        self.recovered_required_tools = &.{};
+        if (tools.len == 0) return;
+        const owned = try self.alloc.alloc([]const u8, tools.len);
+        var count: usize = 0;
+        errdefer {
+            for (owned[0..count]) |item| self.alloc.free(item);
+            self.alloc.free(owned);
+        }
+        for (tools, owned) |src, *dst| {
+            dst.* = try self.alloc.dupe(u8, src);
+            count += 1;
+        }
+        self.recovered_required_tools = owned;
     }
 
     fn lifecycleContext(self: *AskContext) agent_runtime.LifecycleContext {
@@ -1220,7 +1241,13 @@ const AskContext = struct {
             .permission_rules = self.permission_rules,
             .coordinator_mode = if (self.deps.ui_host) |ui| ui.coordinator_mode else false,
             .background_authority = if (self.deps.ui_host) |ui| ui.background_authority else null,
-            .required_tools = if (self.deps.ui_host) |ui| if (ui.background_authority) |authority| authority.required_tools else &.{} else &.{},
+            .required_tools = if (self.deps.ui_host) |ui|
+                if (ui.background_authority) |authority|
+                    if (authority.required_tools.len > 0) authority.required_tools else self.recovered_required_tools
+                else
+                    self.recovered_required_tools
+            else
+                self.recovered_required_tools,
             .tool_registry = self.toolRegistry(),
             .subagent_host = self.subagent_host,
             .subagent_caller_id = self.activeSessionId(),
@@ -2245,8 +2272,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         null;
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
+    const recovered_recipe = try hydrateAskContractRecipe(&ctx, dynamic_tool_arena.allocator(), owned_prompt);
     const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
-    const effective_skill_bindings = if (inherited_authority) |authority|
+    const base_skill_bindings = if (inherited_authority) |authority|
         if (authority.skill_bindings.len > 0 or authority.declared_skills.len > 0)
             try @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
                 dynamic_tool_arena.allocator(),
@@ -2269,6 +2297,16 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             ctx.workspace_root,
             loaded_skills.skills,
         );
+    const effective_skill_bindings = if (recovered_recipe.skill_bindings.len > 0)
+        try @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
+            dynamic_tool_arena.allocator(),
+            recovered_recipe.skill_bindings,
+            base_skill_bindings,
+            ctx.workspace_root,
+            loaded_skills.skills,
+        )
+    else
+        base_skill_bindings;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
@@ -2826,6 +2864,34 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
 }
 
+fn hydrateAskContractRecipe(
+    ctx: *AskContext,
+    arena: Allocator,
+    prompt: []const u8,
+) !@import("../workspace/execution_recovery.zig").SpecialistRecipe {
+    if (comptime std_builtin.target.cpu.arch.isWasm()) return .{};
+    if (!completion_review.enabled()) return .{};
+    if (ctx.writable == null and ctx.v2 == null) return .{};
+    if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return .{};
+    const session_id = ctx.activeSessionId() orelse return .{};
+    const manager = (try @import("../workspace/fossil_workspace.zig").Manager.bound(arena)) orelse return .{};
+    const active_or_recyclable: ?@import("../workspace/fossil_workspace.zig").Task = if (try manager.active(session_id)) |active|
+        if (active.state == .accepted or active.state == .conflict) null else active
+    else blk: {
+        const recyclable_id = (@import("../workspace/contract_admission.zig").findRecyclableContract(
+            manager,
+            "",
+            prompt,
+            ctx.workspace_root,
+        ) catch null) orelse break :blk null;
+        break :blk manager.loadTask(recyclable_id) catch null;
+    };
+    const task = active_or_recyclable orelse return .{};
+    const recipe = try @import("../workspace/execution_recovery.zig").recoverRecipe(arena, manager, task);
+    try ctx.setRecoveredRequiredTools(recipe.required_tools);
+    return recipe;
+}
+
 fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_stream_provider.DynamicFunctionTool {
     if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return &.{};
     const loaded = if (ctx.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
@@ -2845,11 +2911,10 @@ fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_str
     for (loaded.tools) |selected| {
         try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(arena, &tools, selected);
     }
-    if (ctx.deps.ui_host) |ui| if (ui.background_authority) |authority| {
-        if (authority.required_tools.len > 0) {
-            try tool_runtime.prebindRequiredDynamicTools(ctx.toolContext(), arena, authority.required_tools, &tools);
-        }
-    };
+    const effective_required = ctx.toolContext().required_tools;
+    if (effective_required.len > 0) {
+        try tool_runtime.prebindRequiredDynamicTools(ctx.toolContext(), arena, effective_required, &tools);
+    }
     return tools.items;
 }
 
@@ -7803,6 +7868,105 @@ test "fx ask prebinds resolved skills and re-exports required tools into the age
     try std.testing.expectEqual(@as(usize, 1), resolved.len);
     try std.testing.expectEqualStrings("browseros-neo", resolved[0].name);
     try std.testing.expectEqualStrings("/Users/example/project/skills/browseros-neo", resolved[0].path);
+}
+
+test "fx ask hydrates specialist recipe on resume and recycle without bypassing tool permissions" {
+    if (comptime std_builtin.target.cpu.arch.isWasm()) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project");
+    const home_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_dir);
+    const project_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project");
+    defer alloc.free(project_dir);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ask_home = try TestAskHome.install(alloc, home_dir);
+    defer ask_home.deinit();
+
+    completion_review.configureInvocation("omos");
+    defer completion_review.configureInvocation("fx");
+
+    const fossil_workspace = @import("../workspace/fossil_workspace.zig");
+    const repo_path = try std.Io.Dir.path.join(arena, &.{ home_dir, "repo.fossil" });
+    _ = try fossil_workspace.Manager.init(arena, repo_path);
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup);
+
+    // 1. Start an AskContext session and seed a job_application contract on its session ID.
+    var resumed_ctx = AskContext.init(alloc, testConfig(), deps, project_dir);
+    defer resumed_ctx.deinit();
+    try resumed_ctx.initializeSessionStores();
+    const session_id = resumed_ctx.activeSessionId().?;
+
+    var seed_turn = (try @import("../workspace/managed_task.zig").Turn.beginResolvedWithContext(
+        arena,
+        session_id,
+        null,
+        project_dir,
+        "Apply to outside IR35 roles via LinkedIn Easy Apply",
+        false,
+        null,
+        &.{},
+    )).?;
+    try seed_turn.retain();
+    seed_turn.release();
+
+    // Resuming with "continue" hydrates the persisted specialist recipe into AskContext.toolContext().
+    const resumed_recipe = try hydrateAskContractRecipe(&resumed_ctx, arena, "continue");
+    try std.testing.expectEqualStrings("job_application_browser", resumed_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), resumed_ctx.toolContext().required_tools.len);
+    try std.testing.expectEqualStrings("shell", resumed_ctx.toolContext().required_tools[0]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", resumed_ctx.toolContext().required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), resumed_recipe.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", resumed_recipe.skill_bindings[0]);
+
+    // 2. Starting a second AskContext session with a matching job_application prompt recycles the recipe.
+    var reuse_ctx = AskContext.init(alloc, testConfig(), deps, project_dir);
+    defer reuse_ctx.deinit();
+    try reuse_ctx.initializeSessionStores();
+    const reused_recipe = try hydrateAskContractRecipe(
+        &reuse_ctx,
+        arena,
+        "Submit job applications for UK contract roles on LinkedIn",
+    );
+    try std.testing.expectEqualStrings("job_application_browser", reused_recipe.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), reuse_ctx.toolContext().required_tools.len);
+
+    // 3. Permissions remain strictly enforced: pre-bound shell call still requires approval in .ask mode
+    // and is rejected when denied by permission_rules.
+    const shell_call: ToolCall = .{
+        .id = "call-shell-1",
+        .name = "shell",
+        .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"echo test\"}}",
+    };
+    try std.testing.expectError(
+        error.NonInteractivePermissionRequired,
+        requestToolPermissionOutcome(@ptrCast(&reuse_ctx), arena, shell_call, .ask, &.{}, &.{}),
+    );
+
+    var deny_rule = [_]types.PermissionRule{
+        .{ .permission = @constCast("shell"), .pattern = @constCast("*"), .action = .deny },
+    };
+    reuse_ctx.permission_rules = .{ .rules = &deny_rule };
+    defer reuse_ctx.permission_rules = .{};
+    const denied_outcome = try tool_admission.requestPermissionOutcome(
+        reuse_ctx.toolContext().admissionInput(),
+        arena,
+        shell_call,
+        .auto,
+        &.{},
+    );
+    try std.testing.expectEqual(ToolPermissionDecision.deny, denied_outcome.decision);
 }
 
 test "fx ask auto mode uses automatic allow for external prepared file mutation" {

@@ -195,18 +195,23 @@ pub const Db = struct {
         return self.reconstructRid(alloc, rid);
     }
 
-    /// Reconstruct and return the raw bytes of `file_path` at `rev_or_branch`.
-    /// Equivalent to `fossil cat -r <rev_or_branch> <file_path>`.
-    pub fn readFileAtRevision(
-        self: *Db,
-        alloc: Allocator,
-        rev_or_branch: []const u8,
-        file_path: []const u8,
-    ) ![]u8 {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
+    pub const RevisionIndex = struct {
+        db: *Db,
+        artifacts: std.StringHashMap([]const u8),
 
+        pub fn readFile(self: *const RevisionIndex, alloc: Allocator, file_path: []const u8) ![]u8 {
+            const artifact_uuid = self.artifacts.get(file_path) orelse return error.FileNotFoundInRevision;
+            const artifact_rid = (try self.db.findRidByExactUuid(artifact_uuid)) orelse return error.MissingArtifact;
+            const content = try self.db.reconstructRid(alloc, artifact_rid);
+            errdefer alloc.free(content);
+            try fossil_manifest.verifyObject(artifact_uuid, content);
+            return content;
+        }
+    };
+
+    /// Parse and resolve the manifest for `rev_or_branch` once in `arena` so
+    /// multi-file batch verifiers do not re-parse large branch manifests per file.
+    pub fn indexRevision(self: *Db, arena: Allocator, rev_or_branch: []const u8) !RevisionIndex {
         const checkin_ref = try self.resolveCheckin(arena, rev_or_branch);
         const manifest_bytes = try self.reconstructRid(arena, checkin_ref.rid);
         const parsed = try fossil_manifest.parse(arena, manifest_bytes);
@@ -218,17 +223,27 @@ pub const Db = struct {
             break :blk try fossil_manifest.resolve(arena, baseline_manifest, parsed);
         } else parsed.files;
 
+        var artifacts = std.StringHashMap([]const u8).init(arena);
+        try artifacts.ensureTotalCapacity(@intCast(files.len));
         for (files) |file| {
-            if (std.mem.eql(u8, file.path, file_path)) {
-                const artifact_uuid = file.artifact orelse return error.InvalidFossilManifest;
-                const artifact_rid = (try self.findRidByExactUuid(artifact_uuid)) orelse return error.MissingArtifact;
-                const content = try self.reconstructRid(alloc, artifact_rid);
-                errdefer alloc.free(content);
-                try fossil_manifest.verifyObject(artifact_uuid, content);
-                return content;
-            }
+            const artifact_uuid = file.artifact orelse return error.InvalidFossilManifest;
+            try artifacts.put(file.path, artifact_uuid);
         }
-        return error.FileNotFoundInRevision;
+        return .{ .db = self, .artifacts = artifacts };
+    }
+
+    /// Reconstruct and return the raw bytes of `file_path` at `rev_or_branch`.
+    /// Equivalent to `fossil cat -r <rev_or_branch> <file_path>`.
+    pub fn readFileAtRevision(
+        self: *Db,
+        alloc: Allocator,
+        rev_or_branch: []const u8,
+        file_path: []const u8,
+    ) ![]u8 {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const rev_index = try self.indexRevision(arena_state.allocator(), rev_or_branch);
+        return rev_index.readFile(alloc, file_path);
     }
 
     /// Execute a read-only SQL query against the Fossil SQLite database.
