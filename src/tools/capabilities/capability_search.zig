@@ -160,7 +160,7 @@ fn addWorkspaceResults(ctx: tool_dispatch.DispatchContext, input: *const Input, 
     var combined = initial;
     if (comptime !@import("builtin").target.cpu.arch.isWasm()) {
         if (input.server == null and ctx.fossil_workspace_available) {
-            var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             if (try @import("../../core/workspace/fossil_workspace.zig").Manager.bound(arena.allocator())) |manager| {
                 const task = if (ctx.fossil_session_id) |id| try manager.active(id) else null;

@@ -5736,7 +5736,7 @@ fn processQueuedPromptInner(
     finalization: *TurnFinalizationGuard,
     agent: *runtime_agent.Agent,
 ) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var job = borrowed_job;
@@ -5814,7 +5814,7 @@ fn processQueuedPromptInner(
 
     // The overlay arena is reset for every model step so refreshed env,
     // background snapshots do not accumulate for the whole turn.
-    var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer mem_utils.deinit_arena(overlay_arena_state);
 
     var local_grants: std.ArrayList(PermissionGrant) = .empty;
@@ -7086,7 +7086,10 @@ noinline fn assessCompletionAttempt(
     const policy = if (input.managed) |turn| if (turn.task.model_basis) |basis| basis.execution.review else @import("../../workspace/definition.zig").ReviewPolicy{} else @import("../../workspace/definition.zig").ReviewPolicy{};
     const attempt_deadline = initial_deadline orelse std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(policy.attempt_timeout_ms) });
     const collection_deadline = if (std.Io.Clock.Timestamp.compare(attempt_deadline, .lt, total_deadline)) attempt_deadline else total_deadline;
-    const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(arena, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
+    var rev_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer mem_utils.deinit_arena(rev_arena_state);
+    const rev_alloc = rev_arena_state.allocator();
+    const prior_evidence = if (input.managed) |turn| try turn.beforeReviewControlled(rev_alloc, input.messages, input.config.cancel_flag, collection_deadline) else &.{};
     var attempt_usage: types.Usage = .{};
     defer if (attempt_usage.input_tokens != null or attempt_usage.output_tokens != null) {
         if (input.usage_owner) |owner| owner.observeUsage(attempt_usage);
@@ -7097,7 +7100,7 @@ noinline fn assessCompletionAttempt(
     const review_stream = input.config.contract_review_stream_provider orelse deps.agent_stream_provider;
     const review_provider = input.config.contract_review_provider orelse input.job.provider;
     const review_credential = try completion_review.reviewerCredential(input.job.provider, review_provider, activeCredentialLease(input.api_key, input.job.*), input.config.contract_review_credential);
-    const result = completion_review.assess(arena, review_stream, .{
+    const result = completion_review.assess(rev_alloc, review_stream, .{
         .policy = policy,
         .token_spent = token_spent,
         .managed_evidence = input.managed != null,
@@ -7105,7 +7108,11 @@ noinline fn assessCompletionAttempt(
         .journal = if (input.managed) |turn| turn.journal() else null,
         .provider = review_provider,
         .definition = if (input.managed) |turn| turn.task.definition else null,
-        .original_request = if (input.managed) |turn| try turn.manager.originalRequest(turn.task) else null,
+        .original_request = if (input.managed) |turn| blk: {
+            var reader = turn.manager;
+            reader.alloc = rev_alloc;
+            break :blk try reader.originalRequest(turn.task);
+        } else null,
         .prior_evidence = prior_evidence,
         .prior_payloads = if (input.managed) |turn| turn.prior_payloads else &.{},
         .prior_review_pages = if (input.managed) |turn| turn.prior_review_pages else &.{},
@@ -7140,14 +7147,16 @@ noinline fn assessCompletionAttempt(
     debug_trace.eventf("agent", "contract_assessment", .{ .turn_id = input.turn_id }, "disposition={s} step={d}", .{ @tagName(result.decision.disposition), input.step });
     if (input.managed) |turn| {
         try turn.sealReview();
-        turn.assessment = result.assessment;
-        if (!try turn.sourceAssessmentCurrent(result.assessment)) {
+        turn.assessment = try arena.dupe(u8, result.assessment);
+        if (!try turn.sourceAssessmentCurrent(turn.assessment)) {
             try turn.manager.record(turn.task, "stale_validation", .{ .reason = "Source bytes changed since the cited validation evidence." });
             return .{ .disposition = .continue_work, .feedback = "The cited coding validation does not cover the current source bytes. Inspect the final source and run the applicable check against that state before claiming completion. Preserve completed work and external effects." };
         }
         if (result.decision.disposition == .blocked) turn.task = try turn.manager.setState(turn.task.id, .blocked);
     }
-    return result.decision;
+    var decision = result.decision;
+    decision.feedback = try arena.dupe(u8, result.decision.feedback);
+    return decision;
 }
 
 noinline fn resolveContractIntent(deps: *const AgentRuntimeDeps, alloc: Allocator, config: *const Config, job: QueuedPrompt, summary: *runtime_telemetry.TurnSummaryAccumulator, manager: @import("../../workspace/fossil_workspace.zig").Manager, task_id: []const u8, history: []const ChatMessage, turn_id: u64) !@import("../../workspace/contract_channels.zig").Intent {
@@ -7223,6 +7232,8 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         _ = summary.reconcileTokenRequest(usage, false);
     };
     const repository_context = input.job.context_snapshot.modelVisibleBytes();
+    var reader = turn.manager;
+    reader.alloc = alloc;
     const packet = try std.json.Stringify.valueAlloc(alloc, .{
         .workspaceRoot = turn.task.project_root,
         .rootUserContext = @import("review_evidence.zig").View.prefix(input.root_user_context, 8192),
@@ -7230,11 +7241,11 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
         .referenceConversation = try task_governance.referenceConversation(alloc, input.conversation),
         .repositoryContext = @import("review_evidence.zig").View.prefix(repository_context, 16384),
         .repositoryContextBytes = repository_context.len,
-        .originalRequest = try turn.manager.originalRequest(turn.task),
+        .originalRequest = try reader.originalRequest(turn.task),
         .amendments = turn.task.amendments,
         .pendingAmendments = turn.task.amendments[@min(turn.task.planned_amendments, turn.task.amendments.len)..],
         .contract = turn.task.definition,
-        .model = try turn.manager.planningDefinitionSnapshot(turn.task),
+        .model = try reader.planningDefinitionSnapshot(turn.task),
         .step = input.step,
     }, .{});
     const retained_evidence = if (!planning) try turn.beforeReview(alloc, input.messages) else &.{};
@@ -7252,20 +7263,26 @@ noinline fn governManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, s
 const governance_pause_notice = "The task requirements could not be validated by the review service. Work is retained, but execution cannot start or change its contract until those requirements are validated.";
 
 noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, summary: *runtime_telemetry.TurnSummaryAccumulator, input: ContractCandidate) !bool {
+    _ = alloc;
     const turn = input.managed orelse return false;
     const basis = turn.task.model_basis orelse return false;
     if (basis.capability != null and !turn.task.revision_pending) return false;
     const revising = basis.capability != null;
     try deps.push_system_notice(deps.ctx, if (revising) "Revising affected requirements from the user update..." else "Planning against the pinned workspace model...");
-    const reply = try governManagedTask(deps, alloc, summary, input, true, null);
+    var plan_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer mem_utils.deinit_arena(plan_arena);
+    const p_alloc = plan_arena.allocator();
+    const reply = try governManagedTask(deps, p_alloc, summary, input, true, null);
     if (revising) {
-        const revision = try record_json.decode(task_governance.Revision, alloc, reply.raw, .{});
+        const revision = try record_json.decode(task_governance.Revision, p_alloc, reply.raw, .{});
         turn.task = try turn.manager.revisePlan(turn.task, revision.capability, revision.summary, revision.obligations, revision.checks, revision.superseded);
     } else {
-        const plan = try record_json.decode(task_governance.Plan, alloc, reply.raw, .{});
+        const plan = try record_json.decode(task_governance.Plan, p_alloc, reply.raw, .{});
         turn.task = try turn.manager.setPlan(turn.task, plan.capability, plan.summary, plan.obligations, plan.checks);
     }
-    _ = try turn.manager.checkpoint(turn.task);
+    var cp_manager = turn.manager;
+    cp_manager.alloc = p_alloc;
+    _ = try cp_manager.checkpoint(turn.task);
     return true;
 }
 
@@ -7960,7 +7977,9 @@ fn processQueuedPromptLoop(
             }
             if (governance.reviewDue(policy)) progress_check: {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
-                const reply = governManagedTask(deps, arena, &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false, &governance) catch |err| {
+                var gov_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer mem_utils.deinit_arena(gov_arena);
+                const reply = governManagedTask(deps, gov_arena.allocator(), &summary_accumulator, .{ .config = &config, .job = &job, .candidate = "", .messages = within_turn_suffix.items, .api_key = active_api_key, .model = job.model, .root_user_context = root_user_intent_context, .usage_owner = agent, .conversation = history_messages.items, .turn_id = turn_id, .step = step, .managed = turn }, false, &governance) catch |err| {
                     if (err == error.TaskGovernanceUnavailable or err == error.TaskProgressReviewUnresolved) {
                         try turn.manager.record(turn.task, "progress_review_deferred", .{ .step = step, .reason = if (err == error.TaskGovernanceUnavailable) "review_service_unavailable" else "review_assessment_unresolved", .progress_verified = false, .completion_review_required = true });
                         governance.deferUnavailable();
@@ -7991,7 +8010,9 @@ fn processQueuedPromptLoop(
             }
         }
         if (managed) |*turn| {
-            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try turn.manager.context(turn.task) });
+            var overlay_manager = turn.manager;
+            overlay_manager.alloc = overlay_arena;
+            try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try overlay_manager.context(turn.task) });
             if (!config.background_worker and turn.execution_guidance.text.len > 0) {
                 try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.execution_guidance.text });
             }
@@ -7999,8 +8020,8 @@ fn processQueuedPromptLoop(
             if (turn.recovery_context.len > 0) try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = turn.recovery_context });
         } else if (config.fossil_ephemeral) {
             if (comptime !builtin.target.cpu.arch.isWasm()) {
-                if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(arena)) |workspace| {
-                    try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try arena.print("Fossil workspace {s} is read-only for this --no-save turn. No task or history is written.", .{workspace.manifest.id}) });
+                if (try @import("../../workspace/fossil_workspace.zig").Manager.bound(overlay_arena)) |workspace| {
+                    try ephemeral_overlay.append(overlay_arena, .{ .role = .system, .content = try overlay_arena.print("Fossil workspace {s} is read-only for this --no-save turn. No task or history is written.", .{workspace.manifest.id}) });
                 }
             }
         }
@@ -11186,9 +11207,12 @@ fn processQueuedPromptLoop(
                 provider_replay,
         );
         if (managed) |*turn| {
+            var intent_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer mem_utils.deinit_arena(intent_scratch);
+            const s_alloc = intent_scratch.allocator();
             const Intent = struct { id: []const u8, name: []const u8, arguments: []const u8, execution_id: ?[]const u8 };
-            const intents = try arena.alloc(Intent, effective_tool_calls.len);
-            for (effective_tool_calls, intents) |call, *intent| intent.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments_json, .execution_id = if (turn.invocation_id) |invocation| try managed_task.Turn.actionIdentity(arena, invocation, within_turn_suffix.items.len - 1, call.id) else null };
+            const intents = try s_alloc.alloc(Intent, effective_tool_calls.len);
+            for (effective_tool_calls, intents) |call, *intent| intent.* = .{ .id = call.id, .name = call.name, .arguments = call.arguments_json, .execution_id = if (turn.invocation_id) |invocation| try managed_task.Turn.actionIdentity(s_alloc, invocation, within_turn_suffix.items.len - 1, call.id) else null };
             try turn.manager.record(turn.task, "action_intent", .{ .calls = intents });
         }
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);

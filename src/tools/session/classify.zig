@@ -33,7 +33,7 @@ pub fn irreversible(_: dispatch.ToolInput) bool {
 
 pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.DispatchError!dispatch.ToolResult {
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return .{ .failure = try ctx.allocator.dupe(u8, "Classification requires a native host.") };
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const result = classification.execute(arena.allocator(), input.as(Parsed).value, ctx.cancel_flag) catch |err| {
         return .{ .failure = try ctx.allocator.print("Classification unavailable: {s}. No decision or permission was granted.", .{@errorName(err)}) };

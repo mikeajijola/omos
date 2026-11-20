@@ -29,7 +29,7 @@ pub fn irreversible(_: dispatch.ToolInput) bool {
 
 pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.DispatchError!dispatch.ToolResult {
     if (comptime @import("builtin").target.cpu.arch.isWasm()) return .{ .failure = try ctx.allocator.dupe(u8, "Workspace capabilities require a native host.") };
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const request = scopedRequest(ctx, arena.allocator(), input.as(Parsed).value) catch |err| {
         return .{ .failure = try ctx.allocator.print("Workspace contract context unavailable: {s}.", .{@errorName(err)}) };

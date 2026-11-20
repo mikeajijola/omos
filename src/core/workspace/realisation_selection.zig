@@ -804,12 +804,16 @@ pub fn assignGoalForManager(
     workspace_root: []const u8,
     skills: []const skill_contract.Skill,
 ) !?Assignment {
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    var reader = manager;
+    reader.alloc = scratch.allocator();
     const base_branch = if (parent) |p| p.branch else "trunk";
-    const revision = manager.revision(base_branch) catch return null;
-    const declaration = manager.loadDeclaration(revision) catch return null;
+    const revision = reader.revision(base_branch) catch return null;
+    const declaration = reader.loadDeclaration(revision) catch return null;
     return try assignForGoal(
         alloc,
-        manager,
+        reader,
         declaration,
         goal,
         capability_override,

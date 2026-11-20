@@ -81,7 +81,7 @@ const c = struct {
 
 const Allocator = std.mem.Allocator;
 
-const max_delta_chain_depth: usize = 256;
+const max_delta_chain_depth: usize = 65536;
 const max_artifact_bytes: usize = 64 * 1024 * 1024;
 const busy_timeout_ms: c_int = 5000;
 
@@ -155,7 +155,7 @@ pub const Db = struct {
     }
 
     pub fn readResolvedManifest(self: *Db, alloc: Allocator, rev_or_branch: []const u8) ![]const fossil_manifest.File {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
@@ -240,7 +240,7 @@ pub const Db = struct {
         rev_or_branch: []const u8,
         file_path: []const u8,
     ) ![]u8 {
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const rev_index = try self.indexRevision(arena_state.allocator(), rev_or_branch);
         return rev_index.readFile(alloc, file_path);
@@ -496,24 +496,31 @@ pub const Db = struct {
 
     /// Reconstruct the uncompressed, un-deltified artifact bytes for `rid`.
     pub fn reconstructRid(self: *Db, alloc: Allocator, rid: i64) ![]u8 {
-        var chain: std.ArrayList(DeltaLink) = .empty;
-        defer {
-            for (chain.items) |item| alloc.free(item.inflated);
-            chain.deinit(alloc);
+        const first_src_rid = try self.findDeltaSource(rid);
+        if (first_src_rid == null) {
+            return self.readAndInflateBlob(alloc, rid);
         }
 
-        var current_rid = rid;
+        var delta_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer delta_arena.deinit();
+        const d_alloc = delta_arena.allocator();
+
+        var chain: std.ArrayList(DeltaLink) = .empty;
+        var seen_rids = std.AutoHashMap(i64, void).init(d_alloc);
+
+        const first_inflated = try self.readAndInflateBlob(d_alloc, rid);
+        try seen_rids.put(rid, {});
+        try chain.append(d_alloc, .{ .rid = rid, .inflated = first_inflated });
+
+        var current_rid = first_src_rid.?;
         while (true) {
             if (chain.items.len >= max_delta_chain_depth) return error.DeltaChainTooDeep;
-            for (chain.items) |seen| {
-                if (seen.rid == current_rid) return error.DeltaCycleDetected;
-            }
+            const seen_slot = try seen_rids.getOrPut(current_rid);
+            if (seen_slot.found_existing) return error.DeltaCycleDetected;
 
-            const raw_inflated = try self.readAndInflateBlob(alloc, current_rid);
-            errdefer alloc.free(raw_inflated);
-
+            const raw_inflated = try self.readAndInflateBlob(d_alloc, current_rid);
             const src_rid = try self.findDeltaSource(current_rid);
-            try chain.append(alloc, .{ .rid = current_rid, .inflated = raw_inflated });
+            try chain.append(d_alloc, .{ .rid = current_rid, .inflated = raw_inflated });
 
             if (src_rid) |next_rid| {
                 current_rid = next_rid;
@@ -522,23 +529,22 @@ pub const Db = struct {
             }
         }
 
-        // Base artifact is at the end of `chain`.
-        var current_bytes = chain.items[chain.items.len - 1].inflated;
-        // Ownership of the base slice transfers out of `chain` if there are no deltas,
-        // or gets replaced as we step backwards from base to target.
-        chain.items[chain.items.len - 1].inflated = &.{};
-        errdefer alloc.free(current_bytes);
+        // Base artifact is at the end of `chain`. Ping-pong intermediate delta
+        // buffers in `page_allocator` so arena callers retain only the final slice.
+        var current_bytes: []const u8 = chain.items[chain.items.len - 1].inflated;
+        var owned_current: ?[]u8 = null;
+        defer if (owned_current) |buf| std.heap.page_allocator.free(buf);
 
         var idx: usize = chain.items.len - 1;
-        while (idx > 0) {
+        while (idx > 1) {
             idx -= 1;
-            const delta_bytes = chain.items[idx].inflated;
-            const next_bytes = try applyFossilDelta(alloc, current_bytes, delta_bytes);
-            alloc.free(current_bytes);
+            const next_bytes = try applyFossilDelta(std.heap.page_allocator, current_bytes, chain.items[idx].inflated);
+            if (owned_current) |prev| std.heap.page_allocator.free(prev);
+            owned_current = next_bytes;
             current_bytes = next_bytes;
         }
 
-        return current_bytes;
+        return applyFossilDelta(alloc, current_bytes, chain.items[0].inflated);
     }
 
     const DeltaLink = struct {
@@ -1038,7 +1044,7 @@ pub const CompanyViewsIndex = struct {
         if (c.sqlite3_bind_int64(prepared, 3, @intCast(limit)) != c.SQLITE_OK) return error.SqliteBindFailed;
         if (c.sqlite3_bind_int64(prepared, 4, @intCast(offset)) != c.SQLITE_OK) return error.SqliteBindFailed;
 
-        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
@@ -1111,7 +1117,7 @@ fn parseWhatisArtifact(output: []const u8) ?[]const u8 {
     return null;
 }
 
-const fossil_bin = "/home/coder/.local/bin/fossil";
+const fossil_bin = "fossil";
 
 test "fossil_sqlite_reader: parity with fossil cat and whatis across delta chains and branches" {
     const alloc = std.testing.allocator;

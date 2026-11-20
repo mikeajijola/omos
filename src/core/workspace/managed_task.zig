@@ -186,7 +186,13 @@ pub const Turn = struct {
         _ = try manager.checkpoint(turn.task);
         turn.recovery_context = try @import("execution_recovery.zig").context(manager, turn.task);
         turn.projection_pin = try @import("../shared/resource_pin.zig").acquire(try @import("filesystem_projection.zig").retentionPath(manager, turn.task), manager.operation_control);
-        try @import("filesystem_projection.zig").prepare(manager, turn.task);
+        {
+            var proj_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer proj_scratch.deinit();
+            var projection_manager = manager;
+            projection_manager.alloc = proj_scratch.allocator();
+            try @import("filesystem_projection.zig").prepare(projection_manager, turn.task);
+        }
         turn.filesystem_view = true;
         if (turn.task.model_basis) |basis| if (basis.execution.projections != null) {
             turn.maintenance = @import("projection_maintenance.zig").Handle.start(manager) catch null;
@@ -253,10 +259,17 @@ pub const Turn = struct {
     /// Check execution prerequisites without assembling historical review pages.
     pub fn prepareExecution(self: *Turn, alloc: std.mem.Allocator) !void {
         const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
-        if (coding) self.source_basis = if (self.task.authority != null)
-            try @import("company_validation.zig").fingerprint(self.manager, self.task)
-        else
-            try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
+        if (coding) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            var scratch_manager = self.manager;
+            scratch_manager.alloc = scratch.allocator();
+            const fp = if (self.task.authority != null)
+                try @import("company_validation.zig").fingerprint(scratch_manager, self.task)
+            else
+                try @import("source_state.zig").fingerprint(scratch.allocator(), self.task.project_root, self.manager.repository);
+            self.source_basis = try alloc.dupe(u8, fp);
+        }
     }
 
     // Checkpoints and reviews share these retained-evidence traversal paths.
@@ -265,34 +278,53 @@ pub const Turn = struct {
         if (latest.definition.version != self.task.definition.version) self.invalidateAssessment();
         self.task = latest;
         if (self.filesystem_view) {
-            var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
             var projection_manager = self.manager;
             projection_manager.alloc = scratch.allocator();
             if (try @import("filesystem_projection.zig").checkpoint(projection_manager, self.task)) self.invalidateAssessment();
             try @import("filesystem_projection.zig").prepare(projection_manager, self.task);
         }
-        const evidence = try review.collectToolEvidence(alloc, messages);
-        const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
-        const source = if (coding) if (self.task.authority != null) try @import("company_validation.zig").fingerprint(self.manager, self.task) else try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository) else null;
-        for (evidence) |original_record| {
-            var record = original_record;
-            if (self.invocation_id) |invocation| if (record.assistant_index) |index| if (record.raw_call_id) |id| {
-                record.action_id = try actionIdentity(alloc, invocation, index, id);
-                record.id = try alloc.print("execution:{s}:{s}", .{ record.action_id.?, record.id });
-            };
-            record.source = source;
-            if (self.recorded_evidence.contains(record.id)) continue;
-            try self.manager.record(self.task, "tool_evidence", &[_]review.Evidence{record});
-            if (try @import("evidence_receipt.zig").derive(alloc, record)) |receipt| try self.manager.record(self.task, "command_receipt", receipt);
-            if (source) |current| if (self.source_basis) |previous| {
-                if (record.status == .success and record.tool != null and (std.mem.eql(u8, record.tool.?, "shell") or std.mem.eql(u8, record.tool.?, "shell_input")) and std.mem.eql(u8, current, previous)) {
-                    try self.manager.record(self.task, "source_validation", .{ .evidence = record.id, .source = current });
-                }
-            };
-            try self.recorded_evidence.put(alloc, record.id, {});
+        {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const s_alloc = scratch.allocator();
+            var scratch_manager = self.manager;
+            scratch_manager.alloc = s_alloc;
+            const evidence = try review.collectToolEvidence(s_alloc, messages);
+            const coding = if (self.task.model_basis) |basis| if (basis.capability) |id| std.mem.eql(u8, id, "coding_task") else false else false;
+            const scratch_source = if (coding)
+                if (self.task.authority != null)
+                    try @import("company_validation.zig").fingerprint(scratch_manager, self.task)
+                else
+                    try @import("source_state.zig").fingerprint(s_alloc, self.task.project_root, self.manager.repository)
+            else
+                null;
+            for (evidence) |original_record| {
+                var record = original_record;
+                if (self.invocation_id) |invocation| if (record.assistant_index) |index| if (record.raw_call_id) |id| {
+                    record.action_id = try actionIdentity(s_alloc, invocation, index, id);
+                    record.id = try s_alloc.print("execution:{s}:{s}", .{ record.action_id.?, record.id });
+                };
+                record.source = scratch_source;
+                if (self.recorded_evidence.contains(record.id)) continue;
+                try scratch_manager.record(self.task, "tool_evidence", &[_]review.Evidence{record});
+                if (try @import("evidence_receipt.zig").derive(s_alloc, record)) |receipt| try scratch_manager.record(self.task, "command_receipt", receipt);
+                if (scratch_source) |current| if (self.source_basis) |previous| {
+                    if (record.status == .success and record.tool != null and (std.mem.eql(u8, record.tool.?, "shell") or std.mem.eql(u8, record.tool.?, "shell_input")) and std.mem.eql(u8, current, previous)) {
+                        try scratch_manager.record(self.task, "source_validation", .{ .evidence = record.id, .source = current });
+                    }
+                };
+                try self.recorded_evidence.put(alloc, try alloc.dupe(u8, record.id), {});
+            }
+            self.source_basis = if (scratch_source) |s|
+                if (self.source_basis != null and std.mem.eql(u8, self.source_basis.?, s))
+                    self.source_basis
+                else
+                    try alloc.dupe(u8, s)
+            else
+                null;
         }
-        self.source_basis = source;
         // User corrections are authenticated by the runtime's message origin.
         for (messages) |message| {
             if (message.role == .user and (message.context_origin == .user_turn or message.restored_steering)) {
@@ -303,7 +335,11 @@ pub const Turn = struct {
                 }
             }
         }
-        _ = try self.manager.checkpoint(self.task);
+        var cp_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer cp_scratch.deinit();
+        var cp_manager = self.manager;
+        cp_manager.alloc = cp_scratch.allocator();
+        _ = try cp_manager.checkpoint(self.task);
     }
 
     fn invalidateAssessment(self: *Turn) void {
@@ -342,20 +378,30 @@ pub const Turn = struct {
         return result.records;
     }
 
+    fn dupePayloadRef(alloc: std.mem.Allocator, reference: @import("../agent/runtime/review_evidence.zig").PayloadRef) !@import("../agent/runtime/review_evidence.zig").PayloadRef {
+        return .{
+            .id = try alloc.dupe(u8, reference.id),
+            .path = try alloc.dupe(u8, reference.path),
+            .bytes = reference.bytes,
+            .sha256 = try alloc.dupe(u8, reference.sha256),
+            .identity_sha256 = if (reference.identity_sha256) |s| try alloc.dupe(u8, s) else null,
+        };
+    }
+
     fn appendReviewEvidence(self: *Turn, alloc: std.mem.Allocator, rows: *std.ArrayList(review.Evidence), payloads: *std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef), record: review.Evidence) !void {
         const detached = try @import("review_spool.zig").detach(alloc, self.manager.root, record);
         try rows.append(alloc, detached.record);
-        if (detached.payload) |reference| try payloads.append(alloc, reference);
+        if (detached.payload) |reference| try payloads.append(self.manager.alloc, try dupePayloadRef(self.manager.alloc, reference));
     }
 
     fn appendJournalEvidence(self: *Turn, alloc: std.mem.Allocator, rows: *std.ArrayList(JournalEvidence), payloads: *std.ArrayList(@import("../agent/runtime/review_evidence.zig").PayloadRef), record: review.Evidence, at_ms: i64, history_path: []const u8, within_row_index: usize) !void {
         const detached = try @import("review_spool.zig").detach(alloc, self.manager.root, record);
         try rows.append(alloc, .{ .record = detached.record, .recorded_at_ms = at_ms, .history_path = try alloc.dupe(u8, history_path), .within_row_index = within_row_index });
-        if (detached.payload) |reference| try payloads.append(alloc, reference);
+        if (detached.payload) |reference| try payloads.append(self.manager.alloc, try dupePayloadRef(self.manager.alloc, reference));
     }
 
     pub noinline fn beforeReview(self: *Turn, alloc: std.mem.Allocator, messages: []const types.ChatMessage) ![]const review.Evidence {
-        try self.progress(alloc, messages);
+        try self.progress(self.manager.alloc, messages);
         if (self.task.revision_pending) return error.TaskContractRevisionPending;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
         var evidence: std.ArrayList(review.Evidence) = .empty;
@@ -447,12 +493,12 @@ pub const Turn = struct {
                     if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string and data.string.len <= 256 * 1024 - page_bytes) {
                         // Raw replay is a bounded convenience window. Independent
                         // segment decisions below preserve progress beyond it.
-                        try pages.append(alloc, try alloc.dupe(u8, data.string));
+                        try pages.append(self.manager.alloc, try self.manager.alloc.dupe(u8, data.string));
                         page_bytes += data.string.len;
                     };
                 }
                 if (std.mem.eql(u8, entry.kind, "review_segment_assessment") and entry.contract_version == self.task.definition.version) {
-                    if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try checkpoints.append(alloc, try alloc.dupe(u8, data.string));
+                    if (entry.value == .object) if (entry.value.object.get("data")) |data| if (data == .string) try checkpoints.append(self.manager.alloc, try self.manager.alloc.dupe(u8, data.string));
                 }
                 if (!std.mem.eql(u8, entry.kind, "tool_evidence")) continue;
                 const records = (try std.json.parseFromValue([]review.Evidence, a, entry.value, .{})).value;
@@ -561,22 +607,31 @@ pub const Turn = struct {
         // Only the host's audit journal may have advanced during assessment.
         // Fence actual branch edits before adding those audit records.
         const previous = self.reviewed_revision orelse return error.WorkspaceReviewRequired;
-        if (!std.mem.eql(u8, previous, try self.manager.currentRevision(self.task))) return error.WorkspaceRevisionChanged;
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var reader = self.manager;
+        reader.alloc = scratch.allocator();
+        if (!std.mem.eql(u8, previous, try reader.currentRevision(self.task))) return error.WorkspaceRevisionChanged;
         self.reviewed_revision = try self.manager.checkpoint(self.task);
-        var snapshot = (try std.json.parseFromSlice(std.json.Value, self.manager.alloc, self.review_snapshot, .{})).value;
-        try snapshot.object.put(self.manager.alloc, "reviewed_revision", .{ .string = self.reviewed_revision.? });
-        self.review_snapshot = try std.json.Stringify.valueAlloc(self.manager.alloc, snapshot, .{});
+        var snapshot = (try std.json.parseFromSlice(std.json.Value, reader.alloc, self.review_snapshot, .{})).value;
+        try snapshot.object.put(reader.alloc, "reviewed_revision", .{ .string = self.reviewed_revision.? });
+        const serialized = try std.json.Stringify.valueAlloc(reader.alloc, snapshot, .{});
+        self.review_snapshot = try self.manager.alloc.dupe(u8, serialized);
     }
 
     pub fn sourceAssessmentCurrent(self: *Turn, bytes: []const u8) !bool {
         const basis = self.task.model_basis orelse return true;
         if (basis.capability == null or !std.mem.eql(u8, basis.capability.?, "coding_task")) return true;
-        const alloc = self.manager.alloc;
-        const current = if (self.task.authority != null) try @import("company_validation.zig").fingerprint(self.manager, self.task) else try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
+        var outer_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer outer_scratch.deinit();
+        const alloc = outer_scratch.allocator();
+        var reader = self.manager;
+        reader.alloc = alloc;
+        const current = if (self.task.authority != null) try @import("company_validation.zig").fingerprint(reader, self.task) else try @import("source_state.zig").fingerprint(alloc, self.task.project_root, self.manager.repository);
         const assessment = try record_json.decode(@import("../agent/runtime/work_contract.zig").Assessment, alloc, bytes, .{});
         var validations: std.StringHashMapUnmanaged(void) = .empty;
         var receipts: std.StringHashMapUnmanaged([]const u8) = .empty;
-        var history = try self.manager.historyCursor(self.task, self.reviewed_revision.?);
+        var history = try reader.historyCursor(self.task, self.reviewed_revision.?);
         while (history.offset < history.paths.len) {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
@@ -625,11 +680,15 @@ pub const Turn = struct {
     }
 
     pub fn retain(self: *Turn) !void {
-        const current = try self.manager.loadTask(self.task.id);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var worker = self.manager;
+        worker.alloc = scratch.allocator();
+        const current = try worker.loadTask(self.task.id);
         if (current.state == .active) self.task = try self.manager.setState(current.id, .paused);
         if (current.state != .accepted and current.state != .publication_pending) {
-            if (self.filesystem_view) _ = try @import("filesystem_projection.zig").checkpoint(self.manager, current);
-            _ = try self.manager.checkpoint(self.task);
+            if (self.filesystem_view) _ = try @import("filesystem_projection.zig").checkpoint(worker, current);
+            _ = try worker.checkpoint(self.task);
         }
     }
 };
@@ -810,4 +869,200 @@ test "managed_task recycles matching specialist contract and hydrates recipe alo
     try std.testing.expect(!std.mem.eql(u8, original_task_id, coding_turn.task.id));
     try std.testing.expectEqualStrings("coding_task_native", coding_turn.recovered_recipe.realisation_id.?);
     try std.testing.expectEqual(@as(usize, 0), coding_turn.recovered_recipe.required_tools.len);
+}
+
+test "managed_task and fossil tools release per-call scratch memory across repeated steps" {
+    var setup_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer setup_arena.deinit();
+    const setup_alloc = setup_arena.allocator();
+
+    const io_mod = @import("../shared/io.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(setup_alloc, tmp.dir, ".");
+    const repo_path = try std.Io.Dir.path.join(setup_alloc, &.{ root, "repo.fossil" });
+    const project_dir = try std.Io.Dir.path.join(setup_alloc, &.{ root, "project" });
+    _ = try std.Io.Dir.cwd().createDirPathStatus(io_mod.getIo(), project_dir, .fromMode(0o700));
+
+    const EnvFallback = struct {
+        var empty: std.process.Environ.Map = .init(std.heap.page_allocator);
+    };
+    var environ = std.process.Environ.Map.init(setup_alloc);
+    try environ.put("HOME", root);
+    if (io_mod.getenv("PATH")) |p| try environ.put("PATH", p);
+    io_mod.setEnvironMap(&environ);
+    defer io_mod.setEnvironMap(&EnvFallback.empty);
+
+    const seed_manager = try workspace.Manager.init(setup_alloc, repo_path);
+    try seed_manager.use();
+
+    // Seed a large memory file and advance trunk across several delta commits so
+    // manifest and file reads exercise delta reconstruction without leaking into
+    // the caller's turn arena.
+    {
+        var seed_turn = (try Turn.beginResolvedWithContext(
+            setup_alloc,
+            "seed-session",
+            null,
+            project_dir,
+            "Seed workspace memory",
+            false,
+            null,
+            &.{},
+        )).?;
+        defer seed_turn.release();
+        const large_note = try setup_alloc.alloc(u8, 2048);
+        @memset(large_note, 'm');
+        try seed_turn.manager.writeContent(seed_turn.task, "memory/guide.md", large_note);
+        _ = try seed_turn.beforeReview(setup_alloc, &.{});
+        const seed_assessment = try std.json.Stringify.valueAlloc(setup_alloc, .{
+            .version = @as(u32, 1),
+            .contractId = seed_turn.task.id,
+            .obligations = &[_]struct { id: []const u8, status: []const u8, note: []const u8, evidence: []const []const u8 }{.{
+                .id = "request_complete",
+                .status = "met",
+                .note = "Seeded",
+                .evidence = &.{"seed"},
+            }},
+        }, .{});
+        try seed_turn.journal().record("review_assessment", seed_assessment);
+        try seed_turn.sealReview();
+        seed_turn.assessment = seed_assessment;
+        try seed_turn.publish("Seeded workspace memory");
+        try seed_turn.manager.acknowledge(seed_turn.task);
+    }
+
+    var turn_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer turn_arena.deinit();
+    const arena = turn_arena.allocator();
+
+    var turn = (try Turn.beginResolvedWithContext(
+        arena,
+        "bounded-turn-session",
+        null,
+        project_dir,
+        "Inspect workspace capabilities across repeated steps",
+        false,
+        null,
+        &.{},
+    )).?;
+    defer {
+        turn.retain() catch {};
+        turn.release();
+    }
+
+    const fw_tool = @import("../../tools/session/fossil_workspace.zig");
+    const wc_tool = @import("../../tools/session/workspace_content.zig");
+    const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    const fw_calls = [_][]const u8{
+        "{\"action\":\"status\"}",
+        "{\"action\":\"query\",\"entity\":\"omos_capability\"}",
+        "{\"action\":\"history\"}",
+        "{\"action\":\"definition\"}",
+        "{\"action\":\"read\",\"path\":\"memory/guide.md\"}",
+    };
+    const wc_calls = [_][]const u8{
+        "{\"action\":\"catalog\"}",
+        "{\"action\":\"conversations\"}",
+        "{\"action\":\"contracts\",\"contracts\":{\"action\":\"list\"}}",
+        "{\"action\":\"attention\"}",
+        "{\"action\":\"background\",\"background\":{\"action\":\"list\"}}",
+    };
+
+    const cap_after_begin = turn_arena.queryCapacity();
+    for (0..15) |step| {
+        const ctx: tool_dispatch.DispatchContext = .{
+            .allocator = arena,
+            .fossil_workspace_available = true,
+            .fossil_session_id = "bounded-turn-session",
+            .workspace_root = project_dir,
+            .tool_call_id = try arena.print("fw-{d}", .{step}),
+        };
+
+        const fw_args = fw_calls[step % fw_calls.len];
+        const fw_dec = try fw_tool.decode(ctx, fw_args);
+        switch (fw_dec) {
+            .input => |inp| {
+                defer inp.deinit(ctx.allocator);
+                const res = try fw_tool.call(ctx, inp);
+                const body = switch (res) {
+                    .success => |s| s,
+                    .failure => |f| f,
+                    .rich => |r| r.text,
+                };
+                try messages.append(arena, .{
+                    .role = .assistant,
+                    .tool_calls = try arena.dupe(types.ToolCall, &.{.{ .id = ctx.tool_call_id, .name = "fossil_workspace", .arguments_json = fw_args }}),
+                });
+                try messages.append(arena, .{
+                    .role = .tool,
+                    .tool_call_id = ctx.tool_call_id,
+                    .tool_name = "fossil_workspace",
+                    .content = body[0..@min(body.len, 512)],
+                    .tool_result_status = .success,
+                });
+            },
+            .failure => return error.TestUnexpectedResult,
+        }
+
+        const wc_args = wc_calls[step % wc_calls.len];
+        const wc_dec = try wc_tool.decode(ctx, wc_args);
+        switch (wc_dec) {
+            .input => |inp| {
+                defer inp.deinit(ctx.allocator);
+                const res = try wc_tool.call(ctx, inp);
+                const body = switch (res) {
+                    .success => |s| s,
+                    .failure => |f| f,
+                    .rich => |r| r.text,
+                };
+                const wc_id = try arena.print("wc-{d}", .{step});
+                try messages.append(arena, .{
+                    .role = .assistant,
+                    .tool_calls = try arena.dupe(types.ToolCall, &.{.{ .id = wc_id, .name = "workspace_content", .arguments_json = wc_args }}),
+                });
+                try messages.append(arena, .{
+                    .role = .tool,
+                    .tool_call_id = wc_id,
+                    .tool_name = "workspace_content",
+                    .content = body[0..@min(body.len, 512)],
+                    .tool_result_status = .success,
+                });
+            },
+            .failure => return error.TestUnexpectedResult,
+        }
+
+        try turn.progress(arena, messages.items);
+        var overlay_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer overlay_arena.deinit();
+        var overlay_manager = turn.manager;
+        overlay_manager.alloc = overlay_arena.allocator();
+        _ = try overlay_manager.context(turn.task);
+    }
+
+    var review_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer review_arena.deinit();
+    _ = try turn.beforeReview(review_arena.allocator(), messages.items);
+
+    const assessment_json = try std.json.Stringify.valueAlloc(arena, .{
+        .version = @as(u32, 1),
+        .contractId = turn.task.id,
+        .obligations = &[_]struct { id: []const u8, status: []const u8, note: []const u8, evidence: []const []const u8 }{.{
+            .id = "request_complete",
+            .status = "met",
+            .note = "Verified",
+            .evidence = &.{"verified"},
+        }},
+    }, .{});
+    try turn.journal().record("review_assessment", assessment_json);
+    try turn.sealReview();
+    turn.assessment = assessment_json;
+    try turn.publish("Completed bounded workspace inspection");
+
+    const final_cap = turn_arena.queryCapacity();
+    // 15 steps of tool results + small retained IDs must stay well under 2 MiB in the turn arena.
+    try std.testing.expect(cap_after_begin < 512 * 1024);
+    try std.testing.expect(final_cap < 2 * 1024 * 1024);
 }

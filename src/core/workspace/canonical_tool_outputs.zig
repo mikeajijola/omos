@@ -61,14 +61,14 @@ pub const State = struct {
 
     pub fn load(self: *State, manager: workspace.Manager, task: workspace.Task) !void {
         if (self.loaded or self.disabled) return;
-        var lifetime = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var lifetime = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer lifetime.deinit();
         var reader = manager;
         reader.alloc = lifetime.allocator();
         const revision = try reader.currentRevision(task);
         var history = try reader.historyCursor(task, revision);
         while (history.offset < history.paths.len) {
-            var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
             const alloc = scratch.allocator();
             const batch = (try history.next(alloc)) orelse break;
@@ -89,7 +89,7 @@ pub const State = struct {
     /// handled by the runtime as optimization unavailable, never tool failure.
     pub fn capture(self: *State, manager: workspace.Manager, task: workspace.Task, input: canonical.Capture) !void {
         if (self.session.len == 0 or self.disabled) return error.CanonicalEvidenceUnavailable;
-        var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         const alloc = scratch.allocator();
         const record = try canonical.create(alloc, task.id, self.session, input);
