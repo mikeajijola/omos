@@ -83,7 +83,14 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
         "bailii",
     });
 
-    const has_job_signal = containsAnyIgnoreCase(trimmed, &.{
+    const is_job_analogy = containsAnyIgnoreCase(trimmed, &.{
+        "similar to job application",
+        "like job application",
+        "grant application",
+        "grant aplication",
+    });
+
+    const has_job_signal = !is_job_analogy and containsAnyIgnoreCase(trimmed, &.{
         "job application",
         "job applications",
         "apply to jobs",
@@ -132,6 +139,12 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
         ".zig",
         ".ts",
         "edit repository",
+        "develop a capability",
+        "develop the capability",
+        "develop a capabilit",
+        "develop the capabilit",
+        "build a capability",
+        "create a capability",
     }) and !containsAnyIgnoreCase(trimmed, &.{
         "isolated synthetic",
         "synthetic site",
@@ -1036,6 +1049,18 @@ test "deliverable classification selects job_application for application work" {
     }) |prompt| {
         try std.testing.expectEqual(request_plan.Capability.job_application, classifyDeliverable(prompt).?);
     }
+    try std.testing.expectEqual(
+        request_plan.Capability.coding_task,
+        classifyDeliverable("I want you to develop a capability similar to job applications for grant applications").?,
+    );
+    try std.testing.expectEqual(
+        request_plan.Capability.coding_task,
+        classifyDeliverable("I want you to develop the capabilitu similar to job applications for grant aplications").?,
+    );
+    try std.testing.expectEqual(
+        request_plan.Capability.general_task,
+        classifyDeliverable("Yeah but i'm talking about grant applications").?,
+    );
 }
 
 test "prompt skill binding disambiguates duplicate skills in favor of workspace root" {
