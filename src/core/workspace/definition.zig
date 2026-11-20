@@ -7,7 +7,7 @@ const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 
 pub const profile_id = "omos.workspace/v1";
-pub const standard_version = "1.0.0-alpha.7";
+pub const standard_version = "1.0.0-alpha.8";
 pub const declaration_path = "omniform/company.json";
 pub const execution_path = "execution/omos.json";
 pub const seed = compactJson(@embedFile("standard/omos.json"));
@@ -342,6 +342,47 @@ test "workspace declaration contract upgrades are additive and repeatable" {
     try std.testing.expect(try compatible(alloc, current, second));
 }
 
+test "workspace declaration upgrade merges new capability realisation and resources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var value = (try std.json.parseFromSlice(Value, alloc, seed, .{})).value;
+    const root = value.object.getPtr("spec").?;
+
+    // Model an existing Fossil workspace that predates the job capability.
+    for ([_][]const u8{ "capabilities", "realisations" }) |key| {
+        const rows = root.object.getPtr(key).?;
+        var index: usize = 0;
+        while (index < rows.array.items.len) : (index += 1) {
+            if (std.mem.eql(u8, text(rows.array.items[index], "id"), if (std.mem.eql(u8, key, "capabilities")) "job_application" else "job_application_browser")) {
+                _ = rows.array.orderedRemove(index);
+                break;
+            }
+        }
+    }
+    const resources = root.object.getPtr("resources").?;
+    for ([_][2][]const u8{ .{ "skills", "browseros_neo_skill" }, .{ "machines", "native_application_files" } }) |entry| {
+        const rows = resources.object.getPtr(entry[0]).?;
+        var index: usize = 0;
+        while (index < rows.array.items.len) : (index += 1) {
+            if (std.mem.eql(u8, text(rows.array.items[index], "id"), entry[1])) {
+                _ = rows.array.orderedRemove(index);
+                break;
+            }
+        }
+    }
+
+    const previous = try parse(alloc, try canonical(alloc, value));
+    try std.testing.expect(named(items(spec(previous.value), "capabilities"), "job_application") == null);
+    const next = try upgrade(alloc, previous);
+    try std.testing.expect(named(items(spec(next.value), "capabilities"), "job_application") != null);
+    try std.testing.expect(named(items(spec(next.value), "realisations"), "job_application_browser") != null);
+    try std.testing.expect(named(items(field(spec(next.value), "resources").?, "skills"), "browseros_neo_skill") != null);
+    try std.testing.expect(named(items(field(spec(next.value), "resources").?, "machines"), "native_application_files") != null);
+    try std.testing.expect(nativeCapability(next, "job_application"));
+    try std.testing.expectEqualStrings(next.hash, (try upgrade(alloc, next)).hash);
+}
+
 /// Schemas belong to the pinned declaration; older tasks retain their legacy adapter.
 pub fn validateOperation(alloc: Allocator, declaration: Declaration, id: []const u8, value: Value, direction: enum { input, output }) !void {
     const operation = named(items(spec(declaration.value), "operations"), id) orelse return error.UnknownOperation;
@@ -376,6 +417,43 @@ pub fn upgrade(alloc: Allocator, previous: Declaration) !Declaration {
                 };
             }
         } else try operations.array.append(operation);
+    }
+    // Extend the capability map with native capabilities, realisations and the
+    // resources they need that predate this workspace. Entries already present
+    // keep their exact contracts, so proposal compatibility is preserved.
+    for ([_][]const u8{ "capabilities", "realisations" }) |key| {
+        const additions = items(spec(native.value), key);
+        const rows = root.object.getPtr(key) orelse continue;
+        for (additions) |addition| {
+            var exists = false;
+            for (rows.array.items) |row| {
+                if (std.mem.eql(u8, text(row, "id"), text(addition, "id"))) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) try rows.array.append(addition);
+        }
+    }
+    if (field(spec(native.value), "resources")) |native_resources| {
+        if (root.object.getPtr("resources") == null) try root.object.put(alloc, "resources", .{ .object = .empty });
+        const families = root.object.getPtr("resources").?;
+        var it = native_resources.object.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (families.object.get(name) == null) try families.object.put(alloc, name, .{ .array = .init(alloc) });
+            const rows = families.object.getPtr(name).?;
+            for (entry.value_ptr.array.items) |addition| {
+                var exists = false;
+                for (rows.array.items) |row| {
+                    if (std.mem.eql(u8, text(row, "id"), text(addition, "id"))) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) try rows.array.append(addition);
+            }
+        }
     }
     if (root.object.get("semantic") == null) try root.object.put(alloc, "semantic", .{ .object = .empty });
     const semantic = root.object.getPtr("semantic").?;
@@ -626,7 +704,7 @@ fn hierarchyWalk(alloc: Allocator, rows: []const Hierarchy, id: []const u8, visi
 }
 
 pub fn nativeCapability(declaration: Declaration, id: []const u8) bool {
-    if (!std.mem.eql(u8, id, "general_task") and !std.mem.eql(u8, id, "coding_task")) return false;
+    if (!std.mem.eql(u8, id, "general_task") and !std.mem.eql(u8, id, "coding_task") and !std.mem.eql(u8, id, "job_application")) return false;
     const root = spec(declaration.value);
     const capability = named(items(root, "capabilities"), id) orelse return false;
     for (items(root, "realisations")) |realisation| {
@@ -737,7 +815,8 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const declaration = try parse(arena.allocator(), seed);
-    try std.testing.expectEqual(@as(usize, 2), items(spec(declaration.value), "capabilities").len);
+    try std.testing.expectEqual(@as(usize, 3), items(spec(declaration.value), "capabilities").len);
+    try std.testing.expectEqual(@as(usize, 3), items(spec(declaration.value), "realisations").len);
     try std.testing.expectEqual(@as(usize, 41), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }

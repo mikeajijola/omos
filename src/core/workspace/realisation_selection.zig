@@ -60,6 +60,27 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
         "bailii",
     });
 
+    const has_job_signal = containsAnyIgnoreCase(trimmed, &.{
+        "job application",
+        "job applications",
+        "apply to jobs",
+        "apply for jobs",
+        "job board",
+        "linkedin easy apply",
+        "easy apply",
+        "submit applications",
+        "submit an application",
+        "submit a job",
+        "tailor a cv",
+        "tailored cv",
+        "tailor the cv",
+        "job posting",
+        "job listing",
+        "recruiter",
+        "outside ir35",
+        "contract role",
+    });
+
     const has_operational_signal = has_browser_signal or containsAnyIgnoreCase(trimmed, &.{
         "send ",
         "apply ",
@@ -97,7 +118,8 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
         "use the browseros-neo skill",
     });
 
-    if (has_coding_deliverable and !has_browser_signal) return .coding_task;
+    if (has_coding_deliverable and !has_browser_signal and !has_job_signal) return .coding_task;
+    if (has_job_signal and !has_coding_deliverable) return .job_application;
     if (has_operational_signal and !has_coding_deliverable) return .general_task;
     return null;
 }
@@ -106,6 +128,16 @@ pub fn classifyDeliverable(prompt: []const u8) ?request_plan.Capability {
 /// deterministic deliverable analysis when the route is `work` but the
 /// secondary capability probability distribution is flat.
 pub fn resolveCapability(result: ?classification.Result, prompt: []const u8) ?request_plan.Capability {
+    // Config-gated selection: when OMOS_CONTRACT_SELECT=ollaya (legacy
+    // OMOS_OLLAYA_CONTRACT_SELECT=1), ask the winnow decision model to pick a
+    // capability/realisation instead of the deterministic keyword rules. Any
+    // miss falls back to the existing path.
+    const experiment = @import("ollaya_contract_select.zig");
+    if (experiment.enabled()) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (experiment.select(arena.allocator(), prompt, null, null) catch null) |selected| return selected;
+    }
     if (result) |classified| {
         if (request_plan.select(classified)) |selected| return selected;
     }
@@ -594,6 +626,17 @@ test "deliverable classification distinguishes browser and operational tasks fro
         request_plan.Capability.coding_task,
         classifyDeliverable("Refactor src/core/workspace/definition.zig and run zig build test.").?,
     );
+}
+
+test "deliverable classification selects job_application for application work" {
+    inline for (.{
+        "Apply to jobs on LinkedIn Easy Apply and save JSON receipts",
+        "Submit job applications through the job board using BrowserOS Neo",
+        "Tailor a CV for each job posting and record confirmations",
+        "Use the browseros-neo skill to apply for contract roles outside IR35",
+    }) |prompt| {
+        try std.testing.expectEqual(request_plan.Capability.job_application, classifyDeliverable(prompt).?);
+    }
 }
 
 test "prompt skill binding disambiguates duplicate skills in favor of workspace root" {

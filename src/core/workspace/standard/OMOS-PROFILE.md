@@ -6,7 +6,7 @@ copies of the SaaS pinned standard at commit
 `omos.json` is the native host's seed declaration and is maintained in this fork.
 
 The declaration API is `omniform.org/v1alpha1`; the pinned standard is
-`1.0.0-alpha.7`. The native profile is `omos.workspace/v1` and accepts the
+`1.0.0-alpha.8`. The native profile is `omos.workspace/v1` and accepts the
 SaaS `omniseedos.semantic/v1` extension. It strips that extension only while
 validating the upstream structural schema, then validates native semantic
 references and supported execution features separately.

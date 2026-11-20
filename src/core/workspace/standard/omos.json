@@ -64,6 +64,34 @@
         "realisations": [
           "coding_task_native"
         ]
+      },
+      {
+        "id": "job_application",
+        "name": "Job application",
+        "description": "Prepare and submit job applications, tailor a CV, search LinkedIn and job boards, and record confirmed receipts using the browser and native file tools.",
+        "requires": [
+          {
+            "id": "reasoning",
+            "primitiveFamily": "inference"
+          },
+          {
+            "id": "retained_workspace",
+            "primitiveFamily": "memory"
+          },
+          {
+            "id": "application_files",
+            "primitiveFamily": "machines",
+            "description": "native shell, read_file, write_file"
+          },
+          {
+            "id": "browser_skills",
+            "primitiveFamily": "skills",
+            "description": "skill:browseros-neo plus mcp_browseros-neo_run"
+          }
+        ],
+        "realisations": [
+          "job_application_browser"
+        ]
       }
     ],
     "resources": {
@@ -89,6 +117,20 @@
           "spec": {
             "implementation": "omos_repository"
           }
+        },
+        {
+          "id": "browseros_neo_skill",
+          "name": "BrowserOS Neo skill and MCP browser tools",
+          "offers": [
+            "browser_skills"
+          ],
+          "spec": {
+            "implementation": "omos_repository",
+            "skill": "browseros-neo",
+            "tools": [
+              "mcp_browseros-neo_run"
+            ]
+          }
         }
       ],
       "machines": [
@@ -100,6 +142,21 @@
           ],
           "spec": {
             "implementation": "omos_shell"
+          }
+        },
+        {
+          "id": "native_application_files",
+          "name": "Native shell and file tools",
+          "offers": [
+            "application_files"
+          ],
+          "spec": {
+            "implementation": "omos_shell",
+            "tools": [
+              "native shell",
+              "read_file",
+              "write_file"
+            ]
           }
         }
       ],
@@ -163,6 +220,37 @@
             "resource": "native_commands",
             "supplies": [
               "validation_commands"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "job_application_browser",
+        "name": "Job application with BrowserOS Neo",
+        "capability": "job_application",
+        "participants": [
+          {
+            "resource": "configured_model",
+            "supplies": [
+              "reasoning"
+            ]
+          },
+          {
+            "resource": "fossil_workspace",
+            "supplies": [
+              "retained_workspace"
+            ]
+          },
+          {
+            "resource": "native_application_files",
+            "supplies": [
+              "application_files"
+            ]
+          },
+          {
+            "resource": "browseros_neo_skill",
+            "supplies": [
+              "browser_skills"
             ]
           }
         ]
