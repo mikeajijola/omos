@@ -61,6 +61,58 @@ pub const Task = struct {
     capability_runtime_receipt: ?[]const u8 = null,
     state: enum { active, paused, blocked, conflict, publication_pending, accepted } = .active,
 };
+const TaskRecordData = struct {
+    objective: []const u8,
+    state: []const u8,
+    contract: contract.Definition,
+    basis: ?model.Basis,
+    realisation_id: ?[]const u8 = null,
+    criteria: []const contract.Obligation = &.{},
+    required_tools: []const []const u8 = &.{},
+    skill_bindings: []const []const u8 = &.{},
+
+    fn fromTask(item: Task) TaskRecordData {
+        return .{
+            .objective = item.definition.objective,
+            .state = @tagName(item.state),
+            .contract = item.definition,
+            .basis = item.model_basis,
+            .realisation_id = item.definition.realisation_id,
+            .criteria = item.definition.criteria,
+            .required_tools = item.definition.required_tools,
+            .skill_bindings = item.definition.skill_bindings,
+        };
+    }
+
+    pub fn jsonStringify(self: TaskRecordData, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        try writer.objectField("objective");
+        try writer.write(self.objective);
+        try writer.objectField("state");
+        try writer.write(self.state);
+        try writer.objectField("contract");
+        try writer.write(self.contract);
+        try writer.objectField("basis");
+        try writer.write(self.basis);
+        if (self.realisation_id) |realisation_id| {
+            try writer.objectField("realisation_id");
+            try writer.write(realisation_id);
+        }
+        if (self.criteria.len > 0) {
+            try writer.objectField("criteria");
+            try writer.write(self.criteria);
+        }
+        if (self.required_tools.len > 0) {
+            try writer.objectField("required_tools");
+            try writer.write(self.required_tools);
+        }
+        if (self.skill_bindings.len > 0) {
+            try writer.objectField("skill_bindings");
+            try writer.write(self.skill_bindings);
+        }
+        try writer.endObject();
+    }
+};
 pub const Review = struct {
     task_id: []const u8,
     revision: []const u8,
@@ -2812,15 +2864,22 @@ pub const Manager = struct {
     /// Starts from an exact parent revision. Each task owns a separate Fossil
     /// checkout; branch changes never affect Git's checkout or another task.
     pub fn start(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task) !Task {
-        return self.startBound(session, project, goal, parent, null);
+        return self.startBound(session, project, goal, parent, null, null);
+    }
+
+    /// Starts a task and persists specialist realisation metadata (`realisation_id`,
+    /// `required_tools`, and portable `skill_bindings`) from a resolved assignment
+    /// on the initial work contract. Recording these fields never grants tool permissions.
+    pub fn startWithAssignment(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, assignment: ?@import("realisation_selection.zig").Assignment) !Task {
+        return self.startBound(session, project, goal, parent, null, assignment);
     }
 
     pub fn startCompany(self: Manager, session: []const u8, project: []const u8, goal: []const u8, authority: @import("company_authority.zig").Binding) !Task {
         if (!self.company_operation_held) return error.CompanyOperationLeaseRequired;
-        return self.startBound(session, project, goal, null, authority);
+        return self.startBound(session, project, goal, null, authority, null);
     }
 
-    fn startBound(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding) !Task {
+    fn startBound(self: Manager, session: []const u8, project: []const u8, goal: []const u8, parent: ?Task, authority: ?@import("company_authority.zig").Binding, assignment: ?@import("realisation_selection.zig").Assignment) !Task {
         if (goal.len > max_bytes or !std.unicode.utf8ValidateSlice(goal)) return error.WorkspaceGoalTooLarge;
         const lease = try self.writerLease();
         defer lease.release();
@@ -2831,11 +2890,72 @@ pub const Manager = struct {
         const branch = try self.alloc.print("task/{s}", .{id});
         const base = try self.revision(if (parent) |task| task.branch else "trunk");
         if (authority != null) if (self.expected_revision) |expected| if (!try self.sameRevision(base, expected)) return error.WorkspaceRevisionChanged;
-        _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosign", "-R", self.repository });
         const request_text = try text_utils.maskSecrets(self.alloc, goal);
         var objective_len = @min(request_text.len, 8192);
         while (objective_len > 0 and !std.unicode.utf8ValidateSlice(request_text[0..objective_len])) objective_len -= 1;
         const request_artifact = if (request_text.len > objective_len) try self.alloc.print("artifacts/{s}", .{try hash(self.alloc, request_text)}) else null;
+        const model_basis = if (parent) |p| blk: {
+            var basis = p.model_basis;
+            if (basis) |*pinned| pinned.capability = null;
+            break :blk basis;
+        } else try self.modelBasis(base);
+        var definition: contract.Definition = .{
+            .id = id,
+            .version = 1,
+            .objective = if (request_text.len > 0) request_text[0..objective_len] else "Respond to the user's request and attachments.",
+            .obligations = &.{.{ .id = "request_complete", .description = "Fulfil every requested outcome and acceptance criterion, using successful host evidence for actions." }},
+        };
+        if (assignment) |assigned| {
+            const selection = @import("realisation_selection.zig");
+            const trimmed_realisation = std.mem.trim(u8, assigned.realisation, " \t\r\n");
+            if (trimmed_realisation.len > 0) {
+                definition.realisation_id = try self.alloc.dupe(u8, trimmed_realisation);
+            }
+            const declaration = if (model_basis) |basis| self.loadDeclaration(basis.revision) catch null else null;
+            const raw_tools = if (assigned.required_tools.len > 0)
+                assigned.required_tools
+            else if (declaration != null and trimmed_realisation.len > 0)
+                try selection.requiredToolsForRealisation(self.alloc, declaration.?, trimmed_realisation)
+            else
+                &.{};
+            if (raw_tools.len > 0) {
+                var tools_list: std.ArrayList([]const u8) = .empty;
+                for (raw_tools) |tool| {
+                    if (std.mem.trim(u8, tool, " \t\r\n").len == 0) continue;
+                    var duplicate = false;
+                    for (tools_list.items) |existing| {
+                        if (std.mem.eql(u8, existing, tool)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) try tools_list.append(self.alloc, try self.alloc.dupe(u8, tool));
+                }
+                definition.required_tools = try tools_list.toOwnedSlice(self.alloc);
+            }
+            var skill_list: std.ArrayList([]const u8) = .empty;
+            for (try assigned.persistedSkillBindings(self.alloc)) |skill_name| {
+                try skill_list.append(self.alloc, skill_name);
+            }
+            if (declaration != null and trimmed_realisation.len > 0) {
+                for (try selection.declaredSkillsForRealisation(self.alloc, declaration.?, trimmed_realisation)) |skill_name| {
+                    var duplicate = false;
+                    for (skill_list.items) |existing| {
+                        if (std.mem.eql(u8, existing, skill_name)) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) try skill_list.append(self.alloc, skill_name);
+                }
+            }
+            if (skill_list.items.len > 0) {
+                definition.skill_bindings = try skill_list.toOwnedSlice(self.alloc);
+            }
+            const checked_definition = try contract.parse(self.alloc, try json(self.alloc, definition));
+            checked_definition.deinit();
+        }
+        _ = try self.run(null, &.{ "branch", "new", branch, base, "--nosign", "-R", self.repository });
         const task: Task = .{
             .id = id,
             .created_at_ms = io_mod.milliTimestamp(),
@@ -2849,17 +2969,8 @@ pub const Manager = struct {
             .project_root = project,
             .authority = authority,
             .request_artifact = request_artifact,
-            .model_basis = if (parent) |p| blk: {
-                var basis = p.model_basis;
-                if (basis) |*pinned| pinned.capability = null;
-                break :blk basis;
-            } else try self.modelBasis(base),
-            .definition = .{
-                .id = id,
-                .version = 1,
-                .objective = if (request_text.len > 0) request_text[0..objective_len] else "Respond to the user's request and attachments.",
-                .obligations = &.{.{ .id = "request_complete", .description = "Fulfil every requested outcome and acceptance criterion, using successful host evidence for actions." }},
-            },
+            .model_basis = model_basis,
+            .definition = definition,
         };
         const tree = try self.checkout(branch);
         if (request_artifact) |path| try atomicWrite(self.alloc, try join(self.alloc, tree, path), request_text);
@@ -5593,7 +5704,7 @@ pub const Manager = struct {
                 break;
             };
         }
-        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try page.add(self, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = .{ .objective = item.definition.objective, .state = @tagName(item.state), .contract = item.definition, .basis = item.model_basis } }), .{})).value);
+        if (matches(entity, "omos_task")) for (try self.tasks()) |item| try page.add(self, (try std.json.parseFromSlice(std.json.Value, self.alloc, try json(self.alloc, .{ .entity = "omos_task", .id = item.id, .revision = try self.currentRevision(item), .data = TaskRecordData.fromTask(item) }), .{})).value);
         if (matches(entity, "omos_capability")) {
             if (try self.modelBasis(revision_id)) |basis| {
                 const declaration = try self.loadDeclaration(basis.revision);
@@ -6400,4 +6511,109 @@ test "fossil_workspace: auto-rebase merges disjoint files and non-overlapping li
     const rec = (try manager.loadConflictRecord(task_d.id)).?;
     try std.testing.expectEqual(@as(usize, 1), rec.conflicts.len);
     try std.testing.expectEqualStrings("memory/notes.md", rec.conflicts[0].path);
+}
+
+test "fossil_workspace: startWithAssignment persists specialist realisation required_tools and skill_bindings while keeping plain start backward compatible" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const repo_path = try join(alloc, root, "repo.fossil");
+    const project_dir = try join(alloc, root, "project");
+    try mkdir(project_dir);
+
+    const prev_environ = io_mod.environMap();
+    var environ = std.process.Environ.Map.init(alloc);
+    try environ.put("HOME", root);
+    if (prev_environ) |prev| {
+        if (prev.get("PATH")) |path_env| try environ.put("PATH", path_env);
+        if (prev.get("OMOS_FOSSIL_BIN")) |bin_env| try environ.put("OMOS_FOSSIL_BIN", bin_env);
+    }
+    io_mod.setEnvironMap(&environ);
+    defer if (prev_environ) |prev| io_mod.setEnvironMap(prev);
+
+    var writer_queue: WriterQueue = .{};
+    defer writer_queue.deinit();
+
+    var manager = try Manager.init(alloc, repo_path);
+    manager.writer_queue = &writer_queue;
+
+    // 1. Plain start without a realisation leaves specialist fields empty (backward compat).
+    const plain = try manager.start("plain-session", project_dir, "Summarize notes", null);
+    try std.testing.expect(plain.definition.realisation_id == null);
+    try std.testing.expectEqual(@as(usize, 0), plain.definition.criteria.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.definition.required_tools.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.definition.skill_bindings.len);
+    const reloaded_plain = try manager.loadTask(plain.id);
+    try std.testing.expect(reloaded_plain.definition.realisation_id == null);
+
+    // 2. startWithAssignment from assignForGoal persists job_application_browser metadata.
+    const selection = @import("realisation_selection.zig");
+    const skill_contract = @import("../skills/skill_contract.zig");
+    const trunk_rev = try manager.revision("trunk");
+    const declaration = try manager.loadDeclaration(trunk_rev);
+    const catalog = [_]skill_contract.Skill{
+        .{ .name = "browseros-neo", .description = "browser", .path = "/Users/example/project/skills/browseros-neo", .source = .workspace_shared },
+    };
+    const goal = "Apply to outside IR35 UK contract roles on LinkedIn Easy Apply and save receipts";
+    const assignment = try selection.assignForGoal(alloc, manager, declaration, goal, null, trunk_rev, project_dir, &catalog);
+    try std.testing.expectEqualStrings("job_application", assignment.capability);
+    try std.testing.expectEqualStrings("job_application_browser", assignment.realisation);
+
+    const assigned_task = try manager.startWithAssignment("job-session", project_dir, goal, null, assignment);
+    try std.testing.expectEqualStrings("job_application_browser", assigned_task.definition.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), assigned_task.definition.required_tools.len);
+    try std.testing.expectEqualStrings("native shell", assigned_task.definition.required_tools[0]);
+    try std.testing.expectEqualStrings("read_file", assigned_task.definition.required_tools[1]);
+    try std.testing.expectEqualStrings("write_file", assigned_task.definition.required_tools[2]);
+    try std.testing.expectEqualStrings("mcp_browseros-neo_run", assigned_task.definition.required_tools[3]);
+    try std.testing.expectEqual(@as(usize, 1), assigned_task.definition.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", assigned_task.definition.skill_bindings[0]);
+
+    // Verify persistence in both local task storage and Fossil history.
+    const loaded_local = try manager.loadTask(assigned_task.id);
+    try std.testing.expectEqualStrings("job_application_browser", loaded_local.definition.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), loaded_local.definition.required_tools.len);
+    try std.testing.expectEqualStrings("browseros-neo", loaded_local.definition.skill_bindings[0]);
+
+    const loaded_fossil = try manager.taskAtRevision(assigned_task.id, try manager.revision(assigned_task.branch));
+    try std.testing.expectEqualStrings("job_application_browser", loaded_fossil.definition.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), loaded_fossil.definition.required_tools.len);
+    try std.testing.expectEqualStrings("browseros-neo", loaded_fossil.definition.skill_bindings[0]);
+
+    // Verify omos_task query record validates against declaration.semantic.
+    const queried_raw = try manager.queryRecords(assigned_task, "omos_task", 0);
+    const queried = (try std.json.parseFromSlice(std.json.Value, alloc, queried_raw, .{})).value;
+    var saw_assigned = false;
+    for (model.items(queried, "records")) |record| {
+        const data = model.field(record, "data").?;
+        try model.validateRecord(declaration.semantic, "omos_task", data, true);
+        if (std.mem.eql(u8, model.text(record, "id"), assigned_task.id)) {
+            saw_assigned = true;
+            try std.testing.expectEqualStrings("job_application_browser", model.text(data, "realisation_id"));
+            try std.testing.expectEqual(@as(usize, 4), model.items(data, "required_tools").len);
+            try std.testing.expectEqual(@as(usize, 1), model.items(data, "skill_bindings").len);
+        }
+    }
+    try std.testing.expect(saw_assigned);
+
+    // Verify setPlan preserves specialist contract fields.
+    const planned = try manager.setPlan(assigned_task, "job_application", "Submit job applications and save receipts", &.{}, &.{});
+    try std.testing.expectEqualStrings("job_application_browser", planned.definition.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), planned.definition.required_tools.len);
+    try std.testing.expectEqualStrings("browseros-neo", planned.definition.skill_bindings[0]);
+
+    // 3. Minimal assignment without pre-populated required_tools still derives them from declaration.
+    const minimal_task = try manager.startWithAssignment("minimal-session", project_dir, "Apply for role", null, .{
+        .capability = "job_application",
+        .realisation = "job_application_browser",
+        .ranking = .{ .relevance = 0.9, .precedent = 0.7, .evidence = 1.0, .recency = 0.8, .score = 0.88 },
+    });
+    try std.testing.expectEqualStrings("job_application_browser", minimal_task.definition.realisation_id.?);
+    try std.testing.expectEqual(@as(usize, 4), minimal_task.definition.required_tools.len);
+    try std.testing.expectEqual(@as(usize, 1), minimal_task.definition.skill_bindings.len);
+    try std.testing.expectEqualStrings("browseros-neo", minimal_task.definition.skill_bindings[0]);
 }

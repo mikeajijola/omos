@@ -4,7 +4,7 @@ Source: https://github.com/mikeajijola/omniform
 
 Revision: `28168db5d4522ffe3f0c2539f4c0e0c20ff38b53`
 
-Package standard: `1.0.0-alpha.8`; declaration API: `omniform.org/v1alpha1`.
+Package standard: `1.0.0-alpha.9`; declaration API: `omniform.org/v1alpha1`.
 
 The schema, Apache-2.0 licence, and architecture reference are copied unchanged.
 The upstream `src/validate.js` semantic validator is copied with only its schema
