@@ -8,8 +8,10 @@ pub const Options = struct {
     realisation: ?[]const u8 = null,
     selections_path: ?[]const u8 = null,
     summary: ?[]const u8 = null,
-    package_action: enum { plan, import, verify, @"export", promote } = .plan,
+    package_action: enum { plan, distill, import, verify, @"export", promote } = .plan,
     bindings_path: ?[]const u8 = null,
+    promote_config_path: ?[]const u8 = null,
+    apply: bool = false,
     cache_action: @import("filesystem_projection.zig").CacheMode = .status,
     execution_path: ?[]const u8 = null,
     offset: usize = 0,
@@ -55,6 +57,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingContent;
             options.summary = args[index];
+        } else if (std.mem.eql(u8, arg, "--apply")) {
+            if (options.apply) return error.UnexpectedArgument;
+            options.apply = true;
+        } else if (std.mem.eql(u8, arg, "--promote")) {
+            if (options.promote_config_path != null) return error.UnexpectedArgument;
+            index += 1;
+            if (index >= args.len) return error.MissingPath;
+            options.promote_config_path = args[index];
         } else if (std.mem.eql(u8, arg, "--bindings")) {
             if (options.bindings_path != null) return error.UnexpectedArgument;
             index += 1;
@@ -81,7 +91,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
         } else if (options.path == null) {
             options.path = arg;
             positional += 1;
-        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope" or (options.action == .package and (options.package_action == .import or options.package_action == .@"export" or options.package_action == .promote))) and options.request_path == null) {
+        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope" or (options.action == .package and (options.package_action == .distill or options.package_action == .import or options.package_action == .@"export" or options.package_action == .promote))) and options.request_path == null) {
             options.request_path = arg;
         } else return error.UnexpectedArgument;
     }
@@ -95,6 +105,9 @@ pub fn parse(args: []const [:0]const u8) !Options {
             if (options.package_action == .promote) {
                 if (options.path == null) return error.MissingPath;
                 if (options.request_path == null) return error.MissingCapability;
+            } else if (options.package_action == .distill) {
+                if (options.path == null) return error.TaskIdRequired;
+                if (options.request_path == null) return error.MissingCapability;
             } else {
                 if (options.path == null) return error.MissingCapability;
                 if ((options.package_action == .import or options.package_action == .@"export") and options.request_path == null) return error.MissingPath;
@@ -107,9 +120,12 @@ pub fn parse(args: []const [:0]const u8) !Options {
     }
     if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
     const allows_selection = options.action == .package and (options.package_action == .plan or options.package_action == .@"export" or options.package_action == .promote);
-    if ((options.realisation != null or options.selections_path != null) and !allows_selection) return error.UnexpectedArgument;
+    const allows_realisation = allows_selection or (options.action == .package and options.package_action == .distill);
+    if (options.selections_path != null and !allows_selection) return error.UnexpectedArgument;
+    if (options.realisation != null and !allows_realisation) return error.UnexpectedArgument;
     if (options.realisation != null and options.selections_path != null) return error.UnexpectedArgument;
-    if (options.summary != null and !(options.action == .package and options.package_action == .promote)) return error.UnexpectedArgument;
+    if (options.summary != null and !(options.action == .package and (options.package_action == .promote or options.package_action == .distill))) return error.UnexpectedArgument;
+    if ((options.apply or options.promote_config_path != null) and !(options.action == .package and options.package_action == .distill)) return error.UnexpectedArgument;
     if (options.bindings_path != null and !(options.action == .package and options.package_action == .verify)) return error.UnexpectedArgument;
     if (offset_seen and options.action != .query and options.action != .workers) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
@@ -264,6 +280,16 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
                 if (model.hasOperation(declaration, "omos_promote_capabilities")) {
                     try model.validateOperation(alloc, declaration, "omos_promote_capabilities", model_data.?, .output);
                 }
+            } else if (options.package_action == .distill) {
+                const promote_raw: ?[]const u8 = if (options.promote_config_path) |path| try readDefinition(alloc, path) else null;
+                model_data = try @import("capability_distill.zig").distill(manager, .{
+                    .task_id = options.path.?,
+                    .capability_id = options.request_path.?,
+                    .realisation_id = options.realisation,
+                    .apply = options.apply or promote_raw != null,
+                    .promote_config = promote_raw,
+                    .summary = options.summary,
+                });
             } else {
                 const selections: []const @import("capability_package.zig").Selection = if (options.selections_path) |path| try @import("../shared/record_json.zig").decode([]const @import("capability_package.zig").Selection, alloc, try readDefinition(alloc, path), .{}) else &.{.{ .capability = options.path.?, .realisation = options.realisation }};
                 if (selections.len == 0 or !std.mem.eql(u8, selections[0].capability, options.path.?)) return error.InvalidCapabilitySelection;
@@ -429,6 +455,20 @@ test "capability package commands require explicit plan selection" {
     try std.testing.expectError(error.MissingPath, parse(&.{ "package", "promote" }));
     try std.testing.expectError(error.MissingCapability, parse(&.{ "package", "promote", "promote.json" }));
     try std.testing.expectError(error.MissingContent, parse(&.{ "package", "promote", "promote.json", "coding_task", "--summary" }));
+
+    const distilled = try parse(&.{ "package", "distill", "task-123", "invoice_audit", "--realisation", "invoice_audit_v1", "--apply", "--promote", "promote.json", "--summary", "Distilled invoice audit", "--json" });
+    try std.testing.expectEqual(.distill, distilled.package_action);
+    try std.testing.expectEqualStrings("task-123", distilled.path.?);
+    try std.testing.expectEqualStrings("invoice_audit", distilled.request_path.?);
+    try std.testing.expectEqualStrings("invoice_audit_v1", distilled.realisation.?);
+    try std.testing.expect(distilled.apply);
+    try std.testing.expectEqualStrings("promote.json", distilled.promote_config_path.?);
+    try std.testing.expectEqualStrings("Distilled invoice audit", distilled.summary.?);
+    try std.testing.expectError(error.TaskIdRequired, parse(&.{ "package", "distill" }));
+    try std.testing.expectError(error.MissingCapability, parse(&.{ "package", "distill", "task-123" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "package", "plan", "coding_task", "--apply" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "package", "plan", "coding_task", "--promote", "promote.json" }));
+    try std.testing.expectError(error.MissingPath, parse(&.{ "package", "distill", "task-123", "invoice_audit", "--promote" }));
 }
 
 test "local workspace requests require a file and cannot enable writes" {

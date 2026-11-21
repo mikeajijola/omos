@@ -1020,6 +1020,39 @@ publish that task to establish destination availability. The original accepted
 task remains immutable. An active managed task can adopt an accepted package's
 references with `verify_runtime` and `path` set to the source task ID.
 
+### Task-to-capability distillation
+
+`omos fossil package distill TASK_ID CAPABILITY_ID [--realisation ID] [--apply] [--promote CONFIG.json] [--summary TEXT] --json`
+extracts a strictly additive OmniForm capability, realisation, structured
+contract rubric, and portable `fossil_skill` resource from a retained, accepted
+personal task (`state == accepted`, `authority == null`, verified acceptance
+receipt on `trunk`). Pending, paused, failed, or company-authority tasks are
+rejected cleanly.
+
+Distillation enforces a clean separation between reusable capability rubrics
+and private local work. It extracts only structured rubric fields (`objective`,
+`obligations`, `criteria`, `task_plan` checks, `required_tools`,
+`skill_bindings`, and acceptance provenance) and never reads raw conversation
+transcripts, tool logs, or `memory/` files. Automatic file selection inspects
+only published `skills/` paths created or updated by the task (plus existing
+`skills/<name>/` directories referenced by `skill_bindings`), strictly excluding
+`memory/`, `runtime/`, `tasks/`, `records/`, and internal host control trees.
+When an accepted task produced no `skills/` files, distillation synthesizes a
+deterministic `skills/<slug>/SKILL.md` rubric document without clobbering any
+existing user-authored file.
+
+Every candidate declaration is validated through `model.parse`,
+`model.compatible`, `capability_package.describe`, and
+`capability_package.importDefinition` so colliding capability, realisation, or
+resource identities fail cleanly without modifying `trunk`. Preview mode (the
+default) is strictly read-only. Passing `--apply` activates the additive
+declaration (and any synthesized `SKILL.md`) atomically on `trunk` and verifies
+`declaration_complete: true` via `capability_package.inspect`. Passing
+`--promote CONFIG.json` applies locally and hands the verified closure straight
+to `package promote`. Managed agents can run preview (`apply: false`,
+read-only) or local activation (`apply: true`, mutating and gated by saved-task
+and permission policy) through `fossil_workspace` action `distill_capability`.
+
 ### Capability promotion
 
 Actors with an explicit `promote_capability` grant action can promote a locally

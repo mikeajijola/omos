@@ -845,19 +845,25 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
+    .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), distill_capability from an accepted personal task (task_id, capability_id, optional realisation, summary, paths; apply defaults to false for read-only preview or true to activate locally), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
+        .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), distill_capability from an accepted personal task (task_id, capability_id, optional realisation, summary, paths; apply defaults to false for read-only preview or true to activate locally), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui", "verify_runtime", "promote_capability", "dispatch", "workers" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui", "verify_runtime", "distill_capability", "promote_capability", "dispatch", "workers" } } },
                 .{ .name = "path", .json_type = .string },
                 .{ .name = "content", .json_type = .string },
                 .{ .name = "entity", .json_type = .string },
                 .{ .name = "offset", .json_type = .integer },
                 .{ .name = "execution", .json_type = .string },
                 .{ .name = "revision", .json_type = .string },
+                .{ .name = "task_id", .json_type = .string },
+                .{ .name = "capability_id", .json_type = .string },
+                .{ .name = "realisation", .json_type = .string },
+                .{ .name = "summary", .json_type = .string },
+                .{ .name = "paths", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } } },
+                .{ .name = "apply", .json_type = .boolean },
             },
             .required = &.{"action"},
             .additional_properties = false,
@@ -1110,7 +1116,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "acc1a4db8f8b1677a940e7834ac809f1be156f39bab76c314715f3588c128f2f",
+        "e033f5cc7785366dbfa40b76dd657421e505c39b8537439a2f4462532a1ae8af",
         &actual_hex,
     );
 }

@@ -459,6 +459,17 @@ but needs verification on the destination host before reporting availability.
 See [selected capability packages](CONTRACTS.md#selected-capability-packages) for
 request fields, authority, integrity checks, and import bounds.
 
+To distill an accepted personal task into a promotable capability without
+leaking local research, chat logs, or private `memory/` notes, run
+`omos fossil package distill TASK_ID CAPABILITY_ID [--realisation ID] [--apply] [--promote CONFIG.json] [--summary TEXT] --json`.
+By default it runs in read-only preview mode, extracting the task's structured
+rubric (objective, obligations, criteria, plan checks, required tools, and skill
+bindings) and its published `skills/` paths (or synthesizing a clean
+`skills/<slug>/SKILL.md` rubric document when the task created no skill files).
+Pass `--apply` to validate and activate the additive capability declaration
+locally on `trunk`, or `--promote CONFIG.json` to apply locally and immediately
+submit the distilled package to the central company service.
+
 To package or promote a local capability back to a central company service, use
 `omos fossil package export CAPABILITY OUTPUT.tar --json` to write a verified
 offline archive containing only the selected capability closure and its declared
