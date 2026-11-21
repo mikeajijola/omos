@@ -7,7 +7,8 @@ pub const Options = struct {
     definition_action: enum { show, validate, propose } = .show,
     realisation: ?[]const u8 = null,
     selections_path: ?[]const u8 = null,
-    package_action: enum { plan, import, verify } = .plan,
+    summary: ?[]const u8 = null,
+    package_action: enum { plan, import, verify, @"export", promote } = .plan,
     bindings_path: ?[]const u8 = null,
     cache_action: @import("filesystem_projection.zig").CacheMode = .status,
     execution_path: ?[]const u8 = null,
@@ -49,6 +50,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
             index += 1;
             if (index >= args.len) return error.MissingPath;
             options.selections_path = args[index];
+        } else if (std.mem.eql(u8, arg, "--summary")) {
+            if (options.summary != null) return error.UnexpectedArgument;
+            index += 1;
+            if (index >= args.len) return error.MissingContent;
+            options.summary = args[index];
         } else if (std.mem.eql(u8, arg, "--bindings")) {
             if (options.bindings_path != null) return error.UnexpectedArgument;
             index += 1;
@@ -75,7 +81,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
         } else if (options.path == null) {
             options.path = arg;
             positional += 1;
-        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope" or (options.action == .package and options.package_action == .import)) and options.request_path == null) {
+        } else if ((options.action == .remote or options.action == .@"export-scope" or options.action == .@"verify-scope" or (options.action == .package and (options.package_action == .import or options.package_action == .@"export" or options.package_action == .promote))) and options.request_path == null) {
             options.request_path = arg;
         } else return error.UnexpectedArgument;
     }
@@ -86,8 +92,13 @@ pub fn parse(args: []const [:0]const u8) !Options {
             .validate, .propose => if (options.path == null) return error.MissingPath,
         },
         .package => {
-            if (options.path == null) return error.MissingCapability;
-            if (options.package_action == .import and options.request_path == null) return error.MissingPath;
+            if (options.package_action == .promote) {
+                if (options.path == null) return error.MissingPath;
+                if (options.request_path == null) return error.MissingCapability;
+            } else {
+                if (options.path == null) return error.MissingCapability;
+                if ((options.package_action == .import or options.package_action == .@"export") and options.request_path == null) return error.MissingPath;
+            }
         },
         .cache => if (options.path != null) return error.UnexpectedArgument,
         .capabilities, .classify, .request, .company, .@"company-key" => if (options.path == null) return error.MissingPath,
@@ -95,8 +106,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
         else => if (options.path != null) return error.UnexpectedArgument,
     }
     if ((options.action == .@"export-scope" or options.action == .@"verify-scope") and options.request_path == null) return error.MissingPath;
-    if ((options.realisation != null or options.selections_path != null) and !(options.action == .package and options.package_action == .plan)) return error.UnexpectedArgument;
+    const allows_selection = options.action == .package and (options.package_action == .plan or options.package_action == .@"export" or options.package_action == .promote);
+    if ((options.realisation != null or options.selections_path != null) and !allows_selection) return error.UnexpectedArgument;
     if (options.realisation != null and options.selections_path != null) return error.UnexpectedArgument;
+    if (options.summary != null and !(options.action == .package and options.package_action == .promote)) return error.UnexpectedArgument;
     if (options.bindings_path != null and !(options.action == .package and options.package_action == .verify)) return error.UnexpectedArgument;
     if (offset_seen and options.action != .query and options.action != .workers) return error.UnexpectedArgument;
     if (options.writable and options.action != .serve) return error.UnexpectedArgument;
@@ -224,6 +237,33 @@ pub fn execute(alloc: std.mem.Allocator, options: Options) !Reply {
                 try model.validateOperation(alloc, declaration, "omos_import_capabilities", try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}), .input);
                 model_data = try @import("scope_export.zig").importArchive(manager, raw, options.request_path.?);
                 try model.validateOperation(alloc, declaration, "omos_import_capabilities", model_data.?, .output);
+            } else if (options.package_action == .@"export") {
+                const selections: []const @import("capability_package.zig").Selection = if (options.selections_path) |path| try @import("../shared/record_json.zig").decode([]const @import("capability_package.zig").Selection, alloc, try readDefinition(alloc, path), .{}) else &.{.{ .capability = options.path.?, .realisation = options.realisation }};
+                if (selections.len == 0 or !std.mem.eql(u8, selections[0].capability, options.path.?)) return error.InvalidCapabilitySelection;
+                const model = @import("definition.zig");
+                const declaration = try manager.loadDeclaration("trunk");
+                if (model.hasOperation(declaration, "omos_export_local_capability")) {
+                    const input = try std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .selections = selections }, .{}), .{});
+                    try model.validateOperation(alloc, declaration, "omos_export_local_capability", input, .input);
+                }
+                model_data = try @import("capability_promotion.zig").exportArchive(manager, selections, options.request_path.?);
+                if (model.hasOperation(declaration, "omos_export_local_capability")) {
+                    try model.validateOperation(alloc, declaration, "omos_export_local_capability", model_data.?, .output);
+                }
+            } else if (options.package_action == .promote) {
+                const raw = try readDefinition(alloc, options.path.?);
+                const capability_id = options.request_path.?;
+                const selections: []const @import("capability_package.zig").Selection = if (options.selections_path) |path| try @import("../shared/record_json.zig").decode([]const @import("capability_package.zig").Selection, alloc, try readDefinition(alloc, path), .{}) else &.{.{ .capability = capability_id, .realisation = options.realisation }};
+                if (selections.len == 0 or !std.mem.eql(u8, selections[0].capability, capability_id)) return error.InvalidCapabilitySelection;
+                const model = @import("definition.zig");
+                const declaration = try manager.loadDeclaration("trunk");
+                if (model.hasOperation(declaration, "omos_promote_capabilities")) {
+                    try model.validateOperation(alloc, declaration, "omos_promote_capabilities", try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{}), .input);
+                }
+                model_data = try @import("capability_promotion.zig").promote(manager, raw, selections, options.summary);
+                if (model.hasOperation(declaration, "omos_promote_capabilities")) {
+                    try model.validateOperation(alloc, declaration, "omos_promote_capabilities", model_data.?, .output);
+                }
             } else {
                 const selections: []const @import("capability_package.zig").Selection = if (options.selections_path) |path| try @import("../shared/record_json.zig").decode([]const @import("capability_package.zig").Selection, alloc, try readDefinition(alloc, path), .{}) else &.{.{ .capability = options.path.?, .realisation = options.realisation }};
                 if (selections.len == 0 or !std.mem.eql(u8, selections[0].capability, options.path.?)) return error.InvalidCapabilitySelection;
@@ -372,6 +412,23 @@ test "capability package commands require explicit plan selection" {
     try std.testing.expectError(error.MissingCapability, parse(&.{ "package", "plan" }));
     try std.testing.expectError(error.UnknownAction, parse(&.{ "package", "activate", "coding_task" }));
     try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "status", "--realisation", "coding_task_native" }));
+
+    const exported = try parse(&.{ "package", "export", "coding_task", "cap.tar", "--realisation", "coding_task_native", "--json" });
+    try std.testing.expectEqual(.@"export", exported.package_action);
+    try std.testing.expectEqualStrings("coding_task", exported.path.?);
+    try std.testing.expectEqualStrings("cap.tar", exported.request_path.?);
+    try std.testing.expectEqualStrings("coding_task_native", exported.realisation.?);
+    try std.testing.expectError(error.MissingPath, parse(&.{ "package", "export", "coding_task" }));
+    try std.testing.expectError(error.UnexpectedArgument, parse(&.{ "package", "export", "coding_task", "cap.tar", "--summary", "nope" }));
+
+    const promoted = try parse(&.{ "package", "promote", "promote.json", "coding_task", "--summary", "Promote coding skill", "--json" });
+    try std.testing.expectEqual(.promote, promoted.package_action);
+    try std.testing.expectEqualStrings("promote.json", promoted.path.?);
+    try std.testing.expectEqualStrings("coding_task", promoted.request_path.?);
+    try std.testing.expectEqualStrings("Promote coding skill", promoted.summary.?);
+    try std.testing.expectError(error.MissingPath, parse(&.{ "package", "promote" }));
+    try std.testing.expectError(error.MissingCapability, parse(&.{ "package", "promote", "promote.json" }));
+    try std.testing.expectError(error.MissingContent, parse(&.{ "package", "promote", "promote.json", "coding_task", "--summary" }));
 }
 
 test "local workspace requests require a file and cannot enable writes" {

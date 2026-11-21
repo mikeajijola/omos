@@ -3,7 +3,7 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime, dispatch, workers },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime, promote_capability, dispatch, workers },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
     entity: ?[]const u8 = null,
@@ -41,13 +41,13 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
 
 pub fn readsOnly(input: dispatch.ToolInput) bool {
     return switch (input.as(Parsed).value.action) {
-        .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime, .dispatch => false,
+        .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime, .promote_capability, .dispatch => false,
         else => true,
     };
 }
 
-pub fn irreversible(_: dispatch.ToolInput) bool {
-    return false;
+pub fn irreversible(input: dispatch.ToolInput) bool {
+    return input.as(Parsed).value.action == .promote_capability;
 }
 
 pub fn call(ctx: dispatch.DispatchContext, input: dispatch.ToolInput) dispatch.DispatchError!dispatch.ToolResult {
@@ -64,7 +64,7 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
     if (!ctx.fossil_workspace_available) return error.UnmanagedHost;
     var manager = (try workspace.Manager.bound(alloc)) orelse return error.NoFossilWorkspace;
     var cancel = std.atomic.Value(bool).init(false);
-    if (input.action == .verify_runtime) manager.operation_control = .{ .cancel = ctx.cancel_flag orelse &cancel, .deadline = .fromNow(@import("../../core/shared/io.zig").getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60000) }) };
+    if (input.action == .verify_runtime or input.action == .promote_capability) manager.operation_control = .{ .cancel = ctx.cancel_flag orelse &cancel, .deadline = .fromNow(@import("../../core/shared/io.zig").getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(60000) }) };
     const task = if (ctx.fossil_session_id) |session| try manager.active(session) else null;
     if (input.action == .workers) {
         const entries = try manager.backgroundRecords(input.offset);
@@ -92,6 +92,16 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
         .verify_runtime => {
             if (input.content != null or input.execution != null or input.revision != null or input.entity != null or input.offset != 0) return error.InvalidCapabilitySelection;
             return std.json.Stringify.valueAlloc(alloc, try @import("../../core/workspace/capability_runtime.zig").verifyCurrent(manager, active, input.path), .{});
+        },
+        .promote_capability => {
+            if (input.execution != null or input.offset != 0) return error.InvalidCapabilitySelection;
+            const config_path = input.path orelse return error.MissingPath;
+            const capability_id = input.entity orelse return error.MissingCapability;
+            var file = try std.Io.Dir.cwd().openFile(@import("../../core/shared/io.zig").getIo(), config_path, .{ .allow_directory = false, .follow_symlinks = false });
+            defer file.close(@import("../../core/shared/io.zig").getIo());
+            const raw_config = try @import("../../core/shared/io.zig").readFileToEnd(alloc, &file, 1_000_000);
+            const result = try @import("../../core/workspace/capability_promotion.zig").promote(manager, raw_config, &.{.{ .capability = capability_id, .realisation = input.revision }}, input.content);
+            return std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .restore_ui => return manager.restoreUi(active, input.revision orelse return error.MissingRevision),
         .propose_definition => return manager.proposeDefinition(active, input.content orelse return error.MissingContent, input.execution),

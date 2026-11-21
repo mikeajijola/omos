@@ -1020,6 +1020,50 @@ publish that task to establish destination availability. The original accepted
 task remains immutable. An active managed task can adopt an accepted package's
 references with `verify_runtime` and `path` set to the source task ID.
 
+### Capability promotion
+
+Actors with an explicit `promote_capability` grant action can promote a locally
+developed capability closure back to a central company Fossil. Existing grants
+do not gain `promote_capability` implicitly, and delegation obeys normal action
+and path narrowing. Instance discovery advertises `features.capability_promotion`
+and `features.promotion_policy`.
+
+`omos fossil package export CAPABILITY OUTPUT.tar [--realisation ID | --selections PATH] --json`
+packs only the selected capability closure (plan, declared file hashes, sizes,
+and executable flags) from the bound local Fossil's `trunk` into a verified
+`omos.local-capability-package/v1` tar archive, excluding unrelated local
+memory, research, and conversation files.
+
+`omos fossil package promote CONFIG.json CAPABILITY [--realisation ID | --selections PATH] [--summary TEXT] --json`
+validates completeness locally, loads the actor's local key handle from
+`CONFIG.json` (`version: "omos.capability-promote-request/v1"`), opens a central
+view, stages only the declared package files (using chunked upload for files
+exceeding the upload chunk size), and submits `action: "promote_capability"`.
+The central service verifies `declaration_complete: true`, enforces strict
+additive compatibility against central `omniform/company.json` and `trunk` files
+(rejecting collisions or redefinitions), checks path authority for every
+declared selector and staged file, and rejects any unrelated staged paths.
+
+Company operators control the host-owned promotion approval policy stored at
+`authority/promotion_policy.json` on the protected `omos-company` branch via
+`omos fossil company REQUEST.json --json` actions `inspect_promotion_policy` and
+`set_promotion_policy`:
+
+- `require_human_approval` (default): every capability promotion requires
+  explicit operator approval (`inspect_proposal` and `approve` or `deny`) before
+  publication, even when the submitting actor's grant has `human_approval: false`.
+- `follow_actor_grant`: capability promotion follows the submitting actor's
+  `grant.human_approval` flag. When `false`, independent review can activate and
+  publish the promoted capability atomically; when `true`, operator approval
+  remains required.
+
+Upon verification (and approval when required), central publication atomically
+commits the promoted files, updated `omniform/company.json`, `omos_capability_promotion`
+record, and signed issuer proof onto `trunk`. Managed agents can invoke the same
+signed flow through `fossil_workspace` action `promote_capability`, which
+requires an active saved task and never bypasses actor keys, grants, or central
+policy. Older workspaces can adopt these contracts with `omos fossil migrate --contracts`.
+
 Exports use at most 32 inventory entries per page and 16 KiB per content
 request. Files are limited to 8 MiB, inventories to 10,000 paths and 8 MiB of
 receipt metadata. `max_bytes` defaults to 1 GiB of logical file content and

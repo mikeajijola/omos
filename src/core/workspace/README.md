@@ -459,6 +459,20 @@ but needs verification on the destination host before reporting availability.
 See [selected capability packages](CONTRACTS.md#selected-capability-packages) for
 request fields, authority, integrity checks, and import bounds.
 
+To package or promote a local capability back to a central company service, use
+`omos fossil package export CAPABILITY OUTPUT.tar --json` to write a verified
+offline archive containing only the selected capability closure and its declared
+files (excluding unrelated local research, memory, and conversations). Use
+`omos fossil package promote CONFIG.json CAPABILITY [--realisation ID | --selections PATH] [--summary TEXT] --json`
+to sign requests with the actor's local key handle, stage only the declared
+package files on a central view, and submit a strictly additive capability
+promotion for independent review and policy-gated publication. Operators control
+whether promotions always require human approval (`require_human_approval`, the
+default) or follow the submitting actor's `human_approval` grant flag
+(`follow_actor_grant`) via `omos fossil company REQUEST.json --json` actions
+`inspect_promotion_policy` and `set_promotion_policy`. See
+[capability promotion](CONTRACTS.md#capability-promotion) for the full contract.
+
 ## Plan and bound an invocation
 
 Before the first actor call of a modeled task, a separate read-only planner

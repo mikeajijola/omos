@@ -543,18 +543,21 @@ fn extendNativeTransport(alloc: Allocator, operation: *Value, native: Value) !bo
         while (entries.next()) |entry| {
             const key = entry.key_ptr.*;
             if (properties.object.getPtr(key)) |existing| {
-                // Recognize only the minimal native version constraints. Other
+                // Recognize only the minimal native version/action constraints. Other
                 // constraints, company field types and required lists survive.
-                if (!std.mem.eql(u8, key, "version") or existing.* != .object or existing.object.count() != 1) continue;
-                const versions = field(entry.value_ptr.*, "enum") orelse continue;
-                if (versions != .array) continue;
+                const is_version = std.mem.eql(u8, key, "version") and existing.* == .object and existing.object.count() == 1;
+                const is_action = std.mem.eql(u8, id, "omos_company_operation") and std.mem.eql(u8, key, "action") and existing.* == .object and existing.object.count() == 2 and std.mem.eql(u8, text(existing.*, "type"), "string");
+                if (!is_version and !is_action) continue;
+                const allowed = field(entry.value_ptr.*, "enum") orelse continue;
+                if (allowed != .array) continue;
                 var recognized = false;
-                if (field(existing.*, "const")) |old_version| {
-                    recognized = old_version == .string and contains(versions.array.items, old_version.string);
-                } else if (field(existing.*, "enum")) |old_versions| {
-                    if (old_versions == .array and old_versions.array.items.len > 0) {
+                if (is_version and field(existing.*, "const") != null) {
+                    const old_version = field(existing.*, "const").?;
+                    recognized = old_version == .string and contains(allowed.array.items, old_version.string);
+                } else if (field(existing.*, "enum")) |old_values| {
+                    if (old_values == .array and old_values.array.items.len > 0) {
                         recognized = true;
-                        for (old_versions.array.items) |old_version| if (old_version != .string or !contains(versions.array.items, old_version.string)) {
+                        for (old_values.array.items) |old_value| if (old_value != .string or !contains(allowed.array.items, old_value.string)) {
                             recognized = false;
                             break;
                         };
@@ -866,7 +869,7 @@ test "workspace declaration seed shares the pinned OmniForm model and validates 
     const declaration = try parse(arena.allocator(), seed);
     try std.testing.expectEqual(@as(usize, 3), items(spec(declaration.value), "capabilities").len);
     try std.testing.expectEqual(@as(usize, 3), items(spec(declaration.value), "realisations").len);
-    try std.testing.expectEqual(@as(usize, 41), declaration.semantic.entityTypes.len);
+    try std.testing.expectEqual(@as(usize, 43), declaration.semantic.entityTypes.len);
     try std.testing.expectEqual(@as(usize, 64), declaration.hash.len);
 }
 
@@ -1023,9 +1026,11 @@ test "workspace declaration explicit transport upgrades preserve company constra
     }
     const properties = legacy_operation.?.object.getPtr("input").?.object.getPtr("properties").?;
     try properties.object.put(alloc, "version", (try std.json.parseFromSlice(Value, alloc, "{\"const\":\"omos.company/v1\"}", .{})).value);
+    try properties.object.put(alloc, "action", (try std.json.parseFromSlice(Value, alloc, "{\"type\":\"string\",\"enum\":[\"discover\",\"read\",\"create_view\",\"checkpoint\",\"submit\",\"status\",\"export_scope\",\"delegate\",\"reconcile\",\"query\",\"record\",\"execution\",\"execute_task\"]}", .{})).value);
     _ = properties.object.swapRemove("executable");
     _ = properties.object.swapRemove("previous_executable");
     _ = properties.object.swapRemove("upload");
+    _ = properties.object.swapRemove("capability_plan");
     try properties.object.put(alloc, "company_note", (try std.json.parseFromSlice(Value, alloc, "{\"type\":\"string\",\"maxLength\":7}", .{})).value);
     const old = try parse(alloc, try canonical(alloc, value));
     const next = try upgrade(alloc, old);
@@ -1033,7 +1038,12 @@ test "workspace declaration explicit transport upgrades preserve company constra
     const upgraded = field(field(operation, "input").?, "properties").?;
     try std.testing.expect(field(upgraded, "executable") != null);
     try std.testing.expect(field(upgraded, "upload") != null);
+    try std.testing.expect(field(upgraded, "capability_plan") != null);
     try std.testing.expect(contains(items(field(upgraded, "version").?, "enum"), "omos.company/v2"));
+    try std.testing.expect(contains(items(field(upgraded, "action").?, "enum"), "promote_capability"));
+    try std.testing.expect(hasOperation(next, "omos_company_capability_promotion"));
+    try std.testing.expect(hasOperation(next, "omos_inspect_promotion_policy"));
+    try std.testing.expect(hasOperation(next, "omos_set_promotion_policy"));
     try std.testing.expectEqualStrings(try canonical(alloc, field(properties.*, "company_note").?), try canonical(alloc, field(upgraded, "company_note").?));
     try std.testing.expect(!try compatible(alloc, old, next));
     try std.testing.expectEqualStrings(next.hash, (try upgrade(alloc, next)).hash);

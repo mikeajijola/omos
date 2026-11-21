@@ -4,11 +4,11 @@ const std = @import("std");
 const records = @import("../shared/record_json.zig");
 const workspace = @import("fossil_workspace.zig");
 
-pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record, execution, execute_task };
+pub const Action = enum { discover, read, create_view, checkpoint, submit, status, export_scope, delegate, reconcile, query, record, execution, execute_task, promote_capability };
 
 pub fn isMutation(action: Action) bool {
     return switch (action) {
-        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record, .execution, .execute_task => true,
+        .create_view, .checkpoint, .submit, .delegate, .reconcile, .record, .execution, .execute_task, .promote_capability => true,
         .discover, .read, .status, .export_scope, .query => false,
     };
 }
@@ -79,6 +79,7 @@ pub const Request = struct {
     capability: ?[]const u8 = null,
     realisation: ?[]const u8 = null,
     capability_selections: ?[]const CapabilitySelection = null,
+    capability_plan: ?[]const u8 = null,
     scope: ?[]const []const u8 = null,
     record_id: ?[]const u8 = null,
     progress_cursor: ?[]const u8 = null,
@@ -187,7 +188,7 @@ pub fn authenticateRetained(alloc: std.mem.Allocator, state: State, raw: []const
     if (fresh.action != .reconcile) return error.CompanyAccessDenied;
     const original = try authenticateRequest(alloc, state, raw, now, true);
     if (!std.mem.eql(u8, fresh.actor, original.actor) or !std.mem.eql(u8, fresh.grant, original.grant) or fresh.outcome == null or !std.mem.eql(u8, fresh.outcome.?, original.operation)) return error.CompanyAccessDenied;
-    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate and original.action != .execution and original.action != .execute_task) return error.CompanyRecoveryActionDenied;
+    if (original.action != .create_view and original.action != .checkpoint and original.action != .record and original.action != .submit and original.action != .delegate and original.action != .execution and original.action != .execute_task and original.action != .promote_capability) return error.CompanyRecoveryActionDenied;
     return original;
 }
 
@@ -226,16 +227,32 @@ fn authorizeTaskFor(manager: workspace.Manager, task: workspace.Task, publicatio
     const state = try records.decode(State, manager.alloc, try manager.companyContent("authority/state.json"), .{});
     _ = try @import("company_keys.zig").current(manager, state.epoch, state.issuer);
     const grant = try @import("company_task_scope.zig").forTask(manager, task, try liveGrant(state, binding.grant, @import("../shared/io.zig").milliTimestamp()));
-    const permitted = if (publication or planning) permitsAction(grant, .submit) else permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
+    const is_promotion = task.capability_promotion != null;
+    const permitted = if (publication or planning)
+        (if (is_promotion) permitsAction(grant, .promote_capability) else permitsAction(grant, .submit))
+    else
+        permitsAction(grant, .execution) or permitsAction(grant, .execute_task);
     if (!std.mem.eql(u8, binding.actor, grant.actor) or !permitted) return error.CompanyAccessDenied;
     if (publication and binding.desired != null) try @import("company_desired.zig").validateCandidate(manager, task);
-    if (publication and grant.human_approval) _ = try @import("company_approval.zig").authorize(manager, task, try manager.currentRevision(task), (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
-    for (try manager.changedPaths(task.base_revision, try manager.currentRevision(task))) |path| {
+    const promotion_policy = @import("company_promotion_policy.zig");
+    const policy = try promotion_policy.load(manager);
+    const revision = try manager.currentRevision(task);
+    if (publication and promotion_policy.requiresHumanApproval(policy, grant, is_promotion)) {
+        _ = try @import("company_approval.zig").authorize(manager, task, revision, (try manager.companyRevision()).?, state, @import("../shared/io.zig").milliTimestamp());
+    }
+    const promotion_payload = if (is_promotion) try @import("company_promotion.zig").loadPlanAt(manager, task, revision) else null;
+    for (try manager.changedPaths(task.base_revision, revision)) |path| {
         if (!permittedRoot(path)) continue;
         // A long signed objective is retained by the host as an immutable
         // request artifact. It is contract data, not an actor content mutation.
         if (task.request_artifact) |request| if (std.mem.eql(u8, request, path)) continue;
+        if (task.capability_promotion) |promo| {
+            if (std.mem.eql(u8, promo.plan, path) or std.mem.eql(u8, promo.declaration, path)) continue;
+        }
         if (!permitsPath(grant, path)) return error.CompanyAccessDenied;
+        if (promotion_payload) |payload| {
+            if (!@import("capability_package.zig").includes(payload.plan, path)) return error.InvalidCapabilityPromotion;
+        }
     }
 }
 

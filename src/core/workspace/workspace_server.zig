@@ -245,7 +245,7 @@ fn reject(manager: workspace.Manager, request: *std.http.Server.Request, keep_al
     const status: std.http.Status = switch (err) {
         error.CompanySubscriptionsBusy => .too_many_requests,
         error.CompanyAccessDenied, error.CompanyAccessRevoked, error.CompanySignatureRejected, error.CompanyRequestExpired, error.CompanyDelegationDenied, error.WorkspaceIdentityMismatch, error.ServiceReadOnly, error.HostOwnedEntity, error.WorkspacePathDenied => .forbidden,
-        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceMergeConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract => .conflict,
+        error.CompanyIssuerBoundElsewhere, error.CompanyAuthorityRollbackDetected, error.CompanyIssuerRecoveryRequired, error.CompanyOperationConflict, error.WorkspaceProjectionConflict, error.WorkspaceMergeConflict, error.WorkspaceRevisionChanged, error.StaleWorkspaceDefinition, error.StaleWorkContract, error.CapabilityImportCollision => .conflict,
         else => .bad_request,
     };
     return request.respond(try std.json.Stringify.valueAlloc(manager.alloc, .{ .@"error" = @errorName(err) }, .{}), .{ .status = status, .keep_alive = keep_alive });

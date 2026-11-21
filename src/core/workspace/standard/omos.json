@@ -1224,7 +1224,8 @@
                 "query",
                 "record",
                 "execution",
-                "execute_task"
+                "execute_task",
+                "promote_capability"
               ]
             },
             "view": {
@@ -1414,6 +1415,13 @@
                 ],
                 "additionalProperties": false
               }
+            },
+            "capability_plan": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 524288
             },
             "execution": {
               "type": [
@@ -2460,6 +2468,595 @@
         "approval": "policy",
         "interfaces": [
           "cli"
+        ]
+      },
+      {
+        "id": "omos_inspect_promotion_policy",
+        "capability": "general_task",
+        "description": "Inspect the company capability promotion approval policy as the local operator.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "inspect_promotion_policy"
+            },
+            "revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "action"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "policy": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-promotion-policy/v1"
+                },
+                "workspace": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "require_human_approval",
+                    "follow_actor_grant"
+                  ]
+                }
+              },
+              "required": [
+                "version",
+                "workspace",
+                "mode"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "revision",
+            "policy"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_set_promotion_policy",
+        "capability": "general_task",
+        "description": "Update the company capability promotion approval policy as the local operator.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company-admin/v1"
+            },
+            "action": {
+              "const": "set_promotion_policy"
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "require_human_approval",
+                "follow_actor_grant"
+              ]
+            }
+          },
+          "required": [
+            "version",
+            "action",
+            "revision",
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "revision": {
+              "type": "string"
+            },
+            "policy": {
+              "type": "object",
+              "properties": {
+                "version": {
+                  "const": "omos.company-promotion-policy/v1"
+                },
+                "workspace": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "require_human_approval",
+                    "follow_actor_grant"
+                  ]
+                }
+              },
+              "required": [
+                "version",
+                "workspace",
+                "mode"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "revision",
+            "policy"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_company_capability_promotion",
+        "capability": "general_task",
+        "description": "Submit a signed, strictly additive capability package promotion on an isolated company view.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.company/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "grant": {
+              "type": "string"
+            },
+            "operation": {
+              "type": "string"
+            },
+            "expires_ms": {
+              "type": "integer"
+            },
+            "action": {
+              "const": "promote_capability"
+            },
+            "view": {
+              "type": "string",
+              "minLength": 1
+            },
+            "revision": {
+              "type": "string",
+              "minLength": 1
+            },
+            "candidate": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32768
+            },
+            "capability_plan": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 524288
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16384
+            },
+            "encoding": {
+              "type": "string",
+              "enum": [
+                "utf8",
+                "base64"
+              ]
+            },
+            "remove": {
+              "type": "boolean"
+            },
+            "execution": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "runtime": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "runtime",
+                "generation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "expires_ms",
+            "action",
+            "view",
+            "revision",
+            "candidate",
+            "capability_plan"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "view": {
+              "type": "string"
+            },
+            "candidate_revision": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "approval_required",
+                "verification_pending",
+                "published"
+              ]
+            },
+            "approval_required": {
+              "type": "boolean"
+            },
+            "promotion_policy": {
+              "type": "string",
+              "enum": [
+                "require_human_approval",
+                "follow_actor_grant"
+              ]
+            },
+            "graph_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "maxItems": 256
+            },
+            "revision": {
+              "type": "string"
+            },
+            "publication": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "view",
+            "job",
+            "state",
+            "approval_required",
+            "promotion_policy",
+            "graph_hash",
+            "capabilities",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
+        ]
+      },
+      {
+        "id": "omos_export_local_capability",
+        "capability": "general_task",
+        "description": "Export a selected local capability closure and its declared files into a verified offline tar archive.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "selections": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 256,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "capability": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "realisation": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "minLength": 1,
+                    "maxLength": 128
+                  }
+                },
+                "required": [
+                  "capability"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": [
+            "selections"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.local-capability-package/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "capability": {
+              "type": "string"
+            },
+            "graph_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "scope": {
+              "const": "selected_capabilities"
+            },
+            "dependency_closure": {
+              "const": "declared_complete"
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "revision",
+            "path",
+            "capability",
+            "graph_hash",
+            "files",
+            "bytes",
+            "scope",
+            "dependency_closure"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": false,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli"
+        ]
+      },
+      {
+        "id": "omos_promote_capabilities",
+        "capability": "general_task",
+        "description": "Pack a selected local capability closure and submit it to a central company service for verification and policy-gated publication.",
+        "input": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.capability-promote-request/v1"
+            },
+            "endpoint": {
+              "type": "string",
+              "minLength": 1
+            },
+            "workspace": {
+              "type": "string",
+              "minLength": 1
+            },
+            "actor": {
+              "type": "string",
+              "minLength": 1
+            },
+            "grant": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key_handle": {
+              "type": "string",
+              "minLength": 1
+            },
+            "issuer": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "scope": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "minItems": 1,
+              "maxItems": 32,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 240
+              }
+            },
+            "deadline_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 3600000
+            }
+          },
+          "required": [
+            "version",
+            "endpoint",
+            "workspace",
+            "actor",
+            "grant",
+            "key_handle",
+            "issuer"
+          ],
+          "additionalProperties": false
+        },
+        "output": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "const": "omos.capability-promotion-result/v1"
+            },
+            "workspace": {
+              "type": "string"
+            },
+            "source_workspace": {
+              "type": "string"
+            },
+            "source_revision": {
+              "type": "string"
+            },
+            "capability": {
+              "type": "string"
+            },
+            "graph_hash": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64
+            },
+            "view": {
+              "type": "string"
+            },
+            "job": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "approval_required",
+                "verification_pending",
+                "published"
+              ]
+            },
+            "approval_required": {
+              "type": "boolean"
+            },
+            "promotion_policy": {
+              "type": "string",
+              "enum": [
+                "require_human_approval",
+                "follow_actor_grant"
+              ]
+            },
+            "revision": {
+              "type": "string"
+            },
+            "files": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "version",
+            "workspace",
+            "source_workspace",
+            "source_revision",
+            "capability",
+            "graph_hash",
+            "view",
+            "job",
+            "state",
+            "approval_required",
+            "promotion_policy",
+            "revision",
+            "files",
+            "bytes"
+          ],
+          "additionalProperties": false
+        },
+        "mutation": true,
+        "permissions": [
+          "host_policy"
+        ],
+        "approval": "policy",
+        "interfaces": [
+          "cli",
+          "agent"
         ]
       },
       {
@@ -7517,6 +8114,46 @@
             "version",
             "workspace",
             "entries"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_company_promotion_policy",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "mode": "string"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "mode"
+          ],
+          "indexed": []
+        },
+        {
+          "id": "omos_capability_promotion",
+          "fields": {
+            "version": "string",
+            "workspace": "string",
+            "task": "string",
+            "actor": "string",
+            "grant": "string",
+            "graph_hash": "string",
+            "plan": "string",
+            "capabilities": "json",
+            "source_workspace": "json",
+            "source_revision": "json"
+          },
+          "required": [
+            "version",
+            "workspace",
+            "task",
+            "actor",
+            "grant",
+            "graph_hash",
+            "plan",
+            "capabilities"
           ],
           "indexed": []
         },

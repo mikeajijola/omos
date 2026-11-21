@@ -136,7 +136,12 @@ pub fn decide(manager: workspace.Manager, task: workspace.Task, current: authori
     const binding = task.authority orelse return error.CompanyAccessDenied;
     const grant = try authority.liveGrant(current, binding.grant, io.milliTimestamp());
     if (!std.mem.eql(u8, grant.actor, binding.actor)) return error.CompanyAccessDenied;
-    if (!grant.human_approval or !authority.permitsAction(grant, .submit)) return error.CompanyApprovalNotRequired;
+    const is_promotion = task.capability_promotion != null;
+    const promotion_policy = @import("company_promotion_policy.zig");
+    const policy = try promotion_policy.load(manager);
+    const approval_required = promotion_policy.requiresHumanApproval(policy, grant, is_promotion);
+    const permitted = if (is_promotion) authority.permitsAction(grant, .promote_capability) else authority.permitsAction(grant, .submit);
+    if (!approval_required or !permitted) return error.CompanyApprovalNotRequired;
     if (task.state == .accepted or task.state == .publication_pending) return error.TaskIsReadOnly;
     if (!try manager.sameRevision(task.base_revision, try manager.revision(task.parent))) return error.CompanyReconciliationRequired;
     const inputs = try candidate(manager, task, try manager.currentRevision(task), current);

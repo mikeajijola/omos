@@ -4923,6 +4923,9 @@ test {
     _ = @import("core/workspace/company_subscription.zig");
     _ = @import("core/workspace/company_schema.zig");
     _ = @import("core/workspace/company_capabilities.zig");
+    _ = @import("core/workspace/company_promotion_policy.zig");
+    _ = @import("core/workspace/company_promotion.zig");
+    _ = @import("core/workspace/capability_promotion.zig");
     _ = @import("core/workspace/company_execution.zig");
     _ = @import("core/workspace/company_worker_jobs.zig");
     _ = @import("core/workspace/company_desired.zig");
