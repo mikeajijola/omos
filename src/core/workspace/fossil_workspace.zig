@@ -35,6 +35,14 @@ pub fn configureHostBinding(binding: ?Binding) void {
 
 pub const ReadDependency = struct { path: []const u8, base_hash: ?[]const u8, observed_hash: []const u8 };
 pub const CapabilityImport = struct { manifest: []const u8, declaration: []const u8, source_workspace: []const u8, source_revision: []const u8, issuer: []const u8 };
+pub const CapabilityPromotion = struct {
+    plan: []const u8,
+    declaration: []const u8,
+    graph_hash: []const u8,
+    capabilities: []const []const u8,
+    source_workspace: ?[]const u8 = null,
+    source_revision: ?[]const u8 = null,
+};
 pub const Task = struct {
     id: []const u8,
     created_at_ms: i64 = 0,
@@ -59,6 +67,7 @@ pub const Task = struct {
     authority: ?@import("company_authority.zig").Binding = null,
     capability_import: ?CapabilityImport = null,
     capability_runtime_receipt: ?[]const u8 = null,
+    capability_promotion: ?CapabilityPromotion = null,
     state: enum { active, paused, blocked, conflict, publication_pending, accepted } = .active,
 };
 const TaskRecordData = struct {
@@ -167,6 +176,7 @@ const Publication = struct {
     review_fence: ?@import("review_job.zig").Fence = null,
     issuer_proof: ?company_publication.Proof = null,
     capability_activation: ?struct { graph_hash: []const u8, receipt: []const u8, definition_hash: ?[]const u8 = null } = null,
+    capability_promotion: ?struct { graph_hash: []const u8, plan: []const u8, definition_hash: ?[]const u8 = null } = null,
 };
 
 fn publicationEqual(alloc: Allocator, bytes: []const u8, expected: Publication) !bool {
@@ -180,6 +190,9 @@ fn publicationEqual(alloc: Allocator, bytes: []const u8, expected: Publication) 
     if (proposal.issuer_proof == null) retained.issuer_proof = null;
     if (proposal.capability_activation) |expected_activation| if (expected_activation.definition_hash == null) {
         if (retained.capability_activation) |*activation| activation.definition_hash = null;
+    };
+    if (proposal.capability_promotion) |expected_promotion| if (expected_promotion.definition_hash == null) {
+        if (retained.capability_promotion) |*promo| promo.definition_hash = null;
     };
     return std.mem.eql(u8, try json(alloc, retained), try json(alloc, proposal));
 }
@@ -198,9 +211,11 @@ test "workspace paths historical publication receipts preserve omitted optional 
     var legacy = (try std.json.parseFromSlice(std.json.Value, alloc, try json(alloc, publication), .{})).value;
     _ = legacy.object.swapRemove("review_fence");
     _ = legacy.object.swapRemove("capability_activation");
+    _ = legacy.object.swapRemove("capability_promotion");
     _ = legacy.object.getPtr("task").?.object.swapRemove("review_job");
     _ = legacy.object.getPtr("task").?.object.swapRemove("capability_import");
     _ = legacy.object.getPtr("task").?.object.swapRemove("capability_runtime_receipt");
+    _ = legacy.object.getPtr("task").?.object.swapRemove("capability_promotion");
     _ = legacy.object.getPtr("review").?.object.swapRemove("assessment_record");
     try std.testing.expect(try publicationEqual(alloc, try json(alloc, legacy), publication));
     try legacy.object.getPtr("review").?.object.put(alloc, "candidate", .{ .string = "Changed" });
@@ -907,7 +922,7 @@ pub const Manager = struct {
         const declaration = try self.loadDeclaration(basis.revision);
         for (files, 0..) |file, index| {
             if (!allowedPath(file.path) or (!std.mem.startsWith(u8, file.path, "authority/") and !std.mem.startsWith(u8, file.path, "company/"))) return error.WorkspacePathDenied;
-            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, file.path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, file.path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, file.path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, file.path, @import("company_review_resume.zig").prefix)) "omos_company_review_resume" else if (std.mem.startsWith(u8, file.path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, file.path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, file.path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, file.path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
+            const entity = if (std.mem.eql(u8, file.path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, file.path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.eql(u8, file.path, @import("company_promotion_policy.zig").path)) "omos_company_promotion_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, file.path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, file.path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, file.path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, file.path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, file.path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, file.path, @import("company_review_resume.zig").prefix)) "omos_company_review_resume" else if (std.mem.startsWith(u8, file.path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, file.path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, file.path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, file.path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, file.path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, file.path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, file.path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, file.path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, file.path, "company/submissions/")) "omos_company_submission" else if (std.mem.startsWith(u8, file.path, "company/uploads/")) "omos_company_upload" else return error.WorkspacePathDenied;
             try model.validateRecord(declaration.semantic, entity, try parse(self.alloc, std.json.Value, file.content), true);
             if (std.mem.eql(u8, entity, "omos_company_reconciliation_policy") or std.mem.eql(u8, entity, "omos_company_desired_binding") or std.mem.eql(u8, entity, "omos_company_reconciliation")) {
                 try @import("company_desired.zig").validateControl(self.alloc, file.path, file.content, self.manifest.id);
@@ -1302,7 +1317,7 @@ pub const Manager = struct {
 
     fn pinSeriesTemplate(self: Manager, id: []const u8) !series_store.Template {
         const current = try self.loadTask(id);
-        if (current.parent_task_id != null or current.authority != null or current.capability_import != null or current.capability_runtime_receipt != null) return error.CannotRepeatScopedTask;
+        if (current.parent_task_id != null or current.authority != null or current.capability_import != null or current.capability_runtime_receipt != null or current.capability_promotion != null) return error.CannotRepeatScopedTask;
         if (current.model_basis == null or current.model_basis.?.capability == null or current.revision_pending) return error.SeriesTemplateNeedsPlan;
         if (current.state == .conflict or current.state == .publication_pending) return error.TaskIsReadOnly;
         try self.validateTaskBasis(current);
@@ -1312,7 +1327,7 @@ pub const Manager = struct {
     }
 
     fn seriesTemplateAt(self: Manager, task: Task, pinned: []const u8, native: series_session.Blueprint) !series_store.Template {
-        if (task.parent_task_id != null or task.authority != null or task.capability_import != null or task.capability_runtime_receipt != null) return error.CannotRepeatScopedTask;
+        if (task.parent_task_id != null or task.authority != null or task.capability_import != null or task.capability_runtime_receipt != null or task.capability_promotion != null) return error.CannotRepeatScopedTask;
         if (task.model_basis == null or task.model_basis.?.capability == null or task.revision_pending) return error.SeriesTemplateNeedsPlan;
         try self.validateTaskBasis(task);
         const original = if (task.request_artifact) |path| try self.contentAt(path, pinned) else task.definition.objective;
@@ -3201,6 +3216,25 @@ pub const Manager = struct {
         return current;
     }
 
+    pub fn bindCapabilityPromotion(self: Manager, previous: Task, promoted: CapabilityPromotion) !Task {
+        const lease = try self.writerLease();
+        defer lease.release();
+        try self.checkExpectedRevision(previous.branch);
+        var current = try self.refreshTaskContextLocked(try self.loadTask(previous.id));
+        if (current.authority == null or current.capability_import != null) return error.CompanyAccessDenied;
+        if (current.capability_promotion) |existing| {
+            if (!std.mem.eql(u8, try json(self.alloc, existing), try json(self.alloc, promoted))) return error.CapabilityImportCollision;
+            return current;
+        }
+        if (current.state == .accepted or current.state == .publication_pending or current.definition.version != previous.definition.version) return error.TaskIsReadOnly;
+        for ([_][]const u8{ promoted.plan, promoted.declaration }) |path| if (!std.mem.startsWith(u8, path, "artifacts/") or path.len != 74 or !safeId(path[10..])) return error.InvalidArtifactIdentity;
+        if (promoted.graph_hash.len != 64 or !safeId(promoted.graph_hash) or promoted.capabilities.len == 0) return error.InvalidCapabilityPromotion;
+        current.capability_promotion = promoted;
+        try self.retainTaskState(current);
+        try self.saveTask(current);
+        return current;
+    }
+
     pub fn storeLocalCheckpoint(self: Manager, task: Task, bytes: []const u8) !void {
         const lease = try self.writerLease();
         defer lease.release();
@@ -4931,7 +4965,7 @@ pub const Manager = struct {
         if (std.mem.startsWith(u8, path, "runtime/sessions/")) try self.validateSessionBinding(try parse(self.alloc, SessionBinding, bytes), path);
         if (std.mem.startsWith(u8, path, "company/reads/")) try self.checkHistoryHash(path, bytes);
         if (declaration) |definition| {
-            const entity: ?[]const u8 = if (std.mem.startsWith(u8, path, "records/omos_worker_projection/")) "omos_worker_projection" else if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, path, @import("company_review_resume.zig").prefix)) "omos_company_review_resume" else if (std.mem.startsWith(u8, path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
+            const entity: ?[]const u8 = if (std.mem.startsWith(u8, path, "records/omos_worker_projection/")) "omos_worker_projection" else if (std.mem.eql(u8, path, "authority/state.json")) "omos_company_authority" else if (std.mem.eql(u8, path, @import("company_capabilities.zig").path)) "omos_company_capability_policy" else if (std.mem.eql(u8, path, @import("company_promotion_policy.zig").path)) "omos_company_promotion_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").policy_prefix)) "omos_company_reconciliation_policy" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").binding_prefix)) "omos_company_desired_binding" else if (std.mem.startsWith(u8, path, @import("company_desired.zig").state_prefix)) "omos_company_reconciliation" else if (std.mem.startsWith(u8, path, @import("company_task_scope.zig").prefix)) "omos_company_task_scope" else if (std.mem.startsWith(u8, path, @import("company_runtime.zig").prefix)) "omos_company_runtime" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").object_prefix)) "omos_company_archive_object" else if (std.mem.startsWith(u8, path, @import("company_archive.zig").prefix)) "omos_company_archive" else if (std.mem.startsWith(u8, path, @import("company_amendment.zig").prefix)) "omos_company_task_amendment" else if (std.mem.startsWith(u8, path, @import("company_review_resume.zig").prefix)) "omos_company_review_resume" else if (std.mem.startsWith(u8, path, @import("company_control.zig").prefix)) "omos_company_task_input" else if (std.mem.startsWith(u8, path, @import("company_activity.zig").prefix)) "omos_company_activity" else if (std.mem.startsWith(u8, path, "company/workers/")) "omos_company_worker_job" else if (std.mem.startsWith(u8, path, "company/execution/")) "omos_company_execution" else if (std.mem.startsWith(u8, path, "company/views/")) "omos_workspace_view" else if (std.mem.startsWith(u8, path, "company/operations/")) "omos_company_operation" else if (std.mem.startsWith(u8, path, "company/approvals/")) "omos_company_approval" else if (std.mem.startsWith(u8, path, "company/reads/")) "omos_company_read" else if (std.mem.startsWith(u8, path, "company/submissions/")) "omos_company_submission" else null;
             if (entity) |kind| {
                 try model.validateRecord(definition.semantic, kind, try parse(self.alloc, std.json.Value, bytes), true);
                 if (std.mem.eql(u8, kind, "omos_company_reconciliation_policy") or std.mem.eql(u8, kind, "omos_company_desired_binding") or std.mem.eql(u8, kind, "omos_company_reconciliation")) try @import("company_desired.zig").validateControl(self.alloc, path, bytes, self.manifest.id);
@@ -5197,8 +5231,20 @@ pub const Manager = struct {
         try self.requireMergeable(latest, review.revision, try self.revision(task.parent));
         try self.validateDependencies(latest);
         const operation = try hash(self.alloc, try json(self.alloc, .{ task.id, review.revision, review.contract_version, task.parent }));
-        const runtime_activation = try @import("capability_runtime.zig").activation(self, latest, review.revision, try self.revision(task.parent));
-        const publication: Publication = .{ .version = 2, .operation = operation, .source = review.revision, .target = task.parent, .task = latest, .review = review, .review_fence = self.review_fence, .capability_activation = if (runtime_activation) |activation| .{ .graph_hash = activation.graph_hash, .receipt = activation.receipt } else null };
+        const target_revision = try self.revision(task.parent);
+        const runtime_activation = try @import("capability_runtime.zig").activation(self, latest, review.revision, target_revision);
+        const promotion_activation = try @import("company_promotion.zig").activation(self, latest, review.revision, target_revision);
+        const publication: Publication = .{
+            .version = 2,
+            .operation = operation,
+            .source = review.revision,
+            .target = task.parent,
+            .task = latest,
+            .review = review,
+            .review_fence = self.review_fence,
+            .capability_activation = if (runtime_activation) |activation| .{ .graph_hash = activation.graph_hash, .receipt = activation.receipt } else null,
+            .capability_promotion = if (promotion_activation) |activation| .{ .graph_hash = activation.graph_hash, .plan = activation.plan_artifact } else null,
+        };
         try atomicWrite(self.alloc, try self.publicationPath(task.id), try json(self.alloc, publication));
         var pending = latest;
         pending.state = .publication_pending;
@@ -5212,8 +5258,14 @@ pub const Manager = struct {
         const binding = publication.task.authority orelse return error.CompanyAccessDenied;
         const state = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.contentAt("authority/state.json", authority_revision), .{});
         const grant = try @import("company_authority.zig").liveGrant(state, binding.grant, issued_ms);
-        const approval = if (grant.human_approval) try @import("company_approval.zig").authorize(self, publication.task, publication.source, authority_revision, state, issued_ms) else null;
-        return .{ .workspace = self.manifest.id, .actor = binding.actor, .grant = binding.grant, .operation = publication.operation, .task = publication.task.id, .source = publication.source, .target = publication.target, .target_base = publication.task.base_revision, .contract_sha256 = try hash(self.alloc, try json(self.alloc, publication.task.definition)), .candidate_sha256 = try hash(self.alloc, publication.review.candidate), .assessment_sha256 = try hash(self.alloc, publication.review.assessment), .authority_revision = authority_revision, .epoch = epoch, .issued_ms = issued_ms, .approval_sha256 = approval, .reads_sha256 = if (publication.task.company_reads.len == 0) null else try hash(self.alloc, try json(self.alloc, publication.task.company_reads)) };
+        const promotion_policy = @import("company_promotion_policy.zig");
+        const is_promotion = publication.task.capability_promotion != null;
+        const policy = try promotion_policy.loadAt(self, authority_revision);
+        const approval = if (promotion_policy.requiresHumanApproval(policy, grant, is_promotion))
+            try @import("company_approval.zig").authorize(self, publication.task, publication.source, authority_revision, state, issued_ms)
+        else
+            null;
+        return .{ .workspace = self.manifest.id, .actor = binding.actor, .grant = binding.grant, .operation = publication.operation, .task = publication.task.id, .source = publication.source, .target = publication.target, .target_base = publication.task.base_revision, .contract_sha256 = try hash(self.alloc, try json(self.alloc, publication.task.definition)), .candidate_sha256 = try hash(self.alloc, publication.review.candidate), .assessment_sha256 = try hash(self.alloc, publication.review.assessment), .authority_revision = authority_revision, .epoch = epoch, .issued_ms = issued_ms, .approval_sha256 = approval, .reads_sha256 = if (publication.task.company_reads.len == 0) null else try hash(self.alloc, try json(self.alloc, publication.task.company_reads)), .promotion_sha256 = if (publication.task.capability_promotion) |promo| promo.graph_hash else null };
     }
 
     fn verifyPublication(self: Manager, publication: Publication) !void {
@@ -5222,6 +5274,10 @@ pub const Manager = struct {
         if (publication.capability_activation) |activation| {
             if (activation.definition_hash == null) return error.InvalidCapabilityRuntimeProof;
             try @import("capability_runtime.zig").verifyPublication(self, publication.task, publication.source, activation.receipt, activation.graph_hash);
+        }
+        if (publication.capability_promotion) |promo| {
+            if (promo.definition_hash == null) return error.InvalidCapabilityPromotion;
+            try @import("company_promotion.zig").verifyPublication(self, publication.task, publication.source, promo.plan, promo.graph_hash);
         }
         if (publication.issuer_proof) |proof| {
             const claims = try company_publication.verify(self, proof);
@@ -5250,6 +5306,9 @@ pub const Manager = struct {
         try self.verifyPublication(accepted);
         if (accepted.capability_activation) |activation| {
             if (!std.mem.eql(u8, activation.definition_hash.?, (try self.loadDeclaration(revision_id)).hash)) return error.WorkspaceVerificationFailed;
+        }
+        if (accepted.capability_promotion) |promo| {
+            if (!std.mem.eql(u8, promo.definition_hash.?, (try self.loadDeclaration(revision_id)).hash)) return error.WorkspaceVerificationFailed;
         }
         return revision_id;
     }
@@ -5317,13 +5376,20 @@ pub const Manager = struct {
                 const current = try record_json.decode(@import("company_authority.zig").State, self.alloc, try self.contentAt("authority/state.json", authority_revision), .{});
                 publication.issuer_proof = try company_publication.seal(self, try self.publicationClaims(publication, authority_revision, current.epoch, io_mod.milliTimestamp()));
             }
-            const runtime_activation = try @import("capability_runtime.zig").activation(self, publication.task, publication.source, try self.revision(publication.target));
+            const target_head = try self.revision(publication.target);
+            const runtime_activation = try @import("capability_runtime.zig").activation(self, publication.task, publication.source, target_head);
             if (runtime_activation) |activation| {
                 const expected = publication.capability_activation orelse return error.InvalidCapabilityRuntimeProof;
                 if (!std.mem.eql(u8, expected.graph_hash, activation.graph_hash) or !std.mem.eql(u8, expected.receipt, activation.receipt)) return error.CapabilityRuntimeVerificationRequired;
                 const definition = try model.parse(self.alloc, activation.definition);
                 publication.capability_activation.?.definition_hash = definition.hash;
             } else if (publication.capability_activation != null) return error.InvalidCapabilityRuntimeProof;
+            const promotion_activation = try @import("company_promotion.zig").activation(self, publication.task, publication.source, target_head);
+            if (promotion_activation) |activation| {
+                const expected = publication.capability_promotion orelse return error.InvalidCapabilityPromotion;
+                if (!std.mem.eql(u8, expected.graph_hash, activation.graph_hash) or !std.mem.eql(u8, expected.plan, activation.plan_artifact)) return error.InvalidCapabilityPromotion;
+                publication.capability_promotion.?.definition_hash = activation.definition_hash;
+            } else if (publication.capability_promotion != null) return error.InvalidCapabilityPromotion;
             const changes = try self.run(tree, &.{ "changes", "--hash", "--differ" });
             if (std.mem.trim(u8, changes, " \r\n").len != 0) return error.WorkspaceRecoveryRequired;
             try self.merge(tree, publication.source, publication.task);
@@ -5331,6 +5397,11 @@ pub const Manager = struct {
                 try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), activation.definition);
                 try atomicWrite(self.alloc, try join(self.alloc, tree, activation.record_path), activation.record);
                 try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("activations/{s}.json", .{publication.operation})), try json(self.alloc, publication.capability_activation.?));
+            }
+            if (promotion_activation) |activation| {
+                try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), activation.definition);
+                try atomicWrite(self.alloc, try join(self.alloc, tree, activation.record_path), activation.record);
+                try atomicWrite(self.alloc, try join(self.alloc, tree, try self.alloc.print("activations/{s}.json", .{publication.operation})), try json(self.alloc, publication.capability_promotion.?));
             }
             if (publication.review_fence) |fence| {
                 var job = try self.loadReviewJob(publication.task, fence.job);

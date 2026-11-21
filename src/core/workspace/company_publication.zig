@@ -24,6 +24,40 @@ pub const Claims = struct {
     issued_ms: i64,
     approval_sha256: ?[]const u8 = null,
     reads_sha256: ?[]const u8 = null,
+    promotion_sha256: ?[]const u8 = null,
+
+    // Preserve exact byte hashes of historical non-promotion claims while
+    // binding capability promotions to their graph hash.
+    pub fn jsonStringify(self: Claims, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (.{
+            "version",
+            "workspace",
+            "actor",
+            "grant",
+            "operation",
+            "task",
+            "source",
+            "target",
+            "target_base",
+            "contract_sha256",
+            "candidate_sha256",
+            "assessment_sha256",
+            "authority_revision",
+            "epoch",
+            "issued_ms",
+            "approval_sha256",
+            "reads_sha256",
+        }) |field_name| {
+            try writer.objectField(field_name);
+            try writer.write(@field(self, field_name));
+        }
+        if (self.promotion_sha256) |promotion| {
+            try writer.objectField("promotion_sha256");
+            try writer.write(promotion);
+        }
+        try writer.endObject();
+    }
 };
 pub const Proof = struct { payload: []const u8, signature: []const u8, issuer: []const u8 };
 
@@ -51,7 +85,11 @@ pub fn verify(manager: workspace.Manager, proof: Proof) !Claims {
     const signature = std.crypto.sign.Ed25519.Signature.fromBytes(try authority.hexBytes(64, proof.signature));
     signature.verifyStrict(proof.payload, public) catch return error.CompanySignatureRejected;
     const grant = try authority.liveGrant(retained, claims.grant, claims.issued_ms);
-    if (!std.mem.eql(u8, grant.actor, claims.actor) or !authority.permitsAction(grant, .submit)) return error.CompanyAccessDenied;
-    if (grant.human_approval and claims.approval_sha256 == null) return error.CompanyApprovalRequired;
+    const is_promotion = claims.promotion_sha256 != null;
+    const permitted = if (is_promotion) authority.permitsAction(grant, .promote_capability) else authority.permitsAction(grant, .submit);
+    if (!std.mem.eql(u8, grant.actor, claims.actor) or !permitted) return error.CompanyAccessDenied;
+    const promotion_policy = @import("company_promotion_policy.zig");
+    const policy = try promotion_policy.loadAt(manager, claims.authority_revision);
+    if (promotion_policy.requiresHumanApproval(policy, grant, is_promotion) and claims.approval_sha256 == null) return error.CompanyApprovalRequired;
     return claims;
 }

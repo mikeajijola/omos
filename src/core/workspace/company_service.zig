@@ -44,7 +44,7 @@ const Submission = struct {
 };
 const Admin = struct {
     version: []const u8,
-    action: enum { initialize, status, grant, revoke, rotate, inspect_proposal, approve, deny, grant_capabilities, inspect_capabilities, workers, evaluate, runtimes, archive, desired, activity, controls },
+    action: enum { initialize, status, grant, revoke, rotate, inspect_proposal, approve, deny, grant_capabilities, inspect_capabilities, inspect_promotion_policy, set_promotion_policy, workers, evaluate, runtimes, archive, desired, activity, controls },
     revision: ?[]const u8 = null,
     grant: ?authority.Grant = null,
     id: ?[]const u8 = null,
@@ -52,6 +52,7 @@ const Admin = struct {
     candidate_hash: ?[]const u8 = null,
     expires_ms: ?i64 = null,
     capabilities: ?[]const []const u8 = null,
+    mode: ?@import("company_promotion_policy.zig").Mode = null,
     worker: ?@import("company_worker_jobs.zig").Request = null,
     evaluation: ?@import("company_validation.zig").Request = null,
     runtime: ?@import("company_runtime.zig").Request = null,
@@ -117,9 +118,12 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     }
     const declaration = try manager.loadDeclaration(((try manager.modelBasis("trunk")) orelse return error.WorkspaceMigrationRequired).revision);
     const capability_control = request.action == .grant_capabilities or request.action == .inspect_capabilities;
+    const promotion_control = request.action == .inspect_promotion_policy or request.action == .set_promotion_policy;
     const admin_operation = switch (request.action) {
         .grant_capabilities => "omos_grant_capability_scope",
         .inspect_capabilities => "omos_inspect_capability_scopes",
+        .inspect_promotion_policy => "omos_inspect_promotion_policy",
+        .set_promotion_policy => "omos_set_promotion_policy",
         .workers => if (request.worker != null and request.worker.?.change == .amend) "omos_company_worker_amend" else if (request.worker != null and request.worker.?.change == .retire) "omos_company_worker_retirement" else if (request.worker != null and request.worker.?.change == .checkpoint) (if (request.worker.?.checkpoint != null and request.worker.?.checkpoint.?.company_contract != null) "omos_company_worker_contract_checkpoint" else if (request.worker.?.checkpoint != null and request.worker.?.checkpoint.?.continuation != null) "omos_company_worker_continuation" else "omos_company_worker_checkpoint") else "omos_company_worker_admin",
         .evaluate => "omos_company_evaluation",
         .runtimes => "omos_company_runtime_admin",
@@ -131,11 +135,12 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
     };
     if (model.hasOperation(declaration, admin_operation)) {
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, raw), .input);
-    } else if (capability_control or request.action == .workers or request.action == .evaluate or request.action == .runtimes or request.action == .archive or request.action == .desired or request.action == .activity or request.action == .controls or request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
+    } else if (capability_control or promotion_control or request.action == .workers or request.action == .evaluate or request.action == .runtimes or request.action == .archive or request.action == .desired or request.action == .activity or request.action == .controls or request.action == .inspect_proposal or request.action == .approve or request.action == .deny) {
         // Older profiles retain their administrative recovery interface. New
         // decisions require the declared operation and protected record type.
         return error.CompanyDefinitionUpdateRequired;
     }
+    if (request.mode != null and request.action != .set_promotion_policy) return error.UnsupportedCompanyApi;
     if (request.worker != null and request.action != .workers) return error.UnsupportedCompanyApi;
     if (request.evaluation != null and request.action != .evaluate) return error.UnsupportedCompanyApi;
     if (request.runtime != null and request.action != .runtimes) return error.UnsupportedCompanyApi;
@@ -197,7 +202,23 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
         try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
         return output;
     }
+    if (request.action == .inspect_promotion_policy) {
+        if (request.revision != null and !equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
+        const established_revision = revision_id orelse return error.CompanyNotInitialized;
+        const output = try encode(manager.alloc, .{ .revision = established_revision, .policy = try @import("company_promotion_policy.zig").load(manager) });
+        try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
+        return output;
+    }
     if (!equal(request.revision, revision_id)) return error.WorkspaceRevisionChanged;
+    if (request.action == .set_promotion_policy) {
+        const promotion_policy = @import("company_promotion_policy.zig");
+        const mode = request.mode orelse return error.InvalidPromotionPolicy;
+        const policy = try promotion_policy.update(manager.manifest.id, mode);
+        const revision = try manager.companyWrite(revision_id, &.{.{ .path = promotion_policy.path, .content = try encode(manager.alloc, policy) }});
+        const output = try encode(manager.alloc, .{ .revision = revision, .policy = policy });
+        try model.validateOperation(manager.alloc, declaration, admin_operation, try parse(manager.alloc, output), .output);
+        return output;
+    }
     if (request.action == .grant_capabilities) {
         const scopes = @import("company_capabilities.zig");
         const policy = try scopes.assign(manager.alloc, try scopes.load(manager), try state(manager), declaration, request.id orelse return error.InvalidCompanyIdentity, request.capabilities orelse return error.MissingCapabilities, io.milliTimestamp());
@@ -220,7 +241,16 @@ pub fn administer(original: workspace.Manager, raw: []const u8) ![]const u8 {
         if (!std.mem.eql(u8, grant.actor, view.actor) or task.authority == null or !std.mem.eql(u8, task.authority.?.actor, view.actor) or !std.mem.eql(u8, task.authority.?.grant, view.grant)) return error.CompanyAccessDenied;
         const candidate = try approval.candidate(manager, task, try manager.currentRevision(task), current);
         const candidate_hash = try workspace.hash(manager.alloc, try encode(manager.alloc, candidate));
-        if (request.action == .inspect_proposal) return encode(manager.alloc, .{ .revision = revision_id, .candidate = candidate, .candidate_hash = candidate_hash, .approval_required = grant.human_approval });
+        const promotion_policy = @import("company_promotion_policy.zig");
+        const policy = try promotion_policy.load(manager);
+        const is_promotion = task.capability_promotion != null;
+        const approval_required = promotion_policy.requiresHumanApproval(policy, grant, is_promotion);
+        if (request.action == .inspect_proposal) {
+            if (is_promotion) {
+                return encode(manager.alloc, .{ .revision = revision_id, .candidate = candidate, .candidate_hash = candidate_hash, .approval_required = approval_required, .capability_promotion = task.capability_promotion, .promotion_policy = policy.mode });
+            }
+            return encode(manager.alloc, .{ .revision = revision_id, .candidate = candidate, .candidate_hash = candidate_hash, .approval_required = approval_required });
+        }
         const decision = try approval.decide(manager, task, current, request.candidate_hash orelse return error.MissingContent, request.action == .approve, request.expires_ms orelse return error.InvalidCompanyApprovalExpiry);
         const revision = try manager.companyWrite(revision_id, &.{.{ .path = try approval.path(manager.alloc, task.id), .content = try encode(manager.alloc, decision) }});
         // A decision changes authority only. A new verification invocation can
@@ -415,7 +445,7 @@ pub fn bootstrap(original: workspace.Manager) ![]const u8 {
     const upload_entity = for (declaration.semantic.entityTypes) |entity| {
         if (std.mem.eql(u8, entity.id, "omos_company_upload")) break true;
     } else false;
-    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_packages = model.field(properties, "capability_selections") != null and model.hasOperation(declaration, "omos_company_capability"), .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .task_scopes = task_scope.supported(declaration), .execution_ownership = executionDeclared(declaration), .scoped_inventory = model.hasOperation(declaration, "omos_company_inventory"), .inventory_export = model.hasOperation(declaration, "omos_company_inventory_export"), .owned_views = model.hasOperation(declaration, "omos_company_views"), .conversation = model.hasOperation(declaration, "omos_company_conversation"), .worker_checkpoints = model.hasOperation(declaration, "omos_company_worker_checkpoint"), .worker_continuation = model.hasOperation(declaration, "omos_company_worker_continuation"), .verification_resume = @import("company_review_resume.zig").supported(declaration), .task_input = @import("company_control.zig").supported(declaration), .task_amendments = model.hasOperation(declaration, "omos_company_task_amend") and model.hasOperation(declaration, "omos_company_worker_amend") and model.hasOperation(declaration, "omos_company_worker_contract_checkpoint"), .actor_activity = model.hasOperation(declaration, "omos_company_activity_admin") and model.hasOperation(declaration, "omos_company_activity_read"), .desired_state = model.hasOperation(declaration, "omos_company_desired_admin") and model.hasOperation(declaration, "omos_company_desired_read"), .actor_archives = model.hasOperation(declaration, "omos_company_archive_admin") and model.hasOperation(declaration, "omos_company_archive_read"), .retired_archives = model.hasOperation(declaration, "omos_company_worker_retirement") and model.hasOperation(declaration, "omos_company_retired_archive_admin"), .validation_feedback = model.hasOperation(declaration, "omos_company_validation_feedback"), .completion_planning = model.hasOperation(declaration, "omos_company_completion_plan") and @import("company_planning.zig").supported(declaration), .hosted_execution = model.hasOperation(declaration, "omos_company_hosted_execution") and try runtimes.available(manager, null, null), .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
+    return encode(manager.alloc, .{ .version = "omos.company/v1", .workspace = current.workspace, .issuer = current.issuer, .epoch = current.epoch, .revision = try manager.revision("trunk"), .features = .{ .scope = "path", .merge = "record_or_file", .typed_records = "custom_entities", .scoped_export = "manifest", .file_attributes = if (fileAttributesDeclared(properties)) @as(?[]const u8, "omos.company/v2") else null, .chunked_upload = upload_entity and model.field(properties, "upload") != null, .max_upload_chunk_bytes = uploads.chunk_bytes, .checkpoint_attributes = model.field(properties, "executable") != null and model.field(properties, "previous_executable") != null, .read_dependencies = read_dependencies.supported(declaration), .operator_approvals = model.hasOperation(declaration, "omos_company_admin"), .schema_discovery = model.hasOperation(declaration, "omos_company_schema"), .capability_discovery = model.hasOperation(declaration, "omos_company_capability") and model.field(properties, "capability") != null, .capability_packages = model.field(properties, "capability_selections") != null and model.hasOperation(declaration, "omos_company_capability"), .capability_promotion = model.field(properties, "capability_plan") != null and model.hasOperation(declaration, "omos_company_capability_promotion"), .promotion_policy = model.hasOperation(declaration, "omos_inspect_promotion_policy") and model.hasOperation(declaration, "omos_set_promotion_policy"), .capability_delegation = model.hasOperation(declaration, "omos_grant_capability_scope") and model.field(properties, "delegated_capabilities") != null, .progress_history = model.field(properties, "progress_cursor") != null, .progress_stream = if (model.field(properties, "progress_cursor") != null and model.hasOperation(declaration, "omos_company_subscription")) @as(?[]const u8, "omos.company-progress/v1") else null, .max_progress_streams = progress_stream_limit, .max_progress_seconds = progress_stream_seconds, .task_scopes = task_scope.supported(declaration), .execution_ownership = executionDeclared(declaration), .scoped_inventory = model.hasOperation(declaration, "omos_company_inventory"), .inventory_export = model.hasOperation(declaration, "omos_company_inventory_export"), .owned_views = model.hasOperation(declaration, "omos_company_views"), .conversation = model.hasOperation(declaration, "omos_company_conversation"), .worker_checkpoints = model.hasOperation(declaration, "omos_company_worker_checkpoint"), .worker_continuation = model.hasOperation(declaration, "omos_company_worker_continuation"), .verification_resume = @import("company_review_resume.zig").supported(declaration), .task_input = @import("company_control.zig").supported(declaration), .task_amendments = model.hasOperation(declaration, "omos_company_task_amend") and model.hasOperation(declaration, "omos_company_worker_amend") and model.hasOperation(declaration, "omos_company_worker_contract_checkpoint"), .actor_activity = model.hasOperation(declaration, "omos_company_activity_admin") and model.hasOperation(declaration, "omos_company_activity_read"), .desired_state = model.hasOperation(declaration, "omos_company_desired_admin") and model.hasOperation(declaration, "omos_company_desired_read"), .actor_archives = model.hasOperation(declaration, "omos_company_archive_admin") and model.hasOperation(declaration, "omos_company_archive_read"), .retired_archives = model.hasOperation(declaration, "omos_company_worker_retirement") and model.hasOperation(declaration, "omos_company_retired_archive_admin"), .validation_feedback = model.hasOperation(declaration, "omos_company_validation_feedback"), .completion_planning = model.hasOperation(declaration, "omos_company_completion_plan") and @import("company_planning.zig").supported(declaration), .hosted_execution = model.hasOperation(declaration, "omos_company_hosted_execution") and try runtimes.available(manager, null, null), .max_request_bytes = 1024 * 1024, .max_read_bytes = 16384, .max_object_bytes = 8 * 1024 * 1024 } });
 }
 
 pub fn execute(original: workspace.Manager, raw: []const u8, writable: bool) ![]const u8 {
@@ -524,6 +554,10 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
         try model.validateOperation(manager.alloc, declaration, "omos_company_schema", try parse(manager.alloc, incoming.payload), .input);
     }
     if (request.delegated_capabilities != null and request.action != .delegate) return error.InvalidCapabilitySelection;
+    if (request.action == .promote_capability) {
+        if (!model.hasOperation(declaration, "omos_company_capability_promotion")) return error.CompanyDefinitionUpdateRequired;
+        try model.validateOperation(manager.alloc, declaration, "omos_company_capability_promotion", try parse(manager.alloc, incoming.payload), .input);
+    } else if (request.capability_plan != null) return error.InvalidCapabilityPromotion;
     if (request.upload != null and request.action != .checkpoint) return error.InvalidCompanyUpload;
     if (request.progress_cursor != null and (request.action != .status or request.outcome != null or request.offset != 0 or request.revision != null)) return error.InvalidCompanyProgressCursor;
     if (progress_only) if (cursor) |position| {
@@ -549,14 +583,14 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     }
     // Completed receipts remain inspectable. A new compute or mutation request
     // cannot resurrect a task whose host has permanently retired its image.
-    if (request.view) |id| if (request.action == .execution or request.action == .execute_task or request.action == .checkpoint or request.action == .record or request.action == .submit) {
+    if (request.view) |id| if (request.action == .execution or request.action == .execute_task or request.action == .checkpoint or request.action == .record or request.action == .submit or request.action == .promote_capability) {
         const selected = try loadView(manager, grant, id);
         if (try @import("company_worker_jobs.zig").retirement(manager, selected.task.id) != null) return error.CompanyWorkerRetired;
     };
     if (request.view) |id| if (request.action != .status and request.action != .execution and request.action != .reconcile) {
         const selected = try loadView(manager, grant, id);
         const observes = request.action == .read or request.action == .query or request.action == .discover;
-        const edits = request.action == .checkpoint or request.action == .record or request.action == .submit;
+        const edits = request.action == .checkpoint or request.action == .record or request.action == .submit or request.action == .promote_capability;
         if (edits or (observes and !try frozenTask(manager, selected.task))) {
             try requireExecution(manager, selected.view, grant, request.execution);
             try @import("company_desired.zig").require(manager, selected.task);
@@ -566,7 +600,8 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     if (mutation and retained == null) try saveJournal(manager, path, journal);
     const result = perform(manager, current, grant, request, request_hash, writable) catch |err| {
         if (mutation) {
-            journal.state = if (err == error.InvalidCompanyReviewResume or err == error.InvalidCompanyTaskAmendment or err == error.InvalidCompanyTaskScope or err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execute_task and request.content != null and @import("company_control.zig").rejected(err)) or (request.action == .execute_task and (err == error.CompanyImplementationUnavailable or err == error.CompanyWorkerInvocationBudget or err == error.CompanyWorkerCancelled or err == error.TaskIsReadOnly)) or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or err == error.WorkspaceMergeConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
+            const promotion_rejected = request.action == .promote_capability and (err == error.CapabilityImportCollision or err == error.IncompleteCapabilityPackage or err == error.InvalidCapabilitySelection or err == error.InvalidCapabilityPromotion or err == error.MissingCapabilityPlan or err == error.MissingContent or err == error.InvalidCompanyCandidate or err == error.WorkspacePathDenied or err == error.WorkspaceSymlinkDenied or err == error.CapabilityPackageTooLarge or err == error.UnsupportedResourceFamily or err == error.UnknownCapability or err == error.UnknownRealisation or err == error.UnknownResource or err == error.RealisationCapabilityMismatch or err == error.RealisationSelectionRequired or err == error.DuplicateCapabilitySelection or err == error.CapabilityDependencyCycle or err == error.InvalidResourcePackagePath or err == error.InvalidResourceDependency or err == error.UnsupportedResourcePortability or err == error.TaskIsReadOnly or err == error.CompanyOperationConflict);
+            journal.state = if (promotion_rejected or err == error.InvalidCompanyReviewResume or err == error.InvalidCompanyTaskAmendment or err == error.InvalidCompanyTaskScope or err == error.WorkspaceRevisionChanged or err == error.WorkspaceReadDependencyChanged or err == error.CompanyDefinitionUpdateRequired or err == error.CompanyAccessDenied or (request.action == .execute_task and request.content != null and @import("company_control.zig").rejected(err)) or (request.action == .execute_task and (err == error.CompanyImplementationUnavailable or err == error.CompanyWorkerInvocationBudget or err == error.CompanyWorkerCancelled or err == error.TaskIsReadOnly)) or (request.action == .execution and ownership.rejected(err)) or (request.action == .delegate and (err == error.CompanyDelegationDenied or err == error.CompanyGrantAlreadyExists or err == error.UnknownCapability or err == error.DuplicateCapabilitySelection)) or err == error.WorkspaceProjectionConflict or err == error.WorkspaceMergeConflict or ((request.action == .record or request.action == .checkpoint) and @import("company_records.zig").validationFailure(err))) .failed else .uncertain;
             journal.failure = @errorName(err);
             journal.receipt = try signed(manager, current, request, request_hash, try encode(manager.alloc, .{ .operation = request.operation, .state = @tagName(journal.state), .failure = journal.failure }));
             try saveJournal(manager, path, journal);
@@ -576,6 +611,7 @@ fn executeInner(original: workspace.Manager, raw: []const u8, writable: bool, pr
     if (schema_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_schema", try parse(manager.alloc, result), .output);
     if (capability_discovery) try model.validateOperation(manager.alloc, declaration, "omos_company_capability", try parse(manager.alloc, result), .output);
     if (request.action == .execution) try model.validateOperation(manager.alloc, declaration, "omos_company_execution", try parse(manager.alloc, result), .output);
+    if (request.action == .promote_capability) try model.validateOperation(manager.alloc, declaration, "omos_company_capability_promotion", try parse(manager.alloc, result), .output);
     if (snapshot_read) {
         var live = manager;
         live.company_read_revision = null;
@@ -884,6 +920,7 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
     }
     if (request.action == .submit) {
         const view = selected orelse return error.CompanyViewRequired;
+        if (view.task.capability_promotion != null) return error.CompanyOperationConflict;
         const execution = (try manager.tryTaskExecutionLease(view.task.id)) orelse return error.WorkspaceExecutionBusy;
         defer execution.release();
         const candidate = request.candidate orelse return error.MissingContent;
@@ -921,6 +958,91 @@ fn perform(original: workspace.Manager, current: authority.State, original_grant
         _ = try manager.checkpoint(integrated);
         const job = try manager.queueReview(integrated);
         return encode(alloc, .{ .view = view.view.id, .candidate_revision = revision_id, .job = job.id, .state = if (grant.human_approval) "approval_required" else "verification_pending", .revision = try manager.currentRevision(view.task) });
+    }
+    if (request.action == .promote_capability) {
+        const view = selected orelse return error.CompanyViewRequired;
+        const execution = (try manager.tryTaskExecutionLease(view.task.id)) orelse return error.WorkspaceExecutionBusy;
+        defer execution.release();
+        const candidate = request.candidate orelse return error.MissingContent;
+        if (candidate.len == 0 or candidate.len > 32768) return error.InvalidCompanyCandidate;
+        const raw_plan = request.capability_plan orelse return error.MissingCapabilityPlan;
+        const promotion_policy = @import("company_promotion_policy.zig");
+        const policy = try promotion_policy.load(manager);
+        const approval_required = promotion_policy.requiresHumanApproval(policy, grant, true);
+        var retained_proposal = false;
+        var cursor = try manager.historyCursor(view.task, revision_id);
+        find_promotion: while (cursor.offset < cursor.paths.len) {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const batch = (try cursor.next(a)) orelse break;
+            for (batch) |raw| {
+                const row = try parse(a, raw);
+                if (!std.mem.eql(u8, model.text(row, "kind"), "company_proposal")) continue;
+                const value = model.field(row, "value") orelse continue;
+                if (std.mem.eql(u8, model.text(value, "operation"), request.operation)) {
+                    retained_proposal = true;
+                    break :find_promotion;
+                }
+            }
+        }
+        if (retained_proposal) {
+            const promo = view.task.capability_promotion orelse return error.CompanyOperationConflict;
+            const job = if (view.task.review_job) |id| try manager.loadReviewJob(view.task, id) else try manager.queueReview(view.task);
+            if (!std.mem.eql(u8, job.candidate_hash, try workspace.hash(alloc, candidate))) return error.CompanyOperationConflict;
+            return encode(alloc, .{
+                .view = view.view.id,
+                .candidate_revision = request.revision,
+                .job = job.id,
+                .state = if (job.state == .published) "published" else if (approval_required) "approval_required" else "verification_pending",
+                .approval_required = approval_required,
+                .promotion_policy = policy.mode,
+                .graph_hash = promo.graph_hash,
+                .capabilities = promo.capabilities,
+                .revision = try manager.currentRevision(view.task),
+                .publication = if (job.state == .published) try manager.publicationSummary(view.task) else null,
+            });
+        }
+        if (view.task.state == .accepted or view.task.state == .publication_pending) return error.TaskIsReadOnly;
+        const promotion = @import("company_promotion.zig");
+        const base_declaration = try manager.loadDeclaration(view.task.base_revision);
+        _ = try promotion.validate(manager, grant, base_declaration, revision_id, view.task.base_revision, view.task.request_artifact, raw_plan);
+        const submission = try prepareSubmission(manager, view.view, view.task, request, operation_hash, candidate);
+        const frozen = try manager.freezeCompanyReads(view.task, submission.reads);
+        if (frozen.state == .conflict) try manager.reconcileConflict(frozen);
+        const refreshed = try manager.refresh(frozen);
+        const refreshed_revision = try manager.currentRevision(refreshed);
+        const refreshed_declaration = try manager.loadDeclaration(refreshed.base_revision);
+        const validated = try promotion.validate(manager, grant, refreshed_declaration, refreshed_revision, refreshed.base_revision, refreshed.request_artifact, raw_plan);
+        const plan_artifact = try manager.artifact(refreshed, validated.payload_bytes);
+        const declaration_artifact = try manager.artifact(refreshed, validated.definition_bytes);
+        const integrated = try manager.bindCapabilityPromotion(refreshed, .{
+            .plan = plan_artifact,
+            .declaration = declaration_artifact,
+            .graph_hash = validated.graph_hash,
+            .capabilities = validated.capabilities,
+            .source_workspace = validated.payload.source_workspace,
+            .source_revision = validated.payload.source_revision,
+        });
+        const integration_revision = try manager.currentRevision(integrated);
+        try manager.record(integrated, "company_proposal", .{ .actor = grant.actor, .grant = grant.id, .candidate_revision = revision_id, .integration_revision = integration_revision, .operation = request.operation });
+        try manager.record(integrated, "capability_promotion", .{ .graph_hash = validated.graph_hash, .plan = plan_artifact, .declaration = declaration_artifact, .capabilities = validated.capabilities });
+        try manager.record(integrated, "review_candidate", .{ .text = candidate, .at_ms = io.milliTimestamp() });
+        try manager.record(integrated, "review_failure", .{ .code = "IndependentCompanyReviewRequired", .at_ms = io.milliTimestamp() + 1 });
+        _ = try manager.checkpoint(integrated);
+        const job = try manager.queueReview(integrated);
+        return encode(alloc, .{
+            .view = view.view.id,
+            .candidate_revision = revision_id,
+            .job = job.id,
+            .state = if (approval_required) "approval_required" else "verification_pending",
+            .approval_required = approval_required,
+            .promotion_policy = policy.mode,
+            .graph_hash = validated.graph_hash,
+            .capabilities = validated.capabilities,
+            .revision = try manager.currentRevision(integrated),
+            .publication = @as(?std.json.Value, null),
+        });
     }
     if (request.action == .discover or request.action == .read or request.action == .export_scope or request.action == .query) {
         const attributes = std.mem.eql(u8, request.version, "omos.company/v2");

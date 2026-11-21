@@ -845,13 +845,13 @@ pub const read_tool_result = ToolSpec{
 
 pub const fossil_workspace = ToolSpec{
     .name = "fossil_workspace",
-    .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
+    .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
     .model_schema = .{
         .name = "fossil_workspace",
-        .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
+        .description = "Dispatch the unchanged task contract to an independent background worker with dispatch; inspect its pending or verified state with workers. Inspect the pinned OmniForm definition, query typed records, and propose compatible definitions. Also read/write memory, skills or UI source, restore_ui from a historical revision on this task branch, attach artifacts, inspect history/diff, verify_runtime against private owner runtime bindings (optional path selects an accepted source task), promote_capability to a central company service (path selects CONFIG.json, entity selects the capability ID, optional revision selects realisation, optional content supplies summary), or verify_manifest using files with path, sha256, bytes and optional executable flags. Contracts, evidence, assessments and publication are host-owned.",
         .input_schema = .{
             .properties = &.{
-                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui", "verify_runtime", "dispatch", "workers" } } },
+                .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "status", "read", "write", "artifact", "diff", "history", "verify_manifest", "definition", "query", "record", "propose_definition", "restore_ui", "verify_runtime", "promote_capability", "dispatch", "workers" } } },
                 .{ .name = "path", .json_type = .string },
                 .{ .name = "content", .json_type = .string },
                 .{ .name = "entity", .json_type = .string },
@@ -1110,7 +1110,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "e893eb49b258a02c2619d6a45a264c8b4063b858fe4db5dfd669f749a518c11b",
+        "acc1a4db8f8b1677a940e7834ac809f1be156f39bab76c314715f3588c128f2f",
         &actual_hex,
     );
 }
