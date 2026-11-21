@@ -4926,6 +4926,8 @@ test {
     _ = @import("core/workspace/company_promotion_policy.zig");
     _ = @import("core/workspace/company_promotion.zig");
     _ = @import("core/workspace/capability_promotion.zig");
+    _ = @import("core/workspace/capability_distill.zig");
+    _ = @import("tools/session/fossil_workspace.zig");
     _ = @import("core/workspace/company_execution.zig");
     _ = @import("core/workspace/company_worker_jobs.zig");
     _ = @import("core/workspace/company_desired.zig");

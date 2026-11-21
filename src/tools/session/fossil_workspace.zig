@@ -3,13 +3,19 @@ const workspace = @import("../../core/workspace/fossil_workspace.zig");
 const dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Input = struct {
-    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime, promote_capability, dispatch, workers },
+    action: enum { status, read, write, artifact, diff, history, verify_manifest, definition, query, record, propose_definition, restore_ui, verify_runtime, distill_capability, promote_capability, dispatch, workers },
     path: ?[]const u8 = null,
     content: ?[]const u8 = null,
     entity: ?[]const u8 = null,
     offset: usize = 0,
     execution: ?[]const u8 = null,
     revision: ?[]const u8 = null,
+    task_id: ?[]const u8 = null,
+    capability_id: ?[]const u8 = null,
+    realisation: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+    paths: ?[]const []const u8 = null,
+    apply: bool = false,
 };
 const Parsed = std.json.Parsed(Input);
 
@@ -30,6 +36,11 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
     };
     if (ctx.coordinator_mode) switch (parsed.value.action) {
         .status, .read, .diff, .history, .definition, .query, .dispatch, .workers => {},
+        .distill_capability => if (parsed.value.apply) {
+            parsed.deinit();
+            ctx.allocator.destroy(parsed);
+            return .{ .failure = try ctx.allocator.dupe(u8, "Dispatch the original contract to a background worker before making changes.") };
+        },
         else => {
             parsed.deinit();
             ctx.allocator.destroy(parsed);
@@ -40,8 +51,10 @@ pub fn decode(ctx: dispatch.DispatchContext, args: []const u8) dispatch.Dispatch
 }
 
 pub fn readsOnly(input: dispatch.ToolInput) bool {
-    return switch (input.as(Parsed).value.action) {
+    const parsed = input.as(Parsed).value;
+    return switch (parsed.action) {
         .write, .artifact, .record, .propose_definition, .restore_ui, .verify_runtime, .promote_capability, .dispatch => false,
+        .distill_capability => !parsed.apply,
         else => true,
     };
 }
@@ -71,9 +84,24 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
         return std.json.Stringify.valueAlloc(alloc, .{ .version = "omos.background-contracts/v1", .workers = entries, .next_offset = if (entries.len == 32) input.offset + entries.len else @as(?usize, null) }, .{});
     }
     if (input.action == .dispatch) {
-        if (input.path != null or input.content != null or input.entity != null or input.execution != null or input.revision != null or input.offset != 0) return error.InvalidBackgroundDispatch;
+        if (input.path != null or input.content != null or input.entity != null or input.execution != null or input.revision != null or input.offset != 0 or input.task_id != null or input.capability_id != null or input.realisation != null or input.summary != null or input.paths != null or input.apply) return error.InvalidBackgroundDispatch;
         const run = ctx.background_dispatch_fn orelse return error.BackgroundHostUnavailable;
         return run(ctx.background_dispatch_ctx, alloc, ctx.tool_call_id);
+    }
+    if (input.action == .distill_capability) {
+        if (input.execution != null or input.offset != 0) return error.InvalidCapabilitySelection;
+        if (input.apply and task == null) return error.SavedTaskRequired;
+        const task_id = input.task_id orelse input.path orelse return error.TaskIdRequired;
+        const capability_id = input.capability_id orelse input.entity orelse return error.MissingCapability;
+        const result = try @import("../../core/workspace/capability_distill.zig").distill(manager, .{
+            .task_id = task_id,
+            .capability_id = capability_id,
+            .realisation_id = input.realisation orelse input.revision,
+            .paths = input.paths,
+            .apply = input.apply,
+            .summary = input.summary orelse input.content,
+        });
+        return std.json.Stringify.valueAlloc(alloc, result, .{});
     }
     if (input.action == .status) {
         var snapshot = try manager.snapshot("");
@@ -115,4 +143,26 @@ fn execute(alloc: std.mem.Allocator, ctx: dispatch.DispatchContext, input: Input
         .artifact => return manager.artifact(active, input.content orelse return error.MissingContent),
         else => unreachable,
     }
+}
+
+test "fossil_workspace distill_capability enforces read-only classification and coordinator fencing" {
+    const alloc = std.testing.allocator;
+    const ctx: dispatch.DispatchContext = .{ .allocator = alloc };
+
+    const preview = try decode(ctx, "{\"action\":\"distill_capability\",\"task_id\":\"t1\",\"capability_id\":\"invoice_audit\"}");
+    defer preview.input.deinit(alloc);
+    try std.testing.expect(readsOnly(preview.input));
+
+    const mutating = try decode(ctx, "{\"action\":\"distill_capability\",\"task_id\":\"t1\",\"capability_id\":\"invoice_audit\",\"apply\":true}");
+    defer mutating.input.deinit(alloc);
+    try std.testing.expect(!readsOnly(mutating.input));
+
+    const coord_ctx: dispatch.DispatchContext = .{ .allocator = alloc, .coordinator_mode = true };
+    const coord_preview = try decode(coord_ctx, "{\"action\":\"distill_capability\",\"task_id\":\"t1\",\"capability_id\":\"invoice_audit\"}");
+    defer coord_preview.input.deinit(alloc);
+    try std.testing.expect(readsOnly(coord_preview.input));
+
+    const coord_apply = try decode(coord_ctx, "{\"action\":\"distill_capability\",\"task_id\":\"t1\",\"capability_id\":\"invoice_audit\",\"apply\":true}");
+    defer alloc.free(coord_apply.failure);
+    try std.testing.expect(std.mem.find(u8, coord_apply.failure, "background worker") != null);
 }

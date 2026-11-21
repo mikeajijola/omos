@@ -5776,7 +5776,16 @@ pub const Manager = struct {
         return .null;
     }
 
+    pub const DistilledFile = struct {
+        path: []const u8,
+        content: []const u8,
+    };
+
     pub fn proposeDefinition(self: Manager, task: ?Task, bytes: []const u8, execution_bytes: ?[]const u8) ![]const u8 {
+        return self.proposeDefinitionWithFiles(task, bytes, execution_bytes, &.{});
+    }
+
+    pub fn proposeDefinitionWithFiles(self: Manager, task: ?Task, bytes: []const u8, execution_bytes: ?[]const u8, files: []const DistilledFile) ![]const u8 {
         const proposed = try model.parse(self.alloc, bytes);
         const lease = try self.writerLease();
         defer lease.release();
@@ -5793,8 +5802,32 @@ pub const Manager = struct {
             if (model.field(supplied, "server") == null) execution.server = previous_execution.server;
             if (model.field(supplied, "projections") == null) execution.projections = previous_execution.projections;
         }
+        if (files.len > 0) {
+            const authority = @import("company_authority.zig");
+            const base_manifest = try self.fileManifest(base);
+            var seen_lower: std.array_hash_map.String(void) = .empty;
+            for (base_manifest) |entry| {
+                const lower = try std.ascii.allocLowerString(self.alloc, entry.path);
+                try seen_lower.put(self.alloc, lower, {});
+            }
+            for (files) |file| {
+                if (!std.mem.startsWith(u8, file.path, "skills/") or !authority.validPath(file.path, false)) return error.WorkspacePathDenied;
+                if (file.content.len > max_bytes) return error.WorkspaceRecordTooLarge;
+                const lower = try std.ascii.allocLowerString(self.alloc, file.path);
+                if ((try seen_lower.getOrPut(self.alloc, lower)).found_existing) return error.DistillSkillPathCollision;
+            }
+        }
         const compatible = try model.compatible(self.alloc, old, proposed) and model.compatibleExecution(previous_execution, execution);
-        const proposal_id = try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }));
+        const proposal_id = if (files.len == 0)
+            try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution }))
+        else blk: {
+            const FileHash = struct { path: []const u8, sha256: []const u8 };
+            var file_hashes: std.ArrayList(FileHash) = .empty;
+            for (files) |file| {
+                try file_hashes.append(self.alloc, .{ .path = file.path, .sha256 = try hash(self.alloc, file.content) });
+            }
+            break :blk try hash(self.alloc, try json(self.alloc, .{ .base = base, .definition = proposed.hash, .execution = execution, .files = file_hashes.items }));
+        };
         const branch = try self.alloc.print("definition/{s}", .{proposal_id});
         const existing = self.revision(branch) catch |err| switch (err) {
             error.FossilCommandFailed => null,
@@ -5810,6 +5843,9 @@ pub const Manager = struct {
         if (compatible) {
             try atomicWrite(self.alloc, try join(self.alloc, tree, model.declaration_path), try model.canonical(self.alloc, proposed.value));
             try atomicWrite(self.alloc, try join(self.alloc, tree, model.execution_path), try json(self.alloc, execution));
+            for (files) |file| {
+                try atomicWrite(self.alloc, try join(self.alloc, tree, file.path), file.content);
+            }
         }
         const source = try self.commit(tree, "Retain host-validated definition proposal");
         {
