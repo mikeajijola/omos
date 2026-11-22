@@ -19,6 +19,7 @@ const session_permission_state = @import("../permissions/session_permission_stat
 const session_store = @import("../session/session_store.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 
@@ -167,6 +168,7 @@ pub const CaptureRequest = struct {
     parent_id: []const u8,
     source_id: []const u8,
     preferences: TurnPreferences,
+    trust_policy: trust_tier.Policy = .{},
 };
 
 pub const RunOutcome = enum { completed, awaiting_approval, paused };

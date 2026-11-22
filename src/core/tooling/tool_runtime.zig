@@ -2509,6 +2509,7 @@ fn executeSubagentProvider(
         .caller_id = caller_id,
         .invocation_id = invocation_id,
         .parent_permission_mode = ctx.permission_mode,
+        .parent_trust_policy = ctx.trust_policy,
         .root_user_intent_context = ctx.root_user_intent_context,
         .root_user_messages = ctx.root_user_messages,
         .root_user_evidence_complete = ctx.root_user_evidence_complete,

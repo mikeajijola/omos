@@ -1327,10 +1327,12 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
             const app: *App = @ptrCast(@alignCast(raw.?));
             const alloc = std.heap.c_allocator;
+            const child_policy = admission.trust_policy;
             var child_projection = app.snapshotSubagentModelToolProjection(
                 alloc,
                 admission.permission_mode,
                 admission.rules,
+                child_policy,
             ) catch
                 return error.OutOfMemory;
             defer child_projection.deinit(alloc);
@@ -1367,13 +1369,16 @@ pub fn Runtime(comptime App: type) type {
                 .provider_set = providers,
                 .system_prompt = prompt_policy.system_prompt,
                 .model_prompt_overlay = prompt_policy.modelPromptOverlay(admission.model),
-                .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
+                .skill_catalog = if (child_policy.allowsWorkspaceSkills())
+                    .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics }
+                else
+                    .{ .skills = &.{} },
                 .advertised_tool_names = child_projection.advertised_names,
                 .advertised_functions = child_projection.advertised_functions,
                 .custom_tool_guidance = child_projection.custom_guidance,
                 .context_registry = app.contextRegistry(),
-                .context_enabled = if (comptime @hasField(App, "context_enabled")) app.context_enabled else true,
-                .project_context = modelVisibleProjectContext(app),
+                .context_enabled = (if (comptime @hasField(App, "context_enabled")) app.context_enabled else true) and child_policy.allowsProjectContext(),
+                .project_context = if (child_policy.allowsProjectContext()) modelVisibleProjectContext(app) else "",
                 .lifecycle_view = app.lifecycle_view,
             }, turn, message, admission, cancel);
         }
@@ -1958,6 +1963,7 @@ const FakeApp = struct {
         alloc: Allocator,
         permission_mode: PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        _: @import("../permissions/trust_tier.zig").Policy,
     ) !tool_projection_mod.EffectiveToolProjection {
         self.snapshot_tools_count += 1;
         self.snapshot_permission_mode = permission_mode;
