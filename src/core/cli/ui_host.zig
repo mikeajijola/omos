@@ -11,7 +11,9 @@ const background = @import("../workspace/background_contract.zig");
 const background_dispatch = @import("../workspace/background_dispatch.zig");
 const channels = @import("../workspace/contract_channels.zig");
 const background_control = @import("../workspace/background_control.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const version = "omos.ui-host/v1";
+const host_capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1", "trust_tiers_v1" };
 const alloc = std.heap.c_allocator;
 
 pub const Runner = struct {
@@ -35,6 +37,7 @@ const Job = struct {
     cursor: usize = 0,
     attention_seen: bool = false,
     channel_session: ?[]const u8 = null,
+    trust_policy: trust_tier.Policy = .{},
 
     fn emit(raw: *anyopaque, data: []const u8) !void {
         const self: *Job = @ptrCast(@alignCast(raw));
@@ -77,7 +80,7 @@ const Job = struct {
         const attention = std.mem.eql(u8, kind, "input_required") or std.mem.eql(u8, kind, "input_resolved");
         if (attention or (self.attention_seen and std.mem.eql(u8, kind, "turn_end"))) {
             self.attention_seen = true;
-            var saved = true;
+            var saved = self.trust_policy.allowsPersonalFossil();
             for (self.args) |arg| if (std.mem.eql(u8, arg, "--no-save")) {
                 saved = false;
             };
@@ -107,7 +110,7 @@ const Job = struct {
             self.ui.emit(.{ .type = "error", .code = @errorName(err) }) catch {};
             break :blk @as(u8, 1);
         };
-        if (self.channel_session) |session| {
+        if (self.trust_policy.allowsPersonalFossil()) if (self.channel_session) |session| {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             if (workspace.Manager.bound(arena.allocator())) |bound| {
@@ -115,7 +118,7 @@ const Job = struct {
                     self.ui.emit(.{ .type = "channel_binding_pending", .code = @errorName(err), .command = self.id }) catch {};
                 };
             } else |_| {}
-        }
+        };
         self.exit_code = exit;
         self.ui.emit(.{ .type = "turn_end", .exit_code = exit }) catch {};
     }
@@ -202,7 +205,7 @@ const Server = struct {
             queued.writer_queue = self.writer_queue;
             bound_manager = queued;
         }
-        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1" } });
+        if (std.mem.eql(u8, method, "initialize")) return value(arena, .{ .version = version, .project = try io.realpathAlloc(arena, "."), .workspace = self.workspace_id, .active_turn = if (self.job) |job| job.id else null, .capabilities = host_capabilities });
         if (std.mem.eql(u8, method, "prompt") or std.mem.eql(u8, method, "coordinate")) {
             var coordinated = params;
             if (coordinated != .object) return error.InvalidPrompt;
@@ -305,45 +308,86 @@ const Server = struct {
         return self.start(arena, key, try value(arena, .{ .coordinator = true, .text = command.text, .session = command.session }), null);
     }
 
-    fn startWithBackground(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation, background_run: ?*BackgroundRun) !std.json.Value {
-        const Prompt = struct { coordinator: bool = false, text: []const u8 = "", session: ?[]const u8 = null, model: ?[]const u8 = null, effort: ?[]const u8 = null, continue_recovery: bool = false, images: []const []const u8 = &.{} };
-        const request = try std.json.parseFromValueLeaky(Prompt, arena, params, .{});
+    const Prompt = struct {
+        coordinator: bool = false,
+        text: []const u8 = "",
+        session: ?[]const u8 = null,
+        model: ?[]const u8 = null,
+        effort: ?[]const u8 = null,
+        continue_recovery: bool = false,
+        images: []const []const u8 = &.{},
+        trust_tier: ?[]const u8 = null,
+        untrusted_mode: ?[]const u8 = null,
+    };
+
+    const PreparedPrompt = struct {
+        policy: trust_tier.Policy,
+        args: []const [:0]const u8,
+    };
+
+    fn preparePromptArgs(target_alloc: std.mem.Allocator, request: Prompt) !PreparedPrompt {
         if (request.text.len > 1024 * 1024 or !std.unicode.utf8ValidateSlice(request.text) or std.mem.findScalar(u8, request.text, 0) != null) return error.InvalidPrompt;
-        const request_hash = try workspace.hash(arena, try std.json.Stringify.valueAlloc(arena, request, .{}));
-        if (self.job) |active| {
-            if (!std.mem.eql(u8, active.id, id)) return error.TurnInProgress;
-            if (!std.mem.eql(u8, active.request_hash, request_hash)) return error.TurnIdConflict;
-            return value(arena, .{ .turn = id, .already_accepted = true });
-        }
+        const policy = try trust_tier.parsePolicy(request.trust_tier, request.untrusted_mode);
         var args: std.ArrayList([:0]const u8) = .empty;
         errdefer {
-            for (args.items) |arg| alloc.free(arg);
-            args.deinit(alloc);
+            for (args.items) |arg| target_alloc.free(arg);
+            args.deinit(target_alloc);
         }
-        for ([_][]const u8{ "--json", "--prompt-permissions" }) |arg| try args.append(alloc, try alloc.dupeSentinel(u8, arg, 0));
+        for ([_][]const u8{ "--json", "--prompt-permissions" }) |arg| try args.append(target_alloc, try target_alloc.dupeSentinel(u8, arg, 0));
+        if (policy.tier != .private) {
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--trust-tier", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, policy.tier.label(), 0));
+            if (policy.tier == .untrusted) {
+                try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--untrusted-mode", 0));
+                try args.append(target_alloc, try target_alloc.dupeSentinel(u8, policy.untrusted_mode.label(), 0));
+            }
+        }
         if (request.session) |session| {
             if (!safeSessionId(session)) return error.InvalidSessionId;
-            try args.append(alloc, try alloc.dupeSentinel(u8, "--resume-id", 0));
-            try args.append(alloc, try alloc.dupeSentinel(u8, session, 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--resume-id", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, session, 0));
         }
         if (request.model) |model| {
-            try args.append(alloc, try alloc.dupeSentinel(u8, "--model", 0));
-            try args.append(alloc, try alloc.dupeSentinel(u8, model, 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--model", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, model, 0));
         }
         if (request.effort) |effort| {
-            try args.append(alloc, try alloc.dupeSentinel(u8, "--effort", 0));
-            try args.append(alloc, try alloc.dupeSentinel(u8, effort, 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--effort", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, effort, 0));
         }
         if (request.images.len > 5) return error.TooManyImages;
         for (request.images) |image| {
             // The local authenticated host resolves upload handles, never model text.
             if (!std.Io.Dir.path.isAbsolute(image)) return error.InvalidImagePath;
-            try args.append(alloc, try alloc.dupeSentinel(u8, "--image", 0));
-            try args.append(alloc, try alloc.dupeSentinel(u8, image, 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--image", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, image, 0));
         }
-        if (request.continue_recovery) try args.append(alloc, try alloc.dupeSentinel(u8, "--continue-recovery", 0)) else {
-            try args.append(alloc, try alloc.dupeSentinel(u8, "--", 0));
-            try args.append(alloc, try alloc.dupeSentinel(u8, request.text, 0));
+        if (request.continue_recovery) try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--continue-recovery", 0)) else {
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, "--", 0));
+            try args.append(target_alloc, try target_alloc.dupeSentinel(u8, request.text, 0));
+        }
+        return .{
+            .policy = policy,
+            .args = try args.toOwnedSlice(target_alloc),
+        };
+    }
+
+    fn startWithBackground(self: *Server, arena: std.mem.Allocator, id: []const u8, params: std.json.Value, scheduled: ?schedule_worker.Invocation, background_run: ?*BackgroundRun) !std.json.Value {
+        const request = try std.json.parseFromValueLeaky(Prompt, arena, params, .{});
+        const prepared = try preparePromptArgs(alloc, request);
+        const policy = prepared.policy;
+        const owned_args = prepared.args;
+        errdefer {
+            for (owned_args) |arg| alloc.free(arg);
+            alloc.free(owned_args);
+        }
+        const request_hash = try workspace.hash(arena, try std.json.Stringify.valueAlloc(arena, request, .{}));
+        if (self.job) |active| {
+            if (!std.mem.eql(u8, active.id, id)) return error.TurnInProgress;
+            if (!std.mem.eql(u8, active.request_hash, request_hash)) return error.TurnIdConflict;
+            for (owned_args) |arg| alloc.free(arg);
+            alloc.free(owned_args);
+            return value(arena, .{ .turn = id, .already_accepted = true });
         }
         const path = try arena.print("{s}/{s}.ndjson", .{ self.journal_dir, id });
         const journal = std.Io.Dir.createFileAbsolute(io.getIo(), path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch |err| switch (err) {
@@ -356,6 +400,8 @@ const Server = struct {
                 const entry = try parse(arena, first);
                 const data = @import("../workspace/definition.zig").field(entry, "data") orelse return error.TurnAcceptanceUncertain;
                 if (!std.mem.eql(u8, @import("../workspace/definition.zig").text(data, "request_hash"), request_hash)) return error.TurnIdConflict;
+                for (owned_args) |arg| alloc.free(arg);
+                alloc.free(owned_args);
                 return value(arena, .{ .turn = id, .already_accepted = true });
             },
             else => return err,
@@ -369,13 +415,8 @@ const Server = struct {
         errdefer alloc.free(owned_id);
         const owned_hash = try alloc.dupe(u8, request_hash);
         errdefer alloc.free(owned_hash);
-        const owned_args = try args.toOwnedSlice(alloc);
-        errdefer {
-            for (owned_args) |arg| alloc.free(arg);
-            alloc.free(owned_args);
-        }
         const acknowledgement = try value(arena, .{ .turn = id, .already_accepted = false });
-        const execution_lease: ?workspace.ExecutionLease = if (scheduled == null) blk: {
+        const execution_lease: ?workspace.ExecutionLease = if (scheduled == null and policy.allowsPersonalFossil()) blk: {
             var manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
             manager.writer_queue = self.writer_queue;
             break :blk (try manager.trySessionExecutionLease(request.session orelse id)) orelse return error.WorkspaceExecutionBusy;
@@ -383,8 +424,8 @@ const Server = struct {
         errdefer if (execution_lease) |lease| lease.release();
         const job = try alloc.create(Job);
         errdefer alloc.destroy(job);
-        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .coordinator_mode = request.coordinator and background_run == null and scheduled == null and !std.mem.eql(u8, io.getenv("OMOS_COORDINATOR") orelse "", "0"), .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease };
-        if (std.mem.startsWith(u8, id, "command-")) {
+        job.* = .{ .server = self, .id = owned_id, .request_hash = owned_hash, .args = owned_args, .ui = .{ .context = job, .emit_fn = Job.emit, .coordinator_mode = policy.allowsPersonalFossil() and request.coordinator and background_run == null and scheduled == null and !std.mem.eql(u8, io.getenv("OMOS_COORDINATOR") orelse "", "0"), .execution_lease_held = execution_lease != null }, .journal = journal, .execution_lease = execution_lease, .trust_policy = policy };
+        if (policy.allowsPersonalFossil() and std.mem.startsWith(u8, id, "command-")) {
             const manager = (try workspace.Manager.bound(arena)) orelse return error.NoFossilWorkspace;
             const command = try channels.loadCommand(manager, id);
             job.ui.channel_context = try std.json.Stringify.valueAlloc(alloc, command.recent_context, .{});
@@ -758,4 +799,80 @@ test "UI host snapshot vocabulary cannot execute arbitrary commands" {
     try std.testing.expect(!safeSessionId("../session"));
     try std.testing.expect(safeSessionId("native_id.with-dash"));
     try std.testing.expect(safeId("browser-turn-123"));
+}
+
+test "UI host advertises trust_tiers_v1 and validates prompt trust tiers" {
+    var has_trust_tiers = false;
+    for (host_capabilities) |cap| {
+        if (std.mem.eql(u8, cap, "trust_tiers_v1")) has_trust_tiers = true;
+    }
+    try std.testing.expect(has_trust_tiers);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Default private prompt omits --trust-tier
+    const default_prompt = try std.json.parseFromSliceLeaky(Server.Prompt, arena, "{\"text\":\"hello\"}", .{});
+    const default_prepared = try Server.preparePromptArgs(arena, default_prompt);
+    try std.testing.expectEqual(trust_tier.TrustTier.private, default_prepared.policy.tier);
+    for (default_prepared.args) |arg| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "--trust-tier"));
+        try std.testing.expect(!std.mem.eql(u8, arg, "--untrusted-mode"));
+    }
+
+    // Shared prompt with session forwards --trust-tier shared and --resume-id without --no-save
+    const shared_prompt = try std.json.parseFromSliceLeaky(
+        Server.Prompt,
+        arena,
+        "{\"text\":\"hello team\",\"session\":\"group-thread-1\",\"trust_tier\":\"shared\"}",
+        .{},
+    );
+    const shared_prepared = try Server.preparePromptArgs(arena, shared_prompt);
+    try std.testing.expectEqual(trust_tier.TrustTier.shared, shared_prepared.policy.tier);
+    var saw_trust_flag = false;
+    var saw_shared = false;
+    var saw_resume_id = false;
+    for (shared_prepared.args, 0..) |arg, idx| {
+        try std.testing.expect(!std.mem.eql(u8, arg, "--no-save"));
+        if (std.mem.eql(u8, arg, "--trust-tier") and idx + 1 < shared_prepared.args.len) {
+            saw_trust_flag = true;
+            saw_shared = std.mem.eql(u8, shared_prepared.args[idx + 1], "shared");
+        }
+        if (std.mem.eql(u8, arg, "--resume-id")) saw_resume_id = true;
+    }
+    try std.testing.expect(saw_trust_flag and saw_shared and saw_resume_id);
+
+    // Untrusted reader prompt forwards both --trust-tier untrusted and --untrusted-mode reader
+    const reader_prompt = try std.json.parseFromSliceLeaky(
+        Server.Prompt,
+        arena,
+        "{\"text\":\"read this\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"reader\"}",
+        .{},
+    );
+    const reader_prepared = try Server.preparePromptArgs(arena, reader_prompt);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, reader_prepared.policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, reader_prepared.policy.untrusted_mode);
+    var saw_untrusted = false;
+    var saw_reader = false;
+    for (reader_prepared.args, 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, "--trust-tier") and idx + 1 < reader_prepared.args.len) {
+            saw_untrusted = std.mem.eql(u8, reader_prepared.args[idx + 1], "untrusted");
+        }
+        if (std.mem.eql(u8, arg, "--untrusted-mode") and idx + 1 < reader_prepared.args.len) {
+            saw_reader = std.mem.eql(u8, reader_prepared.args[idx + 1], "reader");
+        }
+    }
+    try std.testing.expect(saw_untrusted and saw_reader);
+
+    // Invalid trust_tier / untrusted_mode inputs are rejected cleanly
+    for ([_][]const u8{
+        "{\"text\":\"hi\",\"trust_tier\":\"admin\"}",
+        "{\"text\":\"hi\",\"trust_tier\":\"shared\",\"untrusted_mode\":\"reader\"}",
+        "{\"text\":\"hi\",\"untrusted_mode\":\"chat\"}",
+        "{\"text\":\"hi\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"shell\"}",
+    }) |bad_json| {
+        const bad_prompt = try std.json.parseFromSliceLeaky(Server.Prompt, arena, bad_json, .{});
+        try std.testing.expectError(error.InvalidTrustTier, Server.preparePromptArgs(arena, bad_prompt));
+    }
 }

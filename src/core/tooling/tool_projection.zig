@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const permissions = @import("../permissions/permissions.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set_contract = @import("tool_set.zig");
 const types = @import("../shared/types.zig");
@@ -14,6 +15,7 @@ pub const Options = struct {
     subagent_available: bool = false,
     fossil_workspace_available: bool = false,
     coordinator_mode: bool = false,
+    trust_policy: trust_tier.Policy = .{},
 };
 
 const BuildKind = enum { full, read_only, coordinator };
@@ -530,6 +532,15 @@ pub fn buildReadOnlyModelToolProjectionForSet(alloc: Allocator, tool_set: tool_s
 }
 
 fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) !EffectiveToolProjection {
+    if (options.trust_policy.tier == .untrusted and options.trust_policy.untrusted_mode == .chat) {
+        return .{
+            .advertised_names = try alloc.alloc([]const u8, 0),
+            .advertised_functions = try alloc.alloc(model_tool_schema.FunctionSchema, 0),
+            .dynamic_tool_names = try alloc.alloc([]const u8, 0),
+            .custom_guidance = try alloc.alloc(u8, 0),
+        };
+    }
+
     var advertised_names: std.ArrayList([]const u8) = .empty;
     errdefer advertised_names.deinit(alloc);
     var advertised_functions: std.ArrayList(model_tool_schema.FunctionSchema) = .empty;
@@ -538,7 +549,7 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     errdefer guidance_out.deinit();
 
     var first_custom_guidance = true;
-    if (kind == .coordinator) try guidance_out.writer.writeAll("You coordinate background contract workers. Answer brief informational questions using read-only tools. For work requiring changes, external actions, lengthy investigation or verification, call fossil_workspace with action dispatch immediately. This transfers the ORIGINAL pinned contract to an independent worker and frees the main conversation. Dispatch is pending work, never proof of fulfillment. Use workers to inspect retained status. Do not execute the work yourself or claim it completed at handoff.\n");
+    if (kind == .coordinator and options.trust_policy.allowsPersonalFossil()) try guidance_out.writer.writeAll("You coordinate background contract workers. Answer brief informational questions using read-only tools. For work requiring changes, external actions, lengthy investigation or verification, call fossil_workspace with action dispatch immediately. This transfers the ORIGINAL pinned contract to an independent worker and frees the main conversation. Dispatch is pending work, never proof of fulfillment. Use workers to inspect retained status. Do not execute the work yourself or claim it completed at handoff.\n");
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
@@ -561,7 +572,8 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
                 std.mem.eql(u8, tool.name, "mcp_select_tool");
             if (!tool.prefers_advertised_names and !is_discovery_bridge) continue;
             if (!tool.model_visible) continue;
-            if (tool.executor_kind == .fossil_workspace and !options.fossil_workspace_available) continue;
+            if (!options.trust_policy.allowsToolAdvertisement(tool.name)) continue;
+            if (tool.executor_kind == .fossil_workspace and (!options.fossil_workspace_available or !options.trust_policy.allowsPersonalFossil())) continue;
             if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) continue;
             if (options.permission_mode != .yolo and
                 permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) continue;
@@ -600,7 +612,8 @@ fn appendBuiltinTool(
     options: Options,
 ) !void {
     if (!tool.model_visible) return;
-    if (tool.executor_kind == .fossil_workspace and !options.fossil_workspace_available) return;
+    if (!options.trust_policy.allowsToolAdvertisement(tool.name)) return;
+    if (tool.executor_kind == .fossil_workspace and (!options.fossil_workspace_available or !options.trust_policy.allowsPersonalFossil())) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
@@ -992,4 +1005,69 @@ test "background coordinator includes the host workspace tool outside the canoni
         return;
     };
     return error.TestExpectedEqual;
+}
+
+test "trust tier untrusted chat advertises zero tools" {
+    const alloc = std.testing.allocator;
+    var projection = try buildTestModelToolProjection(alloc, .{
+        .permission_mode = .yolo,
+        .subagent_available = true,
+        .fossil_workspace_available = true,
+        .trust_policy = .{ .tier = .untrusted, .untrusted_mode = .chat },
+    });
+    defer projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), projection.advertised_names.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.advertised_functions.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.dynamic_tool_names.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.custom_guidance.len);
+}
+
+test "trust tier untrusted reader advertises only web_fetch and web_search" {
+    const alloc = std.testing.allocator;
+    var projection = try buildTestModelToolProjection(alloc, .{
+        .permission_mode = .yolo,
+        .subagent_available = true,
+        .fossil_workspace_available = true,
+        .trust_policy = .{ .tier = .untrusted, .untrusted_mode = .reader },
+    });
+    defer projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), projection.advertised_names.len);
+    try expectContainsName(projection.advertised_names, "web_fetch");
+    try expectContainsName(projection.advertised_names, "web_search");
+    try expectNotContainsName(projection.advertised_names, "shell");
+    try expectNotContainsName(projection.advertised_names, "read_file");
+    try expectNotContainsName(projection.advertised_names, "write_file");
+    try expectNotContainsName(projection.advertised_names, "fossil_workspace");
+    try std.testing.expectEqual(@as(usize, 0), projection.dynamic_tool_names.len);
+}
+
+test "trust tier shared strips fossil_workspace, install_skill, and subagent" {
+    const alloc = std.testing.allocator;
+    var fossil = test_tool_seed;
+    fossil.name = "fossil_workspace";
+    fossil.model_schema.name = fossil.name;
+    fossil.executor_kind = .fossil_workspace;
+    const tools = [_]tool_dispatch.Tool{
+        test_read_file,
+        test_write_file,
+        test_shell,
+        test_subagent,
+        test_install_skill,
+        test_web_fetch,
+        fossil,
+    };
+    var projection = try buildTestModelToolProjectionForRegistry(alloc, &tools, .{
+        .permission_mode = .yolo,
+        .subagent_available = true,
+        .fossil_workspace_available = true,
+        .trust_policy = .{ .tier = .shared },
+    });
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "read_file");
+    try expectContainsName(projection.advertised_names, "write_file");
+    try expectContainsName(projection.advertised_names, "shell");
+    try expectContainsName(projection.advertised_names, "web_fetch");
+    try expectNotContainsName(projection.advertised_names, "fossil_workspace");
+    try expectNotContainsName(projection.advertised_names, "install_skill");
+    try expectNotContainsName(projection.advertised_names, "subagent");
 }

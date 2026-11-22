@@ -5080,6 +5080,7 @@ test {
     _ = @import("core/workspace/current_branch.zig");
     _ = @import("core/permissions/permission_gate.zig");
     _ = @import("core/permissions/permissions.zig");
+    _ = @import("core/permissions/trust_tier.zig");
     _ = @import("core/execution/process_identity.zig");
     _ = @import("core/execution/process_provider.zig");
     _ = @import("core/execution/managed_execution_contract.zig");
