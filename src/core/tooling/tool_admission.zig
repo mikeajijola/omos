@@ -22,6 +22,7 @@ const terminal_managed_observer = @import("../terminal/managed_observer.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
 const tool_args = @import("tool_args.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
@@ -85,6 +86,7 @@ pub const Input = struct {
     auto_classifier: permission_auto_classifier.Classifier = .disabled(),
     terminal_review_context: ?terminal_managed_observer.Context = null,
     host_sandbox_default: HostSandboxDefault = .none,
+    trust_policy: trust_tier.Policy = .{},
 };
 
 fn registeredTool(input: Input, name: []const u8) ?*const tool_dispatch.Tool {
@@ -201,6 +203,7 @@ pub const FileMutationPreflightRequest = struct {
     can_prompt: bool,
     session_permission_state: ?*const session_permission_state.State = null,
     prepare_permission_identity: bool = false,
+    trust_policy: trust_tier.Policy = .{},
 };
 
 pub const FileMutationPreparationRequest = struct {
@@ -442,6 +445,10 @@ pub fn preflightPreparedFileMutation(
 ) !FileMutationPreflight {
     defer prepared.deinit(arena);
 
+    if (request.trust_policy.checkToolCall(call.name, call.arguments_json) == .denied) {
+        return .policy_denied;
+    }
+
     const expected_kind: file_mutation_contract.Kind =
         if (std.mem.eql(u8, call.name, "write_file"))
             .write
@@ -466,7 +473,17 @@ pub fn preflightPreparedFileMutation(
     defer if (input_owned) input.deinit(arena);
     var targets = prepared.takeTargets();
 
-    const policy_result = if (request.permission_mode == .yolo)
+    const requires_explicit = request.trust_policy.requiresExplicitApproval(call.name, false);
+    const effective_mode: PermissionMode = if (requires_explicit) .ask else request.permission_mode;
+    const effective_rules: types.PermissionRuleSet = if (requires_explicit) blk: {
+        var filtered: std.ArrayList(types.PermissionRule) = .empty;
+        for (request.permission_rules.rules) |rule| {
+            if (rule.action != .allow) try filtered.append(arena, rule);
+        }
+        break :blk .{ .rules = filtered.items };
+    } else request.permission_rules;
+
+    const policy_result = if (effective_mode == .yolo)
         try permissions.authorizePreparedFileMutationTargets(arena, &targets)
     else
         try permissions.evaluatePreparedFileMutationTargetsInScope(
@@ -474,8 +491,8 @@ pub fn preflightPreparedFileMutation(
             request.access_scope orelse workspace_access.AccessScope.primaryOnly(request.workspace_root),
             expected_kind,
             &targets,
-            request.permission_mode,
-            request.permission_rules,
+            effective_mode,
+            effective_rules,
             request.session_grants,
             request.local_grants,
         );
@@ -494,7 +511,7 @@ pub fn preflightPreparedFileMutation(
 
     const edit_prompt_required = policy_targets.prompt_required;
     const equality_prompt_required =
-        request.permission_mode != .yolo and
+        effective_mode != .yolo and
         policy_targets.items[0].expected_identity != null and
         try fileMutationEqualityDisclosureRequiresPrompt(
             arena,
@@ -1097,6 +1114,9 @@ fn resolveOrdinaryPermissionOutcome(
     permission_mode: PermissionMode,
 ) !command_admission.PermissionOutcome {
     const command_call = try isRunCommandCall(input, arena, call);
+    if (input.trust_policy.requiresExplicitApproval(call.name, is_dynamic_tool or command_call)) {
+        return .{ .decision = .permission_required };
+    }
     if (command_call) {
         const default_outcome = defaultRunCommandPermissionOutcome(
             input,
@@ -1206,6 +1226,7 @@ fn fileMutationPreflightRequest(
     permission_mode: PermissionMode,
     local_grants: []const PermissionGrant,
 ) FileMutationPreflightRequest {
+    const requires_explicit = input.trust_policy.requiresExplicitApproval("write_file", false);
     return .{
         .tool_registry = input.tool_registry,
         .workspace_root = input.workspace_root,
@@ -1214,8 +1235,9 @@ fn fileMutationPreflightRequest(
         .session_grants = input.permission_grants,
         .permission_mode = permission_mode,
         .local_grants = local_grants,
-        .can_prompt = input.permission_prompter != null or permission_mode == .auto,
+        .can_prompt = input.permission_prompter != null or (!requires_explicit and permission_mode == .auto),
         .session_permission_state = input.session_permission_state,
+        .trust_policy = input.trust_policy,
     };
 }
 
@@ -1226,6 +1248,8 @@ fn resolveFileMutationPreflightAdmission(
     permission_mode: PermissionMode,
     preflight: FileMutationPreflight,
 ) !FileMutationAdmission {
+    const requires_explicit = input.trust_policy.requiresExplicitApproval(call.name, false);
+    const effective_mode: PermissionMode = if (requires_explicit) .ask else permission_mode;
     return switch (preflight) {
         .tool_failure => |reason| .{ .resolved = .{ .tool_failure = reason } },
         .policy_denied => .{ .resolved = .{ .decision = .policy_denied } },
@@ -1234,7 +1258,7 @@ fn resolveFileMutationPreflightAdmission(
             .execution_authority = .{ .file_mutation = authorization },
         } },
         .permission_required, .prompt => |authorization| blk: {
-            if (permission_mode == .auto and
+            if (effective_mode == .auto and
                 fileMutationAuthorizationMayBypassAutoReview(input, authorization))
             {
                 break :blk .{ .resolved = .{
@@ -1242,7 +1266,7 @@ fn resolveFileMutationPreflightAdmission(
                     .execution_authority = .{ .file_mutation = authorization },
                 } };
             }
-            if (permission_mode == .auto and
+            if (effective_mode == .auto and
                 fileMutationAuthorizationMayUseAutoReview(authorization))
             {
                 const targets = try fileMutationPermissionTargets(
@@ -1314,6 +1338,12 @@ fn requestPermissionOutcomeResolved(
     permission_mode: PermissionMode,
     local_grants: []const PermissionGrant,
 ) !command_admission.PermissionOutcome {
+    if (input.trust_policy.checkToolCall(call.name, call.arguments_json) == .denied) {
+        return .{
+            .decision = .policy_denied,
+            .denial_reason = .policy_denied,
+        };
+    }
     if (file_mutation_contract.isToolName(call.name) and
         // A host tool that reuses a reserved name executes through the host
         // executor, not the builtin file mutation, so it follows the ordinary
@@ -1332,6 +1362,8 @@ fn requestPermissionOutcomeResolved(
     }
     const is_mcp_tool = isAvailableDynamicTool(input, call.name);
     const command_call = try isRunCommandCall(input, arena, call);
+    const requires_explicit = input.trust_policy.requiresExplicitApproval(call.name, is_mcp_tool or command_call);
+    const effective_mode: PermissionMode = if (requires_explicit) .ask else permission_mode;
     if (!toolHasPermissionContract(input, call.name) and
         !is_mcp_tool and
         !command_call)
@@ -1365,7 +1397,7 @@ fn requestPermissionOutcomeResolved(
         try formatVisionPathPermissionLabel(arena, authority)
     else
         null;
-    if (permission_mode == .yolo) {
+    if (effective_mode == .yolo) {
         return bindVisionPathExecutionAuthority(try permissionOutcomeForDecision(
             input,
             arena,
@@ -1388,7 +1420,9 @@ fn requestPermissionOutcomeResolved(
     for (policy_targets) |target| {
         switch (try permissions.ruleDecisionFor(arena, input.permission_rules, input.workspace_root, permission_name, target.path, target_kind)) {
             .deny => return .{ .decision = .policy_denied },
-            .allow => {},
+            .allow => if (requires_explicit) {
+                all_targets_authorized_by_rule = false;
+            },
             .ask => {
                 if (grants_apply and permissions.sessionGrantAllowed(local_grants, permission_name, target.path)) {
                     used_session_grant = true;
@@ -1462,7 +1496,7 @@ fn requestPermissionOutcomeResolved(
             vision_path_authority,
         );
     }
-    if (input.host_sandbox_default == .allow_sandboxed and
+    if (!requires_explicit and input.host_sandbox_default == .allow_sandboxed and
         try isRunCommandCall(input, arena, call))
     {
         return shellPermissionOutcome(
@@ -1477,7 +1511,7 @@ fn requestPermissionOutcomeResolved(
         call,
         policy_targets,
         is_mcp_tool,
-        permission_mode,
+        effective_mode,
     );
     if (resolution.decision != .permission_required) {
         return bindVisionPathExecutionAuthority(resolution, vision_path_authority);
@@ -6565,4 +6599,116 @@ test "automatic review falls back to active connected model when primary reviewe
     try std.testing.expectEqual(ToolPermissionDecision.deny, outcome_caution.decision);
     try std.testing.expectEqual(types.ToolPermissionDenialReason.review_caution, outcome_caution.denial_reason.?);
     try std.testing.expectEqual(@as(usize, 2), fallback.calls);
+}
+
+test "shared trust tier prevents shell and file writes from auto-clearing without explicit approval" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(alloc);
+    var fake = FakeAutoClassifier{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    input.workspace_root = workspace;
+    input.trust_policy = .{ .tier = .shared };
+
+    // Even with personal allow rules, auto mode, or yolo mode, shell cannot auto-clear in shared tier.
+    var rules = [_]types.PermissionRule{
+        .{ .permission = @constCast("bash"), .pattern = @constCast("*"), .action = .allow },
+        .{ .permission = @constCast("write_file"), .pattern = @constCast("*"), .action = .allow },
+    };
+    input.permission_rules = .{ .rules = &rules };
+
+    const shell_call = ToolCall{
+        .id = "shared-shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"git status\"}",
+    };
+    for ([_]PermissionMode{ .auto, .yolo }) |mode| {
+        const shell_outcome = try requestPermissionOutcome(input, arena, shell_call, mode, &.{});
+        try std.testing.expectEqual(ToolPermissionDecision.permission_required, shell_outcome.decision);
+        try std.testing.expect(shell_outcome.execution_authority == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // File writes also require explicit approval (cannot auto-clear in auto or yolo mode).
+    const target = try std.Io.Dir.path.join(arena, &.{ workspace, "shared.txt" });
+    const write_args = try arena.print("{{\"path\":\"{s}\",\"content\":\"hello\\n\"}}", .{target});
+    const write_call = ToolCall{
+        .id = "shared-write",
+        .name = "write_file",
+        .arguments_json = write_args,
+    };
+    for ([_]PermissionMode{ .auto, .yolo }) |mode| {
+        const write_outcome = try requestPermissionOutcome(input, arena, write_call, mode, &.{});
+        try std.testing.expectEqual(ToolPermissionDecision.permission_required, write_outcome.decision);
+        try std.testing.expect(write_outcome.execution_authority == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    // When a prompter is present, shared tier routes through explicit owner approval.
+    var recording = RecordingPrompter{};
+    input.permission_prompter = recording.prompter();
+    const prompted_shell = try requestPermissionOutcome(input, arena, shell_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, prompted_shell.decision);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
+
+    const prompted_write = try requestPermissionOutcome(input, arena, write_call, .auto, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.once, prompted_write.decision);
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+
+    // Blocked tools (browseros-neo MCP and private Fossil actions) are policy-denied immediately.
+    const neo_denied = try requestPermissionOutcome(input, arena, .{
+        .id = "shared-neo",
+        .name = "mcp_browseros-neo_run",
+        .arguments_json = "{}",
+    }, .yolo, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, neo_denied.decision);
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+
+    const fossil_denied = try requestPermissionOutcome(input, arena, .{
+        .id = "shared-fossil",
+        .name = "fossil_workspace",
+        .arguments_json = "{\"action\":\"read\",\"path\":\"memory/private.md\"}",
+    }, .yolo, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, fossil_denied.decision);
+    try std.testing.expectEqual(@as(usize, 2), recording.calls);
+}
+
+test "untrusted trust tier policy-denies disallowed tools even in yolo mode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+
+    input.trust_policy = .{ .tier = .untrusted, .untrusted_mode = .chat };
+    const chat_denied = try requestPermissionOutcome(input, arena, .{
+        .id = "untrusted-chat-fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com\"}",
+    }, .yolo, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, chat_denied.decision);
+
+    input.trust_policy = .{ .tier = .untrusted, .untrusted_mode = .reader };
+    const reader_shell = try requestPermissionOutcome(input, arena, .{
+        .id = "untrusted-reader-shell",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}",
+    }, .yolo, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.policy_denied, reader_shell.decision);
 }

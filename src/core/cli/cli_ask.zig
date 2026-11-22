@@ -55,6 +55,7 @@ const auto_classifier_context = @import("../permissions/auto_classifier_context.
 const permission_gate = @import("../permissions/permission_gate.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const permissions = @import("../permissions/permissions.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const session_runtime = @import("../session/session.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -282,8 +283,9 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .subagent_available = true,
-            .fossil_workspace_available = completion_review.enabled(),
+            .subagent_available = ctx.trust_policy.allowsToolAdvertisement("subagent"),
+            .fossil_workspace_available = completion_review.enabled() and ctx.trust_policy.allowsPersonalFossil(),
+            .trust_policy = ctx.trust_policy,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -379,6 +381,16 @@ const AskOptions = struct {
     continue_recovery: bool = false,
     /// `fx ask --sessions-v2`: keep this run's session in the v2 store.
     sessions_v2: bool = false,
+    trust_tier: trust_tier.TrustTier = .private,
+    trust_tier_explicit: bool = false,
+    untrusted_mode: ?trust_tier.UntrustedMode = null,
+
+    fn trustPolicy(self: AskOptions) trust_tier.Policy {
+        return .{
+            .tier = self.trust_tier,
+            .untrusted_mode = self.untrusted_mode orelse .chat,
+        };
+    }
 
     fn deinit(self: *AskOptions, alloc: Allocator) void {
         alloc.free(self.prompt);
@@ -514,6 +526,7 @@ const RunOptions = struct {
     ultrafast_override: ?bool = null,
     provider_order_override: ?[]const []const u8 = null,
     provider_strict_override: ?bool = null,
+    trust_policy: trust_tier.Policy = .{},
     deps: RunDeps,
 };
 
@@ -614,6 +627,7 @@ const AskContext = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     permission_mode: PermissionMode = .ask,
     permission_rules: types.PermissionRuleSet = .{},
+    trust_policy: trust_tier.Policy = .{},
     mode_id: []const u8,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -1204,7 +1218,8 @@ const AskContext = struct {
             });
         }
         var tc: tool_runtime.Context = .{
-            .fossil_workspace_available = completion_review.enabled(),
+            .fossil_workspace_available = completion_review.enabled() and self.trust_policy.allowsPersonalFossil(),
+            .trust_policy = self.trust_policy,
             .workspace_root = self.workspace_root,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
@@ -1239,9 +1254,14 @@ const AskContext = struct {
             .permission_mode = self.permission_mode,
             .permission_grants = &.{},
             .permission_rules = self.permission_rules,
-            .coordinator_mode = if (self.deps.ui_host) |ui| ui.coordinator_mode else false,
-            .background_authority = if (self.deps.ui_host) |ui| ui.background_authority else null,
-            .required_tools = if (self.deps.ui_host) |ui|
+            .coordinator_mode = self.trust_policy.allowsPersonalFossil() and (if (self.deps.ui_host) |ui| ui.coordinator_mode else false),
+            .background_authority = if (self.trust_policy.allowsPersonalFossil())
+                if (self.deps.ui_host) |ui| ui.background_authority else null
+            else
+                null,
+            .required_tools = if (!self.trust_policy.allowsPersonalFossil())
+                &.{}
+            else if (self.deps.ui_host) |ui|
                 if (ui.background_authority) |authority|
                     if (authority.required_tools.len > 0) authority.required_tools else self.recovered_required_tools
                 else
@@ -1249,7 +1269,7 @@ const AskContext = struct {
             else
                 self.recovered_required_tools,
             .tool_registry = self.toolRegistry(),
-            .subagent_host = self.subagent_host,
+            .subagent_host = if (self.trust_policy.allowsToolAdvertisement("subagent")) self.subagent_host else null,
             .subagent_caller_id = self.activeSessionId(),
             .auto_classifier = self.admissionAutoClassifier(),
             .worker = &self.worker,
@@ -1290,26 +1310,28 @@ const AskContext = struct {
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
         };
-        if (self.mcp_host) |h| {
-            h.catalog.wire(&tc);
-        } else if (self.mcp != null) {
-            tc.mcp_ctx = @ptrCast(self);
-            tc.mcp_has_tool = mcpHasTool;
-            tc.mcp_validate_tool = mcpValidateTool;
-            tc.mcp_call_tool = mcpCallTool;
-            tc.mcp_search_tools = mcpSearchTools;
-            tc.mcp_tool_schema = mcpToolSchemaJson;
-            tc.mcp_snapshot_tool = mcpSnapshotTool;
-            tc.mcp_call_feature = mcpCallFeature;
-        }
-        // Either engine: on a terminal, a server's question is put to the user.
-        if ((self.mcp_host != null or self.mcp != null) and self.mcp_elicitation_capabilities.any()) {
-            tc.mcp_input_responder = .{
-                .context = @ptrCast(self),
-                .capabilities = self.mcp_elicitation_capabilities,
-                .legacy_url_manual_completion = true,
-                .callback = respondToAskMcpInput,
-            };
+        if (self.trust_policy.allowsMcp()) {
+            if (self.mcp_host) |h| {
+                h.catalog.wire(&tc);
+            } else if (self.mcp != null) {
+                tc.mcp_ctx = @ptrCast(self);
+                tc.mcp_has_tool = mcpHasTool;
+                tc.mcp_validate_tool = mcpValidateTool;
+                tc.mcp_call_tool = mcpCallTool;
+                tc.mcp_search_tools = mcpSearchTools;
+                tc.mcp_tool_schema = mcpToolSchemaJson;
+                tc.mcp_snapshot_tool = mcpSnapshotTool;
+                tc.mcp_call_feature = mcpCallFeature;
+            }
+            // Either engine: on a terminal, a server's question is put to the user.
+            if ((self.mcp_host != null or self.mcp != null) and self.mcp_elicitation_capabilities.any()) {
+                tc.mcp_input_responder = .{
+                    .context = @ptrCast(self),
+                    .capabilities = self.mcp_elicitation_capabilities,
+                    .legacy_url_manual_completion = true,
+                    .callback = respondToAskMcpInput,
+                };
+            }
         }
         return tc;
     }
@@ -1476,22 +1498,23 @@ pub fn runUi(alloc: Allocator, args: []const [:0]const u8, cfg: Config, context_
         monitor.join();
     }
     var ui_cfg = cfg;
-    const assignment = if (ui.background_authority) |authority|
+    const private_ui_turn = argsTrustTierIsPrivate(args);
+    const assignment = if (private_ui_turn) if (ui.background_authority) |authority|
         try alloc.print("\n\n<omos_background_assignment task=\"{s}\">\nYou are the independently owned fulfillment worker for this task. The coordinator has already dispatched the original pinned contract and remains available to the user. Complete the remaining implementation, validation and delivery directly with your tools. A workers entry for this task identifies your own execution, not another agent to wait for. When resuming after interruption, first inspect the retained task history and external receipts. A missing tool response means the outcome is uncertain, not that the action failed. Use read-only checks to reconcile it before any repeat submission or other external mutation; if no check can establish a safe next action, report that specific blocker. Reconnect tools and rediscover browser tabs when handles are stale. Preserve confirmed outcomes and continue only the remaining obligations. The handoff requirement is already performed; retain its evidence and satisfy the remaining original obligations through normal independent review and verified publication.{s}{s}\n</omos_background_assignment>", .{
             authority.task,
             if (authority.execution_guidance.len > 0) "\n" else "",
             authority.execution_guidance,
         })
     else
-        null;
+        null else null;
     defer if (assignment) |text| alloc.free(text);
-    const ui_system = try alloc.print("{s}\n\n{s}{s}", .{
+    const ui_system = if (private_ui_turn) try alloc.print("{s}\n\n{s}{s}", .{
         cfg.prompt_policy.system_prompt,
         "This turn is hosted by the workspace UI. Its running source is the Fossil ui/ tree, not a Git starter template or legacy ui directory. For interface requests, first use fossil_workspace status, then read the exact ui/ source paths from its inventory and write changes with fossil_workspace on the saved task branch. Do not edit omos-ui/template or archived prototypes to change the running interface. Workspace content operations are authorized by the native workspace owner; protected records, permissions, validation and publication remain host-owned. Give concise progress commentary and surface failed tools instead of silently searching unrelated repositories.",
         assignment orelse "",
-    });
-    defer alloc.free(ui_system);
-    ui_cfg.prompt_policy.system_prompt = ui_system;
+    }) else null;
+    defer if (ui_system) |text| alloc.free(text);
+    if (ui_system) |text| ui_cfg.prompt_policy.system_prompt = text;
     return runWithDeps(alloc, args, ui_cfg, .{
         .ui_host = ui,
         .stdout_ctx = ui,
@@ -1655,6 +1678,7 @@ fn runWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: 
         .ultrafast_override = options.ultrafast_override,
         .provider_order_override = options.provider_order_override,
         .provider_strict_override = options.provider_strict_override,
+        .trust_policy = options.trustPolicy(),
         .deps = deps,
     }) catch |err| {
         if (interrupt_scope.requested()) return headless_interrupt.exitCode();
@@ -1844,7 +1868,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         if (@backingInt(permission_mode) > @backingInt(authority.permission_mode)) permission_mode = authority.permission_mode;
     };
 
-    if (permission_mode == .yolo and !startup.yolo_acknowledged) {
+    if (options.trust_policy.allowsPersonalFossil() and permission_mode == .yolo and !startup.yolo_acknowledged) {
         try emitHeadlessYoloWarning(alloc, options);
     }
 
@@ -1862,12 +1886,14 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try options.deps.write_stderr(options.deps.stderr_ctx, notice);
     }
 
-    try app_lifecycle.applyWorkspaceLaunch(
-        &startup,
-        alloc,
-        cfg.additional_directories,
-        cfg.saved_directories_suppressed,
-    );
+    if (options.trust_policy.allowsProjectContext()) {
+        try app_lifecycle.applyWorkspaceLaunch(
+            &startup,
+            alloc,
+            cfg.additional_directories,
+            cfg.saved_directories_suppressed,
+        );
+    }
     try checkHeadlessCancellation(options.deps);
 
     if (cfg.auth_mode == .local and
@@ -1916,6 +1942,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
+    ctx.trust_policy = options.trust_policy;
     ctx.reviewer_model = startup.review_model;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
@@ -1926,7 +1953,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         defer alloc.free(captured);
         if (!std.mem.eql(u8, current, captured)) return error.BackgroundPermissionPolicyChanged;
     };
-    ctx.context_enabled = startup.context_enabled;
+    ctx.context_enabled = startup.context_enabled and options.trust_policy.allowsProjectContext();
     if (options.output_mode.isTerminal()) {
         presenter = try ask_presentation.Runtime.init(alloc, .{
             .text = owned_prompt,
@@ -2103,17 +2130,27 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         try ui.beginSession(ctx.activeSessionId() orelse return error.SessionPersistenceUnavailable);
     }
     try ctx.checkCancellation();
-    ctx.loaded_skills = try options.deps.load_skills(
-        alloc,
-        startup.workspace_root,
-        cfg.skill_root_policy,
-    );
+    if (ctx.trust_policy.allowsWorkspaceSkills()) {
+        const effective_skill_policy: skill_contract.RootPolicy = if (ctx.trust_policy.allowsPersonalSkills())
+            cfg.skill_root_policy
+        else
+            .{
+                .workspace_roots = cfg.skill_root_policy.workspace_roots,
+                .managed_root_source = null,
+                .global_roots = &.{},
+            };
+        ctx.loaded_skills = try options.deps.load_skills(
+            alloc,
+            startup.workspace_root,
+            effective_skill_policy,
+        );
+    }
     const loaded_skills = &ctx.loaded_skills;
     try ctx.checkCancellation();
     skill_runtime.traceDiagnostics("ask_startup", loaded_skills.diagnostics);
     ctx.skills_dir = loaded_skills.dir;
     loaded_skills.dir = &.{};
-    if (startup.context_enabled) {
+    if (ctx.context_enabled) {
         try ctx.checkCancellation();
         const context_targets = try context_contract.applicableTargetsForImages(alloc, current_images);
         defer if (context_targets.len > 0) alloc.free(context_targets);
@@ -2128,62 +2165,67 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
 
     try ctx.checkCancellation();
-    ctx.mcp = try options.deps.load_mcp_runtime(
-        alloc,
-        startup.workspace_root,
-        ctx.mcp_elicitation_capabilities,
-    );
-    if (ctx.mcp) |mcp| {
-        var health_snapshot = try mcp.snapshotHealth(
+    if (ctx.trust_policy.allowsMcp()) {
+        ctx.mcp = try options.deps.load_mcp_runtime(
             alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
+            startup.workspace_root,
+            ctx.mcp_elicitation_capabilities,
         );
-        defer health_snapshot.deinit(alloc);
-        for (health_snapshot.configuration_issues) |issue| {
-            try ctx.writeStderr("fx ask: ");
-            try ctx.writeStderr(issue.message);
-            try ctx.writeStderr("\n");
-        }
-        const project_names = try mcp.pendingWorkspaceNames(alloc);
-        defer mcp_contract.freeOwnedStrings(alloc, project_names);
-        if (project_names.len > 0) {
-            try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
-            for (project_names, 0..) |name, index| {
-                if (index > 0) try ctx.writeStderr(", ");
-                try ctx.writeStderr(name);
+        if (ctx.mcp) |mcp| {
+            var health_snapshot = try mcp.snapshotHealth(
+                alloc,
+                @intCast(@max(io_mod.milliTimestamp(), 0)),
+            );
+            defer health_snapshot.deinit(alloc);
+            for (health_snapshot.configuration_issues) |issue| {
+                try ctx.writeStderr("fx ask: ");
+                try ctx.writeStderr(issue.message);
+                try ctx.writeStderr("\n");
             }
-            try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
+            const project_names = try mcp.pendingWorkspaceNames(alloc);
+            defer mcp_contract.freeOwnedStrings(alloc, project_names);
+            if (project_names.len > 0) {
+                try ctx.writeStderr("fx ask: skipped unapproved project MCP servers: ");
+                for (project_names, 0..) |name, index| {
+                    if (index > 0) try ctx.writeStderr(", ");
+                    try ctx.writeStderr(name);
+                }
+                try ctx.writeStderr(". Approve with fx mcp trust approve <name> before retrying.\n");
+            }
+            if (options.output_mode.isTerminal()) {
+                mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
+            } else {
+                mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
+            }
         }
-        if (options.output_mode.isTerminal()) {
-            mcp.connectAllCancellable(ctx.toolRegistry(), ctx.cancelFlag());
-        } else {
-            mcp.connectRequiredForAsk(ctx.toolRegistry(), ctx.cancelFlag());
+        if (options.deps.load_mcp_host) |load_host| {
+            ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
+            if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
         }
-    }
-    if (options.deps.load_mcp_host) |load_host| {
-        ctx.mcp_host = try load_host(alloc, startup.workspace_root, ctx.toolRegistry(), .{ .questions = ctx.mcp_elicitation_capabilities });
-        if (ctx.mcp_host) |h| try reportUnapprovedMcpServers(&ctx, h);
-    }
-    try ctx.checkCancellation();
-    if (ctx.mcp) |mcp| {
-        if (try mcp.requiredStartupFailure(
-            alloc,
-            @intCast(@max(io_mod.milliTimestamp(), 0)),
-        )) |failure| {
-            defer alloc.free(failure);
-            try ctx.writeStderr("fx ask: ");
-            try ctx.writeStderr(failure);
-            try ctx.writeStderr("\n");
-            return failPromptRunResult(error.McpRequiredServerUnavailable);
+        try ctx.checkCancellation();
+        if (ctx.mcp) |mcp| {
+            if (try mcp.requiredStartupFailure(
+                alloc,
+                @intCast(@max(io_mod.milliTimestamp(), 0)),
+            )) |failure| {
+                defer alloc.free(failure);
+                try ctx.writeStderr("fx ask: ");
+                try ctx.writeStderr(failure);
+                try ctx.writeStderr("\n");
+                return failPromptRunResult(error.McpRequiredServerUnavailable);
+            }
         }
     }
     const session_child_capability = ctx.sessionChildCapability();
+    const allow_personal_fossil = ctx.trust_policy.allowsPersonalFossil();
+    const effective_coordinator_mode = allow_personal_fossil and (if (options.deps.ui_host) |ui| ui.coordinator_mode else false);
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
-        .subagent_available = ctx.subagent_host != null,
-        .fossil_workspace_available = completion_review.enabled(),
-        .coordinator_mode = if (options.deps.ui_host) |ui| ui.coordinator_mode else false,
+        .subagent_available = ctx.subagent_host != null and ctx.trust_policy.allowsToolAdvertisement("subagent"),
+        .fossil_workspace_available = completion_review.enabled() and allow_personal_fossil,
+        .coordinator_mode = effective_coordinator_mode,
+        .trust_policy = ctx.trust_policy,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -2274,7 +2316,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer dynamic_tool_arena.deinit();
     const recovered_recipe = try hydrateAskContractRecipe(&ctx, dynamic_tool_arena.allocator(), owned_prompt);
     const initial_dynamic_tools = try initialAskDynamicTools(&ctx, dynamic_tool_arena.allocator());
-    const base_skill_bindings = if (inherited_authority) |authority|
+    const base_skill_bindings = if (!allow_personal_fossil)
+        &[_]@import("../skills/skill_invocation.zig").ExplicitBinding{}
+    else if (inherited_authority) |authority|
         if (authority.skill_bindings.len > 0 or authority.declared_skills.len > 0)
             try @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
                 dynamic_tool_arena.allocator(),
@@ -2297,7 +2341,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             ctx.workspace_root,
             loaded_skills.skills,
         );
-    const effective_skill_bindings = if (recovered_recipe.skill_bindings.len > 0)
+    const effective_skill_bindings = if (allow_personal_fossil and recovered_recipe.skill_bindings.len > 0)
         try @import("../workspace/realisation_selection.zig").resolveSkillBindingsByNames(
             dynamic_tool_arena.allocator(),
             recovered_recipe.skill_bindings,
@@ -2307,10 +2351,24 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         )
     else
         base_skill_bindings;
+    const raw_provider_capabilities = cfg.provider_set.select(ctx.provider).capabilities;
+    const effective_provider_capabilities: provider_set.Bundle.Capabilities = if (effective_coordinator_mode)
+        .{}
+    else if (ctx.trust_policy.tier == .untrusted) switch (ctx.trust_policy.untrusted_mode) {
+        .chat => .{ .gateway_prompt_caching = raw_provider_capabilities.gateway_prompt_caching },
+        .reader => .{
+            .gateway_prompt_caching = raw_provider_capabilities.gateway_prompt_caching,
+            .fx_search = raw_provider_capabilities.fx_search,
+        },
+    } else raw_provider_capabilities;
+    const effective_first_call_tool_choice: types.ToolChoice = if (ctx.trust_policy.tier == .untrusted and ctx.trust_policy.untrusted_mode == .chat)
+        .none
+    else
+        ctx.first_call_tool_choice;
     options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
-        .host_instructions = if (inherited_authority == null or inherited_authority.?.execution_guidance.len == 0)
+        .host_instructions = if (allow_personal_fossil and (inherited_authority == null or inherited_authority.?.execution_guidance.len == 0))
             @import("../workspace/realisation_selection.zig").browserHostGuidance(owned_prompt, effective_skill_bindings)
         else
             "",
@@ -2321,19 +2379,19 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
-        .provider_capabilities = if (options.deps.ui_host != null and options.deps.ui_host.?.coordinator_mode) .{} else cfg.provider_set.select(ctx.provider).capabilities,
+        .provider_capabilities = effective_provider_capabilities,
         .custom_tool_guidance = tool_projection.custom_guidance,
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
         .cancel_flag = ctx.cancelFlag(),
-        .contract_review_enabled = completion_review.enabled(),
+        .contract_review_enabled = completion_review.enabled() and allow_personal_fossil,
         .ui_host = ctx.deps.ui_host,
-        .fossil_session_id = if (completion_review.enabled()) ctx.activeSessionId() else null,
-        .background_worker = inherited_authority != null,
-        .coordinator_mode = if (options.deps.ui_host) |ui| ui.coordinator_mode else false,
-        .fossil_ephemeral = completion_review.enabled() and ctx.writable == null,
-        .fossil_execution_lease_held = cfg.fossil_execution_lease_held,
+        .fossil_session_id = if (completion_review.enabled() and allow_personal_fossil) ctx.activeSessionId() else null,
+        .background_worker = allow_personal_fossil and inherited_authority != null,
+        .coordinator_mode = effective_coordinator_mode,
+        .fossil_ephemeral = completion_review.enabled() and allow_personal_fossil and ctx.writable == null,
+        .fossil_execution_lease_held = allow_personal_fossil and cfg.fossil_execution_lease_held,
 
         .contract_review_model = review_selection.model,
         .contract_review_effort = completion_review.reviewerEffort(review_selection.provider, cfg.provider_set.definitions),
@@ -2353,7 +2411,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .effort = ctx.effort,
         .provider_order = if (ctx.provider == .gateway) ctx.provider_order else &.{},
         .provider_strict = ctx.provider == .gateway and ctx.provider_strict,
-        .first_call_tool_choice = ctx.first_call_tool_choice,
+        .first_call_tool_choice = effective_first_call_tool_choice,
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .origin = if (ctx.writable) |writable|
@@ -2836,6 +2894,7 @@ fn backgroundDispatched(raw: *anyopaque, entry: @import("../workspace/background
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsProjectContext()) return;
     try ctx.deps.context_registry.appendDefaultTransient(.{
         .workspace_root = ctx.workspace_root,
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
@@ -2847,9 +2906,11 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
 
 fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsProjectContext()) return;
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = project_context orelse ctx.modelVisibleProjectContext(),
     }, arena, messages);
+    if (!ctx.trust_policy.allowsMcp()) return;
     var snapshot = if (ctx.mcp_host) |h|
         try h.catalog.modelSnapshot(arena)
     else if (ctx.mcp) |mcp|
@@ -2857,7 +2918,13 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     else
         try mcp_model_catalog.Snapshot.empty(arena);
     defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
+    var filtered_servers: std.ArrayList(mcp_model_catalog.ServerSummary) = .empty;
+    defer filtered_servers.deinit(arena);
+    for (snapshot.servers) |server| {
+        if (!ctx.trust_policy.allowsMcpServer(server.name)) continue;
+        try filtered_servers.append(arena, server);
+    }
+    const section = try mcp_model_catalog.render(arena, .{ .servers = filtered_servers.items });
     if (section.text.len > 0) {
         try messages.append(arena, .{ .role = .system, .content = section.text });
     }
@@ -2870,7 +2937,7 @@ fn hydrateAskContractRecipe(
     prompt: []const u8,
 ) !@import("../workspace/execution_recovery.zig").SpecialistRecipe {
     if (comptime std_builtin.target.cpu.arch.isWasm()) return .{};
-    if (!completion_review.enabled()) return .{};
+    if (!completion_review.enabled() or !ctx.trust_policy.allowsPersonalFossil()) return .{};
     if (ctx.writable == null and ctx.v2 == null) return .{};
     if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return .{};
     const session_id = ctx.activeSessionId() orelse return .{};
@@ -2895,7 +2962,8 @@ fn hydrateAskContractRecipe(
 }
 
 fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_stream_provider.DynamicFunctionTool {
-    if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return &.{};
+    if (!ctx.trust_policy.allowsMcp()) return &.{};
+    if (ctx.trust_policy.allowsPersonalFossil()) if (ctx.deps.ui_host) |ui| if (ui.coordinator_mode) return &.{};
     const loaded = if (ctx.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
         arena,
         ctx.permission_rules,
@@ -2911,6 +2979,7 @@ fn initialAskDynamicTools(ctx: *AskContext, arena: Allocator) ![]const agent_str
     if (loaded.notice) |notice| try pushContextNotice(@ptrCast(ctx), notice);
     var tools: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
     for (loaded.tools) |selected| {
+        if (!ctx.trust_policy.allowsMcpTool(selected.name)) continue;
         try @import("../agent/runtime/gateway_step.zig").recordSelectedDynamicTool(arena, &tools, selected);
     }
     const effective_required = ctx.toolContext().required_tools;
@@ -2932,6 +3001,10 @@ fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    switch (ctx.trust_policy.checkToolCall(call.name, call.arguments_json)) {
+        .allowed => {},
+        .denied => |reason| return .{ .failure = try trust_tier.formatDeniedJson(arena, call.name, ctx.trust_policy, reason) },
+    }
     if (try ctx.cfg.mode_registry.toolPolicyDeniedJson(arena, ctx.deps.tool_set, ctx.mode_id, call.name)) |reason| {
         return .{ .failure = reason };
     }
@@ -4161,6 +4234,7 @@ fn activateAskMcp(ctx: *AskContext) anyerror!*mcp_runtime.McpRuntime {
 
 fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcpTool(name)) return false;
     const mcp = ctx.mcp orelse return false;
     mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, ctx.cancelFlag()) catch return false;
     return mcp.hasToolWithAccess(name, access);
@@ -4168,6 +4242,7 @@ fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Ac
 
 fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
     const self: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!self.trust_policy.allowsMcpTool(name)) return .not_available;
     const runtime = self.mcp orelse return .not_available;
     try runtime.connectDeferredToolForAsk(self.toolRegistry(), name, access, self.cancelFlag());
     return runtime.validateToolArgumentsByNameWithAccess(arena, name, arguments_json, access);
@@ -4175,6 +4250,7 @@ fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argu
 
 fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcpTool(name)) return error.TrustTierDenied;
     const mcp = ctx.mcp orelse return null;
     try mcp.connectDeferredToolForAsk(ctx.toolRegistry(), name, options.access, options.cancel_flag orelse ctx.cancelFlag());
     return mcp.callToolByNameWithOptions(
@@ -4188,6 +4264,14 @@ fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, argument
 
 fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcp()) {
+        return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
+    }
+    if (request.server) |server_name| {
+        if (!ctx.trust_policy.allowsMcpServer(server_name)) {
+            return .{ .model_output = try arena.dupe(u8, "{\"tools\":[],\"count\":0}") };
+        }
+    }
     const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (request.server) |server_name| {
         mcp.connectDeferredServerForAsk(ctx.toolRegistry(), server_name, access, .tools, cancel_flag orelse ctx.cancelFlag()) catch |err| switch (err) {
@@ -4206,17 +4290,47 @@ fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runti
     } else {
         try mcp.connectDeferredForAsk(ctx.toolRegistry(), cancel_flag orelse ctx.cancelFlag());
     }
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
+    const result = try mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
+    if (ctx.trust_policy.tier == .private) return result;
+    return .{
+        .model_output = try filterMcpSearchOutputForTrustPolicy(arena, ctx.trust_policy, result.model_output),
+        .notice = result.notice,
+    };
+}
+
+fn filterMcpSearchOutputForTrustPolicy(arena: Allocator, policy: trust_tier.Policy, raw_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, arena, raw_json, .{}) catch {
+        return arena.dupe(u8, "{\"tools\":[],\"count\":0}");
+    };
+    if (parsed.value != .object) return arena.dupe(u8, "{\"tools\":[],\"count\":0}");
+    if (parsed.value.object.getPtr("tools")) |tools_val| {
+        if (tools_val.* == .array) {
+            var kept: std.ArrayList(std.json.Value) = .empty;
+            for (tools_val.array.items) |item| {
+                if (item != .object) continue;
+                const tool_name = if (item.object.get("name")) |v| if (v == .string) v.string else "" else "";
+                const server_name = if (item.object.get("server")) |v| if (v == .string) v.string else "" else "";
+                if (!policy.allowsMcpTool(tool_name) or (server_name.len > 0 and !policy.allowsMcpServer(server_name))) continue;
+                try kept.append(arena, item);
+            }
+            tools_val.array.items = kept.items;
+            tools_val.array.capacity = kept.items.len;
+            try parsed.value.object.put(arena, "count", .{ .integer = @intCast(kept.items.len) });
+        }
+    }
+    return std.json.Stringify.valueAlloc(arena, parsed.value, .{});
 }
 
 fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcpTool(name)) return .unavailable;
     const runtime = ctx.mcp orelse return .unavailable;
     return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
 }
 
 fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcpTool(name)) return null;
     const runtime = ctx.mcp orelse return null;
     try runtime.connectDeferredToolForAsk(ctx.toolRegistry(), name, access, cancel_flag orelse ctx.cancelFlag());
     return runtime.toolSchemaJsonByNameWithAccess(arena, name, permission_rules, limits, access, cancel_flag);
@@ -4229,6 +4343,7 @@ fn mcpCallFeature(
     options: tool_mcp_runtime.FeatureCallOptions,
 ) anyerror!tool_mcp_runtime.FeatureResult {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    if (!ctx.trust_policy.allowsMcpServer(request.server_name)) return error.TrustTierDenied;
     const mcp = ctx.mcp orelse return error.McpRuntimeUnavailable;
     if (!options.access.allowsFeatureServer(mcp.generation, request.server_name)) return error.McpServerNotFound;
     try mcp.connectDeferredServerForAsk(ctx.toolRegistry(), request.server_name, options.access, .features, options.cancel_flag orelse ctx.cancelFlag());
@@ -4589,11 +4704,33 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
         } else if (std.mem.eql(u8, arg, "--continue-recovery")) {
             if (opts.continue_recovery) return error.InvalidAskArgs;
             opts.continue_recovery = true;
+        } else if (std.mem.eql(u8, arg, "--trust-tier")) {
+            if (opts.trust_tier_explicit) return error.InvalidAskArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.trust_tier = trust_tier.parseTrustTier(args[i]) orelse return error.InvalidAskArgs;
+            opts.trust_tier_explicit = true;
+        } else if (std.mem.startsWith(u8, arg, "--trust-tier=")) {
+            if (opts.trust_tier_explicit) return error.InvalidAskArgs;
+            opts.trust_tier = trust_tier.parseTrustTier(arg["--trust-tier=".len..]) orelse return error.InvalidAskArgs;
+            opts.trust_tier_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--untrusted-mode")) {
+            if (opts.untrusted_mode != null) return error.InvalidAskArgs;
+            i += 1;
+            if (i >= args.len) return error.InvalidAskArgs;
+            opts.untrusted_mode = trust_tier.parseUntrustedMode(args[i]) orelse return error.InvalidAskArgs;
+        } else if (std.mem.startsWith(u8, arg, "--untrusted-mode=")) {
+            if (opts.untrusted_mode != null) return error.InvalidAskArgs;
+            opts.untrusted_mode = trust_tier.parseUntrustedMode(arg["--untrusted-mode=".len..]) orelse return error.InvalidAskArgs;
         } else if (arg.len > 1 and arg[0] == '-') {
             return error.InvalidAskArgs;
         } else {
             try prompt_parts.append(alloc, arg);
         }
+    }
+
+    if (opts.untrusted_mode != null and opts.trust_tier != .untrusted) {
+        return error.InvalidAskArgs;
     }
 
     if (opts.continue_recovery) {
@@ -4612,6 +4749,26 @@ fn parseOptionsWithStdin(alloc: Allocator, args: []const [:0]const u8, stdin: St
     if (opts.no_save and opts.resume_target != null) return error.NoSaveResumeConflict;
 
     return opts;
+}
+
+fn argsTrustTierIsPrivate(args: []const [:0]const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--trust-tier")) {
+            if (i + 1 < args.len) {
+                const parsed = trust_tier.parseTrustTier(args[i + 1]) orelse return false;
+                return parsed == .private;
+            }
+            return false;
+        }
+        if (std.mem.startsWith(u8, arg, "--trust-tier=")) {
+            const parsed = trust_tier.parseTrustTier(arg["--trust-tier=".len..]) orelse return false;
+            return parsed == .private;
+        }
+    }
+    return true;
 }
 
 fn emitHeadlessYoloWarning(alloc: Allocator, options: RunOptions) !void {
@@ -10749,4 +10906,155 @@ test "CLI output mode selection preserves machine output precedence" {
     try std.testing.expectEqual(OutputMode.raw, selectOutputMode(false, false, false, true));
     try std.testing.expectEqual(OutputMode.terminal, selectOutputMode(false, false, true, false));
     try std.testing.expectEqual(OutputMode.terminal_no_color, selectOutputMode(false, false, true, true));
+}
+
+test "trust tier CLI flags validate --trust-tier and --untrusted-mode" {
+    const alloc = std.testing.allocator;
+
+    var default_opts = try parseOptionsWithStdin(alloc, &.{"hello"}, .tty);
+    defer default_opts.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.private, default_opts.trust_tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.chat, default_opts.trustPolicy().untrusted_mode);
+
+    var shared_opts = try parseOptionsWithStdin(alloc, &.{ "--trust-tier", "shared", "hello" }, .tty);
+    defer shared_opts.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.shared, shared_opts.trust_tier);
+
+    var reader_opts = try parseOptionsWithStdin(alloc, &.{ "--trust-tier=untrusted", "--untrusted-mode=reader", "hello" }, .tty);
+    defer reader_opts.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, reader_opts.trust_tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, reader_opts.trustPolicy().untrusted_mode);
+
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--trust-tier", "bogus", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--untrusted-mode", "reader", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--trust-tier", "shared", "--untrusted-mode", "reader", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--trust-tier", "untrusted", "--untrusted-mode", "invalid", "hello" }, .tty));
+    try std.testing.expectError(error.InvalidAskArgs, parseOptionsWithStdin(alloc, &.{ "--trust-tier", "shared", "--trust-tier", "private", "hello" }, .tty));
+
+    try std.testing.expect(argsTrustTierIsPrivate(&.{ "--json", "hello" }));
+    try std.testing.expect(argsTrustTierIsPrivate(&.{ "--trust-tier", "private", "hello" }));
+    try std.testing.expect(!argsTrustTierIsPrivate(&.{ "--trust-tier", "shared", "hello" }));
+    try std.testing.expect(!argsTrustTierIsPrivate(&.{ "--trust-tier=untrusted", "hello" }));
+}
+
+test "runWithDeps enforces untrusted chat, untrusted reader, and shared trust tiers" {
+    const alloc = std.testing.allocator;
+    const Tracker = struct {
+        var mcp_load_calls: usize = 0;
+        var skill_load_calls: usize = 0;
+        var last_advertised_count: usize = 0;
+        var saw_web_fetch: bool = false;
+        var saw_web_search: bool = false;
+        var saw_shell: bool = false;
+        var saw_fossil: bool = false;
+        var saw_workspace_content: bool = false;
+        var fossil_session_null: bool = false;
+        var contract_review_disabled: bool = false;
+        var first_tool_choice: types.ToolChoice = .auto;
+
+        fn reset() void {
+            mcp_load_calls = 0;
+            skill_load_calls = 0;
+            last_advertised_count = 0;
+            saw_web_fetch = false;
+            saw_web_search = false;
+            saw_shell = false;
+            saw_fossil = false;
+            saw_workspace_content = false;
+            fossil_session_null = false;
+            contract_review_disabled = false;
+            first_tool_choice = .auto;
+        }
+
+        fn loadMcp(_: Allocator, _: []const u8, _: mcp_elicitation.Capabilities) !?*mcp_runtime.McpRuntime {
+            mcp_load_calls += 1;
+            return null;
+        }
+
+        fn loadSkills(_: Allocator, _: []const u8, _: skill_contract.RootPolicy) app_runtime_setup.LoadSkillsError!app_runtime_setup.LoadedSkills {
+            skill_load_calls += 1;
+            return .{};
+        }
+
+        fn process(
+            _: *agent_runtime.Agent,
+            deps: *const agent_runtime.AgentRuntimeDeps,
+            _: ?agent_runtime.SemanticPresentationSink,
+            _: agent_runtime.LifecycleContext,
+            config: agent_runtime.Config,
+            _: worker_runtime.QueuedPrompt,
+        ) !void {
+            last_advertised_count = config.advertised_tool_names.len;
+            for (config.advertised_tool_names) |name| {
+                if (std.mem.eql(u8, name, "web_fetch")) saw_web_fetch = true;
+                if (std.mem.eql(u8, name, "web_search")) saw_web_search = true;
+                if (std.mem.eql(u8, name, "shell")) saw_shell = true;
+                if (std.mem.eql(u8, name, "fossil_workspace")) saw_fossil = true;
+                if (std.mem.eql(u8, name, "workspace_content")) saw_workspace_content = true;
+            }
+            fossil_session_null = config.fossil_session_id == null;
+            contract_review_disabled = !config.contract_review_enabled;
+            first_tool_choice = config.first_call_tool_choice;
+            try deps.push_text(deps.ctx, .assistant_started);
+            try deps.push_text(deps.ctx, .{ .assistant_source = "ok" });
+            try deps.push_text(deps.ctx, .{ .assistant_rendered = "ok" });
+        }
+    };
+
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+
+    // 1. untrusted chat: 0 tools, no MCP, no skills, no Fossil
+    Tracker.reset();
+    var deps = testPromptRunDepsWithProcess(&stdout_capture, &stderr_capture, Tracker.process);
+    deps.load_mcp_runtime = Tracker.loadMcp;
+    deps.load_skills = Tracker.loadSkills;
+    const chat_exit = try runWithDeps(alloc, &.{ "--no-save", "--trust-tier", "untrusted", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 0), chat_exit);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.mcp_load_calls);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.skill_load_calls);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.last_advertised_count);
+    try std.testing.expect(Tracker.fossil_session_null);
+    try std.testing.expect(Tracker.contract_review_disabled);
+    try std.testing.expectEqual(types.ToolChoice.none, Tracker.first_tool_choice);
+
+    // 2. untrusted reader: ONLY web_fetch + web_search, no MCP, no skills, no Fossil
+    Tracker.reset();
+    const reader_exit = try runWithDeps(alloc, &.{ "--no-save", "--trust-tier", "untrusted", "--untrusted-mode", "reader", "summarize" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 0), reader_exit);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.mcp_load_calls);
+    try std.testing.expectEqual(@as(usize, 0), Tracker.skill_load_calls);
+    try std.testing.expectEqual(@as(usize, 2), Tracker.last_advertised_count);
+    try std.testing.expect(Tracker.saw_web_fetch);
+    try std.testing.expect(Tracker.saw_web_search);
+    try std.testing.expect(!Tracker.saw_shell);
+    try std.testing.expect(!Tracker.saw_fossil);
+    try std.testing.expect(Tracker.fossil_session_null);
+    try std.testing.expect(Tracker.contract_review_disabled);
+
+    // 3. shared: no personal Fossil, no workspace_content, MCP & workspace skills filtered
+    Tracker.reset();
+    const shared_exit = try runWithDeps(alloc, &.{ "--no-save", "--trust-tier", "shared", "check repo" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 0), shared_exit);
+    try std.testing.expectEqual(@as(usize, 1), Tracker.mcp_load_calls);
+    try std.testing.expectEqual(@as(usize, 1), Tracker.skill_load_calls);
+    try std.testing.expect(!Tracker.saw_fossil);
+    try std.testing.expect(!Tracker.saw_workspace_content);
+    try std.testing.expect(Tracker.fossil_session_null);
+    try std.testing.expect(Tracker.contract_review_disabled);
+}
+
+test "trust tier MCP search filter strips browseros-neo tools in shared tier" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const raw =
+        \\{"tools":[{"name":"mcp_browseros-neo_run","server":"browseros-neo"},{"name":"mcp_github_list_issues","server":"github"}],"count":2}
+    ;
+    const filtered = try filterMcpSearchOutputForTrustPolicy(arena, .{ .tier = .shared }, raw);
+    try std.testing.expect(std.mem.find(u8, filtered, "browseros-neo") == null);
+    try std.testing.expect(std.mem.find(u8, filtered, "mcp_github_list_issues") != null);
+    try std.testing.expect(std.mem.find(u8, filtered, "\"count\":1") != null);
 }

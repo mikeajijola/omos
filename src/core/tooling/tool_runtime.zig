@@ -27,6 +27,7 @@ const glob_pattern = @import("../workspace/glob_pattern.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const pathing = @import("../workspace/pathing.zig");
 const execution_router = @import("../execution/router.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -120,6 +121,7 @@ pub const Context = struct {
     background_authority: ?*const @import("../workspace/background_control.zig").Authority = null,
     required_tools: []const []const u8 = &.{},
     fossil_workspace_available: bool = false,
+    trust_policy: trust_tier.Policy = .{},
     observer: ?*observation.Observer = null,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
@@ -274,6 +276,7 @@ pub const Context = struct {
             .auto_classifier = self.admissionAutoClassifier(),
             .terminal_review_context = self.terminalReviewContext(),
             .host_sandbox_default = self.host_sandbox_default,
+            .trust_policy = self.trust_policy,
         };
         if (self.permission_state_override != null) {
             input.session_permission_state_provider = null;
@@ -390,6 +393,10 @@ fn providerDisablesTool(capabilities: provider_set.Bundle.Capabilities, name: []
 }
 
 pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_contracts.ToolCallValidationResult {
+    switch (ctx.trust_policy.checkToolCall(call.name, call.arguments_json)) {
+        .allowed => {},
+        .denied => |reason| return .{ .failure = try trust_tier.formatDeniedJson(arena, call.name, ctx.trust_policy, reason) },
+    }
     if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
         return .{ .failure = try arena.dupe(u8, "Unsupported tool: vision") };
     }
@@ -404,7 +411,7 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
             .not_available => .not_registered,
         };
     };
-    if (ctx.fossil_workspace_available and spec.executor_kind != .host) {
+    if (ctx.fossil_workspace_available and ctx.trust_policy.allowsPersonalFossil() and spec.executor_kind != .host) {
         @import("../workspace/filesystem_projection.zig").prepareForTool(
             arena,
             ctx.subagent_caller_id orelse ctx.lifecycle_scope.session_id,
@@ -435,6 +442,10 @@ pub fn validateToolCall(ctx: Context, arena: Allocator, call: ToolCall) !tool_co
 }
 
 pub fn checkToolAvailability(ctx: Context, arena: Allocator, call: ToolCall) !?[]const u8 {
+    switch (ctx.trust_policy.checkToolCall(call.name, call.arguments_json)) {
+        .allowed => {},
+        .denied => |reason| return try trust_tier.formatDeniedJson(arena, call.name, ctx.trust_policy, reason),
+    }
     if (providerDisablesTool(ctx.provider_capabilities, call.name)) {
         return try arena.dupe(u8, "Unsupported tool: vision");
     }
@@ -454,6 +465,9 @@ pub fn executeToolCallAuthorized(
         request.command_replay_capture.?.abort(request.result_allocator);
     };
     var execution_ctx = ctx;
+    if (execution_ctx.trust_policy.checkToolCall(request.call.name, request.call.arguments_json) == .denied) {
+        return tool_contracts.failToolExecutionResult(error.TrustTierDenied);
+    }
     execution_ctx.observer = request.observer orelse ctx.observer;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
@@ -920,7 +934,7 @@ fn executeRegisteredTool(
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     var background_context = ctx;
     background_context.background_image_catalog = authorized_image_catalog;
-    if (ctx.fossil_workspace_available) {
+    if (ctx.fossil_workspace_available and ctx.trust_policy.allowsPersonalFossil()) {
         dispatch_ctx.background_dispatch_ctx = &background_context;
         dispatch_ctx.background_dispatch_fn = dispatchBackgroundContract;
         dispatch_ctx.coordinator_mode = ctx.coordinator_mode;
@@ -1112,6 +1126,7 @@ fn toolExecutionResultFromDispatch(
 }
 
 pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
+    if (!ctx.trust_policy.allowsMcpTool(name)) return .unavailable;
     const runtime = ctx.mcp_ctx orelse return .unavailable;
     const snapshot = ctx.mcp_snapshot_tool orelse return .unavailable;
     return snapshot(runtime, arena, name, known, ctx.permission_rules, ctx.context_limits, ctx.mcp_access);
@@ -1121,6 +1136,7 @@ pub fn snapshotMcpDefinition(ctx: Context, arena: Allocator, name: []const u8, k
 /// without selecting it. Returns null for unknown, denied, inaccessible, or
 /// oversized definitions. The result is allocated in `arena`.
 pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    if (!ctx.trust_policy.allowsMcpTool(name)) return null;
     const runtime_context = ctx.mcp_ctx orelse return null;
     const schema_fn = ctx.mcp_tool_schema orelse return null;
     const projection = (schema_fn(
@@ -1249,7 +1265,7 @@ pub fn prebindRequiredDynamicTools(
     required_tools: []const []const u8,
     selected: *std.ArrayList(agent_stream_provider.DynamicFunctionTool),
 ) !void {
-    if (required_tools.len == 0) return;
+    if (required_tools.len == 0 or !ctx.trust_policy.allowsMcp()) return;
     const prebound = try prebindRequiredTools(
         ctx,
         arena,
@@ -8389,4 +8405,125 @@ test "vision cancellation stops later batches and does not surface the outage ti
         ),
     );
     try std.testing.expectEqual(@as(usize, 1), fixture.call_count);
+}
+
+test "trust tier untrusted chat refuses every tool at validation and dispatch" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rt = TestRuntime{
+        .tool_registry = test_builtin_tools.registry,
+        .permission_mode = .yolo,
+    };
+    defer rt.deinit(alloc);
+    var ctx = rt.context();
+    ctx.trust_policy = .{ .tier = .untrusted, .untrusted_mode = .chat };
+
+    for ([_][]const u8{
+        "read_file",
+        "write_file",
+        "shell",
+        "web_fetch",
+        "web_search",
+        "fossil_workspace",
+        "mcp_browseros-neo_run",
+    }) |tool_name| {
+        const call: ToolCall = .{
+            .id = "chat-denied",
+            .name = tool_name,
+            .arguments_json = "{}",
+        };
+        const validation = try validateToolCall(ctx, arena, call);
+        switch (validation) {
+            .failure => |reason| try std.testing.expect(std.mem.find(u8, reason, "TrustTierDenied") != null),
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectError(
+            error.TrustTierDenied,
+            executeToolCall(ctx, arena, call),
+        );
+    }
+}
+
+test "trust tier untrusted reader refuses non-web tools at dispatch and allows web_fetch validation" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rt = TestRuntime{
+        .tool_registry = test_builtin_tools.registry,
+        .permission_mode = .yolo,
+    };
+    defer rt.deinit(alloc);
+    var ctx = rt.context();
+    ctx.trust_policy = .{ .tier = .untrusted, .untrusted_mode = .reader };
+
+    for ([_][]const u8{
+        "shell",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "fossil_workspace",
+        "mcp_browseros-neo_run",
+    }) |tool_name| {
+        const call: ToolCall = .{
+            .id = "reader-denied",
+            .name = tool_name,
+            .arguments_json = "{}",
+        };
+        const validation = try validateToolCall(ctx, arena, call);
+        switch (validation) {
+            .failure => |reason| try std.testing.expect(std.mem.find(u8, reason, "TrustTierDenied") != null),
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectError(
+            error.TrustTierDenied,
+            executeToolCall(ctx, arena, call),
+        );
+    }
+
+    const valid_fetch = try validateToolCall(ctx, arena, .{
+        .id = "reader-fetch",
+        .name = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com\"}",
+    });
+    try std.testing.expect(valid_fetch == .valid);
+}
+
+test "trust tier shared refuses browseros-neo MCP and private Fossil actions at dispatch" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var rt = TestRuntime{
+        .tool_registry = test_builtin_tools.registry,
+        .permission_mode = .yolo,
+    };
+    defer rt.deinit(alloc);
+    var ctx = rt.context();
+    ctx.trust_policy = .{ .tier = .shared };
+
+    const denied_calls = [_]ToolCall{
+        .{ .id = "neo", .name = "mcp_browseros-neo_run", .arguments_json = "{}" },
+        .{ .id = "neo-select", .name = "mcp_select_tool", .arguments_json = "{\"name\":\"mcp_browseros-neo_run\"}" },
+        .{ .id = "fossil-mem", .name = "fossil_workspace", .arguments_json = "{\"action\":\"read\",\"path\":\"memory/notes.md\"}" },
+        .{ .id = "fossil-write", .name = "fossil_workspace", .arguments_json = "{\"action\":\"write\",\"path\":\"documents/a.md\",\"content\":\"x\"}" },
+        .{ .id = "fossil-promote", .name = "fossil_workspace", .arguments_json = "{\"action\":\"promote_capability\",\"path\":\"c.json\",\"entity\":\"cap\"}" },
+        .{ .id = "workspace-content", .name = "workspace_content", .arguments_json = "{\"action\":\"conversations\"}" },
+    };
+    for (denied_calls) |call| {
+        const validation = try validateToolCall(ctx, arena, call);
+        switch (validation) {
+            .failure => |reason| try std.testing.expect(std.mem.find(u8, reason, "TrustTierDenied") != null),
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectError(
+            error.TrustTierDenied,
+            executeToolCall(ctx, arena, call),
+        );
+    }
 }
