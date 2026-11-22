@@ -1361,6 +1361,7 @@ pub fn runSubagentChild(
         child_bridge.work_id = child_bridge.turn_id;
         if (child_bridge.enabled) ctx.observer = &child_bridge.observer;
     }
+    const child_policy = admission.trust_policy;
     var child_projection = state.cfg.mode_registry.buildModelToolProjection(
         alloc,
         builtin_tools.advertisement_set,
@@ -1368,8 +1369,9 @@ pub fn runSubagentChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .subagent_available = true,
-            .fossil_workspace_available = if (comptime !host_target.is_wasm) completion_review.enabled() else false,
+            .subagent_available = false,
+            .fossil_workspace_available = (if (comptime !host_target.is_wasm) completion_review.enabled() else false) and child_policy.allowsPersonalFossil(),
+            .trust_policy = child_policy,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(alloc);
@@ -1381,13 +1383,16 @@ pub fn runSubagentChild(
         .provider_set = state.cfg.provider_set,
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
+        .skill_catalog = if (child_policy.allowsWorkspaceSkills())
+            .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics }
+        else
+            .{ .skills = &.{} },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = state.cfg.context_registry,
-        .context_enabled = state.context_enabled,
-        .project_context = state.context_snapshot.modelVisibleBytes(),
+        .context_enabled = state.context_enabled and child_policy.allowsProjectContext(),
+        .project_context = if (child_policy.allowsProjectContext()) state.context_snapshot.modelVisibleBytes() else "",
         .lifecycle_view = state.lifecycle_view,
     }, turn, message, admission, cancel);
 }

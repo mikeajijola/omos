@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const trust_tier_mod = @import("../permissions/trust_tier.zig");
 const types = @import("../shared/types.zig");
 const session_commands = @import("../session/session_commands.zig");
 
@@ -108,6 +109,8 @@ pub const RunInput = struct {
     task: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    trust_tier: ?[]const u8 = null,
+    untrusted_mode: ?[]const u8 = null,
 };
 pub const MessageInput = struct {
     agent: []const u8,
@@ -115,6 +118,8 @@ pub const MessageInput = struct {
     message: []const u8,
     model: ?[]const u8 = null,
     effort: ?[]const u8 = null,
+    trust_tier: ?[]const u8 = null,
+    untrusted_mode: ?[]const u8 = null,
 };
 pub const RequestInput = union(Action) {
     run: RunInput,
@@ -137,6 +142,8 @@ pub const Request = union(Action) {
         task: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        trust_tier: ?trust_tier_mod.TrustTier = null,
+        untrusted_mode: ?trust_tier_mod.UntrustedMode = null,
     },
     message: struct {
         agent: []u8,
@@ -144,6 +151,8 @@ pub const Request = union(Action) {
         message: []u8,
         model: ?[]u8 = null,
         effort: ?types.ReasoningEffort = null,
+        trust_tier: ?trust_tier_mod.TrustTier = null,
+        untrusted_mode: ?trust_tier_mod.UntrustedMode = null,
     },
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -179,6 +188,20 @@ pub const Request = union(Action) {
             .message => |value| .{ .model = value.model, .effort = value.effort },
         };
     }
+
+    pub fn trustTier(self: Request) ?trust_tier_mod.TrustTier {
+        return switch (self) {
+            .run => |value| value.trust_tier,
+            .message => |value| value.trust_tier,
+        };
+    }
+
+    pub fn untrustedMode(self: Request) ?trust_tier_mod.UntrustedMode {
+        return switch (self) {
+            .run => |value| value.untrusted_mode,
+            .message => |value| value.untrusted_mode,
+        };
+    }
 };
 
 pub const ValidationError = error{
@@ -189,6 +212,8 @@ pub const ValidationError = error{
     InvalidMessage,
     InvalidModel,
     InvalidEffort,
+    InvalidTrustTier,
+    InvalidUntrustedMode,
 };
 
 pub fn validateRequest(
@@ -199,12 +224,15 @@ pub fn validateRequest(
         .run => |value| blk: {
             try validateText(value.task, domain.max_prompt_bytes, error.InvalidTask);
             const effort = try validateOverrideText(value.model, value.effort);
+            const trust = try validateTrustInput(value.trust_tier, value.untrusted_mode);
             const task = try alloc.dupe(u8, value.task);
             errdefer alloc.free(task);
             break :blk .{ .run = .{
                 .task = task,
                 .model = try dupeOptional(alloc, value.model),
                 .effort = effort,
+                .trust_tier = trust.tier,
+                .untrusted_mode = trust.untrusted_mode,
             } };
         },
         .message => |value| blk: {
@@ -218,6 +246,7 @@ pub fn validateRequest(
             }
             try validateText(value.message, domain.max_message_bytes, error.InvalidMessage);
             const effort = try validateOverrideText(value.model, value.effort);
+            const trust = try validateTrustInput(value.trust_tier, value.untrusted_mode);
             const agent = try alloc.dupe(u8, value.agent);
             errdefer alloc.free(agent);
             const instructions = if (value.instructions) |instructions|
@@ -233,9 +262,34 @@ pub fn validateRequest(
                 .message = message,
                 .model = try dupeOptional(alloc, value.model),
                 .effort = effort,
+                .trust_tier = trust.tier,
+                .untrusted_mode = trust.untrusted_mode,
             } };
         },
     };
+}
+
+const ValidatedTrust = struct {
+    tier: ?trust_tier_mod.TrustTier = null,
+    untrusted_mode: ?trust_tier_mod.UntrustedMode = null,
+};
+
+fn validateTrustInput(
+    tier_raw: ?[]const u8,
+    mode_raw: ?[]const u8,
+) ValidationError!ValidatedTrust {
+    const tier: ?trust_tier_mod.TrustTier = if (tier_raw) |raw|
+        trust_tier_mod.parseTrustTier(raw) orelse return error.InvalidTrustTier
+    else
+        null;
+    const mode: ?trust_tier_mod.UntrustedMode = if (mode_raw) |raw|
+        trust_tier_mod.parseUntrustedMode(raw) orelse return error.InvalidUntrustedMode
+    else
+        null;
+    if (mode != null and tier != .untrusted) {
+        return error.InvalidTrustTier;
+    }
+    return .{ .tier = tier, .untrusted_mode = mode };
 }
 
 /// Validates override text without allocating. Returns the parsed effort.
@@ -344,6 +398,22 @@ pub fn requestFingerprint(request: Request) [32]u8 {
         if (override.effort) |effort| {
             hash.update("\x01");
             hash.update(effort.label());
+        } else {
+            hash.update("\x00");
+        }
+    }
+    if (request.trustTier() != null or request.untrustedMode() != null) {
+        hash.update("\x00\x02");
+        if (request.trustTier()) |tier| {
+            hash.update("\x01");
+            hash.update(tier.label());
+        } else {
+            hash.update("\x00");
+        }
+        hash.update("\x00");
+        if (request.untrustedMode()) |mode| {
+            hash.update("\x01");
+            hash.update(mode.label());
         } else {
             hash.update("\x00");
         }
@@ -596,4 +666,50 @@ test "terminal result omits scheduler identities and phases" {
     try std.testing.expect(std.mem.find(u8, encoded, "operation_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "child_id") == null);
     try std.testing.expect(std.mem.find(u8, encoded, "status") == null);
+}
+
+test "trust tier overrides validate and participate in operation identity" {
+    const alloc = std.testing.allocator;
+    var plain = try validateRequest(alloc, .{ .run = .{ .task = "fetch docs" } });
+    defer plain.deinit(alloc);
+    var reader = try validateRequest(alloc, .{ .run = .{
+        .task = "fetch docs",
+        .trust_tier = "untrusted",
+        .untrusted_mode = "reader",
+    } });
+    defer reader.deinit(alloc);
+    var chat = try validateRequest(alloc, .{ .run = .{
+        .task = "fetch docs",
+        .trust_tier = "untrusted",
+        .untrusted_mode = "chat",
+    } });
+    defer chat.deinit(alloc);
+
+    try std.testing.expect(plain.trustTier() == null);
+    try std.testing.expectEqual(@as(?trust_tier_mod.TrustTier, .untrusted), reader.trustTier());
+    try std.testing.expectEqual(@as(?trust_tier_mod.UntrustedMode, .reader), reader.untrustedMode());
+    try std.testing.expectEqual(@as(?trust_tier_mod.UntrustedMode, .chat), chat.untrustedMode());
+
+    const plain_fp = requestFingerprint(plain);
+    const reader_fp = requestFingerprint(reader);
+    const chat_fp = requestFingerprint(chat);
+    try std.testing.expect(!std.mem.eql(u8, &plain_fp, &reader_fp));
+    try std.testing.expect(!std.mem.eql(u8, &reader_fp, &chat_fp));
+
+    try std.testing.expectError(
+        error.InvalidTrustTier,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .trust_tier = "admin" } }),
+    );
+    try std.testing.expectError(
+        error.InvalidUntrustedMode,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .trust_tier = "untrusted", .untrusted_mode = "shell" } }),
+    );
+    try std.testing.expectError(
+        error.InvalidTrustTier,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .trust_tier = "shared", .untrusted_mode = "reader" } }),
+    );
+    try std.testing.expectError(
+        error.InvalidTrustTier,
+        validateRequest(alloc, .{ .run = .{ .task = "t", .untrusted_mode = "reader" } }),
+    );
 }

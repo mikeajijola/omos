@@ -10,6 +10,7 @@ const worktree_isolation = @import("worktree_isolation.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const permission_request = @import("../permissions/permission_request.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
@@ -28,6 +29,7 @@ pub const Observation = struct {
     outcome: ?child_state.Outcome = null,
     failure: ?types.ModelFailureDiagnostic = null,
     metrics: live_metrics.Snapshot = .{},
+    trust_policy: trust_tier.Policy = .{},
 };
 
 const Slot = struct {
@@ -396,7 +398,12 @@ pub const Owner = struct {
         };
         defer registry.deinit(self.alloc);
         const child = registry.findById(child_id) orelse return error.ChildUnavailable;
-        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
+        return .{
+            .phase = child.phase,
+            .outcome = child.last_outcome,
+            .failure = child.last_failure,
+            .trust_policy = child.trust_policy,
+        };
     }
 
     fn phaseTransition(
@@ -444,7 +451,12 @@ pub const Owner = struct {
             return null;
         };
         const child = registry.findById(child_id) orelse return null;
-        return .{ .phase = child.phase, .outcome = child.last_outcome, .failure = child.last_failure };
+        return .{
+            .phase = child.phase,
+            .outcome = child.last_outcome,
+            .failure = child.last_failure,
+            .trust_policy = child.trust_policy,
+        };
     }
 };
 
@@ -561,11 +573,18 @@ fn runOne(slot: *Slot) OneOutcome {
         .v1 => |sessions| sessions.workspace_root,
         .v2 => |children| children.workspace,
     };
-    var lease = worktree_isolation.Lease.acquire(
-        owner.alloc,
-        parent_workspace_root,
-        slot.child_id,
-    ) catch |err| return failedOutcome(work_id, "worktree_isolation", err);
+    var lease = if (snapshot.trust_policy.allowsProjectContext())
+        worktree_isolation.Lease.acquire(
+            owner.alloc,
+            parent_workspace_root,
+            slot.child_id,
+        ) catch |err| return failedOutcome(work_id, "worktree_isolation", err)
+    else
+        worktree_isolation.Lease{
+            .alloc = owner.alloc,
+            .workspace_root = parent_workspace_root,
+            .isolated = false,
+        };
     defer lease.deinit();
     var turn = child.turn(owner.alloc, owner.max_history_turns) catch |err|
         return failedOutcome(work_id, "turn_initialization", err);
@@ -597,6 +616,7 @@ fn runOne(slot: *Slot) OneOutcome {
         .parent_id = owner.state_store.parent_id,
         .source_id = owner.state_store.parent_id,
         .preferences = turnPreferencesForDurable(child.preferences()),
+        .trust_policy = snapshot.trust_policy,
     }) catch |err| return if (err == error.Cancelled) .{
         .work_id = work_id,
         .outcome = .cancelled,
@@ -810,6 +830,7 @@ fn detachWorker(slot: *Slot) void {
 const RunSnapshot = struct {
     active: child_state.ActiveWork,
     instructions: []u8,
+    trust_policy: trust_tier.Policy = .{},
 
     fn deinit(self: *RunSnapshot, alloc: Allocator) void {
         self.active.deinit(alloc);
@@ -837,6 +858,7 @@ fn loadRunSnapshot(owner: *Owner, child_id: []const u8) !RunSnapshot {
     return .{
         .active = owned_active,
         .instructions = instructions,
+        .trust_policy = active.trust_policy,
     };
 }
 

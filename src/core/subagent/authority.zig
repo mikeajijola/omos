@@ -6,6 +6,7 @@ const permissions = @import("../permissions/permissions.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -151,6 +152,7 @@ pub const LiveAuthority = struct {
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
     permission_mode: types.PermissionMode,
+    trust_policy: trust_tier.Policy = .{},
 };
 
 pub const Snapshot = struct {
@@ -163,6 +165,7 @@ pub const Snapshot = struct {
     grants: []types.PermissionGrant,
     permission_state: session_permission_state.State = .{},
     permission_mode: types.PermissionMode,
+    trust_policy: trust_tier.Policy = .{},
     mcp_view: ?mcp_access.View = null,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
@@ -186,6 +189,7 @@ pub const Snapshot = struct {
             .rules = self.rules,
             .grants = self.grants,
             .permission_mode = self.permission_mode,
+            .trust_policy = self.trust_policy,
         };
     }
 };
@@ -245,35 +249,52 @@ pub const Resolver = struct {
             break :blk .{
                 .generation = registry.generation,
                 .permission_mode = active.permission_mode,
+                .trust_policy = active.trust_policy,
             };
         };
 
+        const child_policy = current.trust_policy;
         const owned_child_id = try alloc.dupe(u8, child_id);
         errdefer alloc.free(owned_child_id);
         const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneToolsWithoutSubagent(alloc, host.tools);
+        const tools = try cloneToolsForChild(alloc, host.tools, child_policy);
         errdefer freeStrings(alloc, tools);
-        const integrations = try cloneStrings(alloc, host.integrations);
+        const integrations = try cloneIntegrationsForChild(alloc, host.integrations, child_policy);
         errdefer freeStrings(alloc, integrations);
-        var rules = try types.dupePermissionRuleSet(alloc, host.rules);
+        var rules = if (child_policy.tier == .untrusted)
+            types.PermissionRuleSet{}
+        else
+            try types.dupePermissionRuleSet(alloc, host.rules);
         errdefer rules.deinit(alloc);
-        const permission_state = session_permission_state.dupe(
-            alloc,
-            host.permission_state,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.InvalidControlRecord,
-        };
+        const permission_state: session_permission_state.State = if (child_policy.allowsPersonalFossil())
+            session_permission_state.dupe(
+                alloc,
+                host.permission_state,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidControlRecord,
+            }
+        else
+            .{};
         errdefer {
             var value = permission_state;
             value.deinit(alloc);
         }
-        var mcp_view = if (host.mcp_view) |view| try view.clone(alloc) else null;
+        var mcp_view: ?mcp_access.View = if (!child_policy.allowsMcp())
+            null
+        else if (host.mcp_view) |view|
+            try cloneMcpViewForChild(alloc, view, child_policy)
+        else
+            null;
         errdefer if (mcp_view) |*view| view.deinit(alloc);
         if (mcp_view) |*view| {
             try rebindMcpViewOwnership(alloc, view, child_id, self.root_id);
         }
+        const grants = if (child_policy.allowsPersonalFossil())
+            try types.dupePermissionGrantSlice(alloc, host.grants)
+        else
+            try alloc.alloc(types.PermissionGrant, 0);
         return .{
             .child_id = owned_child_id,
             .root_id = owned_root_id,
@@ -286,9 +307,10 @@ pub const Resolver = struct {
             .tools = tools,
             .integrations = integrations,
             .rules = rules,
-            .grants = try types.dupePermissionGrantSlice(alloc, host.grants),
+            .grants = grants,
             .permission_state = permission_state,
             .permission_mode = current.permission_mode,
+            .trust_policy = child_policy,
             .mcp_view = mcp_view,
         };
     }
@@ -304,6 +326,12 @@ pub fn decideToolAuthority(
     target: []const u8,
     target_kind: permissions.PermissionTargetKind,
 ) !ToolAuthorityDecision {
+    if (!live.trust_policy.allowsToolAdvertisement(tool_name)) {
+        return .unavailable;
+    }
+    if (live.trust_policy.checkToolCall(tool_name, "{}") == .denied) {
+        return .deny;
+    }
     if (!contains(live.tools, tool_name) and
         !contains(live.integrations, tool_name))
     {
@@ -420,13 +448,14 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return out;
 }
 
-fn cloneToolsWithoutSubagent(
+fn cloneToolsForChild(
     alloc: Allocator,
     values: []const []const u8,
+    policy: trust_tier.Policy,
 ) ![][]u8 {
     var count: usize = 0;
     for (values) |value| {
-        if (!std.mem.eql(u8, value, "subagent")) count += 1;
+        if (!std.mem.eql(u8, value, "subagent") and policy.allowsToolAdvertisement(value)) count += 1;
     }
     const out = try alloc.alloc([]u8, count);
     var copied: usize = 0;
@@ -435,11 +464,98 @@ fn cloneToolsWithoutSubagent(
         alloc.free(out);
     }
     for (values) |value| {
-        if (std.mem.eql(u8, value, "subagent")) continue;
+        if (std.mem.eql(u8, value, "subagent") or !policy.allowsToolAdvertisement(value)) continue;
         out[copied] = try alloc.dupe(u8, value);
         copied += 1;
     }
     return out;
+}
+
+fn cloneIntegrationsForChild(
+    alloc: Allocator,
+    values: []const []const u8,
+    policy: trust_tier.Policy,
+) ![][]u8 {
+    if (!policy.allowsMcp()) return alloc.alloc([]u8, 0);
+    var count: usize = 0;
+    for (values) |value| {
+        if (policy.allowsMcpTool(value)) count += 1;
+    }
+    const out = try alloc.alloc([]u8, count);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        if (!policy.allowsMcpTool(value)) continue;
+        out[copied] = try alloc.dupe(u8, value);
+        copied += 1;
+    }
+    return out;
+}
+
+fn cloneMcpViewForChild(
+    alloc: Allocator,
+    view: mcp_access.View,
+    policy: trust_tier.Policy,
+) !mcp_access.View {
+    if (policy.tier == .private) return view.clone(alloc);
+    const owner_id = try alloc.dupe(u8, view.owner_id);
+    errdefer alloc.free(owner_id);
+    const parent_id = try alloc.dupe(u8, view.parent_id);
+    errdefer alloc.free(parent_id);
+
+    var server_count: usize = 0;
+    for (view.servers) |server| {
+        if (policy.allowsMcpServer(server.name)) server_count += 1;
+    }
+    const servers = try alloc.alloc(mcp_access.ServerIdentity, server_count);
+    var built_servers: usize = 0;
+    errdefer {
+        for (servers[0..built_servers]) |*item| item.deinit(alloc);
+        alloc.free(servers);
+    }
+    for (view.servers) |server| {
+        if (!policy.allowsMcpServer(server.name)) continue;
+        servers[built_servers] = .{
+            .name = try alloc.dupe(u8, server.name),
+            .source = server.source,
+            .scope = server.scope,
+            .connection_generation = server.connection_generation,
+            .catalog_generation = server.catalog_generation,
+            .auth_generation = server.auth_generation,
+        };
+        built_servers += 1;
+    }
+
+    var tool_count: usize = 0;
+    for (view.tools) |tool| {
+        if (policy.allowsMcpServer(tool.server_name) and policy.allowsMcpTool(tool.name)) tool_count += 1;
+    }
+    const tools = try alloc.alloc(mcp_access.ToolIdentity, tool_count);
+    var built_tools: usize = 0;
+    errdefer {
+        for (tools[0..built_tools]) |*item| item.deinit(alloc);
+        alloc.free(tools);
+    }
+    for (view.tools) |tool| {
+        if (!policy.allowsMcpServer(tool.server_name) or !policy.allowsMcpTool(tool.name)) continue;
+        const name = try alloc.dupe(u8, tool.name);
+        errdefer alloc.free(name);
+        const server_name = try alloc.dupe(u8, tool.server_name);
+        tools[built_tools] = .{ .name = name, .server_name = server_name };
+        built_tools += 1;
+    }
+
+    return .{
+        .runtime_generation = view.runtime_generation,
+        .owner_id = owner_id,
+        .parent_id = parent_id,
+        .features_visible = view.features_visible,
+        .servers = servers,
+        .tools = tools,
+    };
 }
 
 fn freeStrings(alloc: Allocator, values: [][]u8) void {
@@ -614,4 +730,132 @@ test "authority capture permits registry access and rejects changed work" {
         }
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     }
+}
+
+test "quarantined untrusted reader and chat child authority strips privileged tools and MCP" {
+    const io_mod = @import("../shared/io.zig");
+    const Fixture = struct {
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) HostResolveError!HostAuthority {
+            var servers = [_]mcp_access.ServerIdentity{.{
+                .name = @constCast("browseros-neo"),
+                .source = .profile,
+                .scope = .profile,
+                .connection_generation = 1,
+                .catalog_generation = 1,
+                .auth_generation = 1,
+            }};
+            var mcp_tools = [_]mcp_access.ToolIdentity{.{
+                .name = @constCast("mcp_browseros-neo_run"),
+                .server_name = @constCast("browseros-neo"),
+            }};
+            const view = mcp_access.View{
+                .runtime_generation = 1,
+                .owner_id = @constCast("parent"),
+                .parent_id = @constCast("parent"),
+                .features_visible = true,
+                .servers = &servers,
+                .tools = &mcp_tools,
+            };
+            const grants = [_]types.PermissionGrant{.{
+                .tool_name = @constCast("shell"),
+                .target_path = @constCast("*"),
+            }};
+            return HostAuthority.captureWithPermissionStateAndMcpView(
+                alloc,
+                &.{ "shell", "read_file", "write_file", "edit_file", "fossil_workspace", "subagent", "web_fetch", "web_search" },
+                &.{"mcp_browseros-neo_run"},
+                .{},
+                &grants,
+                .{},
+                &view,
+            ) catch return error.OutOfMemory;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var sessions = try session_store.Store.initFromHome(alloc, home, home);
+    defer sessions.deinit(alloc);
+    var parent = try sessions.startWritableSession(alloc, .{
+        .id = @constCast("quarantine-parent"),
+        .origin_workspace_root = @constCast(home),
+        .workspace_root = @constCast(home),
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
+        .preferences = .{ .model = @constCast("test/model"), .effort = .auto, .fast_mode = false },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+    });
+    defer parent.deinit(alloc);
+
+    const store = child_state.Store{ .backend = .{ .v1 = &sessions }, .parent_id = "quarantine-parent" };
+    var registry = try child_state.Registry.init(alloc, "quarantine-parent");
+    defer registry.deinit(alloc);
+
+    var reader_work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "reader-work"),
+        .message = try alloc.dupe(u8, "fetch page"),
+        .permission_mode = .yolo,
+        .trust_policy = .{ .tier = .untrusted, .untrusted_mode = .reader },
+        .created_at_ms = 1,
+    };
+    defer reader_work.deinit(alloc);
+    try registry.appendOneOff(alloc, "quarantine-reader", reader_work);
+
+    var chat_work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "chat-work"),
+        .message = try alloc.dupe(u8, "parse email"),
+        .permission_mode = .yolo,
+        .trust_policy = .{ .tier = .untrusted, .untrusted_mode = .chat },
+        .created_at_ms = 2,
+    };
+    defer chat_work.deinit(alloc);
+    try registry.appendOneOff(alloc, "quarantine-chat", chat_work);
+    try store.save(alloc, registry);
+
+    var resolver = Resolver{
+        .backend = .{ .v1 = &sessions },
+        .root_id = "quarantine-parent",
+        .host = .{ .resolve_fn = Fixture.resolve },
+    };
+
+    // Untrusted reader child: ONLY web_fetch and web_search; zero MCP; zero personal grants.
+    var reader_snapshot = try resolver.resolve(alloc, "quarantine-reader");
+    defer reader_snapshot.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, reader_snapshot.trust_policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, reader_snapshot.trust_policy.untrusted_mode);
+    try std.testing.expectEqual(@as(usize, 2), reader_snapshot.tools.len);
+    try std.testing.expectEqualStrings("web_fetch", reader_snapshot.tools[0]);
+    try std.testing.expectEqualStrings("web_search", reader_snapshot.tools[1]);
+    try std.testing.expectEqual(@as(usize, 0), reader_snapshot.integrations.len);
+    try std.testing.expect(reader_snapshot.mcp_view == null);
+    try std.testing.expectEqual(@as(usize, 0), reader_snapshot.grants.len);
+
+    try std.testing.expectEqual(ToolAuthorityDecision.allow, try decideToolAuthority(alloc, reader_snapshot.view(), home, "web_fetch", "https://example.com", .none));
+    try std.testing.expectEqual(ToolAuthorityDecision.allow, try decideToolAuthority(alloc, reader_snapshot.view(), home, "web_search", "zig", .none));
+    for ([_][]const u8{ "shell", "read_file", "write_file", "edit_file", "fossil_workspace", "subagent", "mcp_browseros-neo_run" }) |blocked| {
+        try std.testing.expectEqual(
+            ToolAuthorityDecision.unavailable,
+            try decideToolAuthority(alloc, reader_snapshot.view(), home, blocked, blocked, .none),
+        );
+    }
+
+    // Untrusted chat child: ZERO tools, zero MCP, zero personal grants.
+    var chat_snapshot = try resolver.resolve(alloc, "quarantine-chat");
+    defer chat_snapshot.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, chat_snapshot.trust_policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.chat, chat_snapshot.trust_policy.untrusted_mode);
+    try std.testing.expectEqual(@as(usize, 0), chat_snapshot.tools.len);
+    try std.testing.expectEqual(@as(usize, 0), chat_snapshot.integrations.len);
+    try std.testing.expect(chat_snapshot.mcp_view == null);
+    try std.testing.expectEqual(@as(usize, 0), chat_snapshot.grants.len);
+    try std.testing.expectEqual(
+        ToolAuthorityDecision.unavailable,
+        try decideToolAuthority(alloc, chat_snapshot.view(), home, "web_fetch", "https://example.com", .none),
+    );
 }

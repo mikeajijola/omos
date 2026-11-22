@@ -276,6 +276,7 @@ fn runAskChild(
     cancel: *std.atomic.Value(bool),
 ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
     const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
+    const child_policy = admission.trust_policy;
     var child_projection = ctx.cfg.mode_registry.buildModelToolProjection(
         ctx.alloc,
         ctx.deps.tool_set,
@@ -283,9 +284,9 @@ fn runAskChild(
         .{
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
-            .subagent_available = ctx.trust_policy.allowsToolAdvertisement("subagent"),
-            .fossil_workspace_available = completion_review.enabled() and ctx.trust_policy.allowsPersonalFossil(),
-            .trust_policy = ctx.trust_policy,
+            .subagent_available = false,
+            .fossil_workspace_available = completion_review.enabled() and child_policy.allowsPersonalFossil(),
+            .trust_policy = child_policy,
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
@@ -295,13 +296,16 @@ fn runAskChild(
         .provider_set = ctx.cfg.provider_set,
         .system_prompt = ctx.cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = ctx.cfg.prompt_policy.modelPromptOverlay(admission.model),
-        .skill_catalog = .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics },
+        .skill_catalog = if (child_policy.allowsWorkspaceSkills())
+            .{ .skills = ctx.loaded_skills.skills, .diagnostics = ctx.loaded_skills.diagnostics }
+        else
+            .{ .skills = &.{} },
         .advertised_tool_names = child_projection.advertised_names,
         .advertised_functions = child_projection.advertised_functions,
         .custom_tool_guidance = child_projection.custom_guidance,
         .context_registry = ctx.deps.context_registry,
-        .context_enabled = ctx.context_enabled,
-        .project_context = ctx.modelVisibleProjectContext(),
+        .context_enabled = ctx.context_enabled and child_policy.allowsProjectContext(),
+        .project_context = if (child_policy.allowsProjectContext()) ctx.modelVisibleProjectContext() else "",
         .lifecycle_view = ctx.lifecycle_view,
     }, turn, message, admission, cancel);
 }

@@ -13,7 +13,7 @@ const channels = @import("../workspace/contract_channels.zig");
 const background_control = @import("../workspace/background_control.zig");
 const trust_tier = @import("../permissions/trust_tier.zig");
 const version = "omos.ui-host/v1";
-const host_capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1", "trust_tiers_v1" };
+const host_capabilities = &[_][]const u8{ "schedule_series_v1", "contract_channels_v1", "trust_tiers_v1", "quarantined_reader_v1" };
 const alloc = std.heap.c_allocator;
 
 pub const Runner = struct {
@@ -801,12 +801,15 @@ test "UI host snapshot vocabulary cannot execute arbitrary commands" {
     try std.testing.expect(safeId("browser-turn-123"));
 }
 
-test "UI host advertises trust_tiers_v1 and validates prompt trust tiers" {
+test "UI host advertises trust_tiers_v1 and quarantined_reader_v1 and validates prompt trust tiers" {
     var has_trust_tiers = false;
+    var has_quarantined_reader = false;
     for (host_capabilities) |cap| {
         if (std.mem.eql(u8, cap, "trust_tiers_v1")) has_trust_tiers = true;
+        if (std.mem.eql(u8, cap, "quarantined_reader_v1")) has_quarantined_reader = true;
     }
     try std.testing.expect(has_trust_tiers);
+    try std.testing.expect(has_quarantined_reader);
 
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -6,6 +6,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_child_store = @import("../session/session_child_store.zig");
 const session_store = @import("../session/session_store.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
@@ -59,6 +60,7 @@ pub const ActiveWork = struct {
     root_user_messages: [][]u8 = &.{},
     root_user_evidence_complete: bool = false,
     permission_mode: types.PermissionMode = .yolo,
+    trust_policy: trust_tier.Policy = .{},
     created_at_ms: i64,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
@@ -86,6 +88,7 @@ pub const ActiveWork = struct {
             .root_user_messages = try cloneStrings(alloc, self.root_user_messages),
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .permission_mode = self.permission_mode,
+            .trust_policy = self.trust_policy,
             .created_at_ms = self.created_at_ms,
         };
     }
@@ -127,6 +130,7 @@ pub const Child = struct {
     kind: Kind,
     phase: Phase,
     work_generation: u64 = 0,
+    trust_policy: trust_tier.Policy = .{},
     active: ?ActiveWork = null,
     last_work_id: ?[]u8 = null,
     last_request_fingerprint: ?[32]u8 = null,
@@ -162,6 +166,7 @@ pub const Child = struct {
             .kind = kind,
             .phase = self.phase,
             .work_generation = self.work_generation,
+            .trust_policy = self.trust_policy,
             .active = active,
             .last_work_id = if (self.last_work_id) |value| try alloc.dupe(u8, value) else null,
             .last_request_fingerprint = self.last_request_fingerprint,
@@ -277,6 +282,7 @@ pub const Registry = struct {
             .kind = .one_off,
             .phase = .running,
             .work_generation = 1,
+            .trust_policy = active.trust_policy,
             .active = try active.clone(alloc),
         });
     }
@@ -309,6 +315,7 @@ pub const Registry = struct {
             .kind = .{ .persistent = persistent },
             .phase = .running,
             .work_generation = 1,
+            .trust_policy = active.trust_policy,
             .active = try active.clone(alloc),
         });
     }
@@ -642,6 +649,8 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
+    trust_tier: ?[]const u8 = null,
+    untrusted_mode: ?[]const u8 = null,
 };
 
 /// fx's data on a `child_finished` line.
@@ -690,6 +699,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
     const last_outcome = fxOutcome(outcome);
     if (finish.failure != null and last_outcome != .failed) return error.InvalidState;
     const fingerprint = try parseFingerprint(spawn.fingerprint);
+    const policy = trust_tier.parsePolicy(spawn.trust_tier, spawn.untrusted_mode) catch return error.InvalidState;
 
     const id = try alloc.dupe(u8, entry.id);
     errdefer alloc.free(id);
@@ -711,6 +721,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
             },
         },
         .work_generation = entry.seq,
+        .trust_policy = policy,
         .last_work_id = work_id,
         .last_request_fingerprint = fingerprint,
         .last_outcome = last_outcome,
@@ -744,10 +755,11 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
         if (after_work) |work_id| {
             if (before_work == null or !std.mem.eql(u8, before_work.?, work_id)) {
                 const fingerprint = std.fmt.bytesToHex(after.active.?.request_fingerprint, .lower);
+                const spawn_data = spawnDataFor(after.agentName(), &fingerprint, after.trust_policy);
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint }),
+                    .data = try stringifyAlloc(arena, spawn_data),
                 } });
             }
         }
@@ -781,7 +793,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try stringifyAlloc(arena, SpawnData{ .agent = child.agentName(), .fingerprint = fingerprint }),
+            .data = try stringifyAlloc(arena, spawnDataFor(child.agentName(), fingerprint, child.trust_policy)),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
@@ -791,6 +803,15 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         } });
     }
     return lines.toOwnedSlice(arena);
+}
+
+fn spawnDataFor(agent: ?[]const u8, fingerprint: []const u8, policy: trust_tier.Policy) SpawnData {
+    return .{
+        .agent = agent,
+        .fingerprint = fingerprint,
+        .trust_tier = if (policy.tier != .private) policy.tier.label() else null,
+        .untrusted_mode = if (policy.tier == .untrusted) policy.untrusted_mode.label() else null,
+    };
 }
 
 fn findChild(registry: Registry, child_id: []const u8) ?Child {
@@ -964,6 +985,14 @@ fn renderChild(writer: *std.Io.Writer, child: Child) !void {
     try writeOptionalString(writer, if (child.last_outcome) |outcome| @tagName(outcome) else null);
     try writer.writeAll(",\"last_failure\":");
     try writeOptionalString(writer, if (child.last_failure) |*failure| failure.view() else null);
+    if (child.trust_policy.tier != .private) {
+        try writer.writeAll(",\"trust_tier\":");
+        try std.json.Stringify.value(child.trust_policy.tier.label(), .{}, writer);
+        if (child.trust_policy.tier == .untrusted) {
+            try writer.writeAll(",\"untrusted_mode\":");
+            try std.json.Stringify.value(child.trust_policy.untrusted_mode.label(), .{}, writer);
+        }
+    }
     try writer.writeByte('}');
 }
 
@@ -984,9 +1013,18 @@ fn renderActive(writer: *std.Io.Writer, active: ActiveWork) !void {
         try std.json.Stringify.value(message, .{}, writer);
     }
     try writer.print(
-        "],\"root_user_evidence_complete\":{},\"permission_mode\":\"{s}\",\"created_at_ms\":{d}}}",
+        "],\"root_user_evidence_complete\":{},\"permission_mode\":\"{s}\",\"created_at_ms\":{d}",
         .{ active.root_user_evidence_complete, @tagName(active.permission_mode), active.created_at_ms },
     );
+    if (active.trust_policy.tier != .private) {
+        try writer.writeAll(",\"trust_tier\":");
+        try std.json.Stringify.value(active.trust_policy.tier.label(), .{}, writer);
+        if (active.trust_policy.tier == .untrusted) {
+            try writer.writeAll(",\"untrusted_mode\":");
+            try std.json.Stringify.value(active.trust_policy.untrusted_mode.label(), .{}, writer);
+        }
+    }
+    try writer.writeByte('}');
 }
 
 /// A v1 registry from `children.json` bytes, as `Store.load` parses it;
@@ -1025,7 +1063,12 @@ pub fn parseRegistry(alloc: Allocator, bytes: []const u8, parent_id: []const u8)
 fn parseChild(alloc: Allocator, value: std.json.Value, version: u64) !Child {
     const source = try object(value);
     const fields = [_][]const u8{ "id", "kind", "persistent", "phase", "work_generation", "active", "last_work_id", "last_request_fingerprint", "last_outcome", "last_failure" };
-    try exactFields(source, fields[0..if (version == 1) fields.len - 1 else fields.len]);
+    try requiredWithOptionalFields(
+        source,
+        fields[0..if (version == 1) fields.len - 1 else fields.len],
+        &.{ "trust_tier", "untrusted_mode" },
+    );
+    const trust_policy = try parseOptionalTrustPolicy(source);
     const failure: ?types.ModelFailureDiagnostic = if (version == schema_version) blk: {
         const raw = (try optionalString(source, "last_failure")) orelse break :blk null;
         if (raw.len == 0 or raw.len > types.ModelFailureDiagnostic.max_bytes or
@@ -1058,6 +1101,7 @@ fn parseChild(alloc: Allocator, value: std.json.Value, version: u64) !Child {
         .kind = kind,
         .phase = phase,
         .work_generation = try unsigned(source, "work_generation"),
+        .trust_policy = trust_policy,
         .active = active,
         .last_work_id = try optionalStringAlloc(alloc, source, "last_work_id"),
         .last_request_fingerprint = if (try optionalString(source, "last_request_fingerprint")) |raw|
@@ -1093,7 +1137,12 @@ fn parsePersistent(alloc: Allocator, value: std.json.Value) !PersistentIdentity 
 
 fn parseActive(alloc: Allocator, value: std.json.Value) !ActiveWork {
     const source = try object(value);
-    try exactFields(source, &.{ "id", "request_fingerprint", "message", "root_user_intent_context", "root_user_messages", "root_user_evidence_complete", "permission_mode", "created_at_ms" });
+    try requiredWithOptionalFields(
+        source,
+        &.{ "id", "request_fingerprint", "message", "root_user_intent_context", "root_user_messages", "root_user_evidence_complete", "permission_mode", "created_at_ms" },
+        &.{ "trust_tier", "untrusted_mode" },
+    );
+    const trust_policy = try parseOptionalTrustPolicy(source);
     const messages_value = source.get("root_user_messages") orelse return error.InvalidState;
     if (messages_value != .array or messages_value.array.items.len > domain.max_admission_items) return error.InvalidState;
     const messages = try alloc.alloc([]u8, messages_value.array.items.len);
@@ -1122,8 +1171,52 @@ fn parseActive(alloc: Allocator, value: std.json.Value) !ActiveWork {
             types.PermissionMode,
             try string(source, "permission_mode"),
         ) orelse return error.InvalidState,
+        .trust_policy = trust_policy,
         .created_at_ms = created.integer,
     };
+}
+
+fn parseOptionalTrustPolicy(source: std.json.ObjectMap) !trust_tier.Policy {
+    const tier_raw: ?[]const u8 = if (source.get("trust_tier")) |v| switch (v) {
+        .null => null,
+        .string => v.string,
+        else => return error.InvalidState,
+    } else null;
+    const mode_raw: ?[]const u8 = if (source.get("untrusted_mode")) |v| switch (v) {
+        .null => null,
+        .string => v.string,
+        else => return error.InvalidState,
+    } else null;
+    return trust_tier.parsePolicy(tier_raw, mode_raw) catch return error.InvalidState;
+}
+
+fn requiredWithOptionalFields(
+    source: std.json.ObjectMap,
+    required: []const []const u8,
+    optional: []const []const u8,
+) !void {
+    for (required) |name| {
+        if (source.get(name) == null) return error.InvalidState;
+    }
+    var iterator = source.iterator();
+    while (iterator.next()) |entry| {
+        var matched = false;
+        for (required) |name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            for (optional) |name| {
+                if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (!matched) return error.InvalidState;
+    }
 }
 
 fn validateRegistry(registry: Registry) !void {
@@ -1623,4 +1716,54 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
     try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
     try std.testing.expectEqual(@as([32]u8, @splat(0x11)), child.last_request_fingerprint.?);
+}
+
+test "subagent child trust policy survives v1 JSON and v2 log codecs" {
+    const alloc = std.testing.allocator;
+    const parent_id = "01J00000000000000000000000";
+    const child_id = "01J00000000000000000000001";
+    var registry = try Registry.init(alloc, parent_id);
+    defer registry.deinit(alloc);
+    var work = ActiveWork{
+        .id = try alloc.dupe(u8, "work-quarantine"),
+        .message = try alloc.dupe(u8, "fetch page"),
+        .trust_policy = .{ .tier = .untrusted, .untrusted_mode = .reader },
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try registry.appendPersistent(alloc, child_id, "web-reader", "", work);
+
+    const encoded = try renderRegistry(alloc, registry);
+    defer alloc.free(encoded);
+    var restored = try parseRegistry(alloc, encoded, parent_id);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, restored.children[0].trust_policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, restored.children[0].trust_policy.untrusted_mode);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, restored.children[0].active.?.trust_policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, restored.children[0].active.?.trust_policy.untrusted_mode);
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var empty = try Registry.init(alloc, parent_id);
+    defer empty.deinit(alloc);
+    const lines = try planLines(arena, empty, registry);
+    try std.testing.expectEqual(@as(usize, 1), lines.len);
+    const spawn = try std.json.parseFromSliceLeaky(SpawnData, arena, lines[0].spawned.data.?, .{});
+    try std.testing.expectEqualStrings("untrusted", spawn.trust_tier.?);
+    try std.testing.expectEqualStrings("reader", spawn.untrusted_mode.?);
+
+    var folded = [_]session_adapter.Child{.{
+        .id = @constCast(child_id),
+        .work_id = @constCast("work-quarantine"),
+        .open = false,
+        .outcome = .ok,
+        .spawn_data = @constCast(lines[0].spawned.data.?),
+        .finish_data = null,
+        .seq = 1,
+    }};
+    var rebuilt = try registryFromChildren(alloc, parent_id, &folded);
+    defer rebuilt.deinit(alloc);
+    try std.testing.expectEqual(trust_tier.TrustTier.untrusted, rebuilt.children[0].trust_policy.tier);
+    try std.testing.expectEqual(trust_tier.UntrustedMode.reader, rebuilt.children[0].trust_policy.untrusted_mode);
 }

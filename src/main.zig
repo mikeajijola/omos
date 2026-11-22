@@ -2070,13 +2070,16 @@ const App = struct {
         alloc: Allocator,
         permission_mode: types.PermissionMode,
         permission_rules: types.PermissionRuleSet,
+        trust_policy: @import("core/permissions/trust_tier.zig").Policy,
     ) !tool_projection.EffectiveToolProjection {
-        return self.snapshotModelToolProjectionForRules(
-            alloc,
-            permission_mode,
-            permission_rules,
-            false,
-        );
+        return tool_projection.buildModelToolProjectionForSet(alloc, self.toolAdvertisementSet(), .{
+            .permission_mode = permission_mode,
+            .permission_rules = permission_rules,
+            .subagent_available = false,
+            .fossil_workspace_available = self.fossilWorkspaceAvailable() and trust_policy.allowsPersonalFossil(),
+            .coordinator_mode = false,
+            .trust_policy = trust_policy,
+        });
     }
 
     fn snapshotModelToolProjectionForRules(

@@ -91,6 +91,8 @@ fn validationErrorCode(err: model_contract.ValidationError) []const u8 {
         error.InvalidMessage => "invalid_message",
         error.InvalidModel => "invalid_model",
         error.InvalidEffort => "invalid_effort",
+        error.InvalidTrustTier => "invalid_trust_tier",
+        error.InvalidUntrustedMode => "invalid_untrusted_mode",
     };
 }
 
@@ -103,21 +105,25 @@ fn parseRoot(value: std.json.Value) DecodeError!model_contract.RequestInput {
     const action = try requiredString(request, "action");
 
     if (std.mem.eql(u8, action, "run")) {
-        try rejectUnknown(request, &.{ "action", "task", "model", "effort" });
+        try rejectUnknown(request, &.{ "action", "task", "model", "effort", "trust_tier", "untrusted_mode" });
         return .{ .run = .{
             .task = try requiredString(request, "task"),
             .model = try optionalString(request, "model"),
             .effort = try optionalString(request, "effort"),
+            .trust_tier = try optionalString(request, "trust_tier"),
+            .untrusted_mode = try optionalString(request, "untrusted_mode"),
         } };
     }
     if (std.mem.eql(u8, action, "message")) {
-        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort" });
+        try rejectUnknown(request, &.{ "action", "agent", "instructions", "message", "model", "effort", "trust_tier", "untrusted_mode" });
         return .{ .message = .{
             .agent = try requiredString(request, "agent"),
             .instructions = try optionalString(request, "instructions"),
             .message = try requiredString(request, "message"),
             .model = try optionalString(request, "model"),
             .effort = try optionalString(request, "effort"),
+            .trust_tier = try optionalString(request, "trust_tier"),
+            .untrusted_mode = try optionalString(request, "untrusted_mode"),
         } };
     }
     return error.InvalidEnum;
@@ -317,6 +323,17 @@ test "decode rejects invalid creation overrides" {
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"effort\":\"not an effort!\"}}", "invalid_effort");
     try expectDecodeFailure("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":7}}", "invalid_field_type");
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"provider\":\"gateway\"}}", "unknown_field");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"trust_tier\":\"admin\"}}", "invalid_trust_tier");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"shell\"}}", "invalid_untrusted_mode");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"trust_tier\":\"shared\",\"untrusted_mode\":\"reader\"}}", "invalid_trust_tier");
+    try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\",\"untrusted_mode\":\"reader\"}}", "invalid_trust_tier");
+}
+
+test "decode accepts quarantined untrusted reader and chat requests" {
+    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"fetch docs\",\"trust_tier\":\"untrusted\"}}", .run);
+    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"fetch docs\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"reader\"}}", .run);
+    try expectRequestTag("{\"request\":{\"action\":\"run\",\"task\":\"parse email\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"chat\"}}", .run);
+    try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reader\",\"message\":\"check url\",\"trust_tier\":\"untrusted\",\"untrusted_mode\":\"reader\"}}", .message);
 }
 
 test "decode rejects manager input cross-action fields and unknown actions" {

@@ -3,6 +3,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
 const session_layout = @import("../session/session_layout.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
+const trust_tier = @import("../permissions/trust_tier.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,6 +50,7 @@ pub const AdmissionSnapshot = struct {
     effort: types.ReasoningEffort,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
+    trust_policy: trust_tier.Policy = .{},
     tool_names: [][]u8,
     rules: types.PermissionRuleSet,
     grants: []types.PermissionGrant,
@@ -79,6 +81,7 @@ pub const AdmissionInput = struct {
     effort: types.ReasoningEffort,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
+    trust_policy: trust_tier.Policy = .{},
     tool_names: []const []const u8 = &.{},
     rules: types.PermissionRuleSet = .{},
     grants: []const types.PermissionGrant = &.{},
@@ -157,6 +160,7 @@ pub fn captureAdmission(
         .effort = input.effort,
         .ultrafast_mode = input.ultrafast_mode,
         .permission_mode = input.permission_mode,
+        .trust_policy = input.trust_policy,
         .tool_names = tool_names,
         .rules = rules,
         .grants = grants,
