@@ -7286,6 +7286,23 @@ noinline fn planManagedTask(deps: *const AgentRuntimeDeps, alloc: Allocator, sum
     return true;
 }
 
+fn resolveManagedActorStepLimit(policy_limit: usize, background_worker: bool, env_raw: ?[]const u8) ?usize {
+    const default_limit: usize = if (background_worker) @max(policy_limit, 250) else policy_limit;
+    const raw = env_raw orelse return default_limit;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return default_limit;
+    if (std.mem.eql(u8, trimmed, "0") or
+        std.ascii.eqlIgnoreCase(trimmed, "off") or
+        std.ascii.eqlIgnoreCase(trimmed, "none") or
+        std.ascii.eqlIgnoreCase(trimmed, "unlimited"))
+    {
+        return null;
+    }
+    const parsed = std.fmt.parseUnsigned(usize, trimmed, 10) catch return default_limit;
+    if (parsed == 0) return null;
+    return parsed;
+}
+
 fn discardContractEvent(_: *anyopaque, _: agent_stream_provider.Event) void {}
 
 fn processQueuedPromptLoop(
@@ -7964,16 +7981,18 @@ fn processQueuedPromptLoop(
         }
         if (managed) |*turn| if (turn.task.model_basis) |basis| {
             const policy = basis.execution.defaults;
-            const max_actor_steps = if (config.background_worker) @max(policy.max_actor_steps, 250) else policy.max_actor_steps;
-            if (step >= max_actor_steps) {
-                try turn.manager.record(turn.task, "invocation_stopped", .{ .step = step, .reason = "Actor-step budget exhausted; final summary was not verifiable." });
-                try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The actor-step budget is exhausted. This task is paused with its completed work and evidence retained. Continue to resume remaining obligations.", "workspace_invocation_budget");
-                return;
-            }
-            if (!governance.finalizing and step + 1 >= max_actor_steps) {
-                governance.pause_reason = "This invocation reached its actor-step budget. The task and evidence are retained; continue to resume with a fresh bounded invocation.";
-                governance.finalizing = true;
-                try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
+            const env_override = io_mod.getenv("OMOS_MAX_ACTOR_STEPS") orelse io_mod.getenv("FX_MAX_ACTOR_STEPS");
+            if (resolveManagedActorStepLimit(policy.max_actor_steps, config.background_worker, env_override)) |max_actor_steps| {
+                if (step >= max_actor_steps) {
+                    try turn.manager.record(turn.task, "invocation_stopped", .{ .step = step, .reason = "Actor-step budget exhausted; final summary was not verifiable." });
+                    try finishFailedTurnWithNotice(deps, finalization, arena, job, within_turn_suffix.items, &summary_accumulator, stop_state, &finish_trace, "The actor-step budget is exhausted. This task is paused with its completed work and evidence retained. Continue to resume remaining obligations.", "workspace_invocation_budget");
+                    return;
+                }
+                if (!governance.finalizing and step + 1 >= max_actor_steps) {
+                    governance.pause_reason = "This invocation reached its actor-step budget. The task and evidence are retained; continue to resume with a fresh bounded invocation.";
+                    governance.finalizing = true;
+                    try turn.manager.record(turn.task, "invocation_budget", .{ .step = step, .reason = governance.pause_reason });
+                }
             }
             if (governance.reviewDue(policy)) progress_check: {
                 try deps.push_system_notice(deps.ctx, "Checking task progress...");
@@ -14246,4 +14265,36 @@ test "InvalidToolName performs one-step corrective recovery even when contract_r
         try std.testing.expectEqual(@as(usize, 1), fake.history_turns.items.len);
         try std.testing.expectEqualStrings("Second failure check.", fake.history_turns.items[0].assistant.user.text);
     }
+}
+
+test "resolveManagedActorStepLimit preserves policy defaults when unset or blank" {
+    try std.testing.expectEqual(@as(?usize, 100), resolveManagedActorStepLimit(100, false, null));
+    try std.testing.expectEqual(@as(?usize, 250), resolveManagedActorStepLimit(100, true, null));
+    try std.testing.expectEqual(@as(?usize, 400), resolveManagedActorStepLimit(400, true, null));
+    try std.testing.expectEqual(@as(?usize, 100), resolveManagedActorStepLimit(100, false, ""));
+    try std.testing.expectEqual(@as(?usize, 250), resolveManagedActorStepLimit(100, true, "  \t\r\n "));
+}
+
+test "resolveManagedActorStepLimit returns null for unbounded override tokens" {
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, false, "0"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, true, "0"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, false, " 00 "));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, false, "off"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, true, "OFF"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, false, "none"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, true, "None"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, false, "unlimited"));
+    try std.testing.expectEqual(@as(?usize, null), resolveManagedActorStepLimit(100, true, "  UnLiMiTeD\n"));
+}
+
+test "resolveManagedActorStepLimit parses positive integer overrides" {
+    try std.testing.expectEqual(@as(?usize, 500), resolveManagedActorStepLimit(100, false, "500"));
+    try std.testing.expectEqual(@as(?usize, 500), resolveManagedActorStepLimit(100, true, " 500 "));
+    try std.testing.expectEqual(@as(?usize, 1), resolveManagedActorStepLimit(100, false, "1"));
+}
+
+test "resolveManagedActorStepLimit falls back to safe default on invalid values" {
+    try std.testing.expectEqual(@as(?usize, 100), resolveManagedActorStepLimit(100, false, "invalid"));
+    try std.testing.expectEqual(@as(?usize, 250), resolveManagedActorStepLimit(100, true, "-5"));
+    try std.testing.expectEqual(@as(?usize, 100), resolveManagedActorStepLimit(100, false, "500x"));
 }
